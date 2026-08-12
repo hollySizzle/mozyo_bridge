@@ -62,6 +62,50 @@ sender env** に置き換える。
   authority joinは同じfresh full inventory snapshotで assigned name / locator / terminal_id が各exact 1件、
   かつ全rowがcanonicalであることを要求する。same locator / different terminal、重複、欠落、空白、
   malformed row混在はいずれもnon-greenである。
+- **global offline rolloutのdestructive pin** (#15227 j#104067) はprivate `close_authority` v2へ
+  workspace/lane/role/assigned-name/locator/`startup_action_id`を保存し、terminal値そのものは保存しない。
+  delegate captureと各close直前に、保存tokenをfresh full inventoryのterminal、v4 attestation、completed
+  generation-v2へexact再joinする。first non-replayでtarget absentならclose 0、active-phase replayと各close後は
+  同じgenerationが指すterminalのpositive absenceだけを許可し、name/locator/terminal reclaimまたはstore不読は
+  後続close 0で拒否する。Herdr 0.8のlocator-only mutationにatomic conditional closeが無い制約は残る。
+- **absent legacy recoveryの非破壊pin** は`close_authority`へ混ぜず、別のprivate closed
+  `legacy_absence_authority` v1へworkspace/lane/provider/name/old locator/old `startup_action_id`を保存する。
+  raw terminalは保存・公開・repr描画しない。captureは同じfresh agent+pane snapshotでcurrent generation-v2、
+  completed pair action、`pane_bound_v2` receipt、v4 attestationへexact joinし、name/locator/terminalのpositive
+  absenceとpairの同一old container + passive root exact 1件を要求する。各effect edgeでも再検証し、明示的な
+  generation rebuild完了後、expected restore generationがcurrent rowを置換した場合だけcompleted startup
+  receiptをold terminalのfallback authorityにする。row欠落やforeign generationはfallbackしない。このpinは
+  restore admission専用であり、close executorのtargetにはならない。非空authorityはplanのsource
+  launch-generation storeがrecognized v2の場合だけ有効なので、同runのrebuild phaseは`already_current`となり
+  old pinを消すv1 rebuild crash windowを作らない。
+- **global offline rolloutのrestore identity** は別のprivate closed `restore_intent` v1である。action作成前に
+  canonical workspace/lane/provider/name groupごとのprivate nonceとexpected startup action idを固定し、
+  terminal値は保存しない。restore前は全original generationのpositive absence、restore中は
+  「completed exact expected actionのnew terminal-bound generation」または「expected action absent」の
+  2 stateだけをcumulative exact rosterとして許可し、それ以外をatomic residualとして追加launchなしで
+  拒否する。restore後は全nameがexpected new action + v4 attestation + completed generation-v2へexact join
+  することを各supervisor/final edgeで再確認する。completed-successのexact groupだけはcrash replayでfoldし、
+  planned / partial / rollback / foreign / missing / extraを自動cleanupやfresh nonceへ畳まない。nonceは
+  public CLI/argv/stdout/provider env/status/reprへ出さず、exact candidate runnerがshared typed session-start
+  serviceへin-processで渡す。repo pathは単独でidentity authorityにせず、sealed groupのworkspace idを
+  application-only equality assertionとして同serviceへ渡す。registry refresh / startup reservation直前に加え、
+  実際にcwdを消費する`workspace create` / `pane split` primitive内のinvoke直前にもpathから解決したidentityとの
+  exact一致を再評価する。legacy recoveryはworkspace idだけでなくsealed lifecycle generation +
+  `worktree_identity`をlocal Git worktree一覧へexact-one joinし、同workspaceのforeign sibling worktreeを拒否する。
+  provider APIがpath identityをatomic consumeしないため、最後のcheck→invoke間の最小raceは保証上限として残る。
+- **pane-only stateもrestore authorityの一部である。** `agent list`とfresh strict full-pane listを同一edgeで
+  読み、agent-bearing paneをrole/locator/terminalへ双方向exact joinする。残るshell-only paneは
+  `passive_pane_intent` v1のlocator/workspace/tab/terminal全軸が不変な場合だけnonconsumer baselineとして許す。
+  groupごとの`restore_container_intent` v1は破壊的close前にold completed participantからpassive root exact 1件を
+  sealし、restoreはそのanchorだけをsplitする。new splitはprovider responseのtyped identityをparticipantへ即時記録し、
+  次effectでfresh full joinする。missing/duplicate/malformed/agent-bearing extra、または任意軸driftはzero-close/
+  zero-launchである。
+- **session-start maintenance gateは補助的なconforming-writer exclusionである。** owner-privateな共通namespaceで、
+  NFD+case-foldしたresolved home path keyとhome device/inode keyの2本の0600 lockを同順取得する。通常startは
+  shared、offline `run`全体はexclusiveで保持し、同process内はmint済みopaque leaseだけを再利用する。これにより
+  rename/recreate、macOSのcase/Unicode alias、bind-mount aliasでlock inodeを分岐させない。raw Herdr、
+  provider wrapper単独、旧runtimeはこのcooperative gateへ参加しないため、terminal/full-pane/startup transactionの
+  fresh fenceを省略してはならない。
 - **workspace_registry は無変更 (#11425)。** herdr anchor に新 schema は足さない。純 herdr
   session の identity anchor は既存の `workspace_id` (registry / `.mozyo-bridge/workspace-anchor.json`)
   + assigned-name scheme で完結する。registry には runtime/pane state を持ち込まない不変条件を維持する。

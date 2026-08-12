@@ -16,6 +16,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_COMPLETED_ROLLED_BACK,
+    PHASE_COMPLETED_SUCCESS,
+    PHASE_HEALTH_CHECK,
     PHASE_ROLLBACK_OWED,
     Participant,
     StartupTransactionBusy,
@@ -82,7 +84,7 @@ class _Fence:
         self.outcomes = list(outcomes)
         self.record_calls = []
 
-    def reserve(self, _unit, _nonce):
+    def reserve(self, _unit, _nonce, **_kwargs):
         return self.action
 
     def record_participant(self, action_id, participant):
@@ -193,6 +195,28 @@ class StartupTransactionRecordLaunchTest(unittest.TestCase):
             self.assertFalse(thread.is_alive())
             recorded = fence.read(transaction.action_id)
             self.assertEqual(recorded.participant_for("codex").locator, "w1:p2")
+
+    def test_completion_fence_failure_leaves_health_nonterminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fence = StartupTransactionFence(home=Path(directory))
+            transaction = StartupTransaction(
+                fence=fence,
+                unit=StartupUnit("workspace", "default", ("codex",)),
+                nonce="completion-fence",
+                completion_fence=lambda: (_ for _ in ()).throw(
+                    StartupTransactionError("generation remains pending")
+                ),
+            )
+            transaction.reserve()
+
+            with self.assertRaisesRegex(
+                StartupTransactionError, "generation remains pending"
+            ):
+                transaction.settle(owed=False, launched=True)
+
+            action = fence.read(transaction.action_id)
+            self.assertEqual(action.phase, PHASE_HEALTH_CHECK)
+            self.assertNotEqual(action.phase, PHASE_COMPLETED_SUCCESS)
 
 
 class _PreparedRollbackOps:

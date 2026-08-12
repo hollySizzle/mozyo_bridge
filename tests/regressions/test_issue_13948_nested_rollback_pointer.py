@@ -337,7 +337,9 @@ class RealDriveWiringTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.home = Path(tempfile.mkdtemp())
+        # Entry-stable parent for the session-start gate (see the sibling setUp note).
+        self.home = Path(tempfile.mkdtemp()) / "home"
+        self.home.mkdir(mode=0o700)
         self.obs = _observation()
         # Ruling j#97105: the discard plan reads each participant's CURRENT
         # launch-generation row, and this lane is a pre-#14741 one -- stated for the exact
@@ -530,7 +532,11 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.home = Path(self._tmp.name)
+        # One level below the tempdir root: the session-start gate needs an entry-stable
+        # parent, and the shared TMPDIR above a raw tempdir is not one on older fence
+        # runners (#15227 R-correction; see test_issue_14480 for the full note).
+        self.home = Path(self._tmp.name) / "home"
+        self.home.mkdir(mode=0o700)
         self.action_id = "replacement_action_13948"
         self.assigned = encode_assigned_name(WS, "claude", LANE)
         self.unit = StartupUnit(WS, LANE, _MANAGED)

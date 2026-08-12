@@ -1854,10 +1854,10 @@ class ZeroSideEffectTest(unittest.TestCase):
         import inspect
 
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
-            herdr_session_start,
+            herdr_session_start_entry,
         )
 
-        wrapper = inspect.getsource(herdr_session_start.prepare_session)
+        wrapper = inspect.getsource(herdr_session_start_entry.prepare_session)
         self.assertIn("attestation_store_lock", wrapper)
         self.assertIn("exclusive=False", wrapper)
         self.assertIn("blocking=False", wrapper, "admission must fail closed, not queue")

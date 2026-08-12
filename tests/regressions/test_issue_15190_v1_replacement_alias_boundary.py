@@ -26,6 +26,8 @@ from pathlib import Path
 from unittest import mock
 
 from mozyo_bridge.core.state.workspace_registry import ANCHOR_SCHEMA_VERSION
+from mozyo_bridge.core.state.herdr_session_start_gate import session_start_gate
+from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.workspace_alias import (  # noqa: E501
     MODE_ALIAS,
     MODE_DISABLED,
@@ -165,7 +167,7 @@ class V1ReplacementAliasBoundaryTest(unittest.TestCase):
             session + "preflight_managed_launch", return_value=None
         ), mock.patch(
             session + "register_workspace", side_effect=_capture_root
-        ):
+        ), session_start_gate(mozyo_bridge_home(), exclusive=False) as lease:
             try:
                 binding.prepare_actuator_lane_session(
                     worktree_path=str(self.nested),
@@ -177,6 +179,7 @@ class V1ReplacementAliasBoundaryTest(unittest.TestCase):
                     timeout=5.0,
                     replacement_action_id="action-1",
                     admission_lock_held=True,
+                    session_gate_lease=lease,
                 )
             except _Stop:
                 pass

@@ -87,6 +87,18 @@ EXECUTION_PHASES = (
     "supervisor_pair_readback",
     "final_verify",
 )
+HISTORICAL_V3_EXECUTION_PHASES = tuple(
+    phase for phase in EXECUTION_PHASES if phase != "rebuild_launch_generation"
+)
+_READBACK_PHASES = {
+    3: HISTORICAL_V3_EXECUTION_PHASES,
+    4: EXECUTION_PHASES,
+}
+_HISTORICAL_V3_STORE_TARGETS = {
+    "attestation": 3,
+    "lane_lifecycle": 10,
+    "startup_transaction": 2,
+}
 
 
 class OfflineRolloutActionError(ValueError):
@@ -572,7 +584,137 @@ def new_action(
     }
 
 
-def validate_action(action: object) -> Mapping[str, object]:
+def _readback_plan(
+    plan: object, digest: object
+) -> tuple[Mapping[str, object], tuple[str, ...]]:
+    """Decode only frozen plan generations safe for archival public status.
+
+    This is deliberately not execution compatibility.  Current v4 still traverses the
+    full strict verifier.  Historical v3 is admitted only with its frozen 15-phase order
+    and three old store targets, enough to validate the action prefix without reviving
+    the removed execution semantics.
+    """
+
+    expected_digest = _token(digest, "plan_digest")
+    if _SHA256.fullmatch(expected_digest) is None:
+        raise OfflineRolloutActionError("plan_digest_invalid")
+    if not isinstance(plan, Mapping):
+        raise OfflineRolloutActionError("plan_invalid")
+    if canonical_digest(plan) != expected_digest:
+        raise OfflineRolloutActionError("plan_digest_mismatch")
+    version = plan.get("schema_version")
+    if type(version) is not int or version not in _READBACK_PHASES:
+        raise OfflineRolloutActionError("plan_schema_unsupported")
+    phases = plan.get("phase_order")
+    if not isinstance(phases, list):
+        raise OfflineRolloutActionError("plan_phase_order_invalid")
+    names = []
+    for phase in phases:
+        if not isinstance(phase, Mapping):
+            raise OfflineRolloutActionError("plan_phase_invalid")
+        names.append(_token(phase.get("phase"), "phase"))
+    expected_phases = _READBACK_PHASES[version]
+    if tuple(names) != expected_phases:
+        raise OfflineRolloutActionError("plan_phase_order_unsupported")
+    if version == 4:
+        verify_plan(plan, expected_digest)
+    else:
+        _verify_historical_v3_plan(plan)
+    return plan, expected_phases
+
+
+def _verify_historical_v3_plan(plan: Mapping[str, object]) -> None:
+    """Reapply the frozen v3 writer contract without reviving v3 execution.
+
+    The current strict verifier is the maintained superset of the old contract.  A
+    canonical synthetic launch-generation observation lets it validate every shared
+    artifact, supervisor, migration, recovery, and restore invariant while the checks
+    below pin the exact fields which legitimately differed in v3.  The synthetic value
+    is never returned or persisted.
+    """
+
+    stores = plan.get("stores")
+    if not isinstance(stores, Mapping) or set(stores) != set(
+        _HISTORICAL_V3_STORE_TARGETS
+    ):
+        raise OfflineRolloutActionError("plan_store_set_invalid")
+    for name, target in _HISTORICAL_V3_STORE_TARGETS.items():
+        record = stores.get(name)
+        if (
+            not isinstance(record, Mapping)
+            or type(record.get("target_version")) is not int
+            or record.get("target_version") != target
+            or type(record.get("version")) is not int
+        ):
+            raise OfflineRolloutActionError(f"plan_{name}_not_execution_ready")
+
+    transitions = plan.get("schema_transitions")
+    expected_transitions = [
+        {
+            "store": name,
+            "from_version": stores[name].get("version"),
+            "to_version": target,
+        }
+        for name, target in sorted(_HISTORICAL_V3_STORE_TARGETS.items())
+    ]
+    if transitions != expected_transitions:
+        raise OfflineRolloutActionError("plan_schema_transitions_invalid")
+
+    phases = plan["phase_order"]
+    phases_by_name = {phase["phase"]: phase for phase in phases}
+    for phase_name, target in (
+        ("migrate_attestation", 3),
+        ("migrate_lane_lifecycle", 10),
+        ("migrate_startup_transaction", 2),
+    ):
+        value = phases_by_name[phase_name].get("target_version")
+        if type(value) is not int or value != target:
+            raise OfflineRolloutActionError("plan_phase_target_version_invalid")
+
+    synthetic = json.loads(canonical_bytes(plan).decode("ascii"))
+    synthetic["schema_version"] = 4
+    synthetic_stores = synthetic["stores"]
+    synthetic_stores["attestation"]["target_version"] = 4
+    synthetic_stores["lane_lifecycle"]["target_version"] = 11
+    synthetic_stores["launch_generation"] = {
+        "state": "absent",
+        "version": None,
+        "target_version": 2,
+        "upgrade_required": False,
+        "content_digest": "",
+        "migration_plan_digest": "",
+    }
+    synthetic["schema_transitions"] = [
+        {
+            "store": name,
+            "from_version": synthetic_stores[name].get("version"),
+            "to_version": target,
+        }
+        for name, target in sorted(
+            {
+                "attestation": 4,
+                "lane_lifecycle": 11,
+                "launch_generation": 2,
+                "startup_transaction": 2,
+            }.items()
+        )
+    ]
+    synthetic_phases = synthetic["phase_order"]
+    for phase in synthetic_phases:
+        if phase["phase"] == "migrate_attestation":
+            phase["target_version"] = 4
+        elif phase["phase"] == "migrate_lane_lifecycle":
+            phase["target_version"] = 11
+    insert_at = HISTORICAL_V3_EXECUTION_PHASES.index("exact_runtime_install")
+    synthetic_phases.insert(
+        insert_at, {"phase": "rebuild_launch_generation", "target_version": 2}
+    )
+    verify_plan(synthetic, canonical_digest(synthetic))
+
+
+def validate_action_for_readback(action: object) -> Mapping[str, object]:
+    """Validate a sealed v1 action for status only; never grants execution."""
+
     if not isinstance(action, Mapping):
         raise OfflineRolloutActionError("action_invalid")
     if set(action) != _ACTION_FIELDS:
@@ -586,7 +728,7 @@ def validate_action(action: object) -> Mapping[str, object]:
         raise OfflineRolloutActionError("action_id_invalid")
     plan = action.get("plan")
     digest = action.get("plan_digest")
-    verify_plan(plan, digest)
+    plan, phase_names = _readback_plan(plan, digest)
     approval = action.get("approval")
     if not isinstance(approval, Mapping):
         raise OfflineRolloutActionError("approval_invalid")
@@ -599,8 +741,7 @@ def validate_action(action: object) -> Mapping[str, object]:
     receipts = action.get("phase_receipts")
     if not isinstance(completed, list) or not isinstance(receipts, Mapping):
         raise OfflineRolloutActionError("action_progress_invalid")
-    phase_names = [phase["phase"] for phase in plan["phase_order"]]
-    if completed != phase_names[: len(completed)]:
+    if completed != list(phase_names[: len(completed)]):
         raise OfflineRolloutActionError("action_phase_prefix_invalid")
     if set(receipts) != set(completed):
         raise OfflineRolloutActionError("action_receipts_invalid")
@@ -624,6 +765,14 @@ def validate_action(action: object) -> Mapping[str, object]:
         if not isinstance(action.get(field), str):
             raise OfflineRolloutActionError(f"action_{field}_invalid")
     return action
+
+
+def validate_action(action: object) -> Mapping[str, object]:
+    """Strict current execution decoder (historical readback is a separate rail)."""
+
+    validated = validate_action_for_readback(action)
+    verify_plan(validated["plan"], validated["plan_digest"])
+    return validated
 
 
 def _copy(action: Mapping[str, object]) -> dict:
@@ -719,8 +868,10 @@ def mark_blocked(
 
 def public_status(action: Mapping[str, object]) -> dict:
     """Path/locator/WIP-byte-free status projection."""
-    validate_action(action)
-    phase = next_phase(action)
+    validate_action_for_readback(action)
+    phases = action["plan"]["phase_order"]
+    completed = action["completed_phases"]
+    phase = None if len(completed) == len(phases) else phases[len(completed)]
     return {
         "completed": action["state"] == ACTION_COMPLETED,
         "action_id": action["action_id"],
@@ -749,6 +900,7 @@ __all__ = (
     "APPROVAL_SOURCE",
     "APPROVAL_VERSION",
     "EXECUTION_PHASES",
+    "HISTORICAL_V3_EXECUTION_PHASES",
     "OFFLINE_ROLLOUT_APPROVAL_GATE",
     "OfflineRolloutActionError",
     "approval_action_digest",
@@ -769,5 +921,6 @@ __all__ = (
     "public_status",
     "render_approval_note",
     "validate_action",
+    "validate_action_for_readback",
     "verify_plan",
 )

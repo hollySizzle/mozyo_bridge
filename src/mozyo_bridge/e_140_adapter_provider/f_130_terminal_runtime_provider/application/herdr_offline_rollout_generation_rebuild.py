@@ -3,6 +3,7 @@
 import os
 import sqlite3
 import stat
+from typing import Callable, Optional
 
 from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     remove_attestation_store_artifacts,
@@ -24,6 +25,24 @@ from .herdr_offline_rollout_snapshot import (
 
 
 _REBUILD_AUTHORITY = "launch-generation.rebuild-authority"
+
+
+class _EffectFenceRefused(Exception):
+    """Carry the caller's typed refusal through private mutation helpers."""
+
+    def __init__(self, result: PhaseExecutionResult) -> None:
+        super().__init__(result.reason)
+        self.result = result
+
+
+def _require_effect_fence(
+    effect_fence: Optional[Callable[[], PhaseExecutionResult]],
+) -> None:
+    if effect_fence is None:
+        return
+    admitted = effect_fence()
+    if not admitted.ok:
+        raise _EffectFenceRefused(admitted)
 
 
 def _artifact_matches_plan(path, planned) -> bool:
@@ -70,7 +89,9 @@ def _file_fsync(path) -> None:
         os.close(descriptor)
 
 
-def _publish_rebuild_authority(*, backup_root, path, content_digest):
+def _publish_rebuild_authority(
+    *, backup_root, path, content_digest, effect_fence=None
+):
     metadata = path.lstat()
     marker = backup_root / _REBUILD_AUTHORITY
     staging = marker.with_name(marker.name + ".staging")
@@ -90,7 +111,9 @@ def _publish_rebuild_authority(*, backup_root, path, content_digest):
             raise OSError("rebuild-authority pin changed")
         _directory_fsync(backup_root)
         return pinned
+    _require_effect_fence(effect_fence)
     staging.unlink(missing_ok=True)
+    _require_effect_fence(effect_fence)
     descriptor = os.open(staging, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     try:
         written = 0
@@ -102,6 +125,7 @@ def _publish_rebuild_authority(*, backup_root, path, content_digest):
         os.fsync(descriptor)
     finally:
         os.close(descriptor)
+    _require_effect_fence(effect_fence)
     try:
         os.link(staging, marker)
     except FileExistsError:
@@ -131,7 +155,9 @@ def _read_rebuild_authority(*, backup_root, content_digest):
     return tuple(int(value) for value in fields[1:])
 
 
-def _backup_launch_generation_locked(*, home, backup_root, planned) -> PhaseExecutionResult:
+def _backup_launch_generation_locked(
+    *, home, backup_root, planned, effect_fence=None
+) -> PhaseExecutionResult:
     path = herdr_launch_generation_path(home)
     backup = backup_root / "launch-generation.sqlite3"
     staging = backup.with_name(backup.name + ".staging")
@@ -160,18 +186,23 @@ def _backup_launch_generation_locked(*, home, backup_root, planned) -> PhaseExec
             ):
                 return PhaseExecutionResult(False, reason="launch_generation_backup_unsafe")
         if path.is_file() and not backup.exists():
+            _require_effect_fence(effect_fence)
             remove_attestation_store_artifacts(staging)
+            _require_effect_fence(effect_fence)
             with (
                 sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as src,
                 sqlite3.connect(staging) as dst,
             ):
                 src.backup(dst)
+            _require_effect_fence(effect_fence)
             staging.chmod(0o600)
             if not _artifact_matches_plan(staging, planned):
+                _require_effect_fence(effect_fence)
                 remove_attestation_store_artifacts(staging)
                 return PhaseExecutionResult(
                     False, reason="launch_generation_backup_readback_failed"
                 )
+            _require_effect_fence(effect_fence)
             os.replace(staging, backup)
             _directory_fsync(backup_root)
             if not _artifact_matches_plan(backup, planned):
@@ -197,7 +228,9 @@ def _backup_launch_generation_locked(*, home, backup_root, planned) -> PhaseExec
     })
 
 
-def backup_launch_generation(*, home, backup_root, planned, observe) -> PhaseExecutionResult:
+def backup_launch_generation(
+    *, home, backup_root, planned, observe, effect_fence=None
+) -> PhaseExecutionResult:
     """Pin the source generation from fresh observation through atomic backup publish."""
     if not _planned_shape_exact(planned):
         return PhaseExecutionResult(False, reason="launch_generation_plan_drift")
@@ -206,8 +239,13 @@ def backup_launch_generation(*, home, backup_root, planned, observe) -> PhaseExe
             if observe() != planned:
                 return PhaseExecutionResult(False, reason="launch_generation_plan_drift")
             return _backup_launch_generation_locked(
-                home=home, backup_root=backup_root, planned=planned
+                home=home,
+                backup_root=backup_root,
+                planned=planned,
+                effect_fence=effect_fence,
             )
+    except _EffectFenceRefused as exc:
+        return exc.result
     except Exception as exc:  # noqa: BLE001 - lock/IO errors remain typed
         return PhaseExecutionResult(
             False, reason="launch_generation_backup_failed", detail=type(exc).__name__
@@ -215,7 +253,8 @@ def backup_launch_generation(*, home, backup_root, planned, observe) -> PhaseExe
 
 
 def rebuild_launch_generation(
-    *, home, backup_root, planned, observe, backup_receipt, replaying
+    *, home, backup_root, planned, observe, backup_receipt, replaying,
+    effect_fence=None,
 ) -> PhaseExecutionResult:
     path = herdr_launch_generation_path(home)
     if not _planned_shape_exact(planned):
@@ -266,6 +305,7 @@ def rebuild_launch_generation(
                         pinned = _publish_rebuild_authority(
                             backup_root=backup_root, path=path,
                             content_digest=digest,
+                            effect_fence=effect_fence,
                         )
                     try:
                         metadata = path.lstat()
@@ -281,10 +321,14 @@ def rebuild_launch_generation(
                         )
                 elif observed == planned:
                     pinned = _publish_rebuild_authority(
-                        backup_root=backup_root, path=path, content_digest=digest
+                        backup_root=backup_root,
+                        path=path,
+                        content_digest=digest,
+                        effect_fence=effect_fence,
                     )
                 else:
                     return PhaseExecutionResult(False, reason="launch_generation_plan_drift")
+                _require_effect_fence(effect_fence)
                 remove_attestation_store_artifacts(path)
                 _directory_fsync(path.parent)
                 ok = observe()["state"] == "absent"
@@ -292,6 +336,8 @@ def rebuild_launch_generation(
                     "rebuild_replay_verified" if replaying
                     else "rebuilt_for_v2_restore"
                 )
+    except _EffectFenceRefused as exc:
+        return exc.result
     except Exception as exc:  # noqa: BLE001 - maintenance errors remain typed
         return PhaseExecutionResult(
             False, reason="launch_generation_rebuild_failed",

@@ -708,6 +708,49 @@ class StartupTransactionFence:
             self.read_identity_manifest(action.action_id)
         return action
 
+    @staticmethod
+    def _actions_from_connection(conn: sqlite3.Connection) -> tuple[StartupAction, ...]:
+        """Strictly decode every startup action from one SQLite snapshot."""
+        from mozyo_bridge.core.state.startup_transaction_row import _row_to_action
+
+        rows = conn.execute(
+            "SELECT action_id, workspace_id, lane_id, providers, phase, revision,"
+            " participants, reserved_at, updated_at FROM startup_actions"
+            " ORDER BY action_id"
+        ).fetchall()
+        return tuple(_row_to_action(row) for row in rows)
+
+    def read_snapshot(self) -> tuple[StartupAction, ...]:
+        """Read the complete action authority, never treating damage as an empty store.
+
+        Genuine absence is the only empty result.  Every present row is strict-decoded and
+        every tagged row re-proves its identity manifest before this snapshot is returned.
+        The advisory lock makes the row set stable against every conforming writer while it
+        is captured; callers still re-read at each external effect edge.
+        """
+        with self._hold():
+            shape = self.store_shape()
+            if shape.absent:
+                return ()
+            if shape.state == STORE_DAMAGED:
+                raise StartupTransactionError(
+                    "the startup transaction store is damaged (a partial artifact set); "
+                    "refusing to read an incomplete action snapshot"
+                )
+            try:
+                with self._connection("ro") as conn:
+                    actions = self._actions_from_connection(conn)
+                for action in actions:
+                    self.read_identity_manifest(action.action_id)
+                return actions
+            except StartupTransactionError:
+                raise
+            except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+                raise StartupTransactionError(
+                    f"the startup transaction authority {self.path} action snapshot is "
+                    f"unreadable ({exc}); fail closed rather than treat it as empty"
+                ) from exc
+
     # -- writes ------------------------------------------------------------
 
     def reserve(
@@ -716,6 +759,7 @@ class StartupTransactionFence:
         nonce: str,
         *,
         manifest: "Optional[IdentityManifest]" = None,
+        refuse_nonterminal_slot_overlap: bool = False,
     ) -> StartupAction:
         """Mint + persist a new action BEFORE its first side effect (bootstraps if absent).
 
@@ -755,6 +799,19 @@ class StartupTransactionFence:
                 try:
                     if manifest is not None:
                         _require_v2_for_tagged_reserve(conn)
+                    if refuse_nonterminal_slot_overlap:
+                        actions = self._actions_from_connection(conn)
+                        for action in actions:
+                            self.read_identity_manifest(action.action_id)
+                            if (
+                                not action.terminal
+                                and action.action_id != action_id
+                            ):
+                                raise StartupTransactionError(
+                                    "a foreign nonterminal startup action exists in this "
+                                    "home; refusing the global offline restore reservation "
+                                    "before any effect"
+                                )
                     replayed = _reserve_or_replay(
                         conn,
                         action_id=action_id,

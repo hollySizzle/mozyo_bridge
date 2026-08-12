@@ -563,8 +563,13 @@ Table naming:
       - v4/4-store rolloutを生成・検証できない旧installed binaryでplanを作らない。bootstrapは
         exact candidate artifactを隔離venvへ展開し、そのabsolute CLI pathとprovenanceをpinして旧homeを
         read-only capture → fresh owner approval → delegate/runする。旧schema v3 actionはeffect前にtyped
-        refusalし、新candidateでの再planを要求する。candidateはold v1 generationを読むが通常launchへは
-       書かず、consumer zero後のbackup/rebuild phaseだけがv2へ前進させる。
+        refusalし、新candidateでの再planを要求する。ただしaction schema v1 + canonical plan schema v3の
+        既存sealed recordは、共通のpermission/symlink/size/canonical JSON/payload seal検査を通る
+        **status-only readback**では凍結済み15 phaseと3-store targetを読み続ける。strict `load` /
+        `load_locked` / `create` / `save_locked`はcurrent v4専用で、status readをexecution compatibilityや
+        backfillに昇格させない。plan v4でもprivate authorityが旧形なら同じくstatus-onlyである。
+        candidateはold v1 generationを読むが通常launchへは
+        書かず、consumer zero後のbackup/rebuild phaseだけがv2へ前進させる。
       - plan は home registry の **全 workspace id / project name**、global Herdr inventory の
         **全 managed assigned name**、current top identity、両 supervisor の secret-safe status、
         attestation / lane lifecycle / launch generation / startup transaction の **4 store schema +
@@ -600,8 +605,17 @@ Table naming:
         canonical writer `coordinator` を、gate固有ruling (`#14838 j#97993`) + committed
         `.mozyo-bridge/config.yaml` blob + exact journal/gate evidenceの3部anchorで解決し、markerの
         direct-owner判断軸と連言する。どちらか一方だけではglobal stopをauthorizeしない。
-      - `delegate --execute` は全workspace pathと全agent locatorをpublic planへ混ぜずprivateに
-        再captureし、planのidentity集合とexact一致させる。`${MOZYO_BRIDGE_HOME}/
+      - `delegate --execute` は全workspace pathをpublic planへ混ぜずprivateに再captureする。
+        restore用 `agents` はworkspace/lane/provider/assigned-name（legacy recoveryではissue pointerも）
+        だけを保持し、破壊的停止のauthorityと兼用しない。停止authorityはprivate
+        `close_authority={version:2,pins:[...]}` のclosed shapeへ分離し、各pinを
+        workspace/lane/role/assigned-name/locator/`startup_action_id`へ束縛する。capture時に
+        同一fresh full canonical inventory、name/locator/terminalのglobal uniqueness、exact target、
+        v4 attestation、completed launch-generation v2を全live plan targetについて連言できない場合は、
+        action作成・runner準備より前にtyped zero-effectで拒否する。raw terminalはactionへ保存せず、
+        fresh join中だけ扱う。legacy attestation v1-v3 / launch-generation v1のlive fleetを本rail自身で
+        停止してmigrationする例外は設けない（意図的zero-close）。必要ならidentity-bearing conditional
+        global-stop primitiveを別Design Consultationで扱う。`${MOZYO_BRIDGE_HOME}/
         offline-rollout-actions-v1/<action-id>/` (0700、record 0600、payload SHA-256 seal、exclusive
         nonblocking lock) にactionをreserveしてから、candidate wheelをexact SHA-256で検証する。
         action idはexact plan digest + approval pointerから決定論的に導出し、同じ承認の並行delegateは
@@ -614,8 +628,18 @@ Table naming:
         env override名・verified absolute alias・symlink解決後のexec targetをprivate actionへ固定する。
         one-shot LaunchAgentはこの固定済みprovider bindingだけを受け取り、欠落・過剰・relative path・
         非実行可能化・symlink retargetをrestore時のambient PATHで補完せずtyped refusalにする。
+        同じaction作成前captureでprivate closed `restore_intent` v1も固定する。canonical restore groupごとに
+        phase、workspace/lane、recovery issue、sorted provider/name identity、private nonceと、そのnonceから
+        決定論的に導出したexpected startup action idをsealする。raw terminalは保持せず、nonce/action idは
+        public plan/status/text/repr/error/logへ出さない。missing / old / malformed intentはaction作成前、または
+        runのport構築前にtyped refusalし、live stateから補完しない。
       - `run --execute` はLaunchAgentが注入したexact action tokenを持ち、かつ
         `MOZYO_AGENT_ROLE` / `MOZYO_WORKSPACE_ID`を持たないconsumer外processだけをadmitする。
+        top-level action schema/store root/action-idはv1のまま維持し、旧sealed actionの`status` / readbackを
+        継続する。一方runは最初のsupervisor停止effectより前にprivate `close_authority` v2をstrict decodeし、
+        private `restore_intent` v1とcompleted restore receiptもstrict decodeする。いずれかが
+        missing / old / tokenless / malformedならtyped blockする。live inventoryから旧actionへ
+        `startup_action_id`をbackfillせず、fresh executionにはfresh approval pointerで新actionを作る。
         expected launchd labelを副作用前にprivate actionへ固定し、run時に同labelのlive jobを
         readbackする。同一OS user内での暗号的identity分離ではないため、sealed action / exact token /
         managed-consumer不在 / launchd bindingの連言をこの境界の保証上限とする。
@@ -641,13 +665,41 @@ Table naming:
         patch、Git index、untracked path/archiveをprivate directoryへ保存し、planの
         content-sensitive WIP digestを再照合する。non-top phaseがまだliveなtop workspaceのsnapshotを
         先取りしない。workspace idはpath componentに使わずhashしたprivate directoryへ格納する。
-        stash/reset/checkoutは行わない。close直前のfull snapshotはprivateにpinしたassigned-name +
-        locator + terminal identityを全live rowのworkspace/lane/providerとexact joinし、duplicate・
-        malformed・unexpected rowは先頭close前にzero-progress refusalする。ただしHerdr 0.8のmutationは
+        stash/reset/checkoutは行わない。各close直前にfresh full snapshotを取り、sealed pinの
+        assigned-name + locator + `startup_action_id`を全live rowのworkspace/lane/provider、in-memoryの
+        server-owned terminal、v4 attestation、completed generation-v2へ再joinする。duplicate・malformed・
+        unexpected row、token mismatch、store不読は当該close前にzero-closeで拒否する。ただしHerdr 0.8のmutationは
         locatorしか受け取らずatomic compare-and-closeを持たないため、fresh checkから`pane close`までの
         same-locator restore raceはprovider制約として残り、terminal値をpublic planへ出して補えない。
-        既にabsentなexact planned nameはcrash replayとしてのみ
-        goal stateへ畳み、consumer=0をfresh raw/projection countの連言で確認する。
+        first non-replayでtarget absentは拒否する。durable active phaseのreplayだけは、保存tokenが指す
+        v4/generation-v2のterminalをfresh full inventoryのname/locator/terminal全軸からpositive absenceと
+        証明できるtargetを再closeせずgoal stateへ畳む。各close後も同じpositive absenceを必須とし、
+        terminal reclaim / unreadable / mismatchは後続close・launch・migration 0で停止する。
+        consumer=0はfresh raw/projection countの連言で確認する。さらにconsumer-zero receiptを再利用せず、
+        **各後続effect edge**で3-state fenceをfreshに評価する。(1) restore前のbackup/migration/rebuild/install/
+        adoptionはfull raw/projection zero + 全original close pinのterminal-bound positive absence + schedulerの
+        positive stopped readback、(2) restore中はcompleted groupのexact current v4/generation-v2 rosterと
+        未restore groupのexpected action absent + original pin absence、(3) restore後のsupervisor/final phaseは
+        全new generationのexact rosterを要求する。unmanaged/extra/malformed row、store/scheduler不読、name/
+        locator/terminal reclaimはそのedge以降のeffectを0にする。phase handler入口だけでなく、store/hash等の
+        preflight後、各mutation primitiveを呼ぶ直前にも同じfenceを再評価する。
+      - agent inventoryだけではshell-only paneを観測できないため、delegateは同じfresh strict full-pane
+        snapshotもcaptureする。agent rowとはname/role/locator/terminalを双方向exact joinし、agentの無い
+        canonical paneだけをprivate `passive_pane_intent` v1へlocator/workspace/tab/terminal全軸でsealする。
+        各restore groupはold completed participantが属したcontainer内のpassive root exact 1件を
+        `restore_container_intent` v1へ破壊的close前にsealし、ambient label searchで別rootを選ばない。
+        既存rootは触らずsplit anchorとして再利用する。split responseのtyped full identityだけは同processの
+        provisional allowanceとし、追加read/fenceを挟まずparticipantへ直ちにdurable記録してから、次の
+        pane-run/start edgeでfull snapshotへ再joinする。crashで記録に至らないpaneは次回residualでありadoptしない。
+      - conforming session-startとの競合は、owner-privateな共通namespaceに置く2本の0600 `flock` gateで直列化する。
+        一方はNFD+case-foldしたresolved home path、他方はhomeのdevice/inodeをfull digest化し、同じbyte順で取得する。
+        これによりpathのrename/recreate、macOSのcase/Unicode alias、bind-mount aliasのいずれでもlock inodeを分岐させない。
+        通常のnon-dry public/direct
+        startはfirst effectからcompletionまでshared lease、offline `run`はprivate schema admission後かつ最初の
+        supervisor/close effect前からfinal verifyまでexclusive leaseを保持し、inner restoreへopaque leaseを渡す。
+        action lock → session gate →既存store lockの順序を固定し、crashではkernelがleaseを解放する。このgateは
+        cooperativeなcurrent processだけを覆い、raw Herdr、provider wrapper単独、旧installed runtimeによる
+        launchを排除しないため、full-pane/startup/consumer fenceの代替ではない。
       - backupはattestation/state container/launch-generation/startup seal+DBをSQLite logical snapshotとreadbackで
         検証する。同じverified-backup phaseでattestation/lifecycleのprivate cloneをtarget schemaへ
         migrationし、deterministic logical post-digestをphase receiptへ固定する。live migration後の
@@ -655,9 +707,31 @@ Table naming:
         versionを受理しない。migrationは既存public primitiveをcomposeし、startup v2 replayはprivate actionの
         typed completion receipt + recovery artifact再検証を必須にする。installはprivateに保持した
         exact wheelをpipxへ渡し、通常PATH executableのversionをreadbackする。restoreはtop unitを
-        先に`herdr session-start`し、各nameをfresh inventory locator + globally-unique terminal identity +
-        v4 self-attestation + finalized generation v2でjoinして
-        からremaining unitへ進む。supervisorはpair install/statusの両方で2 agent loaded、home pin、
+        先に進めるが、public CLI/argv/stdin/stdoutをnonce transportにしない。exact candidate runner内で
+        CLIと共通のtyped session-start serviceをin-process呼出しし、private nonceを直接渡す。provider
+        wrapperだけはsealed production `target_cli`を`MOZYO_BRIDGE_LAUNCHER`へ固定し、runner action tokenと
+        caller identity envをprovider envから除去する。candidate venv/module/wheel/version provenanceが
+        exactに証明できなければfallbackせずlaunch前に拒否する。sealed repo selectorから解決したpathは
+        session-start内部へexpected workspace idも渡し、registry refresh / startup action reserveの直前と、
+        `workspace create --cwd` / `pane split --cwd`の各provider invoke直前にpath-derived identityとの
+        exact一致を再評価する。legacy recoveryは同じworkspace idを継承するsibling worktreeを区別するため、
+        sealed lifecycle generation + `worktree_identity`をfresh local `git worktree list`へexact-one joinし、
+        実際に`--cwd`へ渡すpathとの一致も要求する。pathだけをauthorityにして返却action idで事後検知する
+        形にはしない。providerがpath fd/identityをatomic consumeするAPIは無いため、最後のidentity checkから
+        provider invokeまでの最小raceはcloseのlocator-only制約と同様に残る。
+        各groupのlaunch直前にexpected action absenceとcumulative partitionを再確認し、返却action id、
+        completed-success transactionのunit/participants/pane-bound terminal receipt、fresh inventory、v4
+        self-attestation、finalized generation-v2 tokenをexpected actionへexact joinしてから次groupへ進む。
+        offline window内のstartup transaction nonterminalはhome-globalにexact 0件、restore group実行中だけは
+        selected expected action exact 1件を許し、別workspace/lane/providerのplanned/rollback actionもforeign
+        residualとして拒否する。health確認後も全participantのgeneration-v2 finalize readbackをterminal phase
+        write直前に要求し、pending/unreadableならactionを`health_check`に残してsuccessを書かない。このstateは
+        同じoffline action内で自動resumeせず、明示的なrollback/recoveryとfresh approval actionを要する。
+        crash後はこのcompleted exact stateだけを**folded**として再launchせず畳む。planned / health-check中 /
+        rollback owed / foreign action / missing・extra participantまたはlive slotはatomic residualであり、
+        cleanup・replacement nonce mint・追加launchをせずtyped blockする。restore phase receiptはclosed v1で
+        group action idsとcumulative namesを記録し、保存時とresume時の双方でintentとの完全一致を検証する。
+        supervisorはpair install/statusの両方で2 agent loaded、home pin、
         executable、credential readinessを確認する。
       - `status` はaction/plan/phase/reason/timestampだけを返し、workspace path、locator、WIP bytes、
         backup path、credentialを公開しない。status read成功は途中/blockedでもcommand successで、

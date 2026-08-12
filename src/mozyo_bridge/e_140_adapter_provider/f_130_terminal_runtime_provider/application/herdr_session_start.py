@@ -95,15 +95,13 @@ from mozyo_bridge.core.state.workspace_registry import (
     read_anchor,
     register_workspace,
 )
+from mozyo_bridge.core.state.herdr_session_start_gate import (
+    SessionStartGateError,
+    require_session_start_gate,
+)
+from mozyo_bridge.core.state.herdr_identity_attestation_schema import attestation_store_lock
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E501
     LAUNCH_CAUSE_GENERIC_FRESH,
-)
-from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
-    AttestationStoreLockBusy,
-    attestation_store_lock,
-)
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launcher_capability import (  # noqa: E501
-    STORE_MAINTENANCE_IN_PROGRESS,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
@@ -111,8 +109,11 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     evaluate_attestation,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_identity import (  # noqa: E501
+    PrivateRestoreContainerBinding,
+    PrivateWorktreeBinding,
     _lane_id_from_metadata,
     _resolve_workspace_id_readonly,
+    private_workspace_effect_fence,
     resolve_workspace_id_if_registered,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
@@ -196,7 +197,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_role_grouped_space import (  # noqa: E501
     classify_role_grouped_placement,
     preflight_project_coordinator_label_authority,
-    require_registered_top_workspace,
     _resolve_project_coordinator_workspace_under_lock,
     resolve_project_coordinator_container_plan,
     resolve_role_grouped_implementation_target,
@@ -316,109 +316,20 @@ def prepare_session(
     probe: "Optional[StartupProbe]" = None,
     startup_fence: "Optional[StartupTransactionFence]" = None,
     action_nonce: str = "",
+    expected_workspace_id: str = "",
+    expected_worktree: "Optional[PrivateWorktreeBinding]" = None,
     launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH,
+    _restore_effect_fence: "Optional[Callable[[], None]]" = None,
+    _restore_startup_overlap_guard: bool = False,
+    _restore_container: "Optional[PrivateRestoreContainerBinding]" = None,
+    _restore_pane_owner=None,
+    _session_gate_lease=None,
 ) -> SessionStartResult:
-    """Managed-launch admission under the store's shared lock (Redmine #13882 j#80190).
+    """Validate through the typed entry sibling while keeping this stable signature."""
+    arguments = locals()
+    from .herdr_session_start_entry import prepare_session as entry
 
-    Boundary 1 of the three-boundary lock protocol, and the one that lets the other two be
-    safe. R7-F1 showed that a stale operation cannot pin a *generation* by path: the probe
-    approved one store, a peer rotated it, a fresh one appeared at the same path, and the
-    stale run then destroyed that fresh, valid store. The exclusion is what removes the
-    window; this end holds it **shared**, from before the first attestation read through
-    the last actuation, so a launch and an exclusive maintenance can never interleave.
-
-    Non-blocking on purpose (j#80190): if maintenance holds the store exclusively, the
-    launch fails closed **at acquisition** — before any workspace / tab / agent exists —
-    rather than queueing and actuating into a store being rebuilt underneath it. That is
-    the same zero-side-effect boundary the #13748 / #13847 / #13882 preflights already
-    honor. Conversely, because this end is held for the whole run, maintenance cannot
-    overtake an in-flight launch: its own acquisition is what fails.
-
-    A dry run takes no lock: it plans, actuates nothing, and creating a fail-closed path
-    for a read-only report would only make diagnosis harder during maintenance.
-
-    ``pair_order`` is the lane's STABLE managed pair order, for a caller that shrank
-    ``providers`` to a subset (contract: :func:`...validate_pair_order`, #14569).
-    """
-    repo_root, _alias_id = apply_workspace_alias(repo_root)  # nested alias (#15190)
-    # The signature is spelled out rather than `**kwargs` (review j#80305 R8-F2): the
-    # explicit keyword-only contract is public (introspection / typing / IDE / wrapping
-    # callers), and Python's argument binding at THIS entry is what rejects a malformed
-    # call *before* any side effect. Collapsing it to `**kwargs` let a bad call create the
-    # lock file first and only then raise from the inner function — a side effect ahead of
-    # validation, which is exactly what the rest of this component refuses to do.
-    call = dict(
-        alias_expected_workspace_id=_alias_id,
-        repo_root=repo_root,
-        providers=providers,
-        lane_id=lane_id,
-        env=env,
-        pair_order=pair_order,
-        runner=runner,
-        launcher_runner=launcher_runner,
-        timeout=timeout,
-        dry_run=dry_run,
-        claude_permission_mode_default=claude_permission_mode_default,
-        agent_launch=agent_launch,
-        lane_placement=lane_placement,
-        launch_context=launch_context,
-        coordinator_placement_mode=coordinator_placement_mode,
-        coordinator_top_workspace_id=coordinator_top_workspace_id,
-        attestation_reader=attestation_reader,
-        replacement_action_id=replacement_action_id,
-        probe=probe,
-        startup_fence=startup_fence,
-        action_nonce=action_nonce,
-        # In the dict too: signature-only left the public rail unarmed (audit j#97177 F1).
-        launch_cause=launch_cause,
-    )
-    # Pure request validation precedes the home lock, home reads, binary resolution and
-    # capability probes; the locked entry re-checks before actuation.
-    validate_session_request(
-        providers=providers, lane_id=lane_id,
-        coordinator_placement_mode=coordinator_placement_mode,
-        coordinator_top_workspace_id=coordinator_top_workspace_id,
-        claude_permission_mode_default=claude_permission_mode_default, env=env,
-        launch_context=launch_context, pair_order=pair_order,
-        error_type=HerdrSessionStartError,
-    )
-    for provider in providers:
-        if provider not in AGENT_PROVIDERS:
-            raise HerdrSessionStartError(
-                f"unknown provider {provider!r}; expected one of "
-                f"{sorted(AGENT_PROVIDERS)}"
-            )
-    if coordinator_placement_mode == ROLE_GROUPED_SPACE:
-        require_registered_top_workspace(
-            coordinator_top_workspace_id, home=mozyo_bridge_home()
-        )
-    binary = _resolve_binary_or_die(env)
-    capability_runner = runner or subprocess.run
-    require_herdr_cli_capabilities(
-        binary,
-        runner=capability_runner,
-        timeout=timeout,
-        env=env,
-        error_type=HerdrSessionStartError,
-    )
-    with ActionPrivateLaunchShimSet() as launch_shims:
-        call["_launch_shims"] = launch_shims
-        call["_capabilities_observed"] = True
-        if dry_run:
-            return _prepare_session_locked(**call)
-        try:
-            with attestation_store_lock(
-                mozyo_bridge_home(), exclusive=False, blocking=False
-            ):
-                return _prepare_session_locked(**call)
-        except AttestationStoreLockBusy as exc:
-            raise HerdrLauncherIncompatibleError(
-                f"managed-launch admission refused: the selected attestation store is "
-                f"being maintained right now ({exc}), so this launch would attest into "
-                f"a store that is being rebuilt underneath it. No workspace / tab / "
-                f"agent was created. Re-run once the maintenance command finishes.",
-                reason=STORE_MAINTENANCE_IN_PROGRESS,
-            ) from exc
+    return entry(**arguments)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_lifecycle_admission import admit_launch_against_lifecycle  # noqa: E501
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_preflight import validate_coordinator_placement_request, validate_pair_order, validate_session_request  # noqa: E501
 
@@ -447,8 +358,15 @@ def _prepare_session_locked(
     action_nonce: str = "",
     launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH,
     alias_expected_workspace_id: str = "",
+    workspace_effect_expected_id: str = "",
+    expected_worktree: "Optional[PrivateWorktreeBinding]" = None,
     _launch_shims: "Optional[ActionPrivateLaunchShimSet]" = None,
     _capabilities_observed: bool = False,
+    _restore_effect_fence: "Optional[Callable[[], None]]" = None,
+    _restore_startup_overlap_guard: bool = False,
+    _restore_container: "Optional[PrivateRestoreContainerBinding]" = None,
+    _restore_pane_owner=None,
+    _session_gate_lease=None,
 ) -> SessionStartResult:
     """Mint or adopt the requested durable Herdr identities, fail-closed.
 
@@ -467,6 +385,29 @@ def _prepare_session_locked(
     probe — the zero-side-effect ordering this rail promises.
     """
     repo_root, _own_id = apply_workspace_alias(repo_root)
+    restore_axes = (
+        _restore_effect_fence is not None,
+        _restore_startup_overlap_guard is True,
+        _restore_container is not None,
+        _restore_pane_owner is not None,
+    )
+    if any(restore_axes) and (
+        not all(restore_axes)
+        or not workspace_effect_expected_id
+        or not action_nonce
+    ):
+        raise HerdrSessionStartError("private restore authority is incomplete")
+    if expected_worktree is not None and not all(restore_axes):
+        raise HerdrSessionStartError("private restore authority is incomplete")
+    if not dry_run:
+        try:
+            require_session_start_gate(
+                _session_gate_lease,
+                home=mozyo_bridge_home(),
+                exclusive=False,
+            )
+        except SessionStartGateError as exc:
+            raise HerdrSessionStartError(str(exc)) from exc
     _alias_expected_id = alias_expected_workspace_id or _own_id
     for provider in providers:
         if provider not in AGENT_PROVIDERS:
@@ -494,6 +435,12 @@ def _prepare_session_locked(
     # injects a Herdr-only runner that must never receive launcher probes.  Preserve the
     # historical single-runner test seam when no explicit launcher runner is supplied.
     launcher_runner = launcher_runner or runner
+    if _restore_effect_fence is not None:
+        unfenced_runner = runner
+
+        def runner(*args, **kwargs):
+            _restore_effect_fence()
+            return unfenced_runner(*args, **kwargs)
     # Probe both Herdr 0.8 write surfaces before registration or any Herdr write.
     if not _capabilities_observed:
         require_herdr_cli_capabilities(
@@ -547,22 +494,43 @@ def _prepare_session_locked(
         workspace_id = _resolve_workspace_id_readonly(resolved_root)
     else:
         existing_workspace = resolve_workspace_id_if_registered(resolved_root)
+        if alias_expected_workspace_id:
+            require_alias_identity(alias_expected_workspace_id, existing_workspace)
         if existing_workspace:
             workspace_id = existing_workspace
             refresh_registration = True
         else:
             preflight_managed_launch(attest_launcher, launcher_runner, timeout, env, repo_root=repo_root, store_home=Path(store_home), workspace_id="unregistered", lane_id=lane or "default", replacement_action_id=replacement_action_id, launch_planned=bool(providers))
+            if _restore_effect_fence is not None:
+                _restore_effect_fence()
             register_workspace(repo_root)
             anchor = read_anchor(repo_root)
             workspace_id = _norm(anchor.get("workspace_id")) if isinstance(anchor, dict) else ""
             if not workspace_id:
                 raise HerdrSessionStartError("workspace has no resolvable workspace_id after registration")
     require_alias_identity(_alias_expected_id, workspace_id)
-
+    workspace_effect_fence = private_workspace_effect_fence(
+        repo_root,
+        expected_workspace_id=workspace_effect_expected_id,
+        expected_worktree=expected_worktree,
+        home=Path(store_home),
+    )
     result = SessionStartResult(
         workspace_id=workspace_id, lane_id=lane or "default", dry_run=dry_run
     )
-
+    if _restore_container is not None and not (
+        valid_target(_restore_container.workspace_id)
+        and valid_target(_restore_container.tab_id)
+        and valid_target(_restore_container.pane_locator)
+        and _restore_container.pane_locator.startswith(
+            f"{_restore_container.workspace_id}:"
+        )
+        and _restore_container.tab_id.startswith(
+            f"{_restore_container.workspace_id}:t"
+        )
+        and bool(_restore_container.terminal_id)
+    ):
+        raise HerdrSessionStartError("private restore container authority is malformed")
     # This shared-lock boundary resolves the launch's lane-kind (Redmine #13647 T1b): caller context
     # (fresh launch) reconciled with the stored generation-bound kind (heal), fail-closed.
     lane_kind = admit_launch_against_lifecycle(
@@ -719,7 +687,13 @@ def _prepare_session_locked(
         launch_planned=bool(launch_plans),
     )
     if refresh_registration:
+        if workspace_effect_fence is not None:
+            workspace_effect_fence()
+        if _restore_effect_fence is not None:
+            _restore_effect_fence()
         register_workspace(repo_root)
+    if _restore_effect_fence is not None:
+        _restore_effect_fence()
     native_admission = bind_native_launch_set(
         tuple(plan.assigned_name for plan in launch_plans),
         store_home=Path(store_home),
@@ -730,13 +704,23 @@ def _prepare_session_locked(
             workspace_id=workspace_id, binary=binary, runner=runner, timeout=timeout,
             acquire_lock=not dry_run)
     # Reserve startup identities only after preflight; later effects belong to this action.
+    if workspace_effect_fence is not None:
+        workspace_effect_fence()
+    if _restore_effect_fence is not None:
+        _restore_effect_fence()
     transaction = open_startup_transaction_and_reserve_generations(
         workspace_id=workspace_id, lane_id=result.lane_id, providers=providers,
         dry_run=dry_run, home=Path(store_home), fence=startup_fence, nonce=action_nonce,
         launch_plans=launch_plans, attest_launcher=attest_launcher, env=env, resolved=resolved_launches,
+        effect_fence=_restore_effect_fence,
+        completion_fence=getattr(
+            _restore_effect_fence, "before_completion", None
+        ),
+        refuse_nonterminal_slot_overlap=_restore_startup_overlap_guard,
     )
     result.action_id = transaction.action_id if transaction else ""
-
+    if _restore_effect_fence is not None:
+        _restore_effect_fence()
     launch_shim_dirs = prepare_complete_launch_shims(
         _launch_shims,
         providers=tuple(plan.provider for plan in launch_plans),
@@ -745,13 +729,14 @@ def _prepare_session_locked(
         store_home=Path(store_home),
         action_id=result.action_id,
     )
-
     # Resolve workspace; role_grouped_space separates all three roles (#14996).
     launch_plans = [p for p in plans if p.kind == "launch"]
     target_workspace = ""
     if launch_plans:
         adopt_locators = [p.locator for p in plans if p.kind == "adopt"]
-        if shared_space_project_coordinator:
+        if _restore_container is not None:
+            target_workspace = _restore_container.workspace_id
+        elif shared_space_project_coordinator:
             # Legacy shared_space: own identity pin first, exact label otherwise (#14139).
             target_workspace = _shared_coordinator_own_target(
                 rows, workspace_id, adopt_locators
@@ -783,6 +768,7 @@ def _prepare_session_locked(
                         timeout,
                         env,
                         label=SHARED_COORDINATOR_WORKSPACE_LABEL,
+                        effect_fence=workspace_effect_fence,
                     )
                     result.base_pane_id = base_pane_id
         elif role_grouped_project_coordinator:
@@ -792,8 +778,7 @@ def _prepare_session_locked(
                     "resource owner; refusing to enter the single-flight section"
                 )
             # The label alone is not a Herdr 0.8 split authority. Hold the shared
-            # fence until this pair has produced live managed panes, then make the
-            # waiter refresh inventory while it owns the fence.
+            # fence through live pane creation; a waiter then refreshes under that fence.
             _launch_shims.hold(_coordinator_launch_lock("project coordinators"))
             rows = _list_rows(binary, runner, timeout)
             shared = _resolve_project_coordinator_workspace_under_lock(
@@ -806,6 +791,7 @@ def _prepare_session_locked(
                 runner=runner,
                 timeout=timeout,
                 env=env,
+                effect_fence=workspace_effect_fence,
             )
             target_workspace = shared.workspace_id
             result.base_pane_id = shared.base_pane_id
@@ -837,6 +823,7 @@ def _prepare_session_locked(
                     timeout,
                     env,
                     label=create_label,
+                    effect_fence=workspace_effect_fence,
                 )
                 result.base_pane_id = base_pane_id
         result.herdr_workspace_id = target_workspace
@@ -853,16 +840,20 @@ def _prepare_session_locked(
         lane_slot_tabs = _lane_live_slot_tabs(
             rows, workspace_id, target_workspace, result.lane_id
         )
-        target_tab = _tab_target_for_lane(
-            rows, workspace_id, target_workspace, result.lane_id
+        target_tab = (
+            _restore_container.tab_id
+            if _restore_container is not None
+            else _tab_target_for_lane(
+                rows, workspace_id, target_workspace, result.lane_id
+            )
         )
         if not target_tab and not lane_slot_tabs:
             target_tab, tab_pane_id = _create_tab(
-                binary, target_workspace, runner, timeout, env, label=result.lane_id
+                binary, target_workspace, runner, timeout, env,
+                label=result.lane_id, effect_fence=workspace_effect_fence,
             )
             result.tab_pane_id = tab_pane_id
         result.herdr_tab_id = target_tab
-
     # Split placement (#13411 tab axis + #13646 direction / #13646-R1-F1 focus). The first
     # slot occupies the container; later launching slots split beside it. Pure decisions —
     # see `herdr_lane_topology.resolve_container_plan` for the full contract.
@@ -892,7 +883,11 @@ def _prepare_session_locked(
     split_anchor = resolve_required_split_anchor(
         rows,
         launch_required=bool(launch_plans),
-        created_root=result.tab_pane_id or result.base_pane_id,
+        created_root=(
+            _restore_container.pane_locator
+            if _restore_container is not None
+            else result.tab_pane_id or result.base_pane_id
+        ),
         target_workspace=target_workspace,
         target_tab=target_tab,
         preferred_locator=next(
@@ -942,6 +937,8 @@ def _prepare_session_locked(
                 prepared_callback=record_prepared,
                 native_binding=native_admission.bindings.get(plan.assigned_name),
                 shim_dir=launch_shim_dirs.get(plan.provider, ""),
+                workspace_effect_fence=workspace_effect_fence,
+                pane_owner=_restore_pane_owner,
             )
         )
         if plan.kind == "launch":
@@ -970,7 +967,7 @@ def _prepare_session_locked(
         config_ratio=config_ratio, initial_occupancy=plan_of_container.occupancy,
         project_column_coordinator=project_column_coordinator,
         coordinator_top_workspace_id=coordinator_top_workspace_id, binary=binary,
-        runner=runner, timeout=timeout, env=env,
+        runner=runner, timeout=timeout, env=env, effect_fence=_restore_effect_fence,
     )
     return result
 

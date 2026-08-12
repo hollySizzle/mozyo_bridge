@@ -1185,6 +1185,7 @@ class WorkspaceAliasR6FindingTests(WorkspaceAliasCliTestCase):
         """
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
             herdr_session_start as session,
+            herdr_session_start_entry as session_entry,
         )
 
         self.run_cli(
@@ -1199,7 +1200,8 @@ class WorkspaceAliasR6FindingTests(WorkspaceAliasCliTestCase):
 
         with mock.patch.object(session, "require_alias_identity", spy), \
                 mock.patch.object(session, "_resolve_binary_or_die", return_value="herdr"), \
-                mock.patch.object(session, "require_herdr_cli_capabilities", return_value=None), \
+                mock.patch.object(session_entry, "require_herdr_cli_capabilities", return_value=None), \
+                mock.patch.object(session_entry, "validate_session_request", return_value=None), \
                 mock.patch.object(session, "validate_session_request", return_value=None), \
                 mock.patch.object(session, "_resolve_workspace_id_readonly", return_value="e" * 32):
             try:

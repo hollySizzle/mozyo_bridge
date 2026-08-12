@@ -14,6 +14,7 @@ import tempfile
 import unittest
 import warnings
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.cli_herdr_offline_rollout import (  # noqa: E501
@@ -532,70 +533,49 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
         action = {"plan": {"legacy_recoveries": [target]}}
         port = LiveOfflineRolloutExecutionPort(home=self.home)
 
-        first = port.execute_phase(
-            phase=phase,
-            action=action,
-            action_directory=self.home / "private",
-            replaying=False,
-        )
+        class AdmittedFence:
+            @staticmethod
+            def before_effect(_action, _phase):
+                return PhaseExecutionResult(True)
+
+        with patch.object(port, "_phase_fence", return_value=AdmittedFence()):
+            first = port.execute_phase(
+                phase=phase,
+                action=action,
+                action_directory=self.home / "private",
+                replaying=False,
+            )
         self.assertTrue(first.ok, first)
         adopted = lifecycle.get(key)
         self.assertEqual(adopted.lane_epoch, "1")
         self.assertEqual(adopted.revision, legacy.revision + 1)
-        replay = port.execute_phase(
-            phase=phase,
-            action=action,
-            action_directory=self.home / "private",
-            replaying=True,
-        )
+        with patch.object(port, "_phase_fence", return_value=AdmittedFence()):
+            replay = port.execute_phase(
+                phase=phase,
+                action=action,
+                action_directory=self.home / "private",
+                replaying=True,
+            )
         self.assertTrue(replay.ok, replay)
         self.assertEqual(lifecycle.get(key).revision, legacy.revision + 1)
 
     def test_legacy_recovery_launch_uses_bound_lane_worktree_not_workspace_root(self) -> None:
-        name = "mzb1_ws_codex_issueZ5F13842"
-        action = {
-            "private_bindings": {
-                "agents": [
-                    {
-                        "assigned_name": name,
-                        "workspace_id": "ws",
-                        "lane_id": "issue_13842",
-                        "provider": "codex",
-                        "locator": "",
-                        "recovery_issue_id": "13842",
-                    }
-                ],
-                "workspace_paths": {"ws": "/private/workspace-root"},
-                "legacy_recovery_worktree_paths": {
-                    "legacy:13842": "/private/lane-worktree"
-                },
-                "target_cli": "/private/bin/mozyo-bridge",
-            },
-            "plan": {},
-        }
-        completed = subprocess.CompletedProcess(
-            [], 0, stdout='{"ok": true, "action_id": "startup-one"}\n', stderr=""
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_restore import (  # noqa: E501
+            OfflineRolloutRestoreExecutor,
         )
-        port = LiveOfflineRolloutExecutionPort(home=self.home, env={})
-        with (
-            patch(
-                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-                "application.herdr_offline_rollout_executor._run",
-                return_value=completed,
-            ) as invoked,
-            patch.object(
-                port,
-                "_verify_live_names",
-                return_value=PhaseExecutionResult(True),
-            ),
-        ):
-            result = port._restore_agents(  # noqa: SLF001
-                {"assigned_names": [name]}, action, self.home / "private"
-            )
-        self.assertTrue(result.ok, result)
-        argv = invoked.call_args.args[0]
-        self.assertEqual(argv[argv.index("--repo") + 1], "/private/lane-worktree")
-        self.assertNotIn("/private/workspace-root", argv)
+
+        bindings = {
+            "workspace_paths": {"ws": "/private/workspace-root"},
+            "legacy_recovery_worktree_paths": {
+                "legacy:13842": "/private/lane-worktree"
+            },
+        }
+        group = SimpleNamespace(
+            recovery_issue_id="13842", workspace_id="ws"
+        )
+        repo = OfflineRolloutRestoreExecutor._group_repo(bindings, group)  # noqa: SLF001
+        self.assertEqual(repo, Path("/private/lane-worktree"))
+        self.assertNotEqual(repo, Path("/private/workspace-root"))
 
     def test_owner_approval_gate_uses_anchored_coordinator_policy(self) -> None:
         manifest = {"plan_digest": "a" * 64, "global_stop": True}
@@ -923,6 +903,13 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
         action_directory = Path(self.temp.name) / "action"
         action_directory.mkdir(mode=0o700)
         port = LiveOfflineRolloutExecutionPort(home=self.home, env={})
+        edge_patch = patch.object(
+            port,
+            "_require_effect_edge",
+            return_value=PhaseExecutionResult(True),
+        )
+        edge_patch.start()
+        self.addCleanup(edge_patch.stop)
         original = port._fresh_store_records()  # noqa: SLF001
         self.assertEqual(
             {name: row["version"] for name, row in original.items()},

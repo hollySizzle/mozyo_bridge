@@ -22,6 +22,9 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     ParticipantPin,
 )
+from mozyo_bridge.core.state.herdr_session_start_gate import (  # noqa: E402
+    session_start_gate,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E402,E501
     HerdrSublaneActuatorOps,
 )
@@ -292,20 +295,22 @@ class PropagationTest(unittest.TestCase):
                         "TMP": str(tmp),
                         "TEMP": str(tmp),
                     },
-                ), self.assertRaises(_Stop):
-                    start._prepare_session_locked(
-                        repo_root=repo,
-                        providers=["codex"],
-                        lane_id="l",
-                        env={
-                            "MOZYO_HERDR_BINARY": str(herdr),
-                            "MOZYO_BRIDGE_HOME": str(home),
-                        },
-                        runner=FakeHerdr().run,
-                        timeout=1.0,
-                        dry_run=False,
-                        **kwargs,
-                    )
+                ), session_start_gate(home, exclusive=False) as lease:
+                    with self.assertRaises(_Stop):
+                        start._prepare_session_locked(
+                            repo_root=repo,
+                            providers=["codex"],
+                            lane_id="l",
+                            env={
+                                "MOZYO_HERDR_BINARY": str(herdr),
+                                "MOZYO_BRIDGE_HOME": str(home),
+                            },
+                            runner=FakeHerdr().run,
+                            timeout=1.0,
+                            dry_run=False,
+                            _session_gate_lease=lease,
+                            **kwargs,
+                        )
             finally:
                 start.preflight_launch_providers = original
         return seen

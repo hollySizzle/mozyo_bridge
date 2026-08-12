@@ -16,7 +16,6 @@ from __future__ import annotations
 import argparse
 import json
 import os
-from pathlib import Path
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.claude_permission_policy import (  # noqa: E501
     COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
@@ -34,6 +33,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
     SessionStartResult,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_service import (  # noqa: E501
+    prepare_configured_session,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (  # noqa: E501
     RATIO_NOT_APPLICABLE,
@@ -144,66 +146,21 @@ def cmd_herdr_session_start(args: argparse.Namespace) -> int:
     """CLI entry: prepare durable herdr identities for the workspace's agents."""
     from mozyo_bridge.application.commands_common import repo_root_from_args
 
-    from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
-    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
-        RepoLocalConfigError,
-    )
-
     repo_root = repo_root_from_args(args)
     agents = getattr(args, "agent", None) or [PROVIDER_CLAUDE, PROVIDER_CODEX]
     lane_id = getattr(args, "lane", None) or ""
     dry_run = bool(getattr(args, "dry_run", False))
-    # Config-driven launch argv (Redmine #13425) + pane placement (Redmine #13646):
-    # resolved from the repo the command runs in. lane_class is derived inside
-    # `prepare_session` from the resolved lane. One load serves both surfaces.
     try:
-        repo_config = load_repo_local_config(repo_root)
-    except RepoLocalConfigError as exc:
-        die(f"herdr session-start failed: invalid repo-local config: {exc}")
-        raise AssertionError("unreachable")
-    agent_launch = repo_config.agent_launch
-    lane_placement = repo_config.lane_placement
-    # Operator-scoped placement mode (#14139 / #14996), read from HOME. The
-    # role-grouped mode places a named lane only when its durable lane_kind proves
-    # the role; a missing role fact fails closed instead of guessing.
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.coordinator_placement_loader import (  # noqa: E501
-        load_coordinator_placement_for_launch,
-    )
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
-        CoordinatorPlacementError,
-    )
-
-    try:
-        coordinator_placement = load_coordinator_placement_for_launch()
-    except CoordinatorPlacementError as exc:
-        die(f"herdr session-start failed: invalid operator coordinator placement: {exc}")
-        raise AssertionError("unreachable")
-    # Lane-role placement (Redmine #13647 T1b): a no-lane session-start IS the coordinator
-    # (親) pair by construction of this surface, so it carries that fresh-launch authority
-    # explicitly. A NAMED lane supplies none here on purpose — its kind is the durable
-    # generation-bound fact the launch chokepoint reads OFFLINE from the lifecycle authority
-    # record (the heal authority), never re-derived from the command line or a display cache.
-    from mozyo_bridge.core.state.lane_kind import LANE_KIND_COORDINATOR
-    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
-        LaneLaunchContext,
-    )
-
-    launch_context = (
-        None if lane_id else LaneLaunchContext(lane_kind=LANE_KIND_COORDINATOR)
-    )
-    try:
-        result = _use_case.prepare_session(
+        result = prepare_configured_session(
             repo_root=repo_root,
-            providers=list(agents),
+            agents=list(agents),
             lane_id=lane_id,
-            launch_context=launch_context,
             env=os.environ,
             dry_run=dry_run,
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
-            agent_launch=agent_launch,
-            lane_placement=lane_placement,
-            coordinator_placement_mode=coordinator_placement.mode,
-            coordinator_top_workspace_id=coordinator_placement.top_workspace_id,
+            # Preserve the long-standing test/embedding seam while config composition
+            # lives in the shared typed service.
+            session_preparer=_use_case.prepare_session,
         )
     except HerdrSessionStartError as exc:
         die(f"herdr session-start failed: {exc}")

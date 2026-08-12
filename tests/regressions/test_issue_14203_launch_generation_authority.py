@@ -535,6 +535,121 @@ class R7DiagnosticOnlyEvents(unittest.TestCase):
         self.assertEqual(HerdrLaunchGenerationStore(home=home).read(NAME).phase,
                          GENERATION_ATTESTED)
 
+    def test_each_reserve_row_has_its_own_immediate_effect_fence(self):
+        home = _tmp()
+        second = self._slot(
+            assigned_name="worker", provider="claude", locator="w1:p2"
+        )
+        calls = 0
+
+        def fence():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("partition drift before second reserve")
+
+        with self.assertRaisesRegex(RuntimeError, "second reserve"):
+            reserve_launch_generations(
+                store_home=home,
+                startup_action_id="startup-row-fence",
+                launch_plans=[self._slot(), second],
+                workspace_id=WS,
+                lane_id=LANE,
+                effect_fence=fence,
+            )
+
+        store = HerdrLaunchGenerationStore(home=home)
+        self.assertEqual(store.read(NAME).phase, GENERATION_PENDING)
+        self.assertIsNone(store.read("worker"))
+
+    def test_each_finalize_cas_has_its_own_immediate_effect_fence(self):
+        home = _tmp()
+        slots = (
+            self._slot(),
+            self._slot(
+                assigned_name="worker",
+                provider="claude",
+                locator="w1:p2",
+                launch_terminal_id="terminal-B",
+            ),
+        )
+        fence_store = StartupTransactionFence(home=home)
+        action = fence_store.reserve(
+            StartupUnit(WS, LANE, ("claude", "codex")), "two-slot-finalize"
+        )
+        for slot in slots:
+            fence_store.record_participant(
+                action.action_id,
+                Participant(
+                    role=slot.provider,
+                    assigned_name=slot.assigned_name,
+                    locator=slot.locator,
+                    receipt=pane_bound_receipt(
+                        target_workspace="w1",
+                        target_tab="w1:t1",
+                        native_name=native_name_for(slot.assigned_name),
+                        terminal_id=slot.launch_terminal_id,
+                    ),
+                ),
+            )
+            append_execution_event(
+                fence_store,
+                action.action_id,
+                STAGE_ATTESTATION_WRITE_SUCCEEDED,
+                participant=slot.assigned_name,
+            )
+        fence_store.set_phase(action.action_id, PHASE_COMPLETED_SUCCESS)
+        reserve_launch_generations(
+            store_home=home,
+            startup_action_id=action.action_id,
+            launch_plans=slots,
+            workspace_id=WS,
+            lane_id=LANE,
+        )
+        attestations = {
+            slot.assigned_name: SimpleNamespace(
+                assigned_name=slot.assigned_name,
+                role=slot.provider,
+                workspace_id=WS,
+                lane_id=LANE,
+                locator=slot.locator,
+                terminal_id=slot.launch_terminal_id,
+                verdict=VERDICT_PRESENT,
+                observed_at="obs-two-slot",
+            )
+            for slot in slots
+        }
+        calls = 0
+
+        def fence():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("partition drift before second finalize")
+
+        with self.assertRaisesRegex(RuntimeError, "second finalize"):
+            finalize_launch_generations(
+                store_home=home,
+                startup_action_id=action.action_id,
+                slots=slots,
+                workspace_id=WS,
+                lane_id=LANE,
+                attestation_read=attestations.get,
+                inventory_rows=[
+                    {
+                        "name": slot.assigned_name,
+                        "pane_id": slot.locator,
+                        "terminal_id": slot.launch_terminal_id,
+                    }
+                    for slot in slots
+                ],
+                effect_fence=fence,
+            )
+
+        store = HerdrLaunchGenerationStore(home=home)
+        self.assertEqual(store.read(NAME).phase, GENERATION_ATTESTED)
+        self.assertEqual(store.read("worker").phase, GENERATION_PENDING)
+
     def test_receipt_terminal_mismatch_leaves_generation_pending(self):
         home = _tmp()
         token = _seed_fence_success(home, nonce="terminal-mismatch")

@@ -172,7 +172,13 @@ class _CurrentLaunchCase(unittest.TestCase):
     """
 
     def setUp(self):
-        self.home = Path(tempfile.mkdtemp())
+        # The home sits one level below the mkdtemp root, never AT it: the session-start
+        # gate requires a home whose parent no other uid can rename the entry out of, and
+        # a raw tempdir's parent is the shared TMPDIR — private (0700) on a current fence,
+        # but group-writable without a sticky bit on older runners (#15227 R-correction).
+        # The 0700 mkdtemp root satisfies the entry-stability rule on both.
+        self.home = Path(tempfile.mkdtemp()) / "home"
+        self.home.mkdir(mode=0o700)
         self.repo_root = self.home / "worktree"
         self.repo_root.mkdir()
         self.store = ReplacementTransactionStore(home=self.home)

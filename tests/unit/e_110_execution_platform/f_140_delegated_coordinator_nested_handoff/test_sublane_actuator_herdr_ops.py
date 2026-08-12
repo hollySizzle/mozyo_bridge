@@ -677,6 +677,68 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertNotEqual(view.gateway_pane, view.worker_pane)
         self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
 
+    def test_append_holds_one_shared_gate_through_metadata_finalization(self) -> None:
+        from mozyo_bridge.core.state.herdr_session_start_gate import (
+            SessionStartGateError,
+            acquire_session_start_gate,
+            release_session_start_gate,
+            require_session_start_gate,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_actuator_herdr_ops as module,
+        )
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            real_prepare = module.prepare_actuator_lane_session
+            real_metadata = ops._record_lane_metadata  # noqa: SLF001
+            observed_leases = []
+            metadata_fenced = []
+
+            def prepare(**kwargs):
+                lease = kwargs.get("session_gate_lease")
+                observed_leases.append(lease)
+                require_session_start_gate(
+                    lease, home=home, exclusive=False
+                )
+                return real_prepare(**kwargs)
+
+            def record_metadata(path):
+                with self.assertRaisesRegex(
+                    SessionStartGateError, "session_start_gate_busy"
+                ):
+                    acquire_session_start_gate(home, exclusive=True)
+                metadata_fenced.append(True)
+                return real_metadata(path)
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"MOZYO_BRIDGE_HOME": str(home)},
+                    clear=False,
+                ),
+                patch.object(
+                    module,
+                    "prepare_actuator_lane_session",
+                    side_effect=prepare,
+                ),
+                patch.object(
+                    ops,
+                    "_record_lane_metadata",
+                    side_effect=record_metadata,
+                ),
+            ):
+                startup = ops.append_lane_column(str(worktree))
+
+            self.assertTrue(startup.ok)
+            self.assertEqual(len(observed_leases), 1)
+            self.assertEqual(metadata_fenced, [True])
+            exclusive = acquire_session_start_gate(home, exclusive=True)
+            release_session_start_gate(exclusive)
+
     def test_append_launches_claude_worker_in_auto_permission_mode(self) -> None:
         # Redmine #13360: lane creation is a managed-pane chokepoint, so the lane's
         # Claude worker must launch reproducibly auto (#11925 parity with the tmux

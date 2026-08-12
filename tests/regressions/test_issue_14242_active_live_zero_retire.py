@@ -462,21 +462,29 @@ class LaunchExclusionTest(unittest.TestCase):
         import inspect
 
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
-            herdr_session_start,
+            herdr_session_start_entry,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             sublane_actuator_herdr_ops,
             sublane_actuator_v1_replacement,
         )
 
-        funnel = inspect.getsource(herdr_session_start.prepare_session)
+        funnel = inspect.getsource(herdr_session_start_entry.prepare_session)
         self.assertIn("attestation_store_lock(", funnel)
         self.assertIn("exclusive=False", funnel)
         # The heal delegates the v1 compatibility transaction to its typed application
         # service. That driver reaches `_prepare_session_locked` with
         # admission_lock_held=True, so the DRIVER must hold the same shared lock.
-        v1_caller = inspect.getsource(sublane_actuator_herdr_ops.HerdrSublaneActuatorOps.heal_lane_column)
+        heal_entry = inspect.getsource(
+            sublane_actuator_herdr_ops.HerdrSublaneActuatorOps.heal_lane_column
+        )
+        self.assertIn("session_start_gate(", heal_entry)
+        self.assertIn("exclusive=False", heal_entry)
+        v1_caller = inspect.getsource(
+            sublane_actuator_herdr_ops.HerdrSublaneActuatorOps._heal_lane_column_under_gate
+        )
         self.assertIn("V1ReplacementDriver", v1_caller)
+        self.assertIn("session_gate_lease=session_gate_lease", v1_caller)
         v1_driver = inspect.getsource(
             sublane_actuator_v1_replacement.V1ReplacementDriver.run
         )

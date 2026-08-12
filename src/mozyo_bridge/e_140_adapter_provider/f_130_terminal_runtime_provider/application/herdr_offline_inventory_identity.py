@@ -7,7 +7,7 @@ from mozyo_bridge.core.state.herdr_inventory_identity import (
 
 
 def private_agent_bindings(inventory, plan):
-    """Capture secret-safe private process pins; never place terminal ids in the plan."""
+    """Capture restore identities only; destructive pins live in close-authority v2."""
     from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_offline_rollout_action import (  # noqa: E501
         PhaseExecutionResult,
     )
@@ -37,13 +37,15 @@ def private_agent_bindings(inventory, plan):
         agents.append({
             "assigned_name": agent.name, "workspace_id": agent.workspace_id,
             "lane_id": agent.lane_id, "provider": agent.role,
-            "locator": agent.locator, "terminal_id": agent.terminal_id,
         })
     return PhaseExecutionResult(True, receipt={"agents": agents})
 
 
 def private_inventory_current(view, bindings) -> bool:
+    """Compatibility identity-roster check; this never authorizes a close."""
     if not terminal_inventory_complete(view) or view.unmanaged_agents:
+        return False
+    if {agent.name for agent in view.managed_agents} != set(bindings):
         return False
     for agent in view.managed_agents:
         binding = bindings.get(agent.name)
@@ -51,8 +53,6 @@ def private_inventory_current(view, bindings) -> bool:
             agent.workspace_id != binding["workspace_id"],
             agent.lane_id != binding["lane_id"],
             agent.role != binding["provider"],
-            agent.locator != binding["locator"],
-            agent.terminal_id != binding["terminal_id"],
         )):
             return False
     return True

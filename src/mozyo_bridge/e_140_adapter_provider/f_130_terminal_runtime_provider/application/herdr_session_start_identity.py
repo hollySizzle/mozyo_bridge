@@ -13,18 +13,29 @@ unlike `cmd_herdr_session_start` they need no compatibility facade.
 from __future__ import annotations
 
 import json
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Callable
 
 from mozyo_bridge.core.state.workspace_registry import (
     ANCHOR_LEGACY_RELATIVE,
     ANCHOR_RELATIVE,
     _is_linked_worktree,
     anchor_resolution,
+    load_workspace_by_id,
     load_workspace_by_path,
     read_anchor,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_lane_topology import (  # noqa: E501
+    bind_lane_worktree,
+)
+from mozyo_bridge.core.state.lane_lifecycle_readonly import LaneLifecycleReader
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_alias import (  # noqa: E501
+    require_alias_identity,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     HerdrSessionStartError,
+    herdr_workspace_segment,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     DEFAULT_LANE,
@@ -55,7 +66,9 @@ def _lane_id_from_metadata(resolved_root: Path) -> str:
     )
 
 
-def _resolve_workspace_id_readonly(resolved_root: Path) -> str:
+def _resolve_workspace_id_readonly(
+    resolved_root: Path, *, home: Path | None = None
+) -> str:
     """Resolve a registered workspace's ``workspace_id`` for ``--dry-run``, read-only.
 
     The query-side mirror of :func:`register_workspace`'s identity precedence
@@ -83,7 +96,7 @@ def _resolve_workspace_id_readonly(resolved_root: Path) -> str:
         workspace_id = _norm(anchor.get("workspace_id"))
         if workspace_id:
             return workspace_id
-    record = load_workspace_by_path(resolved_root)
+    record = load_workspace_by_path(resolved_root, home=home)
     if record is not None:
         workspace_id = _norm(record.workspace_id)
         if workspace_id:
@@ -95,16 +108,108 @@ def _resolve_workspace_id_readonly(resolved_root: Path) -> str:
     )
 
 
-def resolve_workspace_id_if_registered(resolved_root: Path) -> str:
+def resolve_workspace_id_if_registered(
+    resolved_root: Path, *, home: Path | None = None
+) -> str:
     """Return an existing durable workspace id, or ``""`` without writing."""
     try:
-        return _resolve_workspace_id_readonly(resolved_root)
+        return _resolve_workspace_id_readonly(resolved_root, home=home)
     except HerdrSessionStartError:
         return ""
 
 
+@dataclass(frozen=True, repr=False)
+class PrivateWorktreeBinding:
+    """Sealed lane-worktree selector; its private identity never enters a repr."""
+
+    workspace_id: str
+    lane_id: str
+    lane_generation: int
+    worktree_identity: str = field(repr=False)
+
+
+@dataclass(frozen=True, repr=False)
+class PrivateRestoreContainerBinding:
+    """Sealed pane-only container anchor for an offline restore invocation."""
+
+    workspace_id: str
+    tab_id: str
+    pane_locator: str
+    terminal_id: str = field(repr=False)
+
+
+def private_workspace_effect_fence(
+    repo_root: Path,
+    *,
+    expected_workspace_id: str,
+    expected_worktree: PrivateWorktreeBinding | None = None,
+    home: Path | None = None,
+) -> Callable[[], None] | None:
+    """Rejoin the exact private cwd authority at each path-consuming effect edge."""
+
+    if not expected_workspace_id:
+        if expected_worktree is not None:
+            raise HerdrSessionStartError("private worktree authority lacks workspace")
+        return None
+    if expected_worktree is not None and (
+        expected_worktree.workspace_id != expected_workspace_id
+        or not expected_worktree.lane_id
+        or type(expected_worktree.lane_generation) is not int
+        or expected_worktree.lane_generation < 1
+        or not expected_worktree.worktree_identity
+    ):
+        raise HerdrSessionStartError("private worktree authority is malformed")
+    consumed_path = Path(repo_root)
+
+    def require_exact_binding() -> None:
+        try:
+            actual = consumed_path.expanduser().resolve(strict=True)
+            observed = (
+                herdr_workspace_segment(actual, home=home)
+                if _is_linked_worktree(actual)
+                else resolve_workspace_id_if_registered(actual, home=home)
+            )
+            require_alias_identity(expected_workspace_id, observed)
+            if expected_worktree is None:
+                return
+            record = load_workspace_by_id(expected_workspace_id, home=home)
+            rows = LaneLifecycleReader(home=home).records()
+            matches = [
+                row
+                for row in rows
+                if row.repo_workspace_id == expected_worktree.workspace_id
+                and row.lane_id == expected_worktree.lane_id
+                and row.lane_generation == expected_worktree.lane_generation
+                and row.worktree_identity == expected_worktree.worktree_identity
+            ]
+            bound = (
+                bind_lane_worktree(
+                    Path(record.canonical_path),
+                    matches,
+                    workspace=expected_worktree.workspace_id,
+                    lane=expected_worktree.lane_id,
+                    generation=expected_worktree.lane_generation,
+                )
+                if record is not None and len(matches) == 1
+                else None
+            )
+            if bound is None or bound[0].resolve(strict=True) != actual:
+                raise HerdrSessionStartError("private worktree binding changed")
+        except HerdrSessionStartError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - unreadable authority is refusal
+            raise HerdrSessionStartError(
+                "private workspace effect authority is unreadable"
+            ) from exc
+
+    return require_exact_binding
+
+
 __all__ = (
+    "PrivateRestoreContainerBinding",
+    "PrivateWorktreeBinding",
     "_lane_id_from_metadata",
     "_resolve_workspace_id_readonly",
+    "private_workspace_effect_fence",
     "resolve_workspace_id_if_registered",
 )

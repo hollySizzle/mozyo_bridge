@@ -2,21 +2,18 @@
 
 from __future__ import annotations
 
-import json
 import os
 import plistlib
 import shutil
 import sqlite3
 import subprocess
 import sys
-import time
 from pathlib import Path
 from typing import Mapping, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.application.herdr_offline_rollout_action import (  # noqa: E501
     PhaseExecutionResult,
     adopt_legacy_lanes,
-    merge_legacy_recovery_agent_bindings,
     prepare_store_migration_proofs,
     store_phase_authority,
     verify_migrated_store,
@@ -30,7 +27,6 @@ from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.doma
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_runner import (  # noqa: E501
     RUNNER_ENV,
     bounded_result as _bounded,
-    capture_provider_launch_bindings,
     file_sha256 as _sha256,
     reports_exact_version as _reports_exact_version,
     run_command as _run,
@@ -108,120 +104,9 @@ class LiveOfflineRolloutExecutionPort:
         return _ok(approval_verified=True, issuer_role=issuer.role)
 
     def capture_private_bindings(self, *, plan):
-        from mozyo_bridge.core.state.workspace_registry import list_workspaces
-        from mozyo_bridge.core.state.lane_epoch_adoption import legacy_adoption_refusal
-        from mozyo_bridge.core.state.lane_lifecycle_model import DecisionPointer
-        from mozyo_bridge.core.state.lane_lifecycle_readonly import LaneLifecycleReader
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_lane_topology import (  # noqa: E501
-            bind_lane_worktree,
-        )
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
-            read_live_worktree_fingerprint,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_observability import (  # noqa: E501
-            read_herdr_inventory,
-        )
+        from .herdr_offline_rollout_binding_capture import capture_private_bindings
 
-        if self.repo_root is None:
-            return _fail("repo_root_required")
-        try:
-            records = tuple(list_workspaces(home=self.home))
-            lifecycle_rows = LaneLifecycleReader(home=self.home).records()
-            inventory = read_herdr_inventory(self.repo_root, env=self.env)
-        except Exception as exc:  # noqa: BLE001
-            return _fail("private_binding_capture_failed", type(exc).__name__)
-        from .herdr_offline_inventory_identity import private_agent_bindings
-        wanted_workspaces = {
-            row["workspace_id"] for row in plan.get("workspaces", ())
-        }
-        by_workspace = {record.workspace_id: record for record in records}
-        if set(by_workspace) != wanted_workspaces:
-            return _fail("workspace_set_drift")
-        captured_agents = private_agent_bindings(inventory, plan)
-        if not captured_agents.ok:
-            return captured_agents
-        agents = list(captured_agents.receipt["agents"])
-        merged = merge_legacy_recovery_agent_bindings(plan=plan, agents=agents)
-        if not merged.ok:
-            return merged
-        agents = list(merged.receipt["agents"])
-        recovery_paths = {}
-        for recovery in plan.get("legacy_recoveries", ()):
-            matches = [
-                row
-                for row in lifecycle_rows
-                if row.issue_id == recovery["issue_id"]
-                and row.repo_workspace_id == recovery["workspace_id"]
-                and row.lane_id == recovery["lane_id"]
-                and row.lane_generation == recovery["lane_generation"]
-            ]
-            if len(matches) != 1:
-                return _fail("legacy_recovery_row_drift", recovery["issue_id"])
-            row = matches[0]
-            decision = DecisionPointer(
-                "redmine", recovery["issue_id"], recovery["journal_id"]
-            )
-            refusal = legacy_adoption_refusal(
-                row,
-                expected_revision=recovery["expected_revision"],
-                issue_id=recovery["issue_id"],
-                decision=decision,
-            )
-            registry = by_workspace.get(recovery["workspace_id"])
-            bound = (
-                bind_lane_worktree(
-                    Path(registry.canonical_path),
-                    lifecycle_rows,
-                    workspace=recovery["workspace_id"],
-                    lane=recovery["lane_id"],
-                    generation=recovery["lane_generation"],
-                )
-                if registry is not None and refusal is None
-                else None
-            )
-            if bound is None or row.worktree_identity != recovery["worktree"]["identity"]:
-                return _fail("legacy_recovery_worktree_drift", recovery["issue_id"])
-            worktree, _branch = bound
-            fingerprint = read_live_worktree_fingerprint(worktree, 30.0)
-            expected_wip = recovery["worktree"]["wip"]
-            if (
-                not fingerprint.readable
-                or fingerprint.digest != expected_wip["digest"]
-                or fingerprint.dirty != expected_wip["dirty"]
-                or fingerprint.untracked != expected_wip["untracked"]
-            ):
-                return _fail("legacy_recovery_wip_drift", recovery["issue_id"])
-            recovery_paths[f"legacy:{recovery['issue_id']}"] = str(worktree.resolve())
-        target_cli = shutil.which("mozyo-bridge", path=self.env.get("PATH"))
-        pipx = shutil.which("pipx", path=self.env.get("PATH"))
-        if not target_cli or not pipx:
-            return _fail("runtime_installer_unavailable")
-        try:
-            from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
-                resolve_herdr_binary,
-            )
-
-            herdr_binary = resolve_herdr_binary(self.env).path
-        except Exception as exc:  # noqa: BLE001
-            return _fail("herdr_binary_unavailable", type(exc).__name__)
-        try:
-            provider_executable_bindings = capture_provider_launch_bindings(
-                agents=agents, env=self.env
-            )
-        except Exception as exc:  # noqa: BLE001 - provider resolver is fail-closed
-            return _fail("agent_provider_binary_unavailable", type(exc).__name__)
-        return _ok(
-            workspace_paths={
-                workspace_id: by_workspace[workspace_id].canonical_path
-                for workspace_id in sorted(wanted_workspaces)
-            },
-            legacy_recovery_worktree_paths=recovery_paths,
-            agents=sorted(agents, key=lambda row: row["assigned_name"]),
-            target_cli=str(Path(target_cli).absolute()),
-            pipx=str(Path(pipx).resolve()),
-            herdr_binary=str(Path(herdr_binary).resolve()),
-            provider_executable_bindings=provider_executable_bindings,
-        )
+        return capture_private_bindings(self, plan=plan)
 
     def prepare_external_runner(self, *, action_id, action_directory, plan):
         artifact = plan["candidate_artifact"]
@@ -399,7 +284,15 @@ class LiveOfflineRolloutExecutionPort:
 
     # -- phase execution -----------------------------------------------------------
 
-    def execute_phase(self, *, phase, action, action_directory, replaying=False):
+    def execute_phase(
+        self,
+        *,
+        phase,
+        action,
+        action_directory,
+        replaying=False,
+        session_gate_lease=None,
+    ):
         name = str(phase.get("phase") or "")
         handlers = {
             "supervisor_stop": self._supervisor_stop,
@@ -412,7 +305,7 @@ class LiveOfflineRolloutExecutionPort:
             "migrate_startup_transaction": self._migrate_startup_transaction,
             "rebuild_launch_generation": self._rebuild_launch_generation,
             "exact_runtime_install": self._exact_runtime_install,
-            "legacy_lane_epoch_adoption": lambda _p, action, _d, *, replaying=False: adopt_legacy_lanes(home=self.home, targets=action["plan"].get("legacy_recoveries", ()), replaying=bool(replaying)),  # noqa: E501
+            "legacy_lane_epoch_adoption": self._legacy_lane_epoch_adoption,
             "top_restore_action_bootstrap": self._restore_agents,
             "remaining_workspace_restore": self._restore_agents,
             "supervisor_pair_install": self._supervisor_install,
@@ -423,7 +316,18 @@ class LiveOfflineRolloutExecutionPort:
         if handler is None:
             return _fail("unknown_phase", name)
         try:
+            from .herdr_offline_rollout_phase_fence import (
+                POST_RESTORE_EFFECT_PHASES,
+                PRE_RESTORE_EFFECT_PHASES,
+            )
+
+            if name in PRE_RESTORE_EFFECT_PHASES | POST_RESTORE_EFFECT_PHASES:
+                fenced = self._phase_fence(action).before_effect(action, name)
+                if not fenced.ok:
+                    return fenced
             if name in {
+                "non_top_workspace_stop",
+                "top_workspace_stop",
                 "migrate_attestation",
                 "migrate_lane_lifecycle",
                 "migrate_startup_transaction",
@@ -432,6 +336,13 @@ class LiveOfflineRolloutExecutionPort:
             }:
                 return handler(
                     phase, action, action_directory, replaying=bool(replaying)
+                )
+            if name in {"top_restore_action_bootstrap", "remaining_workspace_restore"}:
+                return self._restore_agents(
+                    phase,
+                    action,
+                    action_directory,
+                    session_gate_lease=session_gate_lease,
                 )
             return handler(phase, action, action_directory)
         except subprocess.TimeoutExpired:
@@ -451,6 +362,48 @@ class LiveOfflineRolloutExecutionPort:
         paths = self._bindings(action)["workspace_paths"]
         repo = Path(paths[action["plan"]["current_workspace_id"]])
         return read_herdr_inventory(repo, env=self.env)
+
+    def _pane_inventory(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_inventory import (  # noqa: E501
+            strict_pane_rows,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
+            _invoke,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
+            COMMAND_TIMEOUT_SECONDS,
+            resolve_herdr_binary,
+        )
+
+        binary = resolve_herdr_binary(self.env).path
+        listed = _invoke(
+            binary,
+            ["pane", "list"],
+            subprocess.run,
+            COMMAND_TIMEOUT_SECONDS,
+            env=self.env,
+        )
+        return strict_pane_rows(listed.stdout)
+
+    def _phase_fence(self, action):
+        from .herdr_offline_rollout_phase_fence import (
+            OfflineRolloutPhaseFence,
+            supervisor_positive_stopped,
+        )
+
+        return OfflineRolloutPhaseFence(
+            home=self.home,
+            inventory_reader=lambda: self._inventory(action),
+            pane_inventory_reader=self._pane_inventory,
+            supervisor_stopped_reader=lambda: supervisor_positive_stopped(
+                home=self.home, action=action
+            ),
+        )
+
+    def _require_effect_edge(self, action, phase_name):
+        """Repeat the fresh three-state join at the mutation-owning call site."""
+
+        return self._phase_fence(action).before_effect(action, phase_name)
 
     def _supervisor_stop(self, phase, _action, _directory):
         # Routed through the platform-resolving backend rather than the launchd module directly
@@ -510,17 +463,22 @@ class LiveOfflineRolloutExecutionPort:
             action_directory=action_directory,
         )
 
-    def _stop_agents(self, phase, action, action_directory):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
-            HerdrRetireClosePlan,
-            execute_herdr_retire_close,
-        )
+    def _stop_agents(
+        self, phase, action, action_directory, *, replaying=False
+    ):
+        from .herdr_offline_rollout_close import OfflineRolloutCloseExecutor
 
         names = tuple(phase.get("assigned_names", ()))
-        bindings = {
-            row["assigned_name"]: row for row in self._bindings(action)["agents"]
-        }
-        settled = self._wait_for_settled_empty(action, names, bindings)
+        closer = OfflineRolloutCloseExecutor(
+            home=self.home,
+            env=self.env,
+            inventory_reader=lambda: self._inventory(action),
+            pane_inventory_reader=self._pane_inventory,
+            workspace_paths=self._bindings(action)["workspace_paths"],
+        )
+        settled = closer.wait_for_settled(
+            action=action, names=names, replaying=bool(replaying)
+        )
         if not settled.ok:
             return settled
         current_workspace = action["plan"]["current_workspace_id"]
@@ -541,101 +499,30 @@ class LiveOfflineRolloutExecutionPort:
             recovered_wip = self._ensure_recovery_wip_snapshots(action, action_directory)
             if not recovered_wip.ok:
                 return recovered_wip
-        for name in names:
-            view = self._inventory(action)
-            from .herdr_offline_inventory_identity import private_inventory_current
-            if not private_inventory_current(view, bindings):
-                return _fail("inventory_unreadable")
-            matches = [agent for agent in view.managed_agents if agent.name == name]
-            if not matches:
-                continue
-            if (
-                len(matches) != 1
-                or matches[0].locator != bindings[name]["locator"]
-                or matches[0].terminal_id != bindings[name]["terminal_id"]
-            ):
-                return _fail("agent_generation_drift", name)
-            result = execute_herdr_retire_close(
-                HerdrRetireClosePlan(
-                    workspace_id=bindings[name]["workspace_id"],
-                    lane_id=bindings[name]["lane_id"],
-                    close_targets=((bindings[name]["provider"], bindings[name]["locator"]),),
-                    foreign_names=(),
-                ),
-                env=self.env,
-            )
-            if result.failed:
-                return _fail("agent_close_failed", name)
-        view = self._inventory(action)
-        from .herdr_offline_inventory_identity import private_inventory_current
-        if not private_inventory_current(view, bindings):
-            return _fail("inventory_unreadable")
-        live = {agent.name for agent in view.managed_agents}
-        if any(name in live for name in names):
-            return _fail("agent_stop_unverified")
-        return _ok(stopped_assigned_names=sorted(names), wip_preserved=True)
-
-    def _wait_for_settled_empty(self, action, names, bindings):
-        """Wait boundedly for every planned target to become idle with no composer debt."""
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_retire_ops import (  # noqa: E501
-            LiveSessionRetireOps,
+        stopped = closer.close_names(
+            action=action, names=names, replaying=bool(replaying)
         )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
-            RUNTIME_AWAITING_INPUT,
-            RUNTIME_TURN_ENDED,
-        )
-
-        if not names:
-            return _ok(targets_settled=True)
-        deadline = time.monotonic() + 600.0
-        paths = self._bindings(action)["workspace_paths"]
-        while True:
-            view = self._inventory(action)
-            from .herdr_offline_inventory_identity import private_inventory_current
-            if not private_inventory_current(view, bindings):
-                return _fail("inventory_unreadable")
-            current = {agent.name: agent for agent in view.managed_agents}
-            pending = []
-            for name in names:
-                agent = current.get(name)
-                if agent is None:
-                    continue
-                binding = bindings.get(name)
-                if (
-                    binding is None
-                    or agent.locator != binding["locator"]
-                    or agent.terminal_id != binding["terminal_id"]
-                ):
-                    return _fail("agent_generation_drift", name)
-                if agent.runtime_state not in (
-                    RUNTIME_AWAITING_INPUT,
-                    RUNTIME_TURN_ENDED,
-                ):
-                    pending.append(name)
-                    continue
-                observer = LiveSessionRetireOps(
-                    repo_root=Path(paths[binding["workspace_id"]]), env=self.env
-                )
-                readable, has_pending = observer.observe_composer(agent.locator)
-                if not readable or has_pending is not False:
-                    pending.append(name)
-            if not pending:
-                return _ok(targets_settled=True)
-            if time.monotonic() >= deadline:
-                return _fail("agents_not_settled", ",".join(sorted(pending)))
-            time.sleep(2.0)
+        if not stopped.ok:
+            return stopped
+        return _ok(**dict(stopped.receipt), wip_preserved=True)
 
     def _consumer_zero(self, _phase, action, _directory):
-        view = self._inventory(action)
-        if (
-            not view.ok
-            or view.invalid_row_count != 0
-            or view.unmanaged_agents
-            or view.managed_agents
-            or view.raw_row_count != 0
-        ):
-            return _fail("consumer_zero_unverified")
-        return _ok(consumer_count=0)
+        result = self._phase_fence(action).require_pre_restore(action)
+        if not result.ok:
+            return result
+        return _ok(consumer_count=0, exact_original_absence=True)
+
+    def _legacy_lane_epoch_adoption(
+        self, _phase, action, _directory, *, replaying=False
+    ):
+        return adopt_legacy_lanes(
+            home=self.home,
+            targets=action["plan"].get("legacy_recoveries", ()),
+            replaying=bool(replaying),
+            effect_fence=lambda: self._require_effect_edge(
+                action, "legacy_lane_epoch_adoption"
+            ),
+        )
 
     def _fresh_store_records(self):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_rollout_snapshot import (  # noqa: E501
@@ -676,12 +563,24 @@ class LiveOfflineRolloutExecutionPort:
         if self._fresh_store_records() != expected:
             return _fail("store_plan_drift")
         backup_root = action_directory / "backups"
+        admitted = self._require_effect_edge(action, "verified_backup")
+        if not admitted.ok:
+            return admitted
         backup_root.mkdir(mode=0o700, exist_ok=True)
+        admitted = self._require_effect_edge(action, "verified_backup")
+        if not admitted.ok:
+            return admitted
         attestation = backup_attestation_store(herdr_identity_attestation_path(self.home))
+        admitted = self._require_effect_edge(action, "verified_backup")
+        if not admitted.ok:
+            return admitted
         state = backup_state_container(lane_lifecycle_path(self.home))
         startup = backup_root / "startup-preflight"
         if not startup.exists():
             fence = StartupTransactionFence(home=self.home)
+            admitted = self._require_effect_edge(action, "verified_backup")
+            if not admitted.ok:
+                return admitted
             with fence._hold():  # noqa: SLF001 - migration authority's external lock
                 with fence._connection("ro") as conn:  # noqa: SLF001
                     staging = startup.with_name(startup.name + ".staging")
@@ -691,8 +590,18 @@ class LiveOfflineRolloutExecutionPort:
         if not startup_digest:
             return _fail("startup_backup_readback_failed")
         from .herdr_offline_rollout_generation_rebuild import backup_launch_generation
+        admitted = self._require_effect_edge(action, "verified_backup")
+        if not admitted.ok:
+            return admitted
         launch = backup_launch_generation(
-            home=self.home, backup_root=backup_root, planned=expected["launch_generation"], observe=lambda: self._fresh_store_records()["launch_generation"])
+            home=self.home,
+            backup_root=backup_root,
+            planned=expected["launch_generation"],
+            observe=lambda: self._fresh_store_records()["launch_generation"],
+            effect_fence=lambda: self._require_effect_edge(
+                action, "verified_backup"
+            ),
+        )
         if not launch.ok:
             return launch
         proofs = prepare_store_migration_proofs(
@@ -701,6 +610,9 @@ class LiveOfflineRolloutExecutionPort:
                 "attestation": herdr_identity_attestation_path(self.home),
                 "lane_lifecycle": lane_lifecycle_path(self.home),
             },
+            effect_fence=lambda: self._require_effect_edge(
+                action, "verified_backup"
+            ),
         )
         if not proofs.ok:
             return proofs
@@ -732,6 +644,9 @@ class LiveOfflineRolloutExecutionPort:
         if not authority.ok:
             return authority
         path = herdr_identity_attestation_path(self.home)
+        admitted = self._require_effect_edge(action, "migrate_attestation")
+        if not admitted.ok:
+            return admitted
         result = migrate_attestation_store(path)
         verified = verify_migrated_store(
             action, "attestation", self._fresh_store_records().get("attestation")
@@ -756,6 +671,9 @@ class LiveOfflineRolloutExecutionPort:
         )
         if not authority.ok:
             return authority
+        admitted = self._require_effect_edge(action, "migrate_lane_lifecycle")
+        if not admitted.ok:
+            return admitted
         outcome = ensure_lane_lifecycle_schema(lane_lifecycle_path(self.home))
         verified = verify_migrated_store(
             action, "lane_lifecycle", self._fresh_store_records().get("lane_lifecycle")
@@ -800,6 +718,9 @@ class LiveOfflineRolloutExecutionPort:
                 store_identity=str(row[0]) if row else "",
                 artifact_digest=artifact_digest_of(artifact),
             )
+        admitted = self._require_effect_edge(action, "migrate_startup_transaction")
+        if not admitted.ok:
+            return admitted
         result = migrate_startup_store_v1_to_v2(
             fence,
             backup_path=artifact,
@@ -817,11 +738,17 @@ class LiveOfflineRolloutExecutionPort:
         """Backup-first v1 cache reset; restore repopulates terminal-bound v2 rows."""
         from .herdr_offline_rollout_generation_rebuild import rebuild_launch_generation
         planned = action["plan"]["stores"]["launch_generation"]
+        admitted = self._require_effect_edge(action, "rebuild_launch_generation")
+        if not admitted.ok:
+            return admitted
         return rebuild_launch_generation(
             home=self.home, backup_root=_directory / "backups", planned=planned,
             observe=lambda: self._fresh_store_records()["launch_generation"],
             backup_receipt=action.get("phase_receipts", {}).get("verified_backup", {}),
             replaying=replaying,
+            effect_fence=lambda: self._require_effect_edge(
+                action, "rebuild_launch_generation"
+            ),
         )
     def _exact_runtime_install(self, _phase, action, _directory):
         bindings = self._bindings(action)
@@ -831,6 +758,9 @@ class LiveOfflineRolloutExecutionPort:
         if _sha256(wheel) != artifact["wheel_sha256"]:
             return _fail("candidate_wheel_digest_mismatch")
         clean_env = _sanitized_runtime_env(self.env)
+        admitted = self._require_effect_edge(action, "exact_runtime_install")
+        if not admitted.ok:
+            return admitted
         installed = _run(
             [bindings["pipx"], "install", "--force", str(wheel)],
             timeout=_INSTALL_TIMEOUT,
@@ -847,58 +777,21 @@ class LiveOfflineRolloutExecutionPort:
             return _fail("runtime_install_unverified", _bounded(checked))
         return _ok(version=artifact["version"], wheel_sha256=artifact["wheel_sha256"])
 
-    def _restore_agents(self, phase, action, _directory):
-        names = set(phase.get("assigned_names", ()))
-        bindings = self._bindings(action)
-        agents = [row for row in bindings["agents"] if row["assigned_name"] in names]
-        groups = {}
-        for row in agents:
-            groups.setdefault(
-                (
-                    row["workspace_id"],
-                    row["lane_id"],
-                    row.get("recovery_issue_id", ""),
-                ),
-                [],
-            ).append(row)
-        action_ids = []
-        for (workspace_id, lane_id, recovery_issue), rows in sorted(groups.items()):
-            repo = (
-                bindings["legacy_recovery_worktree_paths"][f"legacy:{recovery_issue}"]
-                if recovery_issue
-                else bindings["workspace_paths"][workspace_id]
-            )
-            argv = [
-                bindings["target_cli"],
-                "herdr",
-                "session-start",
-                "--repo",
-                repo,
-                "--json",
-            ]
-            if lane_id != "default":
-                argv += ["--lane", lane_id]
-            for row in sorted(rows, key=lambda item: item["provider"]):
-                argv += ["--agent", row["provider"]]
-            result = _run(
-                argv,
-                timeout=_INSTALL_TIMEOUT,
-                env=_sanitized_runtime_env(self.env),
-            )
-            if result.returncode != 0:
-                return _fail("workspace_restore_failed", _bounded(result))
-            try:
-                payload = json.loads(result.stdout)
-            except json.JSONDecodeError:
-                return _fail("workspace_restore_payload_invalid")
-            if payload.get("ok") is not True:
-                return _fail("workspace_restore_unhealthy")
-            if payload.get("action_id"):
-                action_ids.append(payload["action_id"])
-        verified = self._verify_live_names(action, names)
-        if not verified.ok:
-            return verified
-        return _ok(restored_assigned_names=sorted(names), startup_action_ids=action_ids)
+    def _restore_agents(
+        self, phase, action, _directory, *, session_gate_lease=None
+    ):
+        from .herdr_offline_rollout_restore import OfflineRolloutRestoreExecutor
+
+        return OfflineRolloutRestoreExecutor(
+            home=self.home,
+            env=self.env,
+            phase_fence=self._phase_fence(action),
+            session_gate_lease=session_gate_lease,
+        ).execute(
+            phase_name=str(phase.get("phase") or ""),
+            action=action,
+            action_directory=_directory,
+        )
 
     def _verify_live_names(self, action, names, *, exact_roster=False):
         from .herdr_offline_restore_verification import verify_restored_names
@@ -922,6 +815,9 @@ class LiveOfflineRolloutExecutionPort:
         def which(name):
             return target_cli if name == "mozyo-bridge" else shutil.which(name)
 
+        admitted = self._require_effect_edge(action, "supervisor_pair_install")
+        if not admitted.ok:
+            return admitted
         result = supervisor_service_backend.install(mozyo_home=self.home, which=which)
         if not result.get("performed"):
             return _fail("supervisor_install_failed", str(result.get("reason") or ""))

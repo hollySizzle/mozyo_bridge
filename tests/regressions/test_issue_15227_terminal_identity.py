@@ -704,7 +704,6 @@ class TerminalIdentityRegressionTests(unittest.TestCase):
         self.assertTrue(private_inventory_current(_view(first, second), bindings))
         for view in (
             _view(first, replace(second, role="codex")),
-            _view(first, replace(second, terminal_id=_TOKEN)),
             _view(first, replace(second, name=first.name)),
             _view(first, replace(second, locator=first.locator)),
             _view(first, replace(second, name=" bad ")),
@@ -722,7 +721,12 @@ class TerminalIdentityRegressionTests(unittest.TestCase):
             "assigned_name": agent.name, "workspace_id": "ws",
             "lane_id": "default", "provider": "codex",
         }]}
-        self.assertTrue(private_agent_bindings(_view(agent), plan).ok)
+        captured = private_agent_bindings(_view(agent), plan)
+        self.assertTrue(captured.ok)
+        self.assertEqual(
+            set(captured.receipt["agents"][0]),
+            {"assigned_name", "workspace_id", "lane_id", "provider"},
+        )
         for axis, value in (
             ("workspace_id", "foreign"), ("lane_id", "other"),
             ("provider", "claude"),
@@ -738,13 +742,13 @@ class TerminalIdentityRegressionTests(unittest.TestCase):
         module = "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_offline_restore_verification"
         with patch(module + ".HerdrIdentityAttestationStore.read", return_value=object()), \
              patch(module + ".evaluate_attestation", return_value=join), \
-             patch(module + ".verified_generation_token", return_value=""):
+             patch(module + ".verified_terminal_generation_token", return_value=""):
             self.assertFalse(verify_restored_names(
                 view=view, names={"mzb1_ws_codex_default"}, home=Path("/unused"))[0])
         extra = _agent("mzb1_ws_claude_default", "w1:p2", "terminal-2", role="claude")
         with patch(module + ".HerdrIdentityAttestationStore.read", return_value=object()), \
              patch(module + ".evaluate_attestation", return_value=join), \
-             patch(module + ".verified_generation_token", return_value="action"):
+             patch(module + ".verified_terminal_generation_token", return_value="action"):
             self.assertFalse(verify_restored_names(
                 view=_view(_agent(), extra), names={"mzb1_ws_codex_default"},
                 home=Path("/unused"), exact_roster=True)[0])
@@ -830,6 +834,93 @@ class TerminalIdentityRegressionTests(unittest.TestCase):
                 observe=replay_observe, backup_receipt=backup.receipt, replaying=True)
             self.assertTrue(replay.ok, replay)
             self.assertFalse(herdr_launch_generation_path(home).exists())
+
+    def test_generation_backup_internal_effect_fence_blocks_publish(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            home, backups = root / "home", root / "backups"
+            backups.mkdir()
+            planned = _legacy_generation(home)
+            observed = []
+
+            def observe():
+                observed.append(True)
+                return _launch_generation_store_snapshot(home).to_record()
+
+            def drift_after_preflight():
+                self.assertEqual(observed, [True])
+                self.assertFalse((backups / "launch-generation.sqlite3").exists())
+                return PhaseExecutionResult(False, reason="restore_partition_drift")
+
+            result = backup_launch_generation(
+                home=home,
+                backup_root=backups,
+                planned=planned,
+                observe=observe,
+                effect_fence=drift_after_preflight,
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(result.reason, "restore_partition_drift")
+            self.assertTrue(herdr_launch_generation_path(home).exists())
+            self.assertFalse((backups / "launch-generation.sqlite3").exists())
+
+    def test_generation_rebuild_internal_effect_fence_blocks_authority_publish(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            home, backups = root / "home", root / "backups"
+            backups.mkdir()
+            planned = _legacy_generation(home)
+            observe = lambda: _launch_generation_store_snapshot(home).to_record()
+            backup = backup_launch_generation(
+                home=home, backup_root=backups, planned=planned, observe=observe)
+
+            result = rebuild_launch_generation(
+                home=home,
+                backup_root=backups,
+                planned=planned,
+                observe=observe,
+                backup_receipt=backup.receipt,
+                replaying=False,
+                effect_fence=lambda: PhaseExecutionResult(
+                    False, reason="restore_partition_drift"
+                ),
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(result.reason, "restore_partition_drift")
+            self.assertTrue(herdr_launch_generation_path(home).exists())
+            self.assertFalse(
+                (backups / "launch-generation.rebuild-authority").exists()
+            )
+
+    def test_generation_rebuild_internal_effect_fence_blocks_live_removal(self):
+        with tempfile.TemporaryDirectory() as raw:
+            root = Path(raw)
+            home, backups = root / "home", root / "backups"
+            backups.mkdir()
+            planned = _legacy_generation(home)
+            observe = lambda: _launch_generation_store_snapshot(home).to_record()
+            backup = backup_launch_generation(
+                home=home, backup_root=backups, planned=planned, observe=observe)
+            marker = backups / "launch-generation.rebuild-authority"
+
+            def drift_after_authority_publish():
+                return PhaseExecutionResult(
+                    not marker.exists(), reason="restore_partition_drift"
+                )
+
+            result = rebuild_launch_generation(
+                home=home,
+                backup_root=backups,
+                planned=planned,
+                observe=observe,
+                backup_receipt=backup.receipt,
+                replaying=False,
+                effect_fence=drift_after_authority_publish,
+            )
+            self.assertFalse(result.ok)
+            self.assertEqual(result.reason, "restore_partition_drift")
+            self.assertTrue(marker.exists())
+            self.assertTrue(herdr_launch_generation_path(home).exists())
 
     def test_generation_rebuild_refuses_inode_aba_and_bad_backup(self):
         with tempfile.TemporaryDirectory() as raw:

@@ -4,15 +4,24 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     evaluate_attestation,
 )
-from mozyo_bridge.core.state.herdr_launch_generation import verified_generation_token
+from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+    HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+)
 from mozyo_bridge.core.state.herdr_inventory_identity import terminal_inventory_complete
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-    _norm,
-    _norm_lane,
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
+    verified_terminal_generation_token,
 )
 
 
-def verify_restored_names(*, view, names, home, exact_roster=False) -> tuple[bool, str]:
+def verify_restored_names(
+    *,
+    view,
+    names,
+    home,
+    exact_roster=False,
+    expected_identities=None,
+    expected_tokens=None,
+) -> tuple[bool, str]:
     if (
         not terminal_inventory_complete(view)
         or view.unmanaged_agents
@@ -41,11 +50,30 @@ def verify_restored_names(*, view, names, home, exact_roster=False) -> tuple[boo
     store = HerdrIdentityAttestationStore(home=home)
     for name in names:
         agent = live.get(name)
-        record = store.read(name)
+        try:
+            record = store.read(name)
+        except Exception:  # noqa: BLE001 - unreadable authority is never a restored slot
+            return False, name
+        identity = (expected_identities or {}).get(name)
         if (
             agent is None
             or name_counts.get(name) != 1
             or locator_counts.get(agent.locator) != 1
+            or (
+                identity is not None
+                and (
+                    agent.workspace_id,
+                    agent.lane_id,
+                    agent.role,
+                    agent.name,
+                )
+                != (
+                    identity.workspace_id,
+                    identity.lane_id,
+                    identity.provider,
+                    identity.assigned_name,
+                )
+            )
         ):
             return False, name
         terminal_id = (
@@ -59,12 +87,24 @@ def verify_restored_names(*, view, names, home, exact_roster=False) -> tuple[boo
             expected_role=agent.role,
             expected_lane=agent.lane_id,
         )
-        generation = verified_generation_token(
-            home, assigned_name=name, workspace_id=agent.workspace_id,
-            role=agent.role, lane_id=agent.lane_id, locator=agent.locator,
-            live_terminal_id=terminal_id, norm=_norm, norm_lane=_norm_lane,
+        generation = verified_terminal_generation_token(
+            home,
+            assigned_name=name,
+            workspace_id=agent.workspace_id,
+            role=agent.role,
+            lane_id=agent.lane_id,
+            locator=agent.locator,
+            terminal_id=terminal_id or "",
         )
-        if not joined.ok or not generation:
+        expected = (expected_tokens or {}).get(name)
+        if (
+            type(getattr(record, "schema_version", None)) is not int
+            or getattr(record, "schema_version")
+            != HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
+            or not joined.ok
+            or not generation
+            or (expected is not None and generation != expected)
+        ):
             return False, name
     return True, ""
 

@@ -135,7 +135,13 @@ def isolated_env(
     """
     layout = IsolationLayout(root=Path(root).resolve())
     for directory in layout.directories:
-        directory.mkdir(parents=True, exist_ok=True)
+        # 0700, not the umask default: these are task-PRIVATE roots, and a group-writable
+        # temp root is exactly the parent shape the session-start gate's entry-stability
+        # rule refuses (another gid could rename a home out from under its lock). The
+        # fence must present the same safe topology a real host's sticky /tmp does
+        # (#15227 R-correction).
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
     canary = layout.root / "canary"
     control = layout.root / "control"
     for fixture in (canary, control):

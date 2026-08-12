@@ -69,6 +69,7 @@ def reserve_launch_generations(
     launch_plans: Iterable,
     workspace_id: str,
     lane_id: str,
+    effect_fence=None,
 ) -> None:
     """Reserve a ``pending`` generation for every wrapped launch slot (fail-closed).
 
@@ -84,6 +85,8 @@ def reserve_launch_generations(
         return
     store = HerdrLaunchGenerationStore(home=store_home)
     for plan in launch_plans:
+        if effect_fence is not None:
+            effect_fence()
         store.reserve_pending(
             assigned_name=_norm(getattr(plan, "assigned_name", "")),
             startup_action_id=token,
@@ -102,11 +105,13 @@ def finalize_launch_generations(
     lane_id: str,
     attestation_read: Optional[Callable[[str], object]],
     inventory_rows: Iterable,
+    effect_fence=None,
 ) -> None:
     """CAS each launched slot's reservation to ``attested`` when the evidence agrees.
 
-    BEST-EFFORT: never raises. A missing evidence piece or a CAS refused by a newer
-    reservation leaves the row ``pending``; the launch is unaffected.
+    Store/evidence failures remain best-effort and leave the row ``pending``.  A supplied
+    action-time effect fence is different: it runs immediately before each physical CAS
+    and its refusal propagates, so offline restore cannot continue past fresh drift.
     """
     token = _norm(startup_action_id)
     if not token or attestation_read is None:
@@ -207,6 +212,8 @@ def finalize_launch_generations(
         # 4. CAS to attested. A refusal (a newer pending reservation superseded this one)
         #    leaves the row pending — never overwrite the newer generation.
         try:
+            if effect_fence is not None:
+                effect_fence()
             store.finalize(
                 assigned_name=name,
                 startup_action_id=token,
@@ -273,6 +280,7 @@ def verified_terminal_generation_token(
 
 def reserve_session_launch_generations(
     *, store_home, transaction, launch_plans, workspace_id, lane_id, attest_launcher,
+    effect_fence=None,
 ) -> None:
     """Session-boundary reserve: gate on a wrapped managed launch, then reserve every slot's
     ``pending`` generation. Gated identically to the #13748/#13882 launcher-capability
@@ -289,6 +297,7 @@ def reserve_session_launch_generations(
         reserve_launch_generations(
             store_home=store_home, startup_action_id=transaction.action_id,
             launch_plans=launch_plans, workspace_id=workspace_id, lane_id=lane_id,
+            effect_fence=effect_fence,
         )
     except HerdrLaunchGenerationError as exc:
         raise HerdrSessionStartError(
@@ -300,7 +309,8 @@ def reserve_session_launch_generations(
 
 def open_startup_transaction_and_reserve_generations(
     *, workspace_id, lane_id, providers, dry_run, home, fence, nonce, launch_plans,
-    attest_launcher, env=None, resolved=None,
+    attest_launcher, env=None, resolved=None, effect_fence=None,
+    completion_fence=None, refuse_nonterminal_slot_overlap=False,
 ):
     """Reserve BOTH pre-side-effect identity records in one step — the immutable startup
     action (#13948) and each wrapped slot's launch generation (#14203 j#87472) — the LAST
@@ -313,11 +323,14 @@ def open_startup_transaction_and_reserve_generations(
 
     transaction = open_startup_transaction(
         workspace_id=workspace_id, lane_id=lane_id, providers=providers, dry_run=dry_run,
-        home=home, fence=fence, nonce=nonce,
+        home=home, fence=fence, nonce=nonce, effect_fence=effect_fence,
+        completion_fence=completion_fence,
+        refuse_nonterminal_slot_overlap=refuse_nonterminal_slot_overlap,
     )
     reserve_session_launch_generations(
         store_home=home, transaction=transaction, launch_plans=launch_plans,
         workspace_id=workspace_id, lane_id=lane_id, attest_launcher=attest_launcher,
+        effect_fence=effect_fence,
     )
     # Redmine #14741 bracket 1 (j#96917 / j#96966 C12): the identity reservation is
     # established at the SAME pre-side-effect moment as the generation, from the identity
@@ -326,23 +339,28 @@ def open_startup_transaction_and_reserve_generations(
     reserve_session_launch_identities(
         store_home=home, transaction=transaction, launch_plans=launch_plans,
         workspace_id=workspace_id, lane_id=lane_id, attest_launcher=attest_launcher,
-        resolved=resolved,
+        resolved=resolved, effect_fence=effect_fence,
     )
     return transaction
 
 
 def finalize_session_launch_generations(
     *, store_home, transaction, slots, workspace_id, lane_id, attestation_read,
-    inventory_rows, attest_launcher, launch_plans, dry_run,
+    inventory_rows, attest_launcher, launch_plans, dry_run, effect_fence=None,
 ) -> None:
-    """Session-boundary finalize: gate (same as the reserve, plus not-dry-run) then
-    best-effort finalize each launched slot's generation (never raises)."""
+    """Session-boundary finalize after a fresh per-slot action-time admission.
+
+    Generation evidence/CAS failures leave ``pending`` for completion readback to reject;
+    an explicit effect-fence refusal propagates before the affected CAS.
+    """
     if dry_run or transaction is None or not attest_launcher or not launch_plans:
         return
+    if effect_fence is not None:
+        effect_fence()
     finalize_launch_generations(
         store_home=store_home, startup_action_id=transaction.action_id, slots=slots,
         workspace_id=workspace_id, lane_id=lane_id, attestation_read=attestation_read,
-        inventory_rows=inventory_rows,
+        inventory_rows=inventory_rows, effect_fence=effect_fence,
     )
 
 

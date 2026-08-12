@@ -1344,10 +1344,6 @@ class LaunchRatioTest(unittest.TestCase):
         # Ordering, not just absence: a malformed argument must lose to nothing — including
         # a busy store. If validation ran after acquisition, a contended lock would decide
         # the error instead, and the caller would be told to retry a call that can never work.
-        from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
-            AttestationStoreLockBusy,
-        )
-
         config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
         herdr = FakeHerdr()
         with tempfile.TemporaryDirectory() as tmp:
@@ -1364,12 +1360,18 @@ class LaunchRatioTest(unittest.TestCase):
             }
 
             def busy(*_args, **_kwargs):
-                raise AttestationStoreLockBusy("probe: the store is held exclusively")
+                raise AssertionError("invalid arguments must be rejected before locks")
 
             module = "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 with patch(
-                    module + "application.herdr_session_start.attestation_store_lock", busy
+                    module
+                    + "application.herdr_session_start_entry.attestation_store_lock",
+                    busy,
+                ), patch(
+                    module
+                    + "application.herdr_session_start_entry.acquire_session_start_gate",
+                    busy,
                 ):
                     with self.assertRaises(HerdrSessionStartError):
                         prepare_session(

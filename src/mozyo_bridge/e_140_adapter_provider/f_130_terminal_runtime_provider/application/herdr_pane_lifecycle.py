@@ -27,7 +27,7 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
     _extract_list_rows,
@@ -856,6 +856,7 @@ def _create_workspace(
     timeout: float,
     env: Mapping[str, str],
     label: str = "",
+    effect_fence: Optional[Callable[[], None]] = None,
 ) -> tuple[str, str]:
     """Explicitly create a herdr workspace; return ``(workspace_id, root_pane_id)``.
 
@@ -873,6 +874,8 @@ def _create_workspace(
     if label:
         argv.extend(["--label", label])
     argv.append("--no-focus")
+    if effect_fence is not None:
+        effect_fence()
     completed = _invoke(
         binary,
         argv,
@@ -897,6 +900,7 @@ def _create_tab(
     timeout: float,
     env: Mapping[str, str],
     label: str = "",
+    effect_fence: Optional[Callable[[], None]] = None,
 ) -> tuple[str, str]:
     """Explicitly create a herdr tab in ``workspace_id``; return ``(tab_id, root_pane_id)``.
 
@@ -913,6 +917,8 @@ def _create_tab(
     if label:
         argv.extend(["--label", label])
     argv.append("--no-focus")
+    if effect_fence is not None:
+        effect_fence()
     completed = _invoke(binary, argv, runner, timeout, env=dict(env))
     parsed = _parse_tab_created(completed.stdout)
     if parsed is None:

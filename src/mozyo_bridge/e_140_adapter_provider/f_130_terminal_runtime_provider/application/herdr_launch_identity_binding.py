@@ -90,6 +90,7 @@ def reserve_session_launch_identities(
     lane_id: str,
     resolved: Optional[Mapping] = None,
     attest_launcher: str = "",
+    effect_fence=None,
 ) -> None:
     """Bracket 1 — reserve ``unbound_pending`` before the first Herdr side effect.
 
@@ -121,6 +122,8 @@ def reserve_session_launch_identities(
             # the action's manifest, so this is an absence the manifest already states.
             continue
         try:
+            if effect_fence is not None:
+                effect_fence()
             store.reserve(
                 _key(workspace_id, lane_id, provider, assigned, transaction.action_id),
                 identity_digest=digest,

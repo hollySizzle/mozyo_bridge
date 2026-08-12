@@ -84,6 +84,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     resolve_lane_slots,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
+from mozyo_bridge.core.state.herdr_session_start_gate import session_start_gate
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
     evaluate_dispatch_sender,
     evaluate_launcher_compatibility,
@@ -313,7 +314,9 @@ class HerdrSublaneActuatorOps:
         # coordinator's), never `worktree_path`: the committed config is identical after
         # creation and this keeps one config source (the same rule the tmux
         # `resolve_append_lane_argv` follows). An unconfigured repo appends nothing.
-        return project_sublane_startup(self._prepare_lane_session(worktree_path))
+        with session_start_gate(mozyo_bridge_home(), exclusive=False) as lease:
+            result = self._prepare_lane_session(worktree_path, session_gate_lease=lease)
+            return project_sublane_startup(result)
 
     def _prepare_lane_session(
         self,
@@ -325,6 +328,7 @@ class HerdrSublaneActuatorOps:
         admission_lock_held: bool = False,
         providers: "Sequence[str] | None" = None,
         pair_order: "Sequence[str] | None" = None,
+        session_gate_lease: object = None,
     ):
         """Run the production session composition and return its durable launch result.
 
@@ -366,6 +370,7 @@ class HerdrSublaneActuatorOps:
                 # kind yet — the caller's context is the only authority that exists at the
                 # moment the panes are actually created.
                 launch_context=self._launch_context(),
+                session_gate_lease=session_gate_lease,
             )
         except HerdrLauncherIncompatibleError as exc:
             # Redmine #13847: typed launcher-compat error (not a generic pane-create failure),
@@ -568,6 +573,15 @@ class HerdrSublaneActuatorOps:
         )
 
     def heal_lane_column(self, worktree_path: str, *, target_provider: "str | None" = None) -> None:
+        with session_start_gate(mozyo_bridge_home(), exclusive=False) as lease:
+            return self._heal_lane_column_under_gate(
+                worktree_path,
+                target_provider=target_provider,
+                session_gate_lease=lease,
+            )
+
+    def _heal_lane_column_under_gate(self, worktree_path: str, *,
+        target_provider: "str | None" = None, session_gate_lease: object) -> None:
         """Relaunch the lane's missing managed slot(s) (self-heal, Redmine #13378).
 
         A lane gateway can die between its launch and the first dispatch for reasons
@@ -675,12 +689,22 @@ class HerdrSublaneActuatorOps:
                         else None
                     ),
                     pair_order=managed_pair,
+                    session_gate_lease=session_gate_lease,
                 ),
                 target_only=self.replacement_target_only,
             )
         )
         if not used_v1_binding:
-            result = self._prepare_lane_session(worktree_path, providers=((target_provider,) if self.replacement_target_only and target_provider else None), pair_order=managed_pair)
+            result = self._prepare_lane_session(
+                worktree_path,
+                providers=(
+                    (target_provider,)
+                    if self.replacement_target_only and target_provider
+                    else None
+                ),
+                pair_order=managed_pair,
+                session_gate_lease=session_gate_lease,
+            )
             require_replacement_target_healthy(result, self.replacement_action_id, target_provider, self.replacement_assigned_name)
 
         # Same-tab postcondition (Redmine #13705 R1-F3): the compatible heal must have

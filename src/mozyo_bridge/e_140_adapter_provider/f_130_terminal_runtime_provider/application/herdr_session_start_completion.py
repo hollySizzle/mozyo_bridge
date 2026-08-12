@@ -77,6 +77,7 @@ def finalize_session_launch_authority(
     binary: str,
     runner,
     timeout: float,
+    effect_fence=None,
 ) -> None:
     """Finalize v4/generation-v2 authority before any shared-pane geometry effect."""
 
@@ -96,6 +97,7 @@ def finalize_session_launch_authority(
         attest_launcher=attest_launcher,
         launch_plans=launch_plans,
         dry_run=dry_run,
+        effect_fence=effect_fence,
     )
     if transaction is not None:
         transaction.settle(
@@ -121,6 +123,7 @@ def complete_session_start(
     timeout: float,
     env,
     authority_already_completed: bool = False,
+    effect_fence=None,
 ) -> None:
     """Complete authority when needed, then configured placement."""
     if not authority_already_completed:
@@ -136,6 +139,7 @@ def complete_session_start(
             binary=binary,
             runner=runner,
             timeout=timeout,
+            effect_fence=effect_fence,
         )
 
     # Configured reordering is intentionally a fresh-full-pair completion step.
@@ -243,6 +247,7 @@ def complete_session_start_container(
     runner,
     timeout: float,
     env,
+    effect_fence=None,
 ) -> None:
     """Finalize launch authority, geometry, and configured placement in order."""
 
@@ -258,6 +263,7 @@ def complete_session_start_container(
         binary=binary,
         runner=runner,
         timeout=timeout,
+        effect_fence=effect_fence,
     )
     geometry_finalizer(
         result,
@@ -294,6 +300,7 @@ def complete_session_start_container(
         timeout=timeout,
         env=env,
         authority_already_completed=True,
+        effect_fence=effect_fence,
     )
 
 

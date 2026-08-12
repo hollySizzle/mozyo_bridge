@@ -29,7 +29,7 @@ import time
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from mozyo_bridge.core.state.herdr_native_identity_binding import is_native_name
 from mozyo_bridge.core.state.startup_execution_events import (
@@ -91,6 +91,9 @@ class StartupTransaction:
         fence: StartupTransactionFence,
         unit: StartupUnit,
         nonce: str,
+        effect_fence: Optional[Callable[[], None]] = None,
+        completion_fence: Optional[Callable[[], None]] = None,
+        refuse_nonterminal_slot_overlap: bool = False,
         busy_retry_budget_seconds: float = RECORD_LAUNCH_BUSY_RETRY_BUDGET_SECONDS,
         sleep=None,
         monotonic=None,
@@ -98,6 +101,9 @@ class StartupTransaction:
         self._fence = fence
         self._unit = unit
         self._nonce = nonce
+        self._effect_fence = effect_fence
+        self._completion_fence = completion_fence
+        self._refuse_nonterminal_slot_overlap = refuse_nonterminal_slot_overlap
         self._action = None
         self._busy_retry_budget_seconds = max(float(busy_retry_budget_seconds), 0.0)
         self._sleep = sleep if sleep is not None else time.sleep
@@ -109,8 +115,17 @@ class StartupTransaction:
 
     def reserve(self) -> str:
         """Durably record the identity BEFORE the run's first side effect."""
-        self._action = self._fence.reserve(self._unit, self._nonce)
+        self._before_effect()
+        self._action = self._fence.reserve(
+            self._unit,
+            self._nonce,
+            refuse_nonterminal_slot_overlap=self._refuse_nonterminal_slot_overlap,
+        )
         return self._action.action_id
+
+    def _before_effect(self) -> None:
+        if self._effect_fence is not None:
+            self._effect_fence()
 
     def ensure_execution_events(self) -> None:
         """Preflight the optional execution-events projection (Redmine #14231).
@@ -127,6 +142,7 @@ class StartupTransaction:
                 "execution-events preflight was called before reserve(); the reserve "
                 "must precede every side effect"
             )
+        self._before_effect()
         ensure_execution_events_table(self._fence, self._action.action_id)
 
     def record_launch(self, slot, *, receipt: str = "") -> None:
@@ -150,7 +166,9 @@ class StartupTransaction:
             )
         )
 
-    def _record_participant(self, participant: Participant) -> None:
+    def _record_participant(
+        self, participant: Participant, *, recheck_effect_fence: bool = True
+    ) -> None:
         if self._action is None:
             raise StartupTransactionError(
                 "a participant was recorded before its startup action was reserved; "
@@ -159,6 +177,8 @@ class StartupTransaction:
         deadline = self._monotonic() + self._busy_retry_budget_seconds
         while True:
             try:
+                if recheck_effect_fence:
+                    self._before_effect()
                 self._action = self._fence.record_participant(
                     self._action.action_id, participant
                 )
@@ -190,7 +210,8 @@ class StartupTransaction:
                 assigned_name=assigned_name,
                 locator=locator,
                 receipt=receipt,
-            )
+            ),
+            recheck_effect_fence=False,
         )
 
     def settle(self, *, owed: bool, launched: bool) -> None:
@@ -211,17 +232,24 @@ class StartupTransaction:
         if self._action is None:
             return
         action_id = self._action.action_id
+        self._before_effect()
         self._fence.set_phase(action_id, PHASE_HEALTH_CHECK)
         if not owed:
+            if self._completion_fence is not None:
+                self._completion_fence()
+            self._before_effect()
             self._fence.set_phase(action_id, PHASE_SUCCESS_OWED)
+            self._before_effect()
             self._action = self._fence.set_phase(action_id, PHASE_COMPLETED_SUCCESS)
             return
         if not launched:
             # Nothing of ours is out there; there is nothing to roll back. Saying
             # `rollback_owed` here would invite the rail to look for participants that
             # do not exist and report a blocked compensation for a debt that is not one.
+            self._before_effect()
             self._action = self._fence.set_phase(action_id, PHASE_COMPLETED_SUCCESS)
             return
+        self._before_effect()
         self._action = self._fence.set_phase(action_id, PHASE_ROLLBACK_OWED)
 
 
@@ -234,6 +262,9 @@ def open_startup_transaction(
     home: Optional[Path] = None,
     fence: Optional[StartupTransactionFence] = None,
     nonce: str = "",
+    effect_fence: Optional[Callable[[], None]] = None,
+    completion_fence: Optional[Callable[[], None]] = None,
+    refuse_nonterminal_slot_overlap: bool = False,
 ) -> Optional[StartupTransaction]:
     """Reserve this run's action, or ``None`` for a dry run (which starts nothing).
 
@@ -254,6 +285,9 @@ def open_startup_transaction(
             workspace_id=workspace_id, lane_id=lane_id, providers=tuple(providers)
         ),
         nonce=nonce or new_action_nonce(),
+        effect_fence=effect_fence,
+        completion_fence=completion_fence,
+        refuse_nonterminal_slot_overlap=refuse_nonterminal_slot_overlap,
     )
     transaction.reserve()
     transaction.ensure_execution_events()

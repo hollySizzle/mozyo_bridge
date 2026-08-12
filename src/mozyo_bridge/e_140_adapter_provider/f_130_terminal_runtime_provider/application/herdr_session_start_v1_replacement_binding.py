@@ -73,6 +73,7 @@ def prepare_actuator_lane_session(
     launch_context: object = None,
     pair_order: object = None,
     launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH,
+    session_gate_lease: object = None,
 ) -> SessionStartResult:
     """Compose one actuator launch, optionally beneath its caller-held store lock.
 
@@ -133,6 +134,7 @@ def prepare_actuator_lane_session(
         coordinator_placement_mode=coordinator_placement.mode,
         coordinator_top_workspace_id=coordinator_placement.top_workspace_id,
         launch_cause=launch_cause,
+        _session_gate_lease=session_gate_lease,
     )
     if not admission_lock_held:
         return prepare_session(**call)

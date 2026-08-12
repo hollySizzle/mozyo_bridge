@@ -37,6 +37,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback_contract import (  # noqa: E501
     StartupRollbackAgentTarget,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_inventory import (  # noqa: E501
+    strict_pane_rows as _strict_pane_rows,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_rollback import (  # noqa: E501
     ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE,
     ROLLBACK_DETAIL,
@@ -274,45 +277,6 @@ class LiveStartupRollbackOps:
             provider_id=provider, read_visible=lambda: reader(locator)
         )
         return admission.blocker_id if admission.outcome == ADMISSION_BLOCKED else ""
-
-
-def _strict_pane_rows(stdout: object) -> tuple[Mapping[str, object], ...]:
-    """Parse only Herdr 0.8's canonical complete ``pane list`` envelope."""
-    if not isinstance(stdout, str):
-        raise ValueError("pane list did not return text")
-    payload = json.loads(stdout)
-    if not isinstance(payload, Mapping):
-        raise ValueError("pane list did not return an object")
-    result = payload.get("result")
-    if not isinstance(result, Mapping) or result.get("type") != "pane_list":
-        raise ValueError("pane list result type is not pane_list")
-    rows = result.get("panes")
-    if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
-        raise ValueError("pane list does not contain a complete pane array")
-    pane_ids: set[str] = set()
-    terminal_ids: set[str] = set()
-    for row in rows:
-        pane_id = row.get("pane_id")
-        workspace_id = row.get("workspace_id")
-        tab_id = row.get("tab_id")
-        terminal_id = row.get("terminal_id")
-        if (
-            not valid_target(pane_id)
-            or not valid_target(workspace_id)
-            or not valid_target(tab_id)
-            or _workspace_prefix(pane_id) != workspace_id
-            or not tab_id.startswith(f"{workspace_id}:t")
-            or tab_id == f"{workspace_id}:t"
-            or pane_id in pane_ids
-            or type(terminal_id) is not str
-            or not terminal_id
-            or terminal_id.strip() != terminal_id
-            or terminal_id in terminal_ids
-        ):
-            raise ValueError("pane list contains a malformed or duplicate identity")
-        pane_ids.add(pane_id)
-        terminal_ids.add(terminal_id)
-    return tuple(rows)
 
 
 def _read_shell_only(

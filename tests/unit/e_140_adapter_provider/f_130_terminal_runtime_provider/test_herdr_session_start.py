@@ -356,7 +356,11 @@ class Herdr080CapabilityPreflightTest(unittest.TestCase):
 
         lock_target = (
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.herdr_session_start.attestation_store_lock"
+            "application.herdr_session_start_entry.attestation_store_lock"
+        )
+        gate_target = (
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start_entry.acquire_session_start_gate"
         )
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
@@ -369,7 +373,7 @@ class Herdr080CapabilityPreflightTest(unittest.TestCase):
             binary.chmod(0o755)
             with patch.dict(
                 os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False
-            ), patch(lock_target, _lock):
+            ), patch(lock_target, _lock), patch(gate_target) as gate:
                 with self.assertRaises(HerdrSessionStartError):
                     prepare_session(
                         repo_root=repo,
@@ -380,6 +384,7 @@ class Herdr080CapabilityPreflightTest(unittest.TestCase):
                     )
             self.assertEqual(list(repo.iterdir()), [])
         self.assertEqual(lock_entries, [])
+        gate.assert_not_called()
         self.assertEqual(calls, [["agent", "start", "--help"]])
 
 
@@ -1273,6 +1278,7 @@ class _SessionStartHarness:
         coordinator_top_workspace_id=None,
         herdr_runner=None,
         launcher_runner=None,
+        create_home=True,
     ):
         # `exist_ok`: a scenario may drive TWO runs through one tmp (Redmine #13948 pins
         # that a re-run of the same command in the same lane is a NEW action), and the
@@ -1280,7 +1286,8 @@ class _SessionStartHarness:
         repo = Path(tmp) / "repo"
         repo.mkdir(exist_ok=True)
         home = Path(tmp) / "home"
-        home.mkdir(exist_ok=True)
+        if create_home:
+            home.mkdir(exist_ok=True)
         binpath = Path(tmp) / "fake-herdr"
         binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
         binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
@@ -1352,6 +1359,21 @@ class _SessionStartHarness:
 
 
 class SessionStartTest(_SessionStartHarness, unittest.TestCase):
+    def test_first_non_dry_run_bootstraps_the_selected_fresh_home(self) -> None:
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            self.assertFalse(home.exists())
+            result, _anchor, _repo = self._prepare(
+                tmp,
+                providers=["claude"],
+                herdr=herdr,
+                create_home=False,
+            )
+            self.assertTrue(home.is_dir())
+            self.assertEqual(home.stat().st_mode & 0o777, 0o700)
+        self.assertEqual(result.slots[0].outcome, SLOT_LAUNCHED)
+
     def test_launch_wraps_provider_in_self_attest_when_launcher_resolves(self) -> None:
         # Redmine #13637: a launch execs the provider THROUGH `mozyo-bridge herdr
         # agent-attest`, passing the expected identity, so the agent self-attests before
@@ -2384,6 +2406,35 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             }
         ]
         self.assertEqual(writes, [])
+
+    def test_private_expected_workspace_refuses_before_register_or_launch(self) -> None:
+        """Offline restore cannot let a sealed path mint a different workspace."""
+
+        from mozyo_bridge.core.state.workspace_registry import anchor_path, registry_path
+
+        herdr = _Herdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            home = Path(tmp) / "home"
+            home.mkdir()
+            binpath = Path(tmp) / "fake-herdr"
+            binpath.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC)
+            with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
+                with self.assertRaises(HerdrSessionStartError):
+                    prepare_session(
+                        repo_root=repo,
+                        providers=["codex"],
+                        lane_id="",
+                        env=_launch_env(binpath),
+                        runner=herdr.run,
+                        expected_workspace_id="sealed_ws",
+                    )
+            self.assertFalse(registry_path(home).exists())
+            self.assertFalse(anchor_path(repo).exists())
+        self.assertEqual(herdr.workspace_creates, [])
+        self.assertEqual(_agent_start_calls(herdr), [])
 
     def test_dry_run_registry_only_resolves_from_row_without_rewriting_anchor(self) -> None:
         # Matrix: registry row present, anchor deleted. A --dry-run resolves the id
