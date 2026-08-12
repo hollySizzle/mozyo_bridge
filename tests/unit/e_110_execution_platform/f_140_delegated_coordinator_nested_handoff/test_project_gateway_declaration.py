@@ -512,7 +512,10 @@ class _FakeOps:
     def providers(self):
         return self._providers
 
-    def resolve_route(self, project_scope):
+    def resolve_route(self, project_scope, gateway_provider):
+        # #15414 finding_providersnapshot: the use case passes the SAME provider
+        # snapshot it resolved once; record it so tests can pin the threading.
+        self.route_gateway_provider = gateway_provider
         return self._route
 
 
@@ -559,6 +562,31 @@ class ProjectGatewayDeclareUseCaseTest(unittest.TestCase):
             self.assertTrue(o.applied)
             rec = LaneLifecycleStore(home=Path(tmp)).get(LaneLifecycleKey(WS, LANE))
             self.assertEqual(rec.binding_kind, "project_gateway")
+
+    def test_route_consumes_the_single_provider_snapshot(self) -> None:
+        # #15414 finding_providersnapshot (review j#104600): the binding is a
+        # mutable authority resolved ONCE per use-case execution; the route
+        # receives that exact snapshot — a second read could hand the route a
+        # different value than the declaration write pair. The drifting fake
+        # returns a different pair on every read, so any re-read is visible.
+        class _DriftingOps(_FakeOps):
+            def __init__(self):
+                super().__init__()
+                self.provider_reads = 0
+
+            def providers(self):
+                self.provider_reads += 1
+                return (
+                    ("claude", "claude")
+                    if self.provider_reads == 1
+                    else ("codex", "codex")
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ops = _DriftingOps()
+            self._use_case(tmp, ops).run(self._request(), execute=False)
+            self.assertEqual(1, ops.provider_reads)
+            self.assertEqual("claude", ops.route_gateway_provider)
 
 
 class CanonicalRepoRootTest(unittest.TestCase):

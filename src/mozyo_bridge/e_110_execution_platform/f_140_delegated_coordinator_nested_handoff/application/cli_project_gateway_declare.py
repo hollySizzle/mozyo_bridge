@@ -68,7 +68,7 @@ class ProjectGatewayDeclareOps(Protocol):
     def providers(self) -> tuple[str, str]: ...
 
     def resolve_route(
-        self, project_scope: str
+        self, project_scope: str, gateway_provider: str
     ) -> tuple[str, str, Optional[ObservedGatewayRoute]]: ...
 
 
@@ -115,7 +115,7 @@ class LiveProjectGatewayDeclareOps:
             return ("", "")
 
     def resolve_route(
-        self, project_scope: str
+        self, project_scope: str, gateway_provider: str
     ) -> tuple[str, str, Optional[ObservedGatewayRoute]]:
         """``(declared_repo_root, declared_project_path, observed_route)`` (Redmine #13811 R3).
 
@@ -139,15 +139,14 @@ class LiveProjectGatewayDeclareOps:
         # Canonicalize the repo root with the resolver's own normalization (R3 F4), so a
         # relative ``--repo .`` and the resolver's absolute repo root compare equal.
         canon_repo = _canonical_path(self.repo_root)
-        # The declaration's semantic identity and its candidate discovery use the
-        # SAME gateway provider the use case already resolved from the binding
-        # (Redmine #15414 finding_declareidentity) — the use case zero-writes on
-        # an unresolved binding before reaching here, and an unreadable binding
-        # below stays owner-unbound through the same except. Without this, an
-        # all-claude gateway is refused as role_mismatch and the declaration is
-        # permanently owner-unbound.
+        # The declaration's semantic identity and its candidate discovery consume
+        # the SAME gateway provider snapshot the use case resolved once and also
+        # feeds to the declaration write (Redmine #15414 finding_declareidentity
+        # + finding_providersnapshot): the binding is a mutable authority, so it
+        # is passed in rather than re-read here — a second read could hand the
+        # route a different value than the write pair. The use case zero-writes
+        # on an unresolved binding before calling this.
         try:
-            gateway_provider, _worker_provider = self.providers()
             identity = _gateway_identity(
                 canon_repo, project_scope, role=gateway_provider
             )
@@ -232,8 +231,12 @@ class ProjectGatewayDeclareUseCase:
             )
         # Resolve the DECLARED canonical identity + the OBSERVED live gateway route (R3). The
         # declaration verifies they exactly match before writing; an unresolved / mismatched
-        # route is owner-unbound zero-write.
-        expected_repo_root, expected_project_path, observed_route = self.ops.resolve_route(scope)
+        # route is owner-unbound zero-write. The route consumes the SAME provider snapshot
+        # resolved above and fed to the write below (Redmine #15414 finding_providersnapshot)
+        # — never a second binding read.
+        expected_repo_root, expected_project_path, observed_route = self.ops.resolve_route(
+            scope, gateway_provider
+        )
         kwargs: dict[str, Any] = {}
         if self.store_factory is not None:
             kwargs["store_factory"] = self.store_factory

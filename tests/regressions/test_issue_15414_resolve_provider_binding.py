@@ -458,19 +458,21 @@ class DeclareRouteFollowsBindingTest(unittest.TestCase):
         )
 
         ops = cli_project_gateway_declare.LiveProjectGatewayDeclareOps(REPO)
+        # The provider is PASSED IN (the use case's single snapshot, #15414
+        # finding_providersnapshot); the route must not re-read the binding.
         with patch.object(
-            workflow_provider_resolution, "resolve_gateway_provider",
-            return_value=gateway_provider,
-        ):
+            workflow_provider_resolution, "resolve_gateway_provider"
+        ) as gateway_read:
             with patch.object(
-                workflow_provider_resolution, "resolve_worker_provider",
-                return_value="claude",
-            ):
+                workflow_provider_resolution, "resolve_worker_provider"
+            ) as worker_read:
                 with patch.object(
                     cli_project_gateway, "_discover_candidates",
                     return_value=candidates,
                 ) as discovered:
-                    result = ops.resolve_route(PROJECT)
+                    result = ops.resolve_route(PROJECT, gateway_provider)
+        gateway_read.assert_not_called()
+        worker_read.assert_not_called()
         return result, discovered
 
     def test_all_claude_gateway_resolves_the_observed_route(self) -> None:
