@@ -270,7 +270,8 @@ cockpit-visible project gateway にならない。
   - caller は **一段だけ** 委譲する。grandparent が grandchild worker を直接解決することは
     禁止である (`禁止遷移` の `parent_sends_to_grandchild_directly` / direct-send 禁止)。
 - **coordinator-class target (`project_gateway` / `delegated_coordinator`) の解決は
-  launch-or-adopt に従う。** live discovery では両者は同型 (strong + project-scoped Codex) で
+  launch-or-adopt に従う。** live discovery では両者は同型 (strong + project-scoped な
+  coordinator provider — scope の provider_binding 解決値。既定 codex、#15414) で
   あり、相対位置が contract label である。
   - `found` -> **adopt** (live lane を identity で採用)。
   - `gateway_missing` -> **cockpit-visible launch plan** (project workdir から
@@ -521,8 +522,8 @@ runtime command-family exploration を始め、smoke evidence が濁る。
   primitive を固定するものであり、その単一入口が内部で dispatch する compatibility surface
   として扱う。docs / CLI help は本 primitive を通常の標準入口として読ませない。
 - **semantic route identity で child を解決し、active / copied `%pane` を route authority
-  にしない。** child は project gateway と同型の live identity (strong project-scoped
-  Codex) なので、caller の自レーンを除外したうえで解決する。`--from-pane` は caller 自身の
+  にしない。** child は project gateway と同型の live identity (strong project-scoped な
+  provider_binding 解決 provider。既定 codex、#15414) なので、caller の自レーンを除外したうえで解決する。`--from-pane` は caller 自身の
   lane id であり、**same-lane self-fence 専用** (child が parent 自身のレーンへ戻らないため)
   であって、target を addressing する authority ではない。
 - **same-lane / missing / ambiguous は fail closed する。** child route が parent gateway 自身の
