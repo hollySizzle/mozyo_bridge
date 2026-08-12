@@ -377,6 +377,7 @@ def install_rules(
         preset_dir=lambda preset: installed_preset_dir(preset, store=resolved),
         package_text=package_text,
         manifest_relative_path=MANIFEST_RELATIVE_PATH,
+        central_mode=CENTRAL_MODE,
         repo_local_mode=REPO_LOCAL_MODE,
     )
 

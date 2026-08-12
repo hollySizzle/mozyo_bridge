@@ -551,7 +551,7 @@ target project は Project-Local Additions または project-local rule (例: `v
 - {{LANE_DISTRIBUTED_SURFACE_FULL}} (implementation lane)
 - `src/mozyo_bridge/scaffold/presets/**` (packaged preset / router templates)
 - generator 出力 (`.mozyo-bridge/docs/file_conventions.generated.yaml` 等)
-- `.mozyo-bridge/config.yaml`, `.mozyo-bridge/project-defaults.yaml`, `.mozyo-bridge/workflow-role-bindings.json` (別 carve-out `### Coordinator-Owned Operational Config Direct Edit` が所有する。本 lane の `codex_autonomous_edit` journal で代替せず、同節の path 固有検証と `coordinator_operational_config_edit` journal を使う)
+- `.mozyo-bridge/config.yaml`, `.mozyo-bridge/project-defaults.yaml`, `.mozyo-bridge/workflow-role-bindings.json` (別 carve-out `### Coordinator-Owned Operational Config Direct Edit` が所有する。本 lane の `codex_autonomous_edit` journal で代替せず、同節の authority mode と path 固有検証を使う。owner-explicit mode は owner-authorized commit trailer、routine mode は `coordinator_operational_config_edit` journal を証拠とする)
 
 これらを lane に含める project-local override は preset 提供責任の範囲外として **明確に reject** する (target project は本 preset の `### Codex Direct Edit Gate` をそのまま適用する)。
 

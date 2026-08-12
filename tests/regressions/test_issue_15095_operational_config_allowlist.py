@@ -413,6 +413,8 @@ class TheTwoCarveOutsAreNotConflatable(unittest.TestCase):
                 for path in EXPECTED_ALLOWLIST:
                     self.assertIn(path, lane_section)
                 self.assertIn(JOURNAL_TOKEN, lane_section)
+                self.assertIn("owner-authorized commit trailer", lane_section)
+                self.assertIn("authority mode", lane_section)
 
     def test_the_repo_local_lane_doc_points_at_the_other_carve_out(self) -> None:
         body = (
@@ -512,7 +514,7 @@ class RepoLocalRulesInstallKeepsManifestInSync(unittest.TestCase):
 
             self.assertFalse((state_dir / "rules").exists())
 
-    def test_non_repo_local_manifest_mode_fails_before_installing_presets(self) -> None:
+    def test_unknown_manifest_mode_fails_before_installing_presets(self) -> None:
         from mozyo_bridge.scaffold.rules import install_rules, resolve_rules_store
 
         with tempfile.TemporaryDirectory() as tmp:
@@ -520,7 +522,7 @@ class RepoLocalRulesInstallKeepsManifestInSync(unittest.TestCase):
             state_dir = repo / ".mozyo-bridge"
             state_dir.mkdir()
             (state_dir / "scaffold.json").write_text(
-                json.dumps({"mode": "central", "preset": "redmine-governed"}),
+                json.dumps({"mode": "unknown", "preset": "redmine-governed"}),
                 encoding="utf-8",
             )
 

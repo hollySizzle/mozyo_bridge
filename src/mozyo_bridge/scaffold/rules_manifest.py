@@ -22,6 +22,7 @@ def _manifest_update(
     store: RulesStoreLike,
     *,
     manifest_relative_path: Path,
+    central_mode: str,
     repo_local_mode: str,
     package_text: Callable[[str, str], str],
 ) -> tuple[Path, str] | None:
@@ -37,10 +38,17 @@ def _manifest_update(
         die(f"cannot update repo-local rules manifest {path}: {exc}")
     if not isinstance(payload, dict):
         die(f"invalid repo-local rules manifest {path}: expected object")
-    if payload.get("mode") != repo_local_mode:
+    manifest_mode = payload.get("mode")
+    if manifest_mode == central_mode:
+        # This is the documented first step of a central -> repo-local switch:
+        # install the destination store without rewriting the still-central
+        # manifest.  The following `scaffold apply --repo-local` owns the mode,
+        # rule_path, router hashes, and preservation-aware router replacement.
+        return None
+    if manifest_mode != repo_local_mode:
         die(
             f"invalid repo-local rules manifest {path}: "
-            f"mode must be {repo_local_mode!r}"
+            f"mode must be {central_mode!r} or {repo_local_mode!r}"
         )
     preset = payload.get("preset")
     if not isinstance(preset, str) or not preset:
@@ -60,12 +68,14 @@ def install_rule_store(
     preset_dir: Callable[[str], Path],
     package_text: Callable[[str, str], str],
     manifest_relative_path: Path,
+    central_mode: str,
     repo_local_mode: str,
 ) -> list[Path]:
-    """Install presets and atomically couple their repo-local manifest identity."""
+    """Install presets and couple their repo-local manifest identity."""
     manifest_update = _manifest_update(
         store,
         manifest_relative_path=manifest_relative_path,
+        central_mode=central_mode,
         repo_local_mode=repo_local_mode,
         package_text=package_text,
     )

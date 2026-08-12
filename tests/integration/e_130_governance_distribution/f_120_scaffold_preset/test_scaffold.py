@@ -4429,6 +4429,72 @@ class ScaffoldRepoLocalModeTest(unittest.TestCase):
                 text = (project / filename).read_text(encoding="utf-8")
                 self.assertIn("${MOZYO_BRIDGE_HOME", text)
 
+    def test_documented_central_to_repo_local_switch_sequence_completes(self) -> None:
+        """A central manifest must not deadlock the two-step mode switch."""
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp) / "home"
+            project = Path(tmp) / "project"
+            project.mkdir()
+            self.run_cli(["rules", "install", "--home", str(home)])
+            self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-governed",
+                    "--target",
+                    str(project),
+                    "--home",
+                    str(home),
+                ]
+            )
+            manifest_path = project / ".mozyo-bridge/scaffold.json"
+            central_manifest = manifest_path.read_bytes()
+            agents_path = project / "AGENTS.md"
+            agents = agents_path.read_text(encoding="utf-8")
+            end = "<!-- mozyo-bridge:project-local-additions:end -->"
+            agents_path.write_text(
+                agents.replace(end, "switch-preservation-sentinel\n" + end),
+                encoding="utf-8",
+            )
+
+            install_result, _ = self.run_cli(
+                ["rules", "install", "--repo-local", str(project)]
+            )
+
+            self.assertEqual(0, install_result)
+            self.assertEqual(central_manifest, manifest_path.read_bytes())
+            self.assertTrue(
+                (
+                    project
+                    / ".mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md"
+                ).is_file()
+            )
+
+            apply_result, _ = self.run_cli(
+                [
+                    "scaffold",
+                    "apply",
+                    "redmine-governed",
+                    "--target",
+                    str(project),
+                    "--repo-local",
+                    "--force",
+                ]
+            )
+
+            self.assertEqual(0, apply_result)
+            switched = scaffold_state(project)
+            assert switched is not None
+            self.assertEqual("repo-local", switched["mode"])
+            self.assertEqual(
+                self.REPO_LOCAL_RULE_PATH_TEMPLATE.format(preset="redmine-governed"),
+                switched["rule_path"],
+            )
+            self.assertIn(
+                "switch-preservation-sentinel",
+                agents_path.read_text(encoding="utf-8"),
+            )
+
 
 class ScaffoldDiffTest(unittest.TestCase):
     """Coverage for the new `scaffold diff <preset>` breaking-change entrypoint."""

@@ -37,7 +37,7 @@
   "generated_by": "mozyo-bridge 1.0.0rc2",
   "mode": "repo-local",
   "preset": "redmine-governed",
-  "preset_hash": "190c8921903d106e3bb772deedceec8129cfbd9c3f604c084e52415ade8a089f",
+  "preset_hash": "3779698f7593a74118f70e9004f1b32d899e36b8b120746714fa1ef1fe0a7488",
   "preset_version": "2026.08.12.1",
   "rule_path": ".mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md",
   "schema_version": 2
