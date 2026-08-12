@@ -6,18 +6,14 @@ sublane_integration:
 agents:
   profiles:
     implementation:
-      provider: codex
+      provider: claude
       launch_argv:
         default:
         - --model
-        - gpt-5.6-sol
-        - --config
-        - model_reasoning_effort=xhigh
+        - claude-fable-5
         sublane:
         - --model
-        - gpt-5.6-sol
-        - --config
-        - model_reasoning_effort=high
+        - claude-fable-5
     coordination:
       provider: claude
       launch_argv:
