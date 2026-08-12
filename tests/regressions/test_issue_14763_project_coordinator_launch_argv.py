@@ -1,8 +1,11 @@
 """Redmine #14763 — the managed project coordinator launches on an EXPLICIT model.
 
 Owner intent (#14763 description; disposition j#94798, Gate j#95316): a managed
-``delegated_coordinator`` must start as ``gpt-5.6-sol`` at reasoning effort ``high``, and
-that has to be provable from the effective launch argv — not asserted from the config text.
+``delegated_coordinator`` must start on an owner-pinned EXPLICIT model, and that has to be
+provable from the effective launch argv — not asserted from the config text. The pinned
+identity itself is an owner value and has been re-pinned since: ``gpt-5.6-sol`` at effort
+``high`` originally, then ``claude-fable-5`` when the owner consolidated both profiles onto
+the claude provider (a7e3c7d0, then e9f51af8; #15255 j#104520 / #15418).
 
 Causing commit: ``ceab289e`` ("Pin Codex coordinator/default lane to gpt-5.6-sol; keep
 sublane on Codex default", #13451). It put ``--model gpt-5.6-sol`` on the Codex *default*
@@ -93,14 +96,15 @@ CONFIG_PATH = ROOT / ".mozyo-bridge" / "config.yaml"
 #: ``--model <something else> ... claude-fable-5`` appearing anywhere in the argv.
 OWNER_PINNED_COORDINATION_SUBLANE = (("--model", "claude-fable-5"),)
 
-#: The codex PROVIDER sublane identity (#14763 description; unchanged by a7e3c7d0). Layer 2
-#: drives the launch chain with ``providers=["codex"]``, so the argv it observes is pinned by
-#: the codex provider's rows regardless of which profile currently coordinates — it must not
-#: share a constant with the coordination-profile pin above.
-OWNER_PINNED_CODEX_SUBLANE = (
-    ("--model", "gpt-5.6-sol"),
-    ("--config", "model_reasoning_effort=high"),
-)
+#: The managed PROVIDER identity layer 2 drives (#15255 j#104520 / e9f51af8: the owner
+#: consolidated BOTH profiles onto the claude provider pinned to ``claude-fable-5``; the
+#: codex provider rows left the committed config with them). Layer 2 drives the launch
+#: chain with ``providers=[OWNER_PINNED_PROVIDER]``, so the argv it observes is pinned by
+#: that provider's rows regardless of which profile currently coordinates — it must not
+#: share a constant with the coordination-profile pin above (the two claims live on
+#: different layers even when the owner pins them to the same literal).
+OWNER_PINNED_PROVIDER = "claude"
+OWNER_PINNED_PROVIDER_SUBLANE = (("--model", "claude-fable-5"),)
 
 #: The flag that carries the model. A lane class that omits it inherits nothing.
 MODEL_FLAG = "--model"
@@ -248,7 +252,7 @@ class EffectiveManagedLaunchArgvTest(unittest.TestCase):
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 prepare_session(
                     repo_root=repo,
-                    providers=["codex"],
+                    providers=[OWNER_PINNED_PROVIDER],
                     lane_id=lane_id,
                     env=env,
                     runner=herdr.run,
@@ -263,40 +267,41 @@ class EffectiveManagedLaunchArgvTest(unittest.TestCase):
         """The provider arguments after Herdr 0.8's pane-bound launch separator."""
         return list(start_argv[start_argv.index("--") + 1 :])
 
-    def test_delegated_coordinator_lane_launches_on_the_pinned_model_and_effort(self) -> None:
+    def test_delegated_coordinator_lane_launches_on_the_pinned_model(self) -> None:
         start = self._start_argv(lane_id=DELEGATED_COORDINATOR_LANE)
-        self.assertEqual("codex", start[start.index("--kind") + 1])
+        self.assertEqual(OWNER_PINNED_PROVIDER, start[start.index("--kind") + 1])
         argv = self._provider_command(start)
         pairs = _flag_pairs(argv)
-        for flag, value in OWNER_PINNED_CODEX_SUBLANE:
+        for flag, value in OWNER_PINNED_PROVIDER_SUBLANE:
             self.assertIn(
                 (flag, value),
                 pairs,
                 f"the effective launch argv {argv!r} does not pin {flag} {value}",
             )
 
-    def test_the_model_is_pinned_on_the_sublane_row_not_borrowed_from_the_default_lane(
-        self,
-    ) -> None:
-        # The differential that makes layer 2 independent of layer 1: the two lane classes
-        # resolve DIFFERENT effort, so observing the sublane effort proves the sublane row
-        # is the one that produced this argv — and the model rides on that same row.
-        sublane = _flag_pairs(
-            self._provider_command(self._start_argv(lane_id=DELEGATED_COORDINATOR_LANE))
-        )
-        default = _flag_pairs(
-            self._provider_command(self._start_argv(lane_id=DEFAULT_LANE))
-        )
-        sublane_effort = {v for f, v in sublane if f == "--config"}
-        default_effort = {v for f, v in default if f == "--config"}
-        self.assertNotEqual(
-            sublane_effort,
-            default_effort,
-            "the two lane classes resolve the same effort, so this test can no longer tell "
-            "which row produced the argv; re-anchor it on a token that still differs",
-        )
-        self.assertIn(("--config", "model_reasoning_effort=high"), sublane)
-        self.assertIn((MODEL_FLAG, "gpt-5.6-sol"), sublane)
+    def test_every_lane_class_launch_carries_its_own_model_pin(self) -> None:
+        # Re-anchored (Redmine #15418): the former differential proved the sublane ROW
+        # produced the argv by observing an effort token that differed between the two
+        # lane classes. e9f51af8 pinned both committed lane classes to the same tokens,
+        # so no differing token exists to anchor on. The #13451 inheritance illusion is
+        # still re-detected at this layer, per lane class: lane classes do NOT inherit,
+        # so a row that lost its model would launch an argv with ZERO `--model` below —
+        # identical rows cannot mask an empty one.
+        for lane_id, lane_class in (
+            (DELEGATED_COORDINATOR_LANE, "sublane"),
+            (DEFAULT_LANE, "default"),
+        ):
+            with self.subTest(lane_class=lane_class):
+                argv = self._provider_command(self._start_argv(lane_id=lane_id))
+                at = [i for i, tok in enumerate(argv) if tok == MODEL_FLAG]
+                self.assertEqual(
+                    1,
+                    len(at),
+                    f"lane_class {lane_class!r} launched {argv!r}; its own row must pin "
+                    f"exactly one {MODEL_FLAG} (nothing is inherited from another lane "
+                    f"class)",
+                )
+                self.assertIn((MODEL_FLAG, "claude-fable-5"), _flag_pairs(argv))
 
 
 if __name__ == "__main__":  # pragma: no cover
