@@ -50,6 +50,16 @@ from mozyo_bridge.shared.paths import infer_git_worktree_root
 #: The project-owned descriptor filename scanned for under the repository root.
 PROJECT_FILE_NAME = "project.env"
 
+#: The canonical descriptor location inside a project directory:
+#: ``<project-dir>/.mozyo-bridge/project.env``. Owner decision (Redmine #15140,
+#: 2026-08-12): tool-consumed metadata lives inside the tool's namespace
+#: directory, not at the project root. The bare root spelling
+#: (``<project-dir>/project.env``) remains readable for adopters that predate
+#: the rule; a directory carrying BOTH spellings is ambiguous and contributes
+#: no candidate at all — fail-soft here, so the strict project gate downstream
+#: fails closed instead of guessing which declaration is authoritative.
+PROJECT_FILE_SUBDIR = ".mozyo-bridge"
+
 #: The root index / generated-cache file (human policy + generated discovery
 #: cache live together, visibly separated — design doc "Generated Root Cache").
 ROOT_INDEX_FILE_NAME = "projects.yaml"
@@ -213,8 +223,11 @@ def discover_project_candidates(
     env-file reader and then by the domain; a missing schema marker, malformed
     assignment, duplicate key, interpolation, or unreadable file yields no
     candidate (fail-soft — a bad descriptor is never a routing source). The repo
-    root's own ``project.env`` (depth 0) is included so a single-project repo can
-    describe itself.
+    root's own descriptor (depth 0) is included so a single-project repo can
+    describe itself. Each directory is probed for both recognized spellings —
+    canonical ``<dir>/.mozyo-bridge/project.env`` and legacy
+    ``<dir>/project.env`` — and a directory carrying both yields no candidate
+    (ambiguity is never resolved by preference; see :data:`PROJECT_FILE_SUBDIR`).
     """
     root = Path(repo_root)
     if not root.is_dir():
@@ -230,9 +243,22 @@ def discover_project_candidates(
         dirnames[:] = [
             d for d in dirnames if d not in _SKIP_DIRS and not d.startswith(".")
         ]
-        if PROJECT_FILE_NAME not in filenames:
+        # Two recognized spellings per directory: the canonical tool-namespace
+        # location and the legacy project-root one. Both present = ambiguous =
+        # no candidate (see PROJECT_FILE_SUBDIR). `.mozyo-bridge` itself is a
+        # dot-directory the walk never descends into, so the nested spelling is
+        # probed explicitly rather than discovered by the walk.
+        nested_path = Path(dirpath) / PROJECT_FILE_SUBDIR / PROJECT_FILE_NAME
+        has_nested = nested_path.is_file()
+        has_rooted = PROJECT_FILE_NAME in filenames
+        if has_nested and has_rooted:
             continue
-        source_path = Path(dirpath) / PROJECT_FILE_NAME
+        if has_nested:
+            source_path = nested_path
+        elif has_rooted:
+            source_path = Path(dirpath) / PROJECT_FILE_NAME
+        else:
+            continue
         raw_text = _read_text(source_path)
         if raw_text is None:
             continue

@@ -34,6 +34,16 @@ rules:
     作業を続けるためには､上記ドキュメントを確認したことを示してください
 
     '
+- name: project-scoped runtime identity descriptor
+  patterns:
+  - .mozyo-bridge/project.env
+  - project.env
+  severity: block
+  message: 'このファイルを変更する場合は､ @vibes/docs/logics/project-scoped-workspace-identity.md と @vibes/docs/specs/project-map.md をよく確認し従うこと
+
+    作業を続けるためには､上記ドキュメントを確認したことを示してください
+
+    '
 - name: public README and user-facing install guidance
   patterns:
   - README.md

@@ -90,6 +90,17 @@ truth for the same fields.
 discovery and the DevContainer consume the same tracked, non-secret file; a
 generated or hand-maintained YAML mirror is not permitted.
 
+The canonical location is `<project-dir>/.mozyo-bridge/project.env` — inside
+the tool's namespace directory, so the descriptor does not add a file to the
+project root (owner decision, Redmine #15140, 2026-08-12; supersedes the
+original root placement). The legacy spelling `<project-dir>/project.env`
+remains readable for adopters that predate the rule. A directory carrying both
+spellings is ambiguous and contributes no candidate: ambiguity is refused,
+never resolved by preference, so the strict project gate downstream fails
+closed instead of guessing which declaration is authoritative. Compose /
+DevContainer consumers reference the file by explicit path (`env_file:` /
+`containerEnv`), so neither location is load-bearing for them.
+
 Discovery therefore has two distinct outputs:
 
 - **discovered candidates**: project directories found under the repository
@@ -123,7 +134,7 @@ discovery_cache:
   generated_at: "<timestamp>"
   entries:
     - cache_key: "project:cloud-drive-management@projects/cloud-drive-management"
-      source: "projects/cloud-drive-management/project.env"
+      source: "projects/cloud-drive-management/.mozyo-bridge/project.env"
       path: "projects/cloud-drive-management"
       redmine_project: "cloud-drive-management"
       display_label: "クラウドドライブ管理"
