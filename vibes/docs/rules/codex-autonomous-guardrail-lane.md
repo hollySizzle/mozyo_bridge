@@ -36,7 +36,7 @@ preset が listing する **lane 不可** path を本 project でも継続して
 `.mozyo-bridge/config.yaml`、`.mozyo-bridge/project-defaults.yaml`、`.mozyo-bridge/workflow-role-bindings.json` は **本 lane の path ではない**。preset の 2 つめの carve-out `### Coordinator-Owned Operational Config Direct Edit` (完全一致 allowlist) が所有する。どちらも事前 gate journal を不要にするため混同しやすいが、要求される記録と検証が違う。
 
 - 本 lane: `codex_autonomous_edit` journal + `docs validate` 系の共通検証。
-- operational config carve-out: `coordinator_operational_config_edit` journal + **path 固有**検証 (config parse/status、workspace-defaults renderer check、role-authority readback)。
+- operational config carve-out: owner explicit ticketless mode では owner-authorized commit trailer、routine mode では `coordinator_operational_config_edit` journal。それぞれに **path 固有**検証 (config parse/status、workspace-defaults renderer check、role-authority readback) を組み合わせる。
 
 operational config の edit を `codex_autonomous_edit` journal で代替しない (path 固有検証が落ちる)。本 repo での採用記録は `vibes/docs/rules/agent-workflow.md` `## Policy / Skill Authoring Boundary` を読む (Redmine #15095)。
 

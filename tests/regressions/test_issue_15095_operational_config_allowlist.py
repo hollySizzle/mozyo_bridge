@@ -7,9 +7,10 @@ implementation of that intent — a broad ``.mozyo-bridge/**`` glob, which would
 the distributed rule package, the generator outputs, managed identity/state, DBs and anything
 secret-shaped that ever lands in that directory.
 
-So the carve-out is an EXACT-MATCH allowlist of three files, and what it removes is *only* the
-repeated pre-approval. Everything that makes the change auditable afterwards — an active issue,
-reading the diff, path-specific fail-closed verification, the commit, the journal — stays.
+So the carve-out is an EXACT-MATCH allowlist of three files. An explicit owner instruction may
+authorize a ticketless edit and is preserved by commit trailers; routine coordinator edits keep
+the active-issue journal path. Both modes retain diff review, path-specific fail-closed
+verification and a commit.
 
 These tests are derivation-based where derivation is possible:
 
@@ -27,8 +28,11 @@ are present would pass just as happily on a preset that had also granted ``.mozy
 
 from __future__ import annotations
 
+import hashlib
+import json
 import re
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -208,18 +212,15 @@ class AllowlistIsExactlyTheOwnerApprovedSet(unittest.TestCase):
                 )
 
     def test_the_repo_local_preset_store_is_not_a_hidden_third_authority(self) -> None:
-        # The repo-local store is installed from the packaged preset and may legitimately lag
-        # (it carries its own VERSION). What it must never do is carry a DIFFERENT allowlist:
-        # a worker reading only the store would then obey a set nobody approved.
+        # This repo's startup contract reads the repo-local store. It must therefore be the exact
+        # packaged preset, not merely a non-conflicting older document that lacks the authority.
         store = ROOT / ".mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md"
-        if not store.is_file():
-            self.skipTest(f"repo-local preset store absent: {store}")
-        text = store.read_text(encoding="utf-8")
-        if SECTION_HEADING not in text:
-            # Lagging behind the packaged preset is allowed; claiming a different scope is not.
-            self.assertNotIn(JOURNAL_TOKEN, text)
-            return
-        self.assertEqual(set(_allowlist_from(text)), set(EXPECTED_ALLOWLIST))
+        self.assertTrue(store.is_file(), f"repo-local preset store absent: {store}")
+        self.assertEqual(
+            store.read_text(encoding="utf-8"),
+            _packaged_preset("redmine-governed"),
+            "repo-local startup preset differs from the packaged authority",
+        )
 
 
 class ExactMatchIsStatedAndNotGlobbed(unittest.TestCase):
@@ -323,7 +324,6 @@ class PathSpecificVerificationSurvivesTheCarveOut(unittest.TestCase):
     def test_the_retained_obligations_are_stated_not_implied(self) -> None:
         section = _section(CENTRAL_SOURCE.read_text(encoding="utf-8"))
         for marker in (
-            "反復事前承認だけ",  # what is actually carved out
             "差分確認",
             "verification_failed",
             JOURNAL_TOKEN,
@@ -331,6 +331,30 @@ class PathSpecificVerificationSurvivesTheCarveOut(unittest.TestCase):
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, section)
+
+    def test_explicit_owner_mode_is_ticketless_but_commit_anchored(self) -> None:
+        authority = _subsection(CENTRAL_SOURCE.read_text(encoding="utf-8"), "Authority mode")
+        for marker in (
+            "owner_explicit_direct_edit",
+            "active_issue: 不要",
+            "Owner-Authorized-Direct-Edit: true",
+            "Owner-Authorized-Path: <exact-path>",
+            "direct edit を明示",
+        ):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, authority)
+
+    def test_generic_imperatives_do_not_become_owner_direct_edit_authority(self) -> None:
+        authority = _subsection(CENTRAL_SOURCE.read_text(encoding="utf-8"), "Authority mode")
+        for marker in ("いいからやれ", "一般的な実行要求だけでは", "一意に解決"):
+            with self.subTest(marker=marker):
+                self.assertIn(marker, authority)
+
+    def test_routine_mode_keeps_the_issue_and_journal(self) -> None:
+        authority = _subsection(CENTRAL_SOURCE.read_text(encoding="utf-8"), "Authority mode")
+        self.assertIn("coordinator_routine_edit", authority)
+        self.assertIn("active issue", authority)
+        self.assertIn(JOURNAL_TOKEN, authority)
 
     def test_role_bindings_carry_the_extra_routing_authority_conditions(self) -> None:
         # Scoped to the requirements subsection, NOT the whole section: `source_pointer` and
@@ -344,6 +368,7 @@ class PathSpecificVerificationSurvivesTheCarveOut(unittest.TestCase):
             "遡及適用しない",
             "再起動境界",
             "active issue",
+            "ticketless にしない",
         ):
             with self.subTest(marker=marker):
                 self.assertIn(marker, conditions)
@@ -397,6 +422,112 @@ class TheTwoCarveOutsAreNotConflatable(unittest.TestCase):
             with self.subTest(marker=marker):
                 self.assertIn(marker, body)
 
+
+class AuthorityFollowsTheCoordinatorRole(unittest.TestCase):
+    """Finding rolegate: provider binding must not decide operational authority."""
+
+    def test_permission_table_is_role_based_not_codex_keyed(self) -> None:
+        text = CENTRAL_SOURCE.read_text(encoding="utf-8")
+        start = text.index("coordinator_operational_config:")
+        end = text.index("generated物:", start)
+        block = text[start:end]
+        self.assertIn("resolved coordinator role", block)
+        self.assertIn("編集条件:", block)
+        self.assertNotIn("codex編集条件:", block)
+
+    def test_executable_contract_gates_before_the_provider_specific_branch(self) -> None:
+        text = CENTRAL_SOURCE.read_text(encoding="utf-8")
+        start = text.index("@startuml mozyo_bridge_agent_gate_contract")
+        end = text.index("@enduml", start)
+        contract = text[start:end]
+        role_branch = (
+            "if ($agent役割がcoordinator() && "
+            "$対象がoperational_config_allowlist完全一致()) then (yes)"
+        )
+        self.assertIn(role_branch, contract)
+        self.assertLess(contract.index(role_branch), contract.index("if ($agentがcodex())"))
+        self.assertIn("$authority_modeを設定(\"owner_explicit_direct_edit\")", contract)
+        self.assertIn("$authority_modeを設定(\"coordinator_routine_edit\")", contract)
+
+
+class RepoLocalRulesInstallKeepsManifestInSync(unittest.TestCase):
+    """Finding presetstore: install updates only the preset identity fields."""
+
+    def test_repo_local_install_updates_only_version_and_hash(self) -> None:
+        from mozyo_bridge.scaffold.rules import install_rules, resolve_rules_store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".mozyo-bridge"
+            state_dir.mkdir()
+            manifest_path = state_dir / "scaffold.json"
+            original = {
+                "schema_version": 2,
+                "mode": "repo-local",
+                "preset": "redmine-governed",
+                "preset_version": "stale-version",
+                "preset_hash": "stale-hash",
+                "generated_by": "sentinel",
+                "rule_path": ".mozyo-bridge/rules/presets/redmine-governed/agent-workflow.md",
+                "files": {"AGENTS.md": {"sha256": "sentinel-file-hash"}},
+                "sentinel": {"preserve": True},
+            }
+            manifest_path.write_text(
+                json.dumps(original, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+                encoding="utf-8",
+            )
+
+            written = install_rules(store=resolve_rules_store(repo_local=repo))
+
+            updated = json.loads(manifest_path.read_text(encoding="utf-8"))
+            installed = (
+                state_dir
+                / "rules/presets/redmine-governed/agent-workflow.md"
+            )
+            self.assertIn(manifest_path, written)
+            self.assertEqual(
+                hashlib.sha256(installed.read_bytes()).hexdigest(),
+                updated["preset_hash"],
+            )
+            packaged_version = (
+                ROOT
+                / "src/mozyo_bridge/scaffold/presets/redmine-governed/VERSION"
+            ).read_text(encoding="utf-8").strip()
+            self.assertEqual(packaged_version, updated["preset_version"])
+            for key in set(original) - {"preset_version", "preset_hash"}:
+                with self.subTest(key=key):
+                    self.assertEqual(original[key], updated[key])
+
+    def test_malformed_manifest_fails_before_installing_presets(self) -> None:
+        from mozyo_bridge.scaffold.rules import install_rules, resolve_rules_store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".mozyo-bridge"
+            state_dir.mkdir()
+            (state_dir / "scaffold.json").write_text("{", encoding="utf-8")
+
+            with self.assertRaises(SystemExit):
+                install_rules(store=resolve_rules_store(repo_local=repo))
+
+            self.assertFalse((state_dir / "rules").exists())
+
+    def test_non_repo_local_manifest_mode_fails_before_installing_presets(self) -> None:
+        from mozyo_bridge.scaffold.rules import install_rules, resolve_rules_store
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            state_dir = repo / ".mozyo-bridge"
+            state_dir.mkdir()
+            (state_dir / "scaffold.json").write_text(
+                json.dumps({"mode": "central", "preset": "redmine-governed"}),
+                encoding="utf-8",
+            )
+
+            with self.assertRaises(SystemExit):
+                install_rules(store=resolve_rules_store(repo_local=repo))
+
+            self.assertFalse((state_dir / "rules").exists())
 
 class TheCarveOutIsDistributedAndAdopted(unittest.TestCase):
     """Preset, skill body, both mirrors, routers, and the repo-local adoption record."""

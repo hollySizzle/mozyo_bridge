@@ -1329,11 +1329,12 @@ journal field、commit 前検証 command、lane に入れない条件、journal 
 
 同じ preset 群は 2 つめの carve-out として **Coordinator-Owned Operational Config Direct Edit** を配布する: coordinator 責務の repo-local 運用設定 `.mozyo-bridge/config.yaml`、`.mozyo-bridge/project-defaults.yaml`、`.mozyo-bridge/workflow-role-bindings.json` の **完全一致 allowlist** である。この 3 file は反復事前承認 (`codex_direct_edit` gate journal) なしで coordinator role が直接編集してよい。
 
-allowlist の読み方、path 固有の commit 前検証 command、`workflow-role-bindings.json` の追加条件 (active issue / `source_pointer` / closed schema / `mozyo-bridge workflow role-authority --json` readback / owner 承認済み再起動境界)、`coordinator_operational_config_edit` journal の必須 field、対象外 path は central preset の `### Coordinator-Owned Operational Config Direct Edit` が正本であり、本リファレンスは再掲しない。agent の反応を左右する reminder だけ 3 つ残す。
+allowlist の読み方、2 つの authority mode、path 固有の commit 前検証 command、`workflow-role-bindings.json` の追加条件 (active issue / `source_pointer` / closed schema / `mozyo-bridge workflow role-authority --json` readback / owner 承認済み再起動境界)、`coordinator_operational_config_edit` journal と owner-authorized commit trailer、対象外 path は central preset の `### Coordinator-Owned Operational Config Direct Edit` が正本であり、本リファレンスは再掲しない。agent の反応を左右する reminder だけ 4 つ残す。
 
-- carve-out されるのは **反復事前承認だけ** である。active issue、差分確認、path 固有検証、commit、journal 記録は残る。「gate が要らない」を「記録が要らない」と読み替えない。
+- authority は provider 名ではなく resolved coordinator role に属する。
+- owner が direct edit と対象を明示した場合は ticketless でよく、active issue / journal の代わりに owner-authorized commit trailer を残す。一般的な命令形だけでは成立しない。owner の個別指示がない routine edit は active issue と `coordinator_operational_config_edit` journal を使う。どちらも差分確認、path 固有検証、commit は省かない。
 - allowlist は **完全一致** である。`.mozyo-bridge/**` へ展開しない。同じ directory にある未登録 file は既定 deny であり、置かれていること自体は承認の根拠にならない。
-- 本 carve-out は編集権限であって review exemption ではない。`follow_up_review: false` の review exemption は `codex_direct_edit` gate journal に紐づくものであり、`coordinator_operational_config_edit` journal はそれを代替しない。allowlist 自体を変える作業は運用設定ではなく guardrail 変更で、通常の実装 → US-level audit 経路を通す。
+- `workflow-role-bindings.json` は routing authority を持つため owner explicit mode でも active issue が必要。本 carve-out は編集権限であって review exemption ではない。allowlist 自体を変える作業は運用設定ではなく guardrail 変更で、通常の実装 → US-level audit 経路を通す。
 
 ## Audit-Owned Commit Authority (audit 所有 commit 権限)
 
