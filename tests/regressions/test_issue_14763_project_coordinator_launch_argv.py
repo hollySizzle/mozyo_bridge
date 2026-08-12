@@ -87,10 +87,17 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 
 CONFIG_PATH = ROOT / ".mozyo-bridge" / "config.yaml"
 
-#: The owner-pinned launch identity of the managed project coordinator (#14763 description).
+#: The owner-pinned launch identity of the managed project coordinator (#14763 description;
+#: re-pinned by a7e3c7d0, which moved the coordination profile to the claude provider).
 #: Written as flag/value PAIRS because a bare token search would pass on
-#: ``--model <something else> ... gpt-5.6-sol`` appearing anywhere in the argv.
-OWNER_PINNED_COORDINATION_SUBLANE = (
+#: ``--model <something else> ... claude-fable-5`` appearing anywhere in the argv.
+OWNER_PINNED_COORDINATION_SUBLANE = (("--model", "claude-fable-5"),)
+
+#: The codex PROVIDER sublane identity (#14763 description; unchanged by a7e3c7d0). Layer 2
+#: drives the launch chain with ``providers=["codex"]``, so the argv it observes is pinned by
+#: the codex provider's rows regardless of which profile currently coordinates — it must not
+#: share a constant with the coordination-profile pin above.
+OWNER_PINNED_CODEX_SUBLANE = (
     ("--model", "gpt-5.6-sol"),
     ("--config", "model_reasoning_effort=high"),
 )
@@ -261,7 +268,7 @@ class EffectiveManagedLaunchArgvTest(unittest.TestCase):
         self.assertEqual("codex", start[start.index("--kind") + 1])
         argv = self._provider_command(start)
         pairs = _flag_pairs(argv)
-        for flag, value in OWNER_PINNED_COORDINATION_SUBLANE:
+        for flag, value in OWNER_PINNED_CODEX_SUBLANE:
             self.assertIn(
                 (flag, value),
                 pairs,

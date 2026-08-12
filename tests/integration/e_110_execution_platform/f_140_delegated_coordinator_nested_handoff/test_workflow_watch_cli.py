@@ -58,10 +58,15 @@ class RegistrationTest(unittest.TestCase):
 
 
 class ReadyAndAnchorTest(_StoreCase):
+    # Route-resolving invocations pass `--repo` pointed at the config-less temp dir
+    # so the *default* role->provider binding applies: these tests pin role=codex
+    # routes and must not depend on the live checkout's committed
+    # `.mozyo-bridge/config.yaml` (which carries a rebind, Redmine #13229).
     def test_review_request_with_route_is_ready_and_anchored(self):
         rc, out = _run(
             [
                 "workflow", "watch",
+                "--repo", self._tmp.name,
                 "--marker", "12672:68978:review_request",
                 "--route-identity",
                 "route_id=r1,issue=12672,ws=ws1,role=codex,pane_name=audit",
@@ -77,13 +82,17 @@ class ReadyAndAnchorTest(_StoreCase):
         _run(
             [
                 "workflow", "watch",
+                "--repo", self._tmp.name,
                 "--marker", "12672:68978:review_request",
                 "--route-identity",
                 "route_id=r1,issue=12672,ws=ws1,role=codex,pane_name=audit",
                 "--store-path", self.store_path,
             ]
         )
-        rc, out = _run(["workflow", "resume", "--store-path", self.store_path])
+        rc, out = _run(
+            ["workflow", "resume", "--repo", self._tmp.name,
+             "--store-path", self.store_path]
+        )
         self.assertEqual(rc, 0)
         self.assertIn("next_action: perform_review", out)
         self.assertIn("anchor: redmine:12672:68978", out)
@@ -127,9 +136,12 @@ class FailClosedTest(_StoreCase):
         self.assertIn("failed_reason: route_identity_unresolved", out)
 
     def test_two_distinct_codex_routes_same_issue_is_ambiguous(self):
+        # `--repo` -> config-less temp dir: default binding, not the live checkout's
+        # committed config (see ReadyAndAnchorTest note).
         _run(
             [
-                "workflow", "watch", "--marker", "12672:1:start",
+                "workflow", "watch", "--repo", self._tmp.name,
+                "--marker", "12672:1:start",
                 "--route-identity",
                 "route_id=r1,issue=12672,ws=ws1,role=codex,pane_name=a",
                 "--store-path", self.store_path,
@@ -137,7 +149,8 @@ class FailClosedTest(_StoreCase):
         )
         rc, out = _run(
             [
-                "workflow", "watch", "--marker", "12672:68978:review_request",
+                "workflow", "watch", "--repo", self._tmp.name,
+                "--marker", "12672:68978:review_request",
                 "--route-identity",
                 "route_id=r2,issue=12672,ws=ws1,role=codex,pane_name=b",
                 "--store-path", self.store_path,
@@ -443,9 +456,12 @@ class LivePollTest(_StoreCase):
 
 class PaneIdNeverEmittedTest(_StoreCase):
     def test_pane_id_is_not_in_output(self):
+        # `--repo` -> config-less temp dir: default binding, not the live checkout's
+        # committed config (see ReadyAndAnchorTest note).
         rc, out = _run(
             [
                 "workflow", "watch",
+                "--repo", self._tmp.name,
                 "--marker", "12672:68978:review_request",
                 "--route-identity",
                 "route_id=r1,issue=12672,ws=ws1,role=codex,pane_name=audit,pane_id=%999",

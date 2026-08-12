@@ -82,6 +82,9 @@ def _cand(pane_id, *, role="codex", project_scope="", lane_kind="", repo_root=RE
 
 
 def _args(store_path, **overrides):
+    # `repo` pins repo resolution to the config-less temp dir holding the store, so
+    # the *default* role->provider binding applies: these tests must not fall back
+    # to the cwd git root (the live checkout's committed operational config).
     base = dict(
         dry_run=False,
         as_json=True,
@@ -90,6 +93,7 @@ def _args(store_path, **overrides):
         journal=None,
         callback=None,
         store_path=store_path,
+        repo=str(Path(store_path).parent),
     )
     base.update(overrides)
     return argparse.Namespace(**base)
@@ -332,6 +336,10 @@ class HerdrCommonReconcileTest(_StoreCase):
             next_owner="grandchild",
             primitive=PRIMITIVE_NONE,
             durable_anchor="redmine:issue=13291:journal=72672",
+            # The store fold resolves the binding from the live outcome's repo_root;
+            # empty would fall back to the cwd git root (the live checkout's committed
+            # config). Point it at the config-less temp dir: default binding.
+            repo_root=self._tmp.name,
         )
         rc, text = self._run_herdr(live, _args(self.store_path))
         payload = json.loads(text)
