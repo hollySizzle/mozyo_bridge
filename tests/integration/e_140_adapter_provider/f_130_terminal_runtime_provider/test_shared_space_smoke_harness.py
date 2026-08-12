@@ -210,6 +210,7 @@ class _HarnessFixture:
                         role=agent.provider,
                         lane_id=agent.env.get("MOZYO_LANE_ID", ""),
                         locator=pane,
+                        terminal_id=agent.terminal_id,
                         verdict=VERDICT_PRESENT,
                         observed_at="2026-08-08T00:00:00+00:00",
                     ),
@@ -260,20 +261,29 @@ class SharedSpaceSmokeIntegrationTests(unittest.TestCase):
                 self.assertEqual(harness.recorder.coordinators_create_count, 1)
                 self.assertEqual(_count_duplicate_agents(observations), 0)
 
-    def test_smoke_cleans_up_with_zero_residue(self) -> None:
-        # Acceptance 5: the whole smoke tears down by exact identity, residue=0.
+    def test_generic_smoke_has_zero_destructive_cleanup_and_is_nonclear(self) -> None:
+        # A generic/non-disposable harness has no server-minter capability. Its pane
+        # locators are generation-unbound, so teardown sends no close for them.
         with _HarnessFixture() as fx:
-            summary = fx.harness().smoke(fx.specs(2))
+            harness = fx.harness()
+            summary = harness.smoke(fx.specs(2))
             self.assertIsInstance(summary, SharedSpaceSmokeObservation)
             self.assertEqual(summary.coordinators_create_count, 1)
             self.assertEqual(summary.duplicate_agents, 0)
             self.assertTrue(summary.all_projects_completed)
             self.assertTrue(summary.converged)
             self.assertTrue(summary.residue_verified)
-            self.assertEqual(summary.residue_workspaces, 0)
-            self.assertEqual(summary.residue_agents, 0)
-            self.assertTrue(summary.residue_clear)
-            self.assertEqual(fx.fake.workspace_ids, [])
+            self.assertGreater(summary.residue_workspaces, 0)
+            self.assertGreater(summary.residue_agents, 0)
+            self.assertFalse(summary.cleanup_attempted)
+            self.assertFalse(summary.cleanup_completed)
+            self.assertFalse(summary.residue_clear)
+            self.assertTrue(fx.fake.workspace_ids)
+            self.assertFalse(
+                any(call[:2] == ["workspace", "close"] for call in fx.fake.calls)
+            )
+            for locator in harness.recorder.launched_locators:
+                self.assertNotIn(["pane", "close", locator], fx.fake.calls)
 
     def test_smoke_observes_lock_engaged_and_released(self) -> None:
         with _HarnessFixture() as fx:
@@ -294,7 +304,9 @@ class SharedSpaceSmokeIntegrationTests(unittest.TestCase):
             self.assertEqual(evidence["requested_projects"], 2)
             self.assertEqual(evidence["completed_projects"], 2)
             self.assertTrue(evidence["converged"])
-            self.assertTrue(evidence["residue_clear"])
+            self.assertFalse(evidence["cleanup_attempted"])
+            self.assertFalse(evidence["cleanup_completed"])
+            self.assertFalse(evidence["residue_clear"])
 
     def test_second_sequential_project_adopts_existing_space(self) -> None:
         with _HarnessFixture() as fx:
@@ -575,11 +587,9 @@ class ConcurrentFailureTests(unittest.TestCase):
             self.assertFalse(summary.all_projects_completed)
             self.assertFalse(summary.converged)
 
-    def test_post_actuation_crash_is_cleaned_via_receipt_and_not_clear(self) -> None:
-        # review j#83905 F2: a project that crashes AFTER its agent-start succeeds loses
-        # its observation, but the receipt tape still carries the launched panes — so
-        # cleanup closes them (no live residue) AND residue_clear is False (honest,
-        # because a project failed). This is the exact reviewer counterexample.
+    def test_post_actuation_crash_without_disposable_capability_is_not_cleaned(self) -> None:
+        # The receipt tape preserves evidence, but a generic harness cannot turn
+        # generation-unbound pane locators into destructive authority.
         for n in (1, 2):
             with _HarnessFixture() as fx:
                 harness = fx.harness()
@@ -597,13 +607,12 @@ class ConcurrentFailureTests(unittest.TestCase):
                 # Honest: a failed project -> neither converged nor residue_clear.
                 self.assertFalse(summary.all_projects_completed)
                 self.assertFalse(summary.residue_clear)
-                # But the receipt-tape cleanup still closed the leaked project's panes:
-                # the shared coordinators workspace auto-vanished, zero live residue.
-                self.assertEqual(
-                    fx.fake.workspace_ids, [], "receipt cleanup must close leaked panes"
-                )
-                self.assertEqual(summary.residue_workspaces, 0)
-                self.assertEqual(summary.residue_agents, 0)
+                self.assertTrue(fx.fake.workspace_ids)
+                self.assertGreater(summary.residue_workspaces, 0)
+                self.assertGreater(summary.residue_agents, 0)
+                self.assertFalse(summary.cleanup_attempted)
+                for locator in harness.recorder.launched_locators:
+                    self.assertNotIn(["pane", "close", locator], fx.fake.calls)
 
 
 class ResidueVerificationTests(unittest.TestCase):
@@ -627,8 +636,7 @@ class ResidueVerificationTests(unittest.TestCase):
                 harness.verify_residue([created])
 
     def test_smoke_records_residue_unverified_on_unreadable_inventory(self) -> None:
-        # The whole-smoke path: force `workspace list` unreadable only AFTER cleanup
-        # (i.e. once agents have been launched + closed). residue_clear must be False.
+        # Force `workspace list` unreadable only for the post-cleanup residue read.
         with _HarnessFixture() as fx:
             harness = fx.harness()
             state = {"cleanup_started": False}
@@ -636,13 +644,18 @@ class ResidueVerificationTests(unittest.TestCase):
 
             def _rig(argv, *a, **k):
                 head = list(argv[1:3])
-                if head == ["pane", "close"]:
-                    state["cleanup_started"] = True
                 if head == ["workspace", "list"] and state["cleanup_started"]:
                     return subprocess.CompletedProcess(list(argv), 0, stdout="nope", stderr="")
                 return inner(argv, *a, **k)
 
             harness.recorder._inner = _rig
+            original_cleanup = harness.cleanup
+
+            def _mark_cleanup(*args, **kwargs):
+                state["cleanup_started"] = True
+                return original_cleanup(*args, **kwargs)
+
+            harness.cleanup = _mark_cleanup  # type: ignore[assignment]
             summary = harness.smoke(fx.specs(1))
             self.assertFalse(summary.residue_verified)
             self.assertFalse(summary.residue_clear)

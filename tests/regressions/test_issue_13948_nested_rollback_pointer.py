@@ -49,8 +49,8 @@ import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_
 from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
     HerdrIdentityReplacementBindingStore,
 )
-from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_generation,
     seed_current_generation,
 )
 from mozyo_bridge.core.state.replacement_preservation import PreservationObservation
@@ -105,9 +105,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_PREFLIGHT,
     run_session_rollback,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
-    pane_bound_receipt,
-)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_v1_replacement_binding import (  # noqa: E501
     V1_BINDING_LAUNCH_UNHEALTHY,
     V1_BINDING_STARTUP_DEBT,
@@ -117,6 +114,13 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+)
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import pane_bound_receipt
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E501
     COMPENSATION_NOT_NEEDED,
     COMPENSATION_ROLLBACK_OWED,
@@ -259,19 +263,6 @@ class _CloseResult:
         self.failed = tuple(failed)
 
 
-def _terminal_id(locator: str) -> str:
-    return "terminal-" + locator.replace(":", "-")
-
-
-def _terminal_receipt(assigned_name: str, locator: str) -> str:
-    return pane_bound_receipt(
-        target_workspace="w2G",
-        target_tab="w2G:t1",
-        native_name=native_name_for(assigned_name),
-        terminal_id=_terminal_id(locator),
-    )
-
-
 class _RollbackOps:
     """The five reads + one close the public rollback rail is allowed; close is stateful."""
 
@@ -282,11 +273,6 @@ class _RollbackOps:
 
     def agent_rows(self):
         return list(self.rows)
-
-    def supports_conditional_close(self):
-        # This fake models the future server-side primitive so the older convergence
-        # wiring tests remain about their original responsibility.
-        return True
 
     def runtime_state(self, locator):
         return "turn_ended"
@@ -306,10 +292,12 @@ class _RollbackOps:
             self.rows = [r for r in self.rows if r.get("pane_id") != locator]
         return _CloseResult(closed=list(targets))
 
+    def supports_conditional_close(self):
+        return True
+
     def close_agent_participant(self, *, workspace_id, lane_id, target):
         matches = [
-            row
-            for row in self.rows
+            row for row in self.rows
             if row.get("name") == target.assigned_name
             and row.get("pane_id") == target.locator
             and row.get("native_name") == target.native_name
@@ -317,9 +305,25 @@ class _RollbackOps:
             and row.get("agent") == target.role
         ]
         if len(matches) != 1:
-            return False, "terminal-bound startup target changed before close"
+            return False, "terminal generation changed before close"
         self.close(workspace_id, lane_id, ((target.role, target.locator),))
         return True, ""
+
+    def close_prepared_pane(self, **_kwargs):
+        return False, "prepared close disabled"
+
+    def current_generation_targets_absent(self, action, targets, *, store_home):
+        live = {row.get("pane_id") for row in self.rows}
+        return all(locator not in live for _role, locator in targets)
+
+
+def _rollback_receipt(assigned_name, terminal_id):
+    return pane_bound_receipt(
+        target_workspace="w2G",
+        target_tab="w2G:t1",
+        native_name=native_name_for(assigned_name),
+        terminal_id=terminal_id,
+    )
 
 
 class RealDriveWiringTest(unittest.TestCase):
@@ -333,13 +337,15 @@ class RealDriveWiringTest(unittest.TestCase):
     """
 
     def setUp(self):
-        self.home = Path(tempfile.mkdtemp())
+        # Entry-stable parent for the session-start gate (see the sibling setUp note).
+        self.home = Path(tempfile.mkdtemp()) / "home"
+        self.home.mkdir(mode=0o700)
         self.obs = _observation()
         # Ruling j#97105: the discard plan reads each participant's CURRENT
         # launch-generation row, and this lane is a pre-#14741 one -- stated for the exact
         # slots the observation carries rather than left absent (which now refuses).
         for slot in self.obs.slots:
-            seed_current_generation(
+            seed_completed_current_generation(
                 self.home, workspace_id=WS, lane_id=LANE, role=slot.provider,
                 assigned_name=slot.assigned_name, locator=slot.locator,
             )
@@ -357,17 +363,29 @@ class RealDriveWiringTest(unittest.TestCase):
             Participant(
                 role="claude", assigned_name=self.assigned,
                 locator=self.fresh_locator,
-                receipt=_terminal_receipt(self.assigned, self.fresh_locator),
+                receipt=_rollback_receipt(self.assigned, "terminal:claude"),
             ),
         )
         self.fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
+        seed_current_generation(
+            self.home, workspace_id=WS, lane_id=LANE, role="claude",
+            assigned_name=self.assigned, locator=self.fresh_locator,
+            action_id=action.action_id, terminal_id="terminal:claude",
+        )
+        HerdrIdentityAttestationStore(home=self.home).upsert(
+            IdentityAttestationRecord(
+                self.assigned, WS, "claude", LANE, self.fresh_locator,
+                VERDICT_PRESENT, observed_at="2026-08-11T00:00:00+00:00",
+                terminal_id="terminal:claude",
+            )
+        )
 
     def _real_ops(self):
         outer = self
 
         class _Ops(compdisclive.LiveBoundPairPreparationOps):
             # Only the three pure external reads are overridden; drive/actuator/heal are real.
-            def observe(self, request, *, action_id=""):
+            def observe(self, request, *, action_id="", _snapshot_rows=None):
                 return outer.obs
 
             def approval_fields(self, issue, journal):
@@ -395,33 +413,39 @@ class RealDriveWiringTest(unittest.TestCase):
         def _nolock(*a, **k):
             yield
 
-        def _fenced_nested_launch(**_kwargs):
+        def _fenced_nested_launch(*_args, **_kwargs):
             # The nested pane launch came up dead: fail closed carrying the raw result, exactly
             # as the real `session-start` -> v1 adapter would (this is the ONLY seam a live
             # herdr backend would own). heal_lane_column's REAL catch projects it downstream.
-            raise V1ReplacementBindingFailure(
-                "fenced", "nested unhealthy",
-                startup_result=_unhealthy_result(
-                    action_id=self.action_id, assigned=self.assigned,
-                    locator=self.fresh_locator,
-                ),
+            return _unhealthy_result(
+                action_id=self.action_id, assigned=self.assigned,
+                locator=self.fresh_locator,
             )
 
         not_preserved = PreservationObservation(
             dirty_diff=False, running_process=False, pending_approval=False,
             identity_matches=True, attestation_fresh=True,
         )
+        inventory = [
+            {
+                "name": slot.assigned_name,
+                "pane_id": slot.locator,
+                "agent": slot.provider,
+                "terminal_id": f"terminal:{slot.locator}",
+            }
+            for slot in self.obs.slots
+        ]
         port = compdisclive._ComposerDiscardActuatorPort
         with contextlib.ExitStack() as stack:
             for target, name, value in [
-                (compdisclive, "list_herdr_agent_rows", lambda env: []),
-                (convlive, "list_herdr_agent_rows", lambda env: []),
+                (compdisclive, "list_herdr_agent_rows", lambda env: list(inventory)),
+                (convlive, "list_herdr_agent_rows", lambda env: list(inventory)),
                 (herdr_ops, "evaluate_heal_runtime_fence",
                  lambda *a, **k: SimpleNamespace(ok=True, reason="", detail="")),
                 (v1_drive, "selected_attestation_store_is_v1", lambda home: True),
                 (v1_drive, "attestation_store_lock", _nolock),
                 (herdr_ops, "mozyo_bridge_home", lambda: self.home),
-                (v1_drive, "launch_or_resume_v1_replacement", _fenced_nested_launch),
+                (convlive, "replacement_managed_launch_admission", lambda *a, **k: None),
             ]:
                 stack.enter_context(mock.patch.object(target, name, value))
             for cls, name, value in [
@@ -431,6 +455,8 @@ class RealDriveWiringTest(unittest.TestCase):
                 (herdr_ops.HerdrSublaneActuatorOps, "_resolve_lane_slots",
                  lambda self, wt, rows, managed=None: (
                      WS, LANE, {"codex": ("", ""), "claude": ("", "")})),
+                (herdr_ops.HerdrSublaneActuatorOps, "_prepare_lane_session",
+                 _fenced_nested_launch),
                 (port, "observe_old_slot", lambda self, pin: OLD_SLOT_PRESENT),
                 (port, "observe_preservation", lambda self, pin: not_preserved),
                 (port, "close_exact_generation", lambda self, pin: CLOSE_DONE),
@@ -468,9 +494,9 @@ class RealDriveWiringTest(unittest.TestCase):
         action_id = outcome.rollback_pointer.split("--action-id ", 1)[1]
         rows = [{
             "name": self.assigned, "pane_id": self.fresh_locator,
-            "terminal_id": _terminal_id(self.fresh_locator),
-            "native_name": native_name_for(self.assigned),
             "agent": "claude", "agent_status": "idle",
+            "terminal_id": "terminal:claude",
+            "native_name": native_name_for(self.assigned),
         }]
         preflight = run_session_rollback(
             action_id=action_id, ops=_RollbackOps(rows),
@@ -506,7 +532,11 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
-        self.home = Path(self._tmp.name)
+        # One level below the tempdir root: the session-start gate needs an entry-stable
+        # parent, and the shared TMPDIR above a raw tempdir is not one on older fence
+        # runners (#15227 R-correction; see test_issue_14480 for the full note).
+        self.home = Path(self._tmp.name) / "home"
+        self.home.mkdir(mode=0o700)
         self.action_id = "replacement_action_13948"
         self.assigned = encode_assigned_name(WS, "claude", LANE)
         self.unit = StartupUnit(WS, LANE, _MANAGED)
@@ -522,10 +552,22 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
             Participant(
                 role="claude", assigned_name=self.assigned,
                 locator=self.FRESH_LOCATOR,
-                receipt=_terminal_receipt(self.assigned, self.FRESH_LOCATOR),
+                receipt=_rollback_receipt(self.assigned, "terminal:claude"),
             ),
         )
         startup_fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
+        seed_current_generation(
+            self.home, workspace_id=WS, lane_id=LANE, role="claude",
+            assigned_name=self.assigned, locator=self.FRESH_LOCATOR,
+            action_id=action.action_id, terminal_id="terminal:claude",
+        )
+        HerdrIdentityAttestationStore(home=self.home).upsert(
+            IdentityAttestationRecord(
+                self.assigned, WS, "claude", LANE, self.FRESH_LOCATOR,
+                VERDICT_PRESENT, observed_at="2026-08-11T00:00:00+00:00",
+                terminal_id="terminal:claude",
+            )
+        )
         return _unhealthy_result(
             action_id=action.action_id, assigned=self.assigned, locator=self.FRESH_LOCATOR,
         )
@@ -546,9 +588,9 @@ class V1ReplacementBindingRollbackRailTest(unittest.TestCase):
     def _rollback_rows(self):
         return [{
             "name": self.assigned, "pane_id": self.FRESH_LOCATOR,
-            "terminal_id": _terminal_id(self.FRESH_LOCATOR),
-            "native_name": native_name_for(self.assigned),
             "agent": "claude", "agent_status": "idle",
+            "terminal_id": "terminal:claude",
+            "native_name": native_name_for(self.assigned),
         }]
 
     def test_public_rollback_then_replay_converges_to_a_new_action_id(self):

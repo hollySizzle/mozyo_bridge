@@ -85,6 +85,16 @@ class SessionRetireOps(Protocol):
     def close(self, workspace_id: str, lane_id: str, targets):
         """Close exactly ``targets`` (``(role, locator)``); returns the close result."""
 
+    def current_generation_pins(self, workspace_id: str, lane_id: str, targets): ...
+
+    def close_current_generations(self, workspace_id: str, lane_id: str, pins): ...
+
+    def current_generation_pins_absent(self, workspace_id: str, lane_id: str, pins): ...
+
+    def current_generation_pins_replayable(self, workspace_id: str, lane_id: str, pins): ...
+
+    def legacy_retirement_pins_absent(self, workspace_id: str, lane_id: str, pins): ...
+
     def record_retirement(self, *, workspace_id: str, lane_id: str, intent: dict) -> str:
         """Append the durable audit record; returns an outcome token."""
 
@@ -92,9 +102,16 @@ class SessionRetireOps(Protocol):
 class LiveSessionRetireOps:
     """The live composition root (herdr CLI + state stores)."""
 
-    def __init__(self, *, repo_root: Path, env: Optional[Mapping[str, str]] = None):
+    def __init__(
+        self,
+        *,
+        repo_root: Path,
+        env: Optional[Mapping[str, str]] = None,
+        home: Optional[Path] = None,
+    ):
         self._repo_root = repo_root
         self._env = env
+        self._home = home
 
     def _environ(self) -> Mapping[str, str]:
         return self._env if self._env is not None else os.environ
@@ -360,7 +377,7 @@ class LiveSessionRetireOps:
             ScratchRetirementFence,
         )
 
-        return ScratchRetirementFence().transaction(
+        return ScratchRetirementFence(home=self._home).transaction(
             unit, live_pair_present=live_pair_present
         )
 
@@ -370,7 +387,89 @@ class LiveSessionRetireOps:
             ScratchRetirementFence,
         )
 
-        return ScratchRetirementFence().peek(unit)
+        return ScratchRetirementFence(home=self._home).peek(unit)
+
+    def current_generation_pins(self, workspace_id: str, lane_id: str, targets):
+        from mozyo_bridge.core.state.scratch_retirement_pin import ScratchRetirementPin
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_destructive_close_identity import current_generation_release_pins  # noqa: E501
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import encode_assigned_name  # noqa: E501
+
+        rows = tuple(self.agent_rows())
+        release = current_generation_release_pins(
+            rows,
+            home=self._home,
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            targets=tuple(
+                (role, encode_assigned_name(workspace_id, role, lane_id), locator)
+                for role, locator in targets
+            ),
+        )
+        if release is None:
+            return None
+        return tuple(
+            ScratchRetirementPin(
+                pin.role, pin.assigned_name, pin.locator, pin.startup_action_id
+            )
+            for pin in release
+        )
+
+    @staticmethod
+    def _release_pins(pins):
+        from mozyo_bridge.core.state.lane_lifecycle_model import ReleasePin
+
+        return tuple(
+            ReleasePin(pin.role, pin.assigned_name, pin.locator, pin.startup_action_id)
+            for pin in pins
+        )
+
+    def _partition_current_generations(self, workspace_id: str, lane_id: str, pins):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_destructive_close_identity import pinned_generation_partition  # noqa: E501
+
+        return pinned_generation_partition(
+            self._release_pins(pins),
+            tuple(self.agent_rows()),
+            home=self._home,
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+        )
+
+    def current_generation_pins_absent(self, workspace_id: str, lane_id: str, pins):
+        partition = self._partition_current_generations(workspace_id, lane_id, pins)
+        return partition is not None and not partition[0] and bool(partition[1])
+
+    def current_generation_pins_replayable(self, workspace_id: str, lane_id: str, pins):
+        return self._partition_current_generations(workspace_id, lane_id, pins) is not None
+
+    def legacy_retirement_pins_absent(self, workspace_id: str, lane_id: str, pins):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            AGENT_KEY_NAME, _agent_locator, encode_assigned_name,
+            terminal_identity_snapshot_complete,
+        )
+
+        rows = tuple(self.agent_rows())
+        if not pins or not terminal_identity_snapshot_complete(rows):
+            return False
+        return all(
+            not any(
+                row.get(AGENT_KEY_NAME) == encode_assigned_name(
+                    workspace_id, role, lane_id
+                ) or _agent_locator(row) == locator
+                for row in rows
+            )
+            for role, locator in pins
+        )
+
+    def close_current_generations(self, workspace_id: str, lane_id: str, pins):
+        partition = self._partition_current_generations(workspace_id, lane_id, pins)
+        if partition is None:
+            return None
+        live, _absent = partition
+        return self.close(
+            workspace_id,
+            lane_id,
+            tuple((pin.role, pin.locator) for pin in live),
+        )
 
     def close(self, workspace_id: str, lane_id: str, targets):
         """Close only the exact role/locator pins admitted by the retire verdict."""
@@ -529,10 +628,19 @@ def observe_scratch_pair(
     )
 
 
-
+def completed_retirement_replay_proven(live_ops, attempt, workspace_id, lane_id):
+    """Require version-specific fresh absence before trusting a completed attempt."""
+    if attempt.pin_version == 2:
+        return bool(attempt.generation_pins) and live_ops.current_generation_pins_absent(
+            workspace_id, lane_id, attempt.generation_pins
+        )
+    return attempt.pin_version == 1 and live_ops.legacy_retirement_pins_absent(
+        workspace_id, lane_id, attempt.pinned
+    )
 
 __all__ = (
     "SessionRetireOps",
     "LiveSessionRetireOps",
+    "completed_retirement_replay_proven",
     "observe_scratch_pair",
 )

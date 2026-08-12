@@ -365,6 +365,14 @@ def _attest_fresh_recovery_generation(
         finalize_launch_generations,
     )
 
+    terminal_id = fake.terminal_id_of(locator)
+    inventory_rows = [
+        {
+            **row,
+            "terminal_id": fake.terminal_id_of(row["pane_id"]),
+        }
+        for row in fake.agents
+    ]
     attestations = HerdrIdentityAttestationStore(home=home)
     attestations.upsert(
         IdentityAttestationRecord(
@@ -373,6 +381,7 @@ def _attest_fresh_recovery_generation(
             role="claude",
             lane_id=lane_id,
             locator=locator,
+            terminal_id=terminal_id,
             verdict=VERDICT_PRESENT,
             observed_at=observed_at,
             replacement_action_id=replacement_action_id,
@@ -402,12 +411,13 @@ def _attest_fresh_recovery_generation(
                 assigned_name=assigned_name,
                 provider="claude",
                 locator=locator,
-                launch_terminal_id=fake.terminal_id_of(locator),
+                launch_terminal_id=terminal_id,
             )
         ],
         workspace_id=workspace_id,
         lane_id=lane_id,
         attestation_read=attestations.read,
+        inventory_rows=inventory_rows,
     )
     finalized = generations.read(assigned_name)
     return bool(

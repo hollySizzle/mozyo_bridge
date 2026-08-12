@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 #: Refusals that are about the action, not about any one participant.
@@ -41,7 +41,8 @@ class PreparedPaneObservation:
     locator: str = ""
     workspace_id: str = ""
     tab_id: str = ""
-    terminal_id: str = ""
+    terminal_id: str = field(default="", repr=False)
+    terminal_reclaimed: Optional[bool] = None
     agent_absent: bool = False
     shell_only: bool = False
     input_empty: Optional[bool] = None
@@ -56,7 +57,7 @@ class StartupRollbackAgentTarget:
     assigned_name: str
     locator: str
     native_name: str
-    terminal_id: str
+    terminal_id: str = field(repr=False)
 
 
 @dataclass(frozen=True)

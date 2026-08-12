@@ -79,10 +79,10 @@ def format_hibernate_text(outcome: HibernateOutcome) -> str:
             lines.append(f"    - closed {role} {locator}")
         for role, locator, detail in rel.failed:
             lines.append(f"    ! close failed {role} {locator}: {detail}")
-    # Redmine #13843: a released lane whose post-release check found unexpected residue is a
-    # WITHHELD success, not a clean one — surface the recovery next-action and exit non-zero.
+    # Redmine #13843: an incomplete release or a post-release residue is a WITHHELD success,
+    # not a clean one — surface its typed, value-free reason and recovery next-action.
     if outcome.success_withheld:
-        lines.append("  -> success WITHHELD: post-release worktree residue detected")
+        lines.append(f"  -> success WITHHELD: {outcome.detail}")
         if outcome.recovery_detail:
             lines.append(f"     recovery: {outcome.recovery_detail}")
     if not outcome.executed and outcome.preflight.may_hibernate:
@@ -127,8 +127,8 @@ def cmd_sublane_hibernate(args: argparse.Namespace) -> int:
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
     else:
         print(format_hibernate_text(outcome), file=sys.stdout)
-    # Redmine #13843: a withheld success (post-release residue) is not a clean success — it
-    # must exit non-zero so the coordinator converges to the recovery / boundary-record path.
+    # Redmine #13843: a withheld completion is not a clean success. Exit non-zero so the
+    # coordinator converges the typed recovery path.
     if outcome.is_blocked or outcome.success_withheld:
         return 1
     # Review F5 + Redmine #14477 review j#94805 R9-F1: an EXECUTED run exits non-zero unless the

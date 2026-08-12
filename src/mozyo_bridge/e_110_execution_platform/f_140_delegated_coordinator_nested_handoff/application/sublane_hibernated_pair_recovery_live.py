@@ -41,12 +41,13 @@ from mozyo_bridge.core.state.dispatch_outbox_fence import (
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     evaluate_attestation,
+    herdr_identity_attestation_path,
 )
-from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
-    BINDING_BOUND,
-    HerdrIdentityReplacementBindingStore,
-    replacement_action_is_bound,
-    selected_attestation_store_is_v1,
+from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+    HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+    STORE_ABSENT,
+    STORE_RECOGNIZED,
+    probe_store_schema,
 )
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
@@ -102,7 +103,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_pair_recovery import (  # noqa: E501
     SlotRecoveryObservation,
-    hibernated_pair_recovery_action_id,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     SublaneLauncherIncompatibleError,
@@ -121,6 +121,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
     derive_lane_workspace_token,
     encode_assigned_name,
 )
@@ -137,7 +138,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     Runner,
 )
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
-from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 _STATUS_KEYS = ("agent_status", "status", "state")
 
@@ -214,6 +214,7 @@ class LiveHibernatedPairRecoveryOps:
             env=self.env,
             runner=self.runner,
             timeout=self.timeout,
+            home=self.attestation_home,
             ghost_policy=default_ghost_policy(),
         )
 
@@ -239,6 +240,16 @@ class LiveHibernatedPairRecoveryOps:
         try:
             rows = self._rows()
         except Exception:  # noqa: BLE001 - UNREADABLE inventory => nothing observable (preserve)
+            return SlotRecoveryObservation(), "", assigned_name
+        try:
+            shape = probe_store_schema(herdr_identity_attestation_path(self.attestation_home))
+        except Exception:  # noqa: BLE001 - unknown authority preserves every live slot
+            return SlotRecoveryObservation(), "", assigned_name
+        if not (
+            shape.state == STORE_ABSENT
+            or (shape.state == STORE_RECOGNIZED
+                and shape.version == HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION)
+        ):
             return SlotRecoveryObservation(), "", assigned_name
         matches = [
             row for row in rows
@@ -281,52 +292,13 @@ class LiveHibernatedPairRecoveryOps:
         join = evaluate_attestation(
             record_att,
             live_locator=live_locator,
+            live_terminal_id=terminal_identity_of_live_slot(
+                assigned_name, live_locator, rows
+            ),
             expected_workspace_id=workspace_id,
             expected_role=provider,
             expected_lane=lane,
         )
-        # A normal-v1 self-attestation is insufficient after this recovery action has
-        # reserved a replacement.  The side binding and its startup transaction are the
-        # authority that prevents a fresh-but-unbound / rollback-owed participant from
-        # being promoted to healthy on replay.  A reserved, malformed, or unreadable binding
-        # is therefore PRESERVE (neither bad-generation nor healthy): the operator must
-        # discharge the exact startup rollback debt before the same action can relaunch.
-        binding_allows_classification = True
-        home = self.attestation_home or mozyo_bridge_home()
-        try:
-            is_v1 = selected_attestation_store_is_v1(home)
-        except Exception:  # noqa: BLE001 - unknown generation is not positive health
-            is_v1 = True
-            binding_allows_classification = False
-        if is_v1 and binding_allows_classification:
-            try:
-                recovery_action_id = hibernated_pair_recovery_action_id(
-                    issue=_norm(self.request_issue),
-                    lane_id=_norm_lane(lane),
-                    revision=str(getattr(record, "revision", "")),
-                    generation=str(getattr(record, "lane_generation", "")),
-                )
-                binding = HerdrIdentityReplacementBindingStore(home=home).read(
-                    recovery_action_id, assigned_name
-                )
-            except Exception:  # noqa: BLE001 - unreadable authority preserves the live slot
-                binding_allows_classification = False
-            else:
-                if binding is not None:
-                    binding_allows_classification = bool(
-                        binding.phase == BINDING_BOUND
-                        and replacement_action_is_bound(
-                            record_att,
-                            action_id=recovery_action_id,
-                            live_locator=live_locator,
-                            expected_workspace_id=workspace_id,
-                            expected_role=provider,
-                            expected_lane=lane,
-                            expected_assigned_name=assigned_name,
-                            expected_old_locator=binding.old_locator,
-                            home=home,
-                        )
-                    )
         observation = SlotRecoveryObservation(
             identity_resolved=True,
             belongs_to_pair=belongs,
@@ -339,12 +311,9 @@ class LiveHibernatedPairRecoveryOps:
             is_bad_generation=(
                 belongs
                 and att_readable
-                and binding_allows_classification
                 and not join.ok
             ),
-            already_healthy=(
-                att_readable and binding_allows_classification and join.ok
-            ),
+            already_healthy=(att_readable and join.ok),
         )
         return observation, live_locator, assigned_name
 
@@ -417,15 +386,27 @@ class LiveHibernatedPairRecoveryOps:
     def close_bad_slot(
         self, *, role: str, provider: str, assigned_name: str, locator: str, action_id: str
     ) -> bool:
+        quarantine = self._quarantine()
+        request = self._quarantine_request(
+            role=role, assigned_name=assigned_name, locator=locator, action_id=action_id
+        )
+        from .herdr_destructive_close_identity import current_generation_release_pin
         try:
-            release = ReleasePin(role=_norm(provider), assigned_name=_norm(assigned_name), locator=_norm(locator))
-        except ReleasePinError:
+            release = current_generation_release_pin(
+                tuple(self._rows()),
+                home=self.attestation_home,
+                workspace_id=self.workspace_id(),
+                lane_id=self.request_lane,
+                role=provider,
+                assigned_name=assigned_name,
+                locator=locator,
+            )
+        except Exception:  # noqa: BLE001 - destructive authority unreadable
+            release = None
+        if release is None:
             return False
         try:
-            result = self._quarantine().close_receiver(
-                self._quarantine_request(role=role, assigned_name=assigned_name, locator=locator, action_id=action_id),
-                release,
-            )
+            result = quarantine.close_receiver(request, release)
         except Exception:  # noqa: BLE001 - a fixed close failure, nothing partially closed
             return False
         # A positively-absent exact slot (recycled / already gone) is byte-preserving: not an
@@ -438,35 +419,12 @@ class LiveHibernatedPairRecoveryOps:
         self.relaunch_failure_reason = ""
         self.relaunch_failure_startup = None
         try:
-            if selected_attestation_store_is_v1(mozyo_bridge_home()):
-                for slot in slots:
-                    if not (
-                        _norm(slot.provider)
-                        and _norm(slot.assigned_name)
-                        and _norm(slot.declared_locator)
-                    ):
-                        self.relaunch_failure_reason = (
-                            "replacement_binding_context_missing"
-                        )
-                        return False
-                    HerdrSublaneActuatorOps(
-                        repo_root=self.repo_root, lane_label=_norm(self.request_lane),
-                        issue=_norm(self.request_issue), journal=_norm(self.request_journal),
-                        env=self.env, runner=self.runner, timeout=self.timeout,
-                        replacement_action_id=_norm(action_id),
-                        replacement_assigned_name=_norm(slot.assigned_name),
-                        replacement_old_locator=_norm(slot.declared_locator),
-                        replacement_target_only=True,
-                    ).heal_lane_column(
-                        str(self.repo_root), target_provider=_norm(slot.provider)
-                    )
-            else:
-                HerdrSublaneActuatorOps(
-                    repo_root=self.repo_root, lane_label=_norm(self.request_lane),
-                    issue=_norm(self.request_issue), journal=_norm(self.request_journal),
-                    env=self.env, runner=self.runner, timeout=self.timeout,
-                    replacement_action_id=_norm(action_id),
-                ).heal_lane_column(str(self.repo_root))
+            HerdrSublaneActuatorOps(
+                repo_root=self.repo_root, lane_label=_norm(self.request_lane),
+                issue=_norm(self.request_issue), journal=_norm(self.request_journal),
+                env=self.env, runner=self.runner, timeout=self.timeout,
+                replacement_action_id=_norm(action_id),
+            ).heal_lane_column(str(self.repo_root))
         except SublaneHealError as exc:
             self.relaunch_failure_reason = _norm(exc.reason) or "launch_error"
             self.relaunch_failure_startup = exc.startup

@@ -34,8 +34,6 @@ there would silently re-create a lost authority and then close panes on the stre
 from __future__ import annotations
 
 import contextlib
-import errno
-import fcntl
 import hashlib
 import json
 import re
@@ -46,6 +44,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
+from mozyo_bridge.core.state.startup_transaction_fence_lock import FenceLock as _FenceLock
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 STARTUP_TRANSACTION_FENCE_FILENAME = "startup-transaction-fence.sqlite"
@@ -200,20 +199,6 @@ def _rollback_quietly(conn) -> None:
         pass
 
 
-def _close_os_fd_quietly(fd) -> None:
-    """Close an OS fd during error cleanup, swallowing a secondary close failure.
-
-    The lock's acquire-failure path (review j#81202 R6-F2): a close error while an acquire
-    failure is already propagating must not mask it with a raw OSError.
-    """
-    if fd is None:
-        return
-    try:
-        os.close(fd)
-    except OSError:
-        pass
-
-
 def _utc_now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -261,17 +246,21 @@ class Participant:
     role: str
     assigned_name: str
     locator: str
-    receipt: str = ""
+    receipt: str = field(default="", repr=False)
     closed: bool = False
 
     def as_payload(self) -> dict:
+        """Return the public projection; private pane receipts are deliberately omitted."""
         return {
             "role": self.role,
             "assigned_name": self.assigned_name,
             "locator": self.locator,
-            "receipt": self.receipt,
             "closed": self.closed,
         }
+
+    def as_authority_payload(self) -> dict:
+        """Return the exact private on-disk authority shape."""
+        return {**self.as_payload(), "receipt": self.receipt}
 
     @staticmethod
     def from_payload(raw: dict) -> "Participant":
@@ -378,6 +367,13 @@ class StartupAction:
             "participants": [p.as_payload() for p in self.participants],
             "reserved_at": self.reserved_at,
             "updated_at": self.updated_at,
+        }
+
+    def as_authority_payload(self) -> dict:
+        """Return the private fingerprint/storage projection including receipts."""
+        return {
+            **self.as_payload(),
+            "participants": [p.as_authority_payload() for p in self.participants],
         }
 
 
@@ -712,6 +708,49 @@ class StartupTransactionFence:
             self.read_identity_manifest(action.action_id)
         return action
 
+    @staticmethod
+    def _actions_from_connection(conn: sqlite3.Connection) -> tuple[StartupAction, ...]:
+        """Strictly decode every startup action from one SQLite snapshot."""
+        from mozyo_bridge.core.state.startup_transaction_row import _row_to_action
+
+        rows = conn.execute(
+            "SELECT action_id, workspace_id, lane_id, providers, phase, revision,"
+            " participants, reserved_at, updated_at FROM startup_actions"
+            " ORDER BY action_id"
+        ).fetchall()
+        return tuple(_row_to_action(row) for row in rows)
+
+    def read_snapshot(self) -> tuple[StartupAction, ...]:
+        """Read the complete action authority, never treating damage as an empty store.
+
+        Genuine absence is the only empty result.  Every present row is strict-decoded and
+        every tagged row re-proves its identity manifest before this snapshot is returned.
+        The advisory lock makes the row set stable against every conforming writer while it
+        is captured; callers still re-read at each external effect edge.
+        """
+        with self._hold():
+            shape = self.store_shape()
+            if shape.absent:
+                return ()
+            if shape.state == STORE_DAMAGED:
+                raise StartupTransactionError(
+                    "the startup transaction store is damaged (a partial artifact set); "
+                    "refusing to read an incomplete action snapshot"
+                )
+            try:
+                with self._connection("ro") as conn:
+                    actions = self._actions_from_connection(conn)
+                for action in actions:
+                    self.read_identity_manifest(action.action_id)
+                return actions
+            except StartupTransactionError:
+                raise
+            except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
+                raise StartupTransactionError(
+                    f"the startup transaction authority {self.path} action snapshot is "
+                    f"unreadable ({exc}); fail closed rather than treat it as empty"
+                ) from exc
+
     # -- writes ------------------------------------------------------------
 
     def reserve(
@@ -720,6 +759,7 @@ class StartupTransactionFence:
         nonce: str,
         *,
         manifest: "Optional[IdentityManifest]" = None,
+        refuse_nonterminal_slot_overlap: bool = False,
     ) -> StartupAction:
         """Mint + persist a new action BEFORE its first side effect (bootstraps if absent).
 
@@ -759,6 +799,19 @@ class StartupTransactionFence:
                 try:
                     if manifest is not None:
                         _require_v2_for_tagged_reserve(conn)
+                    if refuse_nonterminal_slot_overlap:
+                        actions = self._actions_from_connection(conn)
+                        for action in actions:
+                            self.read_identity_manifest(action.action_id)
+                            if (
+                                not action.terminal
+                                and action.action_id != action_id
+                            ):
+                                raise StartupTransactionError(
+                                    "a foreign nonterminal startup action exists in this "
+                                    "home; refusing the global offline restore reservation "
+                                    "before any effect"
+                                )
                     replayed = _reserve_or_replay(
                         conn,
                         action_id=action_id,
@@ -879,7 +932,7 @@ class StartupTransactionFence:
                     " ?, revision = revision + 1 WHERE action_id = ?",
                     (
                         phase,
-                        json.dumps([p.as_payload() for p in participants]),
+                        json.dumps([p.as_authority_payload() for p in participants]),
                         _utc_now(),
                         _norm(action_id),
                     ),
@@ -891,85 +944,6 @@ class StartupTransactionFence:
                     f"the startup transaction authority {self.path} could not be written "
                     f"({exc}); fail closed"
                 ) from exc
-
-
-class _FenceLock:
-    """The exclusive, non-blocking advisory lock, held across an external close.
-
-    ``BEGIN IMMEDIATE`` only spans statements, so it cannot cover a ``herdr pane close``
-    subprocess. This can (#13892's pattern). Contention is a refusal — never a wait, never
-    a steal: two rollbacks racing the same panes is exactly what must not happen.
-    """
-
-    def __init__(self, fence: StartupTransactionFence) -> None:
-        self._fence = fence
-        self._nested = False
-
-    def __enter__(self) -> "_FenceLock":
-        fence = self._fence
-        if fence._lock_depth > 0:
-            # Already held by this exact holder: nest without re-acquiring.
-            fence._lock_depth += 1
-            self._nested = True
-            return self
-        # Acquire lifecycle (review j#81202 R6-F2). mkdir / open / flock are all inside the
-        # guard, and the failure-path `os.close(fd)` is done through `_close_os_fd_quietly`
-        # so a SECONDARY close failure during cleanup cannot mask the acquire failure with a
-        # raw OSError. flock contention (a live fd + EAGAIN/EACCES) is `StartupTransactionBusy`;
-        # a failed open — where fd is None — is authority-unavailable, never mistaken for it.
-        fd = None
-        try:
-            lock = fence.lock_path
-            lock.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
-            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError as exc:
-            contention = (
-                fd is not None
-                and getattr(exc, "errno", None) in (errno.EACCES, errno.EAGAIN)
-            )
-            _close_os_fd_quietly(fd)
-            if contention:
-                raise StartupTransactionBusy(
-                    "another startup transaction holds this authority; refusing to wait "
-                    "or steal it — nothing was started or closed"
-                ) from exc
-            raise StartupTransactionError(
-                f"could not take the startup transaction lock ({exc}); fail closed"
-            ) from exc
-        fence._lock_fd = fd
-        fence._lock_depth = 1
-        return self
-
-    def __exit__(self, exc_type, exc, tb) -> None:
-        fence = self._fence
-        if self._nested:
-            fence._lock_depth -= 1
-            return
-        if fence._lock_fd is None:
-            return
-        fd = fence._lock_fd
-        fence._lock_fd = None
-        fence._lock_depth = 0
-        # Release lifecycle (review j#81202 R6-F2): unlock and close are BOTH normalized,
-        # the fd is always closed, and a release failure is surfaced only when the body
-        # succeeded (`exc_type is None`). A body exception is the real fault and must not be
-        # overwritten by a secondary unlock/close error — so on the body-failure path the
-        # release error is swallowed and the body exception propagates unchanged.
-        release_error = None
-        try:
-            fcntl.flock(fd, fcntl.LOCK_UN)
-        except OSError as unlock_exc:
-            release_error = unlock_exc
-        try:
-            os.close(fd)
-        except OSError as close_exc:
-            release_error = release_error or close_exc
-        if release_error is not None and exc_type is None:
-            raise StartupTransactionError(
-                f"could not release the startup transaction lock ({release_error}); "
-                "fail closed"
-            ) from release_error
 
 
 __all__ = (

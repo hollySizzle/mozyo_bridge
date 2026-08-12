@@ -75,7 +75,7 @@ is unaffected — its failures are ``subprocess.CalledProcessError``, which the 
 from __future__ import annotations
 
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Callable, List, Optional, Protocol
 
 from mozyo_bridge.application.handoff_delivery_command import submit_lines_for
@@ -192,7 +192,7 @@ class TmuxTransportRailRequest:
     persist_delivery: bool
     herdr_send: bool
     herdr_assigned_name: Optional[str]
-    herdr_process_generation: Optional[str]
+    herdr_process_generation: Optional[str] = field(repr=False)
     read_lines: int
     landing_timeout: Optional[float]
     submit_delay: Optional[float]

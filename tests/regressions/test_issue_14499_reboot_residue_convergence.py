@@ -78,6 +78,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
     DecisionPointer,
     LaneLifecycleKey,
     ProcessGenerationPin,
+    ReleasePin,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E402
     LiveSublaneGitOperations,
@@ -1333,6 +1334,7 @@ class Finding3PreCloseIdentityRecheck(unittest.TestCase):
 
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
             sublane_herdr_projection as projection,
+            herdr_destructive_close_identity as close_identity,
         )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
             herdr_pane_lifecycle,
@@ -1356,12 +1358,20 @@ class Finding3PreCloseIdentityRecheck(unittest.TestCase):
             attempted.append(locator)
             return True, ""
 
-        with mock.patch.object(
+        pin = ReleasePin(
+            "codex", encode_assigned_name(_WORKSPACE_ID, "codex", _LANE),
+            "w3N:pF", "startup-current",
+        )
+        with tempfile.TemporaryDirectory() as home, mock.patch.object(
             projection, "list_herdr_agent_rows", side_effect=_reread
         ), mock.patch.object(
             herdr_session_start, "_resolve_binary_or_die", return_value="herdr"
         ), mock.patch.object(
             herdr_pane_lifecycle, "_close_base_pane", side_effect=_close
+        ), mock.patch.object(
+            close_identity, "current_generation_release_pin", return_value=pin
+        ), mock.patch.object(
+            close_identity, "pinned_generations_absent", return_value=True
         ):
             closed, failed, skipped = _execute_closes(
                 plan,
@@ -1369,6 +1379,7 @@ class Finding3PreCloseIdentityRecheck(unittest.TestCase):
                 lane_id=_LANE,
                 legacy_workspace_id="",
                 managed_roles=_ROLES,
+                home=Path(home),
             )
         return closed, failed, skipped, attempted
 
@@ -1384,6 +1395,52 @@ class Finding3PreCloseIdentityRecheck(unittest.TestCase):
         self.assertEqual(len(closed), 1)
         self.assertEqual(skipped, ())
         self.assertEqual(attempted, ["w3N:pF"])
+
+    def test_same_name_locator_new_terminal_is_zero_close(self):
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore, IdentityAttestationRecord,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_herdr_projection as projection,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_residue_close import (  # noqa: E501
+            _execute_closes,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_pane_lifecycle, herdr_session_start,
+        )
+        from tests.support.current_launch_authority import seed_completed_current_generation
+
+        initial = _residue_row("codex", "w3N:pF") | {"terminal_id": "terminal-old"}
+        moved = initial | {"terminal_id": "terminal-new"}
+        plan = self._plan([initial])
+        attempted = []
+        with tempfile.TemporaryDirectory() as raw_home:
+            home = Path(raw_home)
+            name = initial["name"]
+            seed_completed_current_generation(
+                home, workspace_id=_WORKSPACE_ID, lane_id=_LANE, role="codex",
+                assigned_name=name, locator="w3N:pF", terminal_id="terminal-old",
+            )
+            HerdrIdentityAttestationStore(home=home).upsert(IdentityAttestationRecord(
+                name, _WORKSPACE_ID, "codex", _LANE, "w3N:pF", "present",
+                observed_at="2026-08-11T00:00:00+00:00", terminal_id="terminal-old",
+            ))
+            with mock.patch.object(
+                projection, "list_herdr_agent_rows", return_value=[moved]
+            ), mock.patch.object(
+                herdr_session_start, "_resolve_binary_or_die", return_value="herdr"
+            ), mock.patch.object(
+                herdr_pane_lifecycle, "_close_base_pane",
+                side_effect=lambda _b, locator, *_a, **_k: (attempted.append(locator), ""),
+            ):
+                closed, failed, skipped = _execute_closes(
+                    plan, workspace_id=_WORKSPACE_ID, lane_id=_LANE,
+                    legacy_workspace_id="", managed_roles=_ROLES, home=home,
+                )
+        self.assertEqual((closed, failed), ((), ()))
+        self.assertTrue(skipped)
+        self.assertFalse(attempted)
 
     def test_a_locator_reassigned_to_a_foreign_occupant_is_not_closed(self):
         """The finding's scenario: same pane id, different (foreign) occupant."""
@@ -1456,6 +1513,95 @@ class Finding3PreCloseIdentityRecheck(unittest.TestCase):
         )
         self.assertFalse(verdict.ok)
         self.assertEqual(len(verdict.as_payload()["skipped"]), 1)
+
+
+class CurrentGenerationResidueCallerMatrix(unittest.TestCase):
+    """#15227: the public preflight and execute share the current-generation gate."""
+
+    def _run(self, authority, *, execute, failure_detail=""):
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore, IdentityAttestationRecord,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_herdr_projection as projection,
+            workflow_provider_resolution as providers,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_residue_close import (  # noqa: E501
+            run_residue_close,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_pane_lifecycle,
+        )
+        from tests.support.current_launch_authority import seed_completed_current_generation
+
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        home = Path(temp.name)
+        name = encode_assigned_name(_WORKSPACE_ID, "codex", _LANE)
+        terminal = "terminal-current" if authority != "mismatch" else "terminal-new"
+        rows = [_residue_row("codex", "w3N:pF") | {"terminal_id": terminal}]
+        if authority in ("current", "mismatch"):
+            recorded_terminal = "terminal-current" if authority == "current" else "terminal-old"
+            seed_completed_current_generation(
+                home, workspace_id=_WORKSPACE_ID, lane_id=_LANE, role="codex",
+                assigned_name=name, locator="w3N:pF", terminal_id=recorded_terminal,
+            )
+            HerdrIdentityAttestationStore(home=home).upsert(IdentityAttestationRecord(
+                name, _WORKSPACE_ID, "codex", _LANE, "w3N:pF", "present",
+                observed_at="2026-08-11T00:00:00+00:00",
+                terminal_id=recorded_terminal,
+            ))
+        inventories = [rows] if not execute else [rows, rows, []]
+        close_result = (not failure_detail, failure_detail)
+        args = argparse.Namespace(
+            lane_label=_LANE, issue="14499", worktree="",
+        )
+        with mock.patch.object(
+            projection, "repo_backend_is_herdr", return_value=True
+        ), mock.patch.object(
+            projection, "repo_scope_workspace_id", return_value=_WORKSPACE_ID
+        ), mock.patch.object(
+            projection, "list_herdr_agent_rows", side_effect=inventories
+        ), mock.patch.object(
+            providers, "resolve_gateway_provider", return_value="codex"
+        ), mock.patch.object(
+            providers, "resolve_worker_provider", return_value="claude"
+        ), mock.patch(
+            "mozyo_bridge.shared.paths.mozyo_bridge_home", return_value=home
+        ), mock.patch.object(
+            LaneLifecycleStore, "get", return_value=mock.Mock(issue_id="14499")
+        ), mock.patch(
+            "mozyo_bridge.core.state.herdr_identity_attestation_schema."
+            "attestation_store_lock", return_value=contextlib.nullcontext()
+        ), mock.patch.object(
+            herdr_pane_lifecycle, "_close_base_pane", return_value=close_result
+        ), mock.patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_session_start._resolve_binary_or_die",
+            return_value="/test/herdr",
+        ):
+            return run_residue_close(args, Path("/repo"), execute=execute)
+
+    def test_preflight_and_execute_require_the_same_current_generation(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_residue_close as close,
+        )
+
+        self.assertEqual(self._run("current", execute=False).state, close.RESIDUE_PREFLIGHT)
+        self.assertEqual(self._run("current", execute=True).state, close.RESIDUE_CLOSED)
+        for authority in ("missing", "mismatch"):
+            for execute in (False, True):
+                with self.subTest(authority=authority, execute=execute):
+                    verdict = self._run(authority, execute=execute)
+                    self.assertEqual(verdict.reason, close.RESIDUE_GENERATION_UNVERIFIED)
+                    self.assertEqual(verdict.closed, ())
+
+    def test_provider_failure_cannot_render_a_private_terminal(self):
+        secret = "terminal-secret-T"
+        verdict = self._run("current", execute=True, failure_detail=secret)
+        rendered = repr(verdict) + json.dumps(verdict.as_payload(), sort_keys=True)
+        self.assertNotIn(secret, rendered)
+        self.assertIn("provider close failed", rendered)
 
 
 class Finding4UnreadableAuthorityIsNotEmpty(unittest.TestCase):

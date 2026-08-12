@@ -23,16 +23,13 @@ from __future__ import annotations
 import math
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Iterator, Optional, Protocol, cast
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     QUEUE_ENTER_RETRY_MAX_SECONDS,
     QueueEnterRetryPolicy,
-)
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
-    canonical_queue_enter_generation_binding,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (
     RUNTIME_AWAITING_INPUT,
@@ -75,6 +72,47 @@ _STABLE_GENERATION_FIELDS = (
     "startup_action_id",
 )
 
+_PUBLIC_GENERATION_FIELDS = (
+    "provider",
+    "assigned_name",
+    "locator",
+    "row_revision",
+    "attestation_observed_at",
+    "startup_action_id",
+)
+
+
+def _canonical_private_generation_binding(binding: object) -> bool:
+    """Validate the terminal-bearing action-time shape without rendering it."""
+    if not isinstance(binding, dict):
+        return False
+    required = {
+        "provider", "assigned_name", "locator", "terminal_id", "row_revision",
+        "process_generation", "attestation_observed_at", "startup_action_id",
+    }
+    if set(binding) != required:
+        return False
+    if any(
+        type(binding[field]) is not str
+        or not binding[field]
+        or binding[field].strip() != binding[field]
+        for field in required
+    ):
+        return False
+    revision = binding["row_revision"]
+    if any(char not in "0123456789" for char in revision):
+        return False
+    if len(revision) > 1 and revision.startswith("0"):
+        return False
+    name = binding["assigned_name"]
+    terminal = binding["terminal_id"]
+    locator = binding["locator"]
+    expected = (
+        f"{len(name)}:{name}:{len(terminal)}:{terminal}:"
+        f"{len(locator)}:{locator}:r{revision}"
+    )
+    return binding["process_generation"] == expected
+
 _ACTIVE_ENTER_EFFECT_FENCE: ContextVar[Optional[Callable[[], None]]] = ContextVar(
     "mozyo_queue_enter_effect_fence", default=None
 )
@@ -110,10 +148,15 @@ def _same_terminal_generation(left: object, right: object) -> bool:
     if not isinstance(left, dict) or not isinstance(right, dict):
         return False
     return (
-        canonical_queue_enter_generation_binding(left)
-        and canonical_queue_enter_generation_binding(right)
+        _canonical_private_generation_binding(left)
+        and _canonical_private_generation_binding(right)
         and all(left[field] == right[field] for field in _STABLE_GENERATION_FIELDS)
     )
+
+
+def _public_generation_binding(binding: dict[str, str]) -> dict[str, str]:
+    """Project the private terminal join onto the redaction-safe ledger shape."""
+    return {field: binding[field] for field in _PUBLIC_GENERATION_FIELDS}
 
 
 @dataclass(frozen=True)
@@ -224,11 +267,11 @@ class HerdrQueueEnterSession:
     text: str
     receiver: str
     expected_assigned_name: Optional[str]
-    expected_process_generation: Optional[str]
+    expected_process_generation: Optional[str] = field(repr=False)
     retry_policy: QueueEnterRetryPolicy
     monotonic: Callable[[], float]
 
-    pre_binding: Optional[dict[str, str]] = None
+    pre_binding: Optional[dict[str, str]] = field(default=None, repr=False)
     baseline_state: Optional[str] = None
     armed_wait: Optional[object] = None
     retry_deadline: Optional[float] = None
@@ -336,7 +379,7 @@ class HerdrQueueEnterSession:
     def capture_before_body(self) -> bool:
         """Pin and validate the exact authorised target before body injection."""
         self.pre_binding = self._observe_binding()
-        if not canonical_queue_enter_generation_binding(self.pre_binding):
+        if not _canonical_private_generation_binding(self.pre_binding):
             self.resend_skipped_reason = RESEND_SKIP_IDENTITY_UNCONFIRMED
             return False
         assert self.pre_binding is not None
@@ -690,7 +733,10 @@ class HerdrQueueEnterSession:
         if causal_baseline is not None:
             extra["baseline_runtime_state"] = causal_baseline
         if generation_coherent:
-            extra["gateway_binding"] = post_binding
+            # The terminal id and the process-generation encoding are private
+            # destructive-edge evidence.  The exact terminal-aware comparison above
+            # must succeed, but those values never enter public telemetry or the ledger.
+            extra["gateway_binding"] = _public_generation_binding(post_binding)
             extra["observation_version"] = 2
             if (
                 self.causal_start_confirmed
@@ -890,6 +936,7 @@ class LiveHerdrQueueEnterOpsMixin:
             and _norm(getattr(record, "role", "")) == _norm(identity.role)
             and _norm(getattr(record, "assigned_name", "")) == name
             and _norm(getattr(record, "locator", "")) == _norm(target)
+            and getattr(record, "terminal_id", "") == terminal_id
         ):
             return None
         observed_at = _norm(str(getattr(record, "observed_at", "") or ""))

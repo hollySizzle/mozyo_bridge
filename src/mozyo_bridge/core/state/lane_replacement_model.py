@@ -10,6 +10,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     LaneLifecycleKey,
     LaneLifecycleRecord,
     ReleasePin,
+    decode_release_pin_projection,
     norm,
 )
 
@@ -31,6 +32,7 @@ class LaneReplacementRecord:
     state: str
     action_id: str
     pins: tuple[ReleasePin, ...]
+    pin_version: int
     revision: int
     lane_active: bool
     updated_at: str
@@ -38,12 +40,14 @@ class LaneReplacementRecord:
 
     @classmethod
     def from_lifecycle(cls, row: LaneLifecycleRecord) -> "LaneReplacementRecord":
+        projection = decode_release_pin_projection(row.replacement_pins)
         return cls(
             key=row.key,
             issue_id=row.issue_id,
             state=row.replacement_state,
             action_id=row.replacement_action_id,
-            pins=row.replacement_slots,
+            pins=projection.pins,
+            pin_version=projection.version,
             revision=row.revision,
             lane_active=row.lane_disposition == DISPOSITION_ACTIVE,
             updated_at=row.updated_at,

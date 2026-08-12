@@ -9,10 +9,15 @@ that every full-height project column differs in width by at most one cell.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     HerdrSessionStartError,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_managed_column_scope import (  # noqa: E501
+    ManagedColumnScope,
+    managed_column_scope,
+    managed_column_scope_matches,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (  # noqa: E501
     MAX_RESIZE_PASSES,
@@ -42,6 +47,7 @@ class ColumnRatioTarget:
     pane: str
     right_pane: str
     ratio: float
+    managed_scope: "Optional[ManagedColumnScope]" = None
 
 
 def _tab_bounds(layout: LayoutSnapshot) -> "Optional[tuple[int, int, int, int]]":
@@ -54,6 +60,24 @@ def _tab_bounds(layout: LayoutSnapshot) -> "Optional[tuple[int, int, int, int]]"
         max(rect.x + rect.width for rect in rects),
         max(rect.y + rect.height for rect in rects),
     )
+
+
+def _scope(
+    layout: LayoutSnapshot,
+    groups: "Mapping[tuple[str, str], tuple[CoordinatorPane, ...]]",
+) -> Optional[ManagedColumnScope]:
+    return managed_column_scope(
+        layout,
+        tuple(
+            tuple(pane.locator for pane in members)
+            for _key, members in sorted(groups.items())
+        ),
+    )
+
+
+def _bounds(scope: ManagedColumnScope) -> tuple[int, int, int, int]:
+    rect = scope.bounds
+    return (rect.x, rect.y, rect.x + rect.width, rect.y + rect.height)
 
 
 def _column_span(
@@ -80,9 +104,16 @@ def columnar_verdict(
     groups: "Mapping[tuple[str, str], tuple[CoordinatorPane, ...]]",
 ) -> "tuple[bool, str]":
     """Whether every project pair owns one full-height column tiling the tab."""
-    bounds = _tab_bounds(layout)
-    if bounds is None:
-        return False, "the tab layout reports no panes"
+    for key, members in sorted(groups.items()):
+        for pane in members:
+            if pane.locator not in layout.panes:
+                return False, (
+                    f"pane {pane.locator!r} of pair {key!r} is not in the tab"
+                )
+    scope = _scope(layout, groups)
+    if scope is None:
+        return False, "the managed panes do not form one isolated split subtree"
+    bounds = _bounds(scope)
     spans = []
     for key, members in sorted(groups.items()):
         rects = []
@@ -117,8 +148,9 @@ def balanced_column_verdict(
     columnar, reason = columnar_verdict(layout, groups)
     if not columnar:
         return False, reason
-    bounds = _tab_bounds(layout)
-    assert bounds is not None
+    scope = _scope(layout, groups)
+    assert scope is not None
+    bounds = _bounds(scope)
     widths = []
     for members in groups.values():
         span = _column_span([layout.panes[pane.locator] for pane in members], bounds)
@@ -144,8 +176,9 @@ def plan_equal_column_ratios(
         )
     if count < 2:
         return (), ""
-    bounds = _tab_bounds(layout)
-    assert bounds is not None
+    scope = _scope(layout, groups)
+    assert scope is not None
+    bounds = _bounds(scope)
     x0, y0, x1, y1 = bounds
     ordered = []
     for key, members in groups.items():
@@ -170,6 +203,7 @@ def plan_equal_column_ratios(
                 pane_id,
                 ordered[index + 1][2],
                 1.0 / (count - index),
+                managed_scope=scope,
             )
         )
     if ordered[0][0] != x0:
@@ -191,19 +225,33 @@ def read_pane_layout(
 
 
 def _resize_column_ratio(
-    target: ColumnRatioTarget, *, binary: str, runner, timeout: float, env
+    target: ColumnRatioTarget, *, binary: str, runner, timeout: float, env,
+    authority_check: "Optional[Callable[[], bool]]" = None,
+    layout_check: "Optional[Callable[[LayoutSnapshot], bool]]" = None,
 ) -> "tuple[bool, str]":
     """Drive one verified RIGHT-axis divider to its planned ratio."""
     changed = False
     detail = ""
     for pass_index in range(MAX_RESIZE_PASSES + 1):
+        if authority_check is not None and not authority_check():
+            return changed, "managed generation authority changed before resize"
         layout = read_pane_layout(
             target.pane, binary=binary, runner=runner, timeout=timeout, env=env
         )
         if layout is None:
             return changed, "pane layout could not be read after project-column resize"
+        if target.managed_scope is not None and not managed_column_scope_matches(
+            layout, target.managed_scope
+        ):
+            return changed, "the managed project-column boundary changed before resize"
+        if layout_check is not None and not layout_check(layout):
+            return changed, "the managed Unit topology changed before resize"
         rect = layout.panes.get(target.pane)
-        bounds = _tab_bounds(layout)
+        bounds = (
+            _bounds(target.managed_scope)
+            if target.managed_scope is not None
+            else _tab_bounds(layout)
+        )
         if rect is None or bounds is None:
             return changed, f"project-column target pane {target.pane!r} is absent"
         x0, y0, x1, y1 = bounds
@@ -222,9 +270,15 @@ def _resize_column_ratio(
         distance = abs(split.ratio - target.ratio)
         direction, amount = resize_step(split.ratio, target.ratio, "right")
         boundary_x = rect.x + rect.width
+        admitted = (
+            target.managed_scope.pane_ids
+            if target.managed_scope is not None
+            else frozenset(layout.panes)
+        )
         immediate_right = [
             pane_id
             for pane_id, pane_rect in layout.panes.items()
+            if pane_id in admitted
             if pane_rect.x == boundary_x
             and pane_rect.y == y0
             and pane_rect.x + pane_rect.width <= x1
@@ -236,6 +290,8 @@ def _resize_column_ratio(
                 "immediate project column"
             )
         actuator_pane = target.pane if direction == "right" else target.right_pane
+        if authority_check is not None and not authority_check():
+            return changed, "managed generation authority changed before resize"
         try:
             _invoke(
                 binary,
@@ -257,6 +313,12 @@ def _resize_column_ratio(
         )
         if measured is None:
             return changed, "pane layout could not be read after project-column resize"
+        if target.managed_scope is not None and not managed_column_scope_matches(
+            measured, target.managed_scope
+        ):
+            return changed, "the managed project-column boundary changed during resize"
+        if layout_check is not None and not layout_check(measured):
+            return changed, "the managed Unit topology changed during resize"
         measured_rect = measured.panes.get(target.pane)
         measured_split = (
             governing_split(measured, measured_rect, "right")
@@ -281,6 +343,8 @@ def balance_project_columns(
     runner,
     timeout: float,
     env,
+    authority_check: "Optional[Callable[[], bool]]" = None,
+    layout_check: "Optional[Callable[[LayoutSnapshot], bool]]" = None,
 ) -> "tuple[bool, str]":
     """Equalise a proved right-nested column layout — ``(changed, refusal)``."""
     targets, refusal = plan_equal_column_ratios(layout, groups)
@@ -289,7 +353,9 @@ def balance_project_columns(
     changed = False
     for target in targets:
         target_changed, refusal = _resize_column_ratio(
-            target, binary=binary, runner=runner, timeout=timeout, env=env
+            target, binary=binary, runner=runner, timeout=timeout, env=env,
+            authority_check=authority_check,
+            layout_check=layout_check,
         )
         changed = changed or target_changed
         if refusal:

@@ -14,6 +14,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -112,6 +113,12 @@ class _Port:
 class _LiveCase(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(tempfile.mkdtemp())
+        self.completed_startup = patch(
+            "mozyo_bridge.core.state.herdr_launch_generation.completed_generation_startup_token",
+            side_effect=lambda _home, generation, **_kw: generation.startup_action_id,
+        )
+        self.completed_startup.start()
+        self.addCleanup(self.completed_startup.stop)
         self.store = ReplacementTransactionStore(home=self.home)
         seed_current_generation(
             self.home, workspace_id=WORKSPACE, lane_id=LANE, role=PROVIDER,
@@ -122,6 +129,7 @@ class _LiveCase(unittest.TestCase):
         self.plan = plan_fresh_recovery(
             store_factory=lambda: ReplacementTransactionStore(home=self.home),
             home=self.home, anchor=_anchor(), authority=self._authority(),
+            live_rows=(),
         )
         self.assertFalse(self.plan.refused, self.plan.decision.refusal)
 

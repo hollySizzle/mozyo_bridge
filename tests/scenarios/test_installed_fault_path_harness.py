@@ -420,10 +420,11 @@ class NestedRollbackPointerThroughPublicCli(unittest.TestCase):
         self.assertEqual(out.json()["participants"], [])
         self.assertEqual(h.live_locator_count(), 1)  # the other action's slot is untouched
 
-    def test_same_binding_new_action_keeps_old_debt_and_refuses_ambiguity(self):
+    def test_same_binding_new_action_keeps_old_debt_and_refuses_noncanonical_inventory(self):
         # Without conditional close, action A cannot be discharged. A later fixture reservation
-        # for the SAME durable name still mints a distinct action id, but neither action guesses
-        # which duplicate live row it owns or closes either row.
+        # for the SAME durable name still mints a distinct action id. Duplicate logical names
+        # violate the globally unique terminal-identity snapshot, so neither action interprets
+        # the inventory or closes either row.
         h = InstalledFaultHarness(self)
         action_a, _ = h.seed_owed_rollback(
             "issue_14097_replay", providers=("claude",), nonce="n1"
@@ -440,13 +441,13 @@ class NestedRollbackPointerThroughPublicCli(unittest.TestCase):
         self.assertNotEqual(action_b, action_a)  # a distinct new action id
         replay = h.session_rollback_cli(action_b).json()
         self.assertEqual(replay["state"], "blocked")
-        self.assertEqual(replay["participants"][0]["verdict"], "ambiguous")
+        self.assertEqual(replay["participants"][0]["verdict"], "inventory_unreadable")
         self.assertEqual(h.live_locator_count(), 2)
 
         # Action A's debt is not silently discharged or rewritten by action B.
         original = h.session_rollback_cli(action_a).json()
         self.assertEqual(original["state"], "blocked")
-        self.assertEqual(original["participants"][0]["verdict"], "ambiguous")
+        self.assertEqual(original["participants"][0]["verdict"], "inventory_unreadable")
         self.assertEqual(h.live_locator_count(), 2)
 
 
@@ -567,9 +568,9 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
     def test_an_installed_launcher_lacking_generation_protocol_refuses_the_heal_launch(self):
         # #14203 review j#87479 F1 (installed-launcher fault harness): an installed launcher
         # whose attestation schema/store contract landed but that predates the generation
-        # protocol event is refused when a heal tries to launch a fresh worker THROUGH it —
-        # the launch effect fails fail-closed and no fresh worker comes up, rather than
-        # launching a pair whose generation could never be finalized.
+        # protocol event is refused at the preservation boundary BEFORE a heal closes the old
+        # worker or launches a fresh one. No pair whose generation could never be finalized is
+        # actuated.
         #
         # Baseline (non-vacuous control): a fully-capable installed launcher heals — the first
         # `--execute` pass owns and lands a fresh worker.
@@ -584,12 +585,16 @@ class StaleWorkerRecoveryThroughPublicCli(unittest.TestCase):
         faulty = InstalledFaultHarness(self)
         ctx = faulty.recover_stale_git_lane("issue_14203_gen_incapable", issue="14203")
         faulty.make_launcher_generation_incapable()
+        before = faulty.live_locator_count()
 
         with _fresh_stale_recovery_approval(ctx):
             outcome = faulty.recover_stale_cli(ctx, execute=True).json()
-        self.assertEqual(outcome["recovery_status"], "effect_failed")
+        self.assertEqual(outcome["recovery_status"], "preservation_blocked")
+        self.assertIn("generation_protocol_contract_absent", outcome["detail"])
+        self.assertFalse(outcome["closed_old_worker"])
         self.assertFalse(outcome["fresh_slot_attested"])
         self.assertFalse(faulty._fresh_worker_locator(ctx))
+        self.assertEqual(faulty.live_locator_count(), before)
 
     def test_injected_uncertain_redispatch_is_rejected_by_the_shared_predicate(self):
         # The negative CONTROL: an attestation landing OUTSIDE the redispatch's durable window makes

@@ -123,9 +123,20 @@ def _measure_consumers(view, home: Path) -> tuple:
     when agents ARE live does readability matter, and a store whose rows cannot be enumerated
     is :data:`_CONSUMERS_UNMEASURABLE`, never "none".
     """
-    if not view.backend_selected:
-        return _CONSUMERS_NONE, ()
-    if not view.ok:
+    if not view.backend_selected or not view.ok:
+        return _CONSUMERS_UNMEASURABLE, ()
+    if (
+        view.raw_row_count is None
+        or view.invalid_row_count is None
+        or view.invalid_row_count != 0
+        or view.raw_row_count != len(view.agents)
+        or any(
+            type(agent.terminal_id) is not str
+            or not agent.terminal_id
+            or agent.terminal_id.strip() != agent.terminal_id
+            for agent in view.agents
+        )
+    ):
         return _CONSUMERS_UNMEASURABLE, ()
     live = {agent.name for agent in view.managed_agents}
     if not live:
@@ -157,7 +168,7 @@ def _consumer_gate(
             ),
             live_consumers=names,
         )
-    if not view.ok:
+    if not view.backend_selected or not view.ok:
         return LaunchGenerationStoreMaintenanceResult(
             intent="rebuild",
             state=BLOCKED_INVENTORY_UNREADABLE,

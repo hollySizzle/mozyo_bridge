@@ -105,6 +105,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _invoke,
     _list_rows,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_managed_column_scope import (  # noqa: E501
+    ManagedColumnScope,
+    managed_column_scope,
+    managed_external_boundary_matches,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_balance import (  # noqa: E501
     MAX_EQUAL_PROJECT_COLUMNS,
     ColumnRatioTarget,
@@ -117,8 +122,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_internal_ratio import (  # noqa: E501
     ColumnInternalRatio,
     capture_internal_ratios,
-    effective_internal_ratios_match,
-    internal_ratios_match,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow_recovery import (  # noqa: E501
+    ProjectColumnReflowPorts as _ProjectColumnReflowPorts,
+    generation_authority_fingerprint as _generation_authority_fingerprint,
+    phase_internal_ratios_match as _phase_internal_ratios_match,
+    restore_detached as _restore_detached,
+    stranded_detail as _stranded_detail,
+    verify_reflow as _verify_reflow,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_result import (  # noqa: E501
     SLOT_LAUNCHED,
@@ -209,6 +220,7 @@ class ColumnReflowPlan:
     attach: "tuple[ColumnAttach, ...]"
     anchor_pane: str
     internal_ratios: "tuple[ColumnInternalRatio, ...]"
+    managed_scope: ManagedColumnScope
 
 
 def _anchor_group(
@@ -265,6 +277,15 @@ def plan_project_columns(
        own partner — restoring it to exactly where it was.
     """
     own = tuple(locator for locator in own_launched if locator)
+    scope = managed_column_scope(
+        layout,
+        tuple(
+            tuple(pane.locator for pane in members)
+            for _key, members in sorted(groups.items())
+        ),
+    )
+    if scope is None:
+        return None, "managed project panes do not own one isolated split subtree"
     if len(own) != 2:
         return None, (
             f"a project column is appended by a full fresh pair; this run reports "
@@ -290,13 +311,10 @@ def plan_project_columns(
     for locator in own:
         if layout.panes.get(locator) is None:
             return None, f"launched pane {locator!r} is not in the tab layout"
-    internal_ratios, refusal = capture_internal_ratios(
-        layout,
-        {
-            own_key: groups[own_key],
-            anchor_keys[0]: foreign[anchor_keys[0]],
-        },
-    )
+    # Freeze every complete Unit, not only the two columns this choreography
+    # intentionally touches.  An untouched neighbour whose divider drifts is
+    # still a stale phase and cannot lend authority to the next pane move.
+    internal_ratios, refusal = capture_internal_ratios(layout, groups)
     if refusal:
         return None, refusal
     internal_by_lower = {
@@ -334,6 +352,7 @@ def plan_project_columns(
             ),
             anchor_pane=anchor_top,
             internal_ratios=internal_ratios,
+            managed_scope=scope,
         ),
         "",
     )
@@ -443,71 +462,22 @@ def _identity_map(
     return {pane.locator: pane.assigned_name for pane in panes}
 
 
-def _restore_detached(
-    detached: Sequence[str],
-    tab_id: str,
-    planned: Sequence[ColumnAttach],
-    *,
-    before: "Mapping[str, str]",
-    target_workspace: str,
-    anchor: str,
-    internal_ratios: Sequence[ColumnInternalRatio],
-    binary: str,
-    runner,
-    timeout: float,
-    env,
-) -> "tuple[tuple[str, ...], str]":
-    """Best-effort return, then verify inventory, tab and saved ratios afresh."""
-    stranded: list = []
-    pending = set(detached)
-    for attach in planned:
-        if attach.pane not in pending:
-            continue
-        refusal = attach_pane(
-            attach,
-            tab_id,
-            binary=binary,
-            runner=runner,
-            timeout=timeout,
-            env=env,
-        )
-        if refusal:
-            stranded.append(attach.pane)
-        pending.remove(attach.pane)
-    stranded.extend(sorted(pending))
-    try:
-        after = _identity_map(_list_rows(binary, runner, timeout), target_workspace)
-    except HerdrSessionStartError:
-        return tuple(stranded), "the shared workspace inventory could not be read during recovery"
-    if after != before:
-        lost = sorted(set(before) - set(after))
-        changed = sorted(
-            locator
-            for locator in set(before) & set(after)
-            if before[locator] != after[locator]
-        )
-        return tuple(stranded), (
-            "the shared workspace inventory changed during recovery "
-            f"(missing: {lost!r}, renamed: {changed!r})"
-        )
-    layout = read_pane_layout(
-        anchor, binary=binary, runner=runner, timeout=timeout, env=env
+def _recovery_ports() -> _ProjectColumnReflowPorts:
+    """Bind the facade's current public/patch seams for one recovery call."""
+    return _ProjectColumnReflowPorts(
+        attach_pane=attach_pane,
+        identity_map=_identity_map,
+        list_rows=_list_rows,
+        read_pane_layout=read_pane_layout,
+        balance_project_columns=balance_project_columns,
+        balanced_column_verdict=balanced_column_verdict,
+        columnar_verdict=columnar_verdict,
+        max_equal_project_columns=MAX_EQUAL_PROJECT_COLUMNS,
+        failed_outcome=COLUMN_FAILED,
+        prepared_outcome=COLUMN_PREPARED,
+        applied_outcome=COLUMN_APPLIED,
+        matched_outcome=COLUMN_MATCHED,
     )
-    if layout is None:
-        return tuple(stranded), "the recovery pane layout could not be read or parsed"
-    if _norm(layout.tab_id) != tab_id:
-        return tuple(stranded), (
-            f"the recovery layout reports tab {layout.tab_id!r}, not {tab_id!r}"
-        )
-    ratios_ok, ratio_detail = effective_internal_ratios_match(
-        layout, internal_ratios
-    )
-    if not ratios_ok:
-        return tuple(stranded), (
-            "a Unit's internal ratio changed during recovery: "
-            f"{ratio_detail}"
-        )
-    return (), ""
 
 
 def _is_settled_health(value: object) -> bool:
@@ -751,11 +721,12 @@ def reflow_project_columns(
         for slot in launched_slots
     )
     own_launched = tuple(slot.locator for slot in own_slots)
+    authority_port = authority or project_column_authority(home)
     rows, decision = _resolve_project_groups_after_startup(
         binary=binary,
         runner=runner,
         timeout=timeout,
-        authority=authority or project_column_authority(home),
+        authority=authority_port,
         target_workspace=target_workspace,
         own_slots=own_slots,
         # The run's own claim is an INPUT to the join, not a second derivation
@@ -773,6 +744,32 @@ def reflow_project_columns(
         return COLUMN_FAILED, f"{decision.refusal}; no live pane was moved"
     groups = decision.groups
     own_key = decision.own_key
+    opening_authority = _generation_authority_fingerprint(groups, home)
+    if opening_authority is None:
+        return COLUMN_FAILED, "the managed panes lack exact completed current-generation authority"
+
+    def same_generation_authority() -> bool:
+        try:
+            _fresh_rows, fresh_decision = _resolve_project_groups_after_startup(
+                binary=binary,
+                runner=runner,
+                timeout=timeout,
+                authority=authority_port,
+                target_workspace=target_workspace,
+                own_slots=own_slots,
+                expected_own_key=(result.workspace_id, _norm(result.lane_id) or DEFAULT_LANE),
+                top_workspace_id=top_workspace_id,
+                retry_budget_seconds=0.0,
+                retry_interval_seconds=0.0,
+            )
+        except Exception:
+            return False
+        return bool(
+            fresh_decision.ok
+            and fresh_decision.own_key == own_key
+            and _generation_authority_fingerprint(fresh_decision.groups, home)
+            == opening_authority
+        )
     if not [key for key in groups if key != own_key]:
         return COLUMN_NOT_APPLICABLE, (
             "this project is the only coordinator pair in the shared workspace, so "
@@ -789,6 +786,15 @@ def reflow_project_columns(
     if not tab_id:
         return COLUMN_FAILED, "the shared project-coordinator tab id is unreadable"
     columnar, reason = columnar_verdict(layout, groups)
+    opening_scope = managed_column_scope(
+        layout,
+        tuple(
+            tuple(pane.locator for pane in members)
+            for _key, members in sorted(groups.items())
+        ),
+    )
+    if opening_scope is None:
+        return COLUMN_FAILED, "managed project panes do not own one isolated split subtree"
     before = _identity_map(rows, target_workspace)
     if columnar:
         return _verify_reflow(
@@ -799,6 +805,9 @@ def reflow_project_columns(
             anchor=own_launched[0],
             geometry_changed=False,
             internal_ratios=(),
+            managed_scope=opening_scope,
+            ports=_recovery_ports(),
+            authority_check=same_generation_authority,
             binary=binary,
             runner=runner,
             timeout=timeout,
@@ -809,16 +818,76 @@ def reflow_project_columns(
         return COLUMN_FAILED, f"{refusal} (observed geometry: {reason})"
     detached: list = []
     for pane_id in plan.detach:
+        boundary = read_pane_layout(
+            plan.anchor_pane,
+            binary=binary,
+            runner=runner,
+            timeout=timeout,
+            env=env,
+        )
+        present = plan.managed_scope.pane_ids.difference(detached)
+        if (
+            boundary is None
+            or not managed_external_boundary_matches(
+                boundary,
+                plan.managed_scope,
+                present_managed_ids=present,
+            )
+            or not _phase_internal_ratios_match(
+                boundary,
+                plan.internal_ratios,
+                present,
+            )
+            or not same_generation_authority()
+        ):
+            if detached:
+                stranded, recovery_refusal = _restore_detached(
+                    tuple(detached), tab_id, plan.attach,
+                    before=before,
+                    target_workspace=target_workspace,
+                    anchor=plan.anchor_pane,
+                    internal_ratios=plan.internal_ratios,
+                    managed_scope=plan.managed_scope,
+                    ports=_recovery_ports(),
+                    authority_check=same_generation_authority,
+                    binary=binary, runner=runner, timeout=timeout, env=env,
+                )
+                return COLUMN_FAILED, _stranded_detail(
+                    "the generation or external boundary changed before detach",
+                    stranded,
+                    recovery_refusal,
+                )
+            return COLUMN_FAILED, "the generation or external boundary changed before detach"
         _temp_tab, step_refusal = detach_pane(
             pane_id, binary=binary, runner=runner, timeout=timeout, env=env
         )
         if step_refusal:
+            # A provider error does not tell us whether the move took effect.  A
+            # pane that is still in the freshly-read shared layout was never
+            # detached and must not be excluded from the recovery boundary.
+            # Conversely, unreadable evidence stays conservative: recovery then
+            # treats the pane as detached and will refuse to claim success.
+            after_refusal = read_pane_layout(
+                plan.anchor_pane,
+                binary=binary,
+                runner=runner,
+                timeout=timeout,
+                env=env,
+            )
+            refused_detached = (
+                ()
+                if after_refusal is not None and pane_id in after_refusal.panes
+                else (pane_id,)
+            )
             stranded, recovery_refusal = _restore_detached(
-                tuple(detached) + (pane_id,), tab_id, plan.attach,
+                tuple(detached) + refused_detached, tab_id, plan.attach,
                 before=before,
                 target_workspace=target_workspace,
                 anchor=plan.anchor_pane,
                 internal_ratios=plan.internal_ratios,
+                managed_scope=plan.managed_scope,
+                ports=_recovery_ports(),
+                authority_check=same_generation_authority,
                 binary=binary, runner=runner, timeout=timeout, env=env,
             )
             return COLUMN_FAILED, _stranded_detail(
@@ -826,6 +895,44 @@ def reflow_project_columns(
             )
         detached.append(pane_id)
     for attach in plan.attach:
+        boundary = read_pane_layout(
+            plan.anchor_pane,
+            binary=binary,
+            runner=runner,
+            timeout=timeout,
+            env=env,
+        )
+        present = plan.managed_scope.pane_ids.difference(detached)
+        if (
+            boundary is None
+            or not managed_external_boundary_matches(
+                boundary,
+                plan.managed_scope,
+                present_managed_ids=present,
+            )
+            or not _phase_internal_ratios_match(
+                boundary,
+                plan.internal_ratios,
+                present,
+            )
+            or not same_generation_authority()
+        ):
+            stranded, recovery_refusal = _restore_detached(
+                tuple(detached), tab_id, plan.attach,
+                before=before,
+                target_workspace=target_workspace,
+                anchor=plan.anchor_pane,
+                internal_ratios=plan.internal_ratios,
+                managed_scope=plan.managed_scope,
+                ports=_recovery_ports(),
+                authority_check=same_generation_authority,
+                binary=binary, runner=runner, timeout=timeout, env=env,
+            )
+            return COLUMN_FAILED, _stranded_detail(
+                "the external pane/split boundary changed before attach",
+                stranded,
+                recovery_refusal,
+            )
         step_refusal = attach_pane(
             attach, tab_id, binary=binary, runner=runner, timeout=timeout, env=env
         )
@@ -839,12 +946,17 @@ def reflow_project_columns(
                 target_workspace=target_workspace,
                 anchor=plan.anchor_pane,
                 internal_ratios=plan.internal_ratios,
+                managed_scope=plan.managed_scope,
+                ports=_recovery_ports(),
+                authority_check=same_generation_authority,
                 binary=binary, runner=runner, timeout=timeout, env=env,
             )
             return COLUMN_FAILED, _stranded_detail(
                 step_refusal, stranded, recovery_refusal
             )
         detached.remove(attach.pane)
+    if not same_generation_authority():
+        return COLUMN_FAILED, "managed generation authority changed before final verification"
     return _verify_reflow(
         before,
         groups,
@@ -853,124 +965,13 @@ def reflow_project_columns(
         anchor=plan.anchor_pane,
         geometry_changed=True,
         internal_ratios=plan.internal_ratios,
+        managed_scope=plan.managed_scope,
+        ports=_recovery_ports(),
+        authority_check=same_generation_authority,
         binary=binary,
         runner=runner,
         timeout=timeout,
         env=env,
-    )
-
-
-def _stranded_detail(
-    refusal: str, stranded: Sequence[str], recovery_refusal: str
-) -> str:
-    """A failure detail that claims recovery only after fresh observation."""
-    if not recovery_refusal:
-        return (
-            f"{refusal}; every detached pane was returned to the shared tab, "
-            "and identities and internal ratios were verified"
-        )
-    if not stranded:
-        return f"{refusal}; recovery could not be verified: {recovery_refusal}"
-    return (
-        f"{refusal}; pane(s) {sorted(stranded)!r} are NOT in the shared "
-        "project-coordinator tab or their return could not be verified "
-        f"({recovery_refusal}); the live-relayout runbook is required"
-    )
-
-
-def _verify_reflow(
-    before: "Mapping[str, str]",
-    groups: "Mapping[tuple[str, str], tuple[CoordinatorPane, ...]]",
-    target_workspace: str,
-    tab_id: str,
-    *,
-    anchor: str,
-    geometry_changed: bool,
-    internal_ratios: Sequence[ColumnInternalRatio],
-    binary: str,
-    runner,
-    timeout: float,
-    env,
-) -> "tuple[str, str]":
-    """Measure and equalise the produced columns — identity first, then geometry.
-
-    Identity comes first deliberately: a layout that looks right tells us nothing
-    if a pane came back under a different assigned name, and that is the property
-    the whole placement model rests on (``spec-herdr-native-identity``).
-    """
-    after = _identity_map(_list_rows(binary, runner, timeout), target_workspace)
-    if after != before:
-        lost = sorted(set(before) - set(after))
-        changed = sorted(
-            locator
-            for locator in set(before) & set(after)
-            if before[locator] != after[locator]
-        )
-        return COLUMN_FAILED, (
-            "the shared workspace inventory changed across the reflow "
-            f"(missing: {lost!r}, renamed: {changed!r}); the geometry is not claimed"
-        )
-    layout = read_pane_layout(
-        anchor, binary=binary, runner=runner, timeout=timeout, env=env
-    )
-    if layout is None:
-        return COLUMN_FAILED, "the closing pane layout could not be read or parsed"
-    if _norm(layout.tab_id) != tab_id:
-        return COLUMN_FAILED, (
-            f"the closing layout reports tab {layout.tab_id!r}, not {tab_id!r}"
-        )
-    columnar, reason = columnar_verdict(layout, groups)
-    if not columnar:
-        return COLUMN_FAILED, f"the reflowed tab is still not columnar: {reason}"
-    ratios_ok, ratio_detail = internal_ratios_match(layout, internal_ratios)
-    if not ratios_ok:
-        return COLUMN_FAILED, (
-            "a Unit's internal ratio changed across project-column reflow: "
-            f"{ratio_detail}"
-        )
-    if len(groups) > MAX_EQUAL_PROJECT_COLUMNS:
-        outcome = COLUMN_PREPARED
-        action = "now own" if geometry_changed else "already own"
-        return outcome, (
-            f"{len(groups)} project pair(s) {action} full-height columns; "
-            "configured placement must establish their final relative widths"
-        )
-    resized, refusal = balance_project_columns(
-        layout,
-        groups,
-        binary=binary,
-        runner=runner,
-        timeout=timeout,
-        env=env,
-    )
-    if refusal:
-        return COLUMN_FAILED, refusal
-    closing = read_pane_layout(
-        anchor, binary=binary, runner=runner, timeout=timeout, env=env
-    )
-    if closing is None:
-        return COLUMN_FAILED, "the balanced pane layout could not be read or parsed"
-    balanced, reason = balanced_column_verdict(closing, groups)
-    if not balanced:
-        return COLUMN_FAILED, f"the project columns are still not balanced: {reason}"
-    ratios_ok, ratio_detail = internal_ratios_match(closing, internal_ratios)
-    if not ratios_ok:
-        return COLUMN_FAILED, (
-            "a Unit's internal ratio changed during project-column balancing: "
-            f"{ratio_detail}"
-        )
-    final_inventory = _identity_map(
-        _list_rows(binary, runner, timeout), target_workspace
-    )
-    if final_inventory != before:
-        return COLUMN_FAILED, (
-            "the shared workspace inventory changed during project-column balancing"
-        )
-    outcome = COLUMN_APPLIED if geometry_changed or resized else COLUMN_MATCHED
-    action = "now own" if outcome == COLUMN_APPLIED else "already own"
-    return outcome, (
-        f"{len(groups)} project pair(s) {action} equal-width full-height columns "
-        f"in tab {tab_id}"
     )
 
 

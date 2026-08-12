@@ -1,4 +1,4 @@
-"""herdr command invocation + workspace/tab creation & root-pane reclaim.
+"""Herdr invocation plus workspace/tab creation and root observation.
 
 The third cohesive sibling of :mod:`herdr_session_start`, alongside
 :mod:`herdr_lane_topology` (the pure placement / parse decision core) and
@@ -9,17 +9,15 @@ fail-closed command runner every step shares (:func:`_invoke`), the ``agent list
 (:func:`_create_workspace`, :func:`_create_tab`, :func:`_close_base_pane`).
 
 Homing them here — the extraction the ``module_health.yaml`` allowlist entry for
-``herdr_session_start`` pre-declared ("a further reduction could extract the empty-base-pane
-/ tab reclaim helpers if this grows"), carried out when Redmine #13646 added the
+``herdr_session_start`` pre-declared, carried out when Redmine #13646 added the
 config-driven ``lane_placement`` axis — keeps the session-start composition root focused on
-classification / placement / reclaim *orchestration* and drops it back under the
+classification / placement / root-preservation orchestration and drops it back under the
 module-health threshold.
 
-The reclaim contract is unchanged (Redmine #13330 / #13411): a workspace / tab this run
-**creates** is the only reclaim target, so its empty root pane is a *known* handle rather
-than one scanned for (a user's own shell can never be mis-closed); a create that returns an
-unparseable payload fails closed rather than guessing a pane; and a ``pane close`` failure
-is recorded non-fatally (the agents are already live, an empty root pane is only cosmetic).
+The #15227 contract treats a created root locator as exact observation but not destructive
+authority. Unparseable create output fails closed; generation-unbound roots are preserved.
+The low-level close helper remains for callers that independently prove fresh v4 and
+completed generation-v2 authority and must never be used as a root-locator fallback.
 """
 
 from __future__ import annotations
@@ -29,7 +27,7 @@ import re
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
     _extract_list_rows,
@@ -285,11 +283,10 @@ def preflight_attest_store_schema(
     launcher probe, i.e. before the caller's first ``workspace`` / ``tab`` / ``agent``
     write, so an incompatible store aborts with zero herdr side effect (acceptance 1).
 
-    A v1 store with a **normal** launch is admitted: the launcher writes it v1-shaped and
-    ``replacement_action_id`` is empty, so nothing is dropped and no generation is
-    fabricated. A **replacement** launch is refused there, because that field cannot
-    survive the v1 shape. The error is raised, never persisted, so no personal path is
-    written to a durable store.
+    Recognized v1-v3 stores are read-compatible diagnostics only. Every managed launch,
+    normal or replacement, requires an absent store or exact writable v4 because the
+    server-owned terminal identity cannot survive any older shape. Migration is the
+    approved four-store offline rollout, never an implicit launch-side write.
 
     ``epoch_launch`` (Redmine #14756) is the second instance of that same "field that cannot
     be dropped" rule, and it MUST be decided here rather than in the child: the child's
@@ -717,7 +714,10 @@ def preflight_launcher_compatibility(
        the shared lane lifecycle join. Every config outcome is typed HERE;
     4. **the lane cwd probe** (#14231) — re-run in ``repo_root`` once the config is proven
        parseable by this launcher, so a failure there is now unambiguously about something
-       other than the config.
+       other than the config;
+    5. **generation protocol and store** — the advertised protocol first, then the shared
+       store's absent-or-v2 shape.  Keeping both last preserves the established refusal
+       precedence while still refusing before either caller's first mutation.
     """
     with tempfile.TemporaryDirectory(prefix="mozyo-capability-probe-") as neutral:
         observation = preflight_attest_launcher_capability(
@@ -755,6 +755,21 @@ def preflight_launcher_compatibility(
     #    `prepare_session` boundary refuses — leaving exactly the worktree residue #14258's
     #    close condition 1 exists to prevent.
     preflight_generation_protocol_capability(observation)
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        GENERATION_STORE_ABSENT,
+        GENERATION_STORE_HEALTHY,
+        herdr_launch_generation_path,
+        probe_launch_generation_store,
+    )
+    generation_state, _detail = probe_launch_generation_store(
+        herdr_launch_generation_path(Path(store_home))
+    )
+    if generation_state not in (GENERATION_STORE_ABSENT, GENERATION_STORE_HEALTHY):
+        raise HerdrLauncherIncompatibleError(
+            "managed-launch preflight refused the selected launcher: launch-generation "
+            "store requires the offline v2 rebuild. No workspace / tab / agent was created.",
+            reason="launch_generation_store_unsupported",
+        )
     return observation
 
 
@@ -789,7 +804,13 @@ def preflight_generation_protocol_capability(
         )
 
 
-def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[str, object]]:
+def _list_rows(
+    binary: str,
+    runner: Runner,
+    timeout: float,
+    *,
+    binding_store=None,
+) -> Sequence[Mapping[str, object]]:
     """Return logicalized inventory rows; preserve the raw name as ``native_name``."""
     completed = _invoke(binary, ["agent", "list"], runner, timeout, env=None)
     rows = _extract_list_rows(completed.stdout)
@@ -803,7 +824,7 @@ def _list_rows(binary: str, runner: Runner, timeout: float) -> Sequence[Mapping[
     )
 
     try:
-        return logicalize_agent_rows(rows)
+        return logicalize_agent_rows(rows, store=binding_store)
     except HerdrNativeIdentityBindingError as exc:
         raise HerdrSessionStartError(
             "herdr agent inventory contains a managed native name whose logical "
@@ -835,12 +856,12 @@ def _create_workspace(
     timeout: float,
     env: Mapping[str, str],
     label: str = "",
+    effect_fence: Optional[Callable[[], None]] = None,
 ) -> tuple[str, str]:
     """Explicitly create a herdr workspace; return ``(workspace_id, root_pane_id)``.
 
-    Making the workspace ourselves (rather than letting the first ``agent start``
-    auto-create it) is what turns the empty base pane into a *known* handle we can
-    reclaim by id — never one we scan for. ``--no-focus`` avoids stealing the
+    Making the workspace ourselves turns the empty base pane into an exact observation,
+    never generation-bound close authority and never one we scan for. ``--no-focus`` avoids stealing the
     operator's focus. ``label`` names a minted workspace for the operator: for a
     **sublane host** (Redmine #13380) it is cosmetic and never a join key; for the
     **shared coordinators space** (Redmine #14139) the SAME label
@@ -853,6 +874,8 @@ def _create_workspace(
     if label:
         argv.extend(["--label", label])
     argv.append("--no-focus")
+    if effect_fence is not None:
+        effect_fence()
     completed = _invoke(
         binary,
         argv,
@@ -865,7 +888,7 @@ def _create_workspace(
         raise HerdrSessionStartError(
             "herdr workspace create returned no parseable workspace id / root pane "
             "(expected result.workspace.workspace_id + result.root_pane.pane_id in a "
-            "workspace_created payload); refuse to guess a pane to reclaim"
+            "workspace_created payload); refuse to guess a root observation"
         )
     return parsed
 
@@ -877,14 +900,15 @@ def _create_tab(
     timeout: float,
     env: Mapping[str, str],
     label: str = "",
+    effect_fence: Optional[Callable[[], None]] = None,
 ) -> tuple[str, str]:
     """Explicitly create a herdr tab in ``workspace_id``; return ``(tab_id, root_pane_id)``.
 
     Lane=tab subdivision (Redmine #13411): a non-default lane gets its OWN tab in
     the sublane host workspace, its gateway + worker placed as a split pair inside
-    it. Minting the tab ourselves turns its empty root pane into a *known* handle
-    to reclaim by id (the tab analogue of the #13330 workspace base pane), never
-    one we scan for. ``--label`` (the lane label) is cosmetic and operator-readable
+    it. Minting the tab ourselves makes its empty root pane an exact observation
+    (the tab analogue of the #13330 workspace base pane), never generation-bound
+    close authority and never one we scan for. ``--label`` is cosmetic and operator-readable
     only — every join decision keys on the live ``tab_id``, never the label.
     ``--no-focus`` avoids stealing the operator's focus. Fails closed if the
     response is unparseable.
@@ -893,13 +917,15 @@ def _create_tab(
     if label:
         argv.extend(["--label", label])
     argv.append("--no-focus")
+    if effect_fence is not None:
+        effect_fence()
     completed = _invoke(binary, argv, runner, timeout, env=dict(env))
     parsed = _parse_tab_created(completed.stdout)
     if parsed is None:
         raise HerdrSessionStartError(
             "herdr tab create returned no parseable tab id / root pane "
             "(expected result.tab.tab_id + result.root_pane.pane_id in a "
-            "tab_created payload); refuse to guess a pane to reclaim"
+            "tab_created payload); refuse to guess a root observation"
         )
     return parsed
 
@@ -911,13 +937,12 @@ def _close_base_pane(
     timeout: float,
     env: Mapping[str, str],
 ) -> tuple[bool, str]:
-    """Reclaim a created root pane; **never hard-fail** (cosmetic residue only).
+    """Low-level locator close; callers must first prove destructive authority.
 
-    Used for both the #13330 workspace base pane and the #13411 lane tab root
-    pane. Returns ``(True, "")`` on a clean close, else ``(False, <detail>)``. A
-    failed reclaim only leaves the harmless empty root pane behind — the agent
-    slots are already live — so it is recorded, not raised (Redmine #13330 ruling
-    j#73225).
+    The provider cannot condition this mutation on terminal generation. Current
+    #15227 code therefore never calls it for generation-unbound workspace/tab roots;
+    guarded retire/recovery callers must supply their own fresh v4 + generation-v2
+    admission. Returns a bounded fixed-shape result rather than raising.
     """
     try:
         _invoke(binary, ["pane", "close", pane_id], runner, timeout, env=dict(env))

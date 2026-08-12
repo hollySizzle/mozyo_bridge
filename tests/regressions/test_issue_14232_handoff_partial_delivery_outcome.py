@@ -133,17 +133,16 @@ _GATEWAY_NAME = "mzb1_ws_codex_lane"
 _GATEWAY_TERMINAL = "terminal-test"
 _GATEWAY_LOCATOR = "%7"
 _GATEWAY_REVISION = "1"
+_GATEWAY_PROCESS_GENERATION = (
+    f"{len(_GATEWAY_NAME)}:{_GATEWAY_NAME}:"
+    f"{len(_GATEWAY_TERMINAL)}:{_GATEWAY_TERMINAL}:"
+    f"{len(_GATEWAY_LOCATOR)}:{_GATEWAY_LOCATOR}:r{_GATEWAY_REVISION}"
+)
 _GATEWAY_BINDING = {
     "provider": "codex",
     "assigned_name": _GATEWAY_NAME,
     "locator": _GATEWAY_LOCATOR,
-    "terminal_id": _GATEWAY_TERMINAL,
     "row_revision": _GATEWAY_REVISION,
-    "process_generation": (
-        f"{len(_GATEWAY_NAME)}:{_GATEWAY_NAME}:"
-        f"{len(_GATEWAY_TERMINAL)}:{_GATEWAY_TERMINAL}:"
-        f"{len(_GATEWAY_LOCATOR)}:{_GATEWAY_LOCATOR}:r{_GATEWAY_REVISION}"
-    ),
     "attestation_observed_at": "2026-07-29T20:10:01+00:00",
     "startup_action_id": "startup-abc",
 }
@@ -365,7 +364,7 @@ def _request(mode: str = _MODE_QUEUE_ENTER, **overrides) -> TmuxTransportRailReq
         persist_delivery=False,
         herdr_send=True,
         herdr_assigned_name="mzb1_ws_codex_lane",
-        herdr_process_generation=_GATEWAY_BINDING["process_generation"],
+        herdr_process_generation=_GATEWAY_PROCESS_GENERATION,
         read_lines=50,
         landing_timeout=8.0,
         submit_delay=None,

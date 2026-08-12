@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
@@ -89,6 +89,10 @@ class ProjectGatewayBackendSupport(Protocol):
     def slot_is_live(self, row: object) -> bool: ...
 
     def valid_target(self, value: object) -> bool: ...
+
+    def terminal_identity(
+        self, assigned_name: object, locator: object, rows: object
+    ) -> object: ...
 
     def workspace_segment(self, repo_root: Path) -> str: ...
 
@@ -242,8 +246,8 @@ class HerdrTargetObservation:
     project_scope: str
     assigned_name: str
     locator: str
-    terminal_id: str
-    process_generation: str
+    terminal_id: str = field(repr=False)
+    process_generation: str = field(repr=False)
     generation_token: str
     target_cwd: str
     target_repo_root: str
@@ -673,11 +677,15 @@ class ProjectGatewayBackendInventoryUseCase:
                     "herdr_locator_ambiguous",
                     "the matching Herdr locator is aliased by multiple live inventory rows",
                 )
-            terminal_id = row.get(_require_backend_support().terminal_id_key)
+            row_terminal_id = row.get(_require_backend_support().terminal_id_key)
+            terminal_id = _require_backend_support().terminal_identity(
+                assigned_name, locator, rows
+            )
             if (
                 type(terminal_id) is not str
                 or not terminal_id
                 or terminal_id.strip() != terminal_id
+                or terminal_id != row_terminal_id
             ):
                 self._error(
                     "herdr_terminal_identity_unavailable",

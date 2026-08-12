@@ -31,6 +31,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
     process_generation_of_locator,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
@@ -77,6 +78,15 @@ class HerdrProjectGatewayBackendSupport:
     @staticmethod
     def valid_target(value: object) -> bool:
         return valid_target(value)
+
+    @staticmethod
+    def terminal_identity(assigned_name: object, locator: object, rows: object) -> object:
+        return (
+            terminal_identity_of_live_slot(assigned_name, locator, rows)
+            if isinstance(rows, (list, tuple))
+            and all(isinstance(row, Mapping) for row in rows)
+            else None
+        )
 
     @staticmethod
     def workspace_segment(repo_root: Path) -> str:

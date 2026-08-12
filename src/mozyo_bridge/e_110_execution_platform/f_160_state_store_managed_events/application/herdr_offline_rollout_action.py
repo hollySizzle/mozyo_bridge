@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional, Protocol
+from typing import Callable, Mapping, Optional, Protocol
 
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_action import (  # noqa: E501
     OfflineRolloutActionError,
@@ -20,6 +20,30 @@ from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.doma
     parse_approval_pointer,
     public_status,
 )
+from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_close_authority import (  # noqa: E501
+    OfflineRolloutCloseAuthorityError,
+    decode_close_authority,
+)
+from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_container_intent import (  # noqa: E501
+    OfflineRolloutContainerIntentError,
+    decode_container_intent,
+    require_container_pane_join,
+)
+from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_legacy_absence_authority import (  # noqa: E501
+    OfflineRolloutLegacyAbsenceAuthorityError,
+    decode_legacy_absence_authority,
+)
+from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_pane_intent import (  # noqa: E501
+    OfflineRolloutPaneIntentError,
+    decode_pane_intent,
+)
+from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_restore_intent import (  # noqa: E501
+    RESTORE_PHASES,
+    OfflineRolloutRestoreIntentError,
+    decode_restore_intent,
+    validate_completed_restore_receipts,
+    validate_restore_phase_receipt,
+)
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.infrastructure.offline_rollout_action_store import (  # noqa: E501
     OfflineRolloutActionStore,
     OfflineRolloutActionStoreError,
@@ -31,7 +55,7 @@ class PhaseExecutionResult:
     ok: bool
     reason: str = ""
     detail: str = ""
-    receipt: Mapping[str, object] = field(default_factory=dict)
+    receipt: Mapping[str, object] = field(default_factory=dict, repr=False)
 
 
 @dataclass(frozen=True)
@@ -91,6 +115,7 @@ class OfflineRolloutExecutionPort(Protocol):
         action: Mapping[str, object],
         action_directory: Path,
         replaying: bool,
+        session_gate_lease: object = None,
     ) -> PhaseExecutionResult: ...
 
 
@@ -104,7 +129,11 @@ def _blocked(reason: str, detail: str = "", **payload) -> OfflineRolloutCommandR
 
 
 def adopt_legacy_lanes(
-    *, home: Path, targets, replaying: bool
+    *,
+    home: Path,
+    targets,
+    replaying: bool,
+    effect_fence: Optional[Callable[[], PhaseExecutionResult]] = None,
 ) -> PhaseExecutionResult:
     """Adopt exact pre-v10 hibernated rows inside the already-offline global window."""
     from mozyo_bridge.core.state.lane_epoch_adoption import (
@@ -123,6 +152,10 @@ def adopt_legacy_lanes(
     reader = LaneLifecycleReader(home=home)
     adopted = []
     for target in targets:
+        if effect_fence is not None:
+            admitted = effect_fence()
+            if not admitted.ok:
+                return admitted
         key = LaneLifecycleKey(target["workspace_id"], target["lane_id"])
         decision = DecisionPointer("redmine", target["issue_id"], target["journal_id"])
         outcome = store.adopt_legacy_epoch(
@@ -187,7 +220,6 @@ def merge_legacy_recovery_agent_bindings(*, plan, agents) -> PhaseExecutionResul
                 continue
             row = {
                 **expected,
-                "locator": "",
                 "recovery_issue_id": recovery["issue_id"],
             }
             merged.append(row)
@@ -196,7 +228,10 @@ def merge_legacy_recovery_agent_bindings(*, plan, agents) -> PhaseExecutionResul
 
 
 def prepare_store_migration_proofs(
-    *, action_directory: Path, store_paths: Mapping[str, Path]
+    *,
+    action_directory: Path,
+    store_paths: Mapping[str, Path],
+    effect_fence: Optional[Callable[[], PhaseExecutionResult]] = None,
 ) -> PhaseExecutionResult:
     """Migrate private logical clones and pin each deterministic target content digest."""
     import hashlib
@@ -211,18 +246,38 @@ def prepare_store_migration_proofs(
 
     proof_root = action_directory / "migration-proofs"
     try:
+        if effect_fence is not None:
+            admitted = effect_fence()
+            if not admitted.ok:
+                return admitted
         proof_root.mkdir(mode=0o700, exist_ok=True)
         digests = {}
         for name in ("attestation", "lane_lifecycle"):
             source = store_paths[name]
             target = proof_root / f"{name}.sqlite3"
+            if effect_fence is not None:
+                admitted = effect_fence()
+                if not admitted.ok:
+                    return admitted
             target.unlink(missing_ok=True)
+            if effect_fence is not None:
+                admitted = effect_fence()
+                if not admitted.ok:
+                    return admitted
             with (
                 sqlite3.connect(source.resolve().as_uri() + "?mode=ro", uri=True) as src,
                 sqlite3.connect(target) as dst,
             ):
                 src.backup(dst)
+            if effect_fence is not None:
+                admitted = effect_fence()
+                if not admitted.ok:
+                    return admitted
             target.chmod(0o600)
+            if effect_fence is not None:
+                admitted = effect_fence()
+                if not admitted.ok:
+                    return admitted
             if name == "attestation":
                 migrate_attestation_store(target)
             else:
@@ -265,6 +320,8 @@ def store_phase_authority(
     replay_candidate = (
         isinstance(observed, Mapping)
         and observed.get("state") == "recognized"
+        and type(observed.get("version")) is int
+        and type(planned.get("target_version")) is int
         and observed.get("version") == planned.get("target_version")
         and replaying is True
         and action.get("active_phase") == phase_name
@@ -292,6 +349,8 @@ def verify_migrated_store(action, store_name: str, observed) -> PhaseExecutionRe
     if (
         isinstance(observed, Mapping)
         and observed.get("state") == "recognized"
+        and type(observed.get("version")) is int
+        and type(planned.get("target_version")) is int
         and observed.get("version") == planned.get("target_version")
         and expected
         and observed.get("content_digest") == expected
@@ -350,6 +409,30 @@ def delegate_offline_rollout(
     bindings = port.capture_private_bindings(plan=plan)
     if not bindings.ok:
         return _blocked(bindings.reason or "private_binding_capture_failed", bindings.detail)
+    try:
+        decode_close_authority(bindings.receipt, plan=plan)
+    except OfflineRolloutCloseAuthorityError as exc:
+        # Capture has not created an action yet.  Missing/legacy/malformed private
+        # authority is therefore a typed zero-write, zero-runner refusal.
+        return _blocked(str(exc))
+    try:
+        restore_intent = decode_restore_intent(bindings.receipt, plan=plan)
+    except OfflineRolloutRestoreIntentError as exc:
+        return _blocked(str(exc))
+    try:
+        decode_legacy_absence_authority(
+            bindings.receipt, plan=plan, restore_intent=restore_intent
+        )
+    except OfflineRolloutLegacyAbsenceAuthorityError as exc:
+        return _blocked(str(exc))
+    try:
+        pane_intent = decode_pane_intent(bindings.receipt)
+        container_intent = decode_container_intent(
+            bindings.receipt, restore_intent=restore_intent
+        )
+        require_container_pane_join(container_intent, pane_intent)
+    except (OfflineRolloutPaneIntentError, OfflineRolloutContainerIntentError) as exc:
+        return _blocked(str(exc))
     # The plan is a host-global operation authority, so its action identity is deterministic.
     # Concurrent delegates of the same plan therefore contend on one action lock/record instead
     # of launching independent global-stop runners from the same approval.
@@ -419,46 +502,157 @@ def run_offline_rollout_action(
 ) -> OfflineRolloutCommandResult:
     """Run or resume one action under its exclusive lock, forward only."""
     store = OfflineRolloutActionStore(home)
-    port = ops or _live_ops(home=home)
     try:
-        attested = port.attest_external_runner(action_id=action_id)
-        if not attested.ok:
-            return _blocked(
-                attested.reason or "external_runner_unattested", attested.detail
-            )
         with store.locked(action_id) as directory:
             action = store.load_locked(directory)
-            action = mark_running(action)
-            store.save_locked(directory, action)
-            while True:
-                phase = next_phase(action)
-                if phase is None:
-                    return OfflineRolloutCommandResult(
-                        ok=True, state="completed", payload=public_status(action)
-                    )
-                replaying = action.get("active_phase") == phase["phase"]
-                action = mark_phase_started(action, str(phase["phase"]))
-                store.save_locked(directory, action)
-                result = port.execute_phase(
-                    phase=phase,
-                    action=action,
-                    action_directory=directory,
-                    replaying=replaying,
+            try:
+                decode_close_authority(
+                    action.get("private_bindings"), plan=action["plan"]
                 )
-                if not result.ok:
-                    action = mark_blocked(
-                        action,
-                        result.reason or "phase_failed",
-                        result.detail,
-                    )
-                    store.save_locked(directory, action)
+            except OfflineRolloutCloseAuthorityError as exc:
+                # Top-level action v1 stays readable through ``status``.  Execution
+                # never backfills an old sealed action from the current inventory.
+                return _blocked(str(exc), **public_status(action))
+            try:
+                restore_intent = decode_restore_intent(
+                    action.get("private_bindings"), plan=action["plan"]
+                )
+                decode_legacy_absence_authority(
+                    action.get("private_bindings"),
+                    plan=action["plan"],
+                    restore_intent=restore_intent,
+                )
+                pane_intent = decode_pane_intent(action.get("private_bindings"))
+                container_intent = decode_container_intent(
+                    action.get("private_bindings"),
+                    restore_intent=restore_intent,
+                )
+                require_container_pane_join(container_intent, pane_intent)
+                validate_completed_restore_receipts(
+                    action, intent=restore_intent
+                )
+            except (
+                OfflineRolloutRestoreIntentError,
+                OfflineRolloutLegacyAbsenceAuthorityError,
+                OfflineRolloutPaneIntentError,
+                OfflineRolloutContainerIntentError,
+            ) as exc:
+                return _blocked(str(exc), **public_status(action))
+            # Historical/current-private validation precedes even construction of the
+            # live host port.  A status-only record never reaches runner attestation.
+            from mozyo_bridge.core.state.herdr_session_start_gate import (
+                SessionStartGateError,
+                acquire_session_start_gate,
+                release_session_start_gate,
+            )
+
+            try:
+                session_gate_lease = acquire_session_start_gate(
+                    home, exclusive=True
+                )
+            except SessionStartGateError as exc:
+                return _blocked(str(exc), **public_status(action))
+            # The exclusive gate prevents every conforming session-start from entering
+            # after this point.  Re-read the whole startup authority while it is held so
+            # an already-planned action in any workspace/lane cannot survive into the
+            # first supervisor/close effect of this home-global maintenance window.
+            try:
+                from mozyo_bridge.core.state.startup_transaction_fence import (
+                    StartupTransactionFence,
+                )
+
+                startup_actions = StartupTransactionFence(
+                    home=home
+                ).read_snapshot()
+                startup_window_blocked = any(
+                    not startup.terminal for startup in startup_actions
+                )
+            except Exception:  # noqa: BLE001 - unreadable authority is not empty
+                startup_window_blocked = True
+            if startup_window_blocked:
+                try:
+                    release_session_start_gate(session_gate_lease)
+                except SessionStartGateError:
                     return _blocked(
-                        action["last_reason"], action["last_detail"], **public_status(action)
+                        "session_start_gate_release_unverified",
+                        **public_status(action),
                     )
-                action = mark_phase_completed(
-                    action, str(phase["phase"]), dict(result.receipt)
-                )
-                store.save_locked(directory, action)
+                return _blocked("restore_action_residual", **public_status(action))
+            result = None
+            try:
+                port = ops or _live_ops(home=home)
+                attested = port.attest_external_runner(action_id=action_id)
+                if not attested.ok:
+                    result = _blocked(
+                        attested.reason or "external_runner_unattested",
+                        attested.detail,
+                    )
+                else:
+                    action = mark_running(action)
+                    store.save_locked(directory, action)
+                    while result is None:
+                        phase = next_phase(action)
+                        if phase is None:
+                            result = OfflineRolloutCommandResult(
+                                ok=True,
+                                state="completed",
+                                payload=public_status(action),
+                            )
+                            break
+                        replaying = action.get("active_phase") == phase["phase"]
+                        action = mark_phase_started(action, str(phase["phase"]))
+                        store.save_locked(directory, action)
+                        executed = port.execute_phase(
+                            phase=phase,
+                            action=action,
+                            action_directory=directory,
+                            replaying=replaying,
+                            session_gate_lease=session_gate_lease,
+                        )
+                        if not executed.ok:
+                            action = mark_blocked(
+                                action,
+                                executed.reason or "phase_failed",
+                                executed.detail,
+                            )
+                            store.save_locked(directory, action)
+                            result = _blocked(
+                                action["last_reason"],
+                                action["last_detail"],
+                                **public_status(action),
+                            )
+                            break
+                        if str(phase["phase"]) in RESTORE_PHASES:
+                            try:
+                                validate_restore_phase_receipt(
+                                    executed.receipt,
+                                    intent=restore_intent,
+                                    phase=str(phase["phase"]),
+                                )
+                            except OfflineRolloutRestoreIntentError as exc:
+                                action = mark_blocked(action, str(exc))
+                                store.save_locked(directory, action)
+                                result = _blocked(
+                                    action["last_reason"], **public_status(action)
+                                )
+                                break
+                        action = mark_phase_completed(
+                            action,
+                            str(phase["phase"]),
+                            dict(executed.receipt),
+                        )
+                        store.save_locked(directory, action)
+            finally:
+                try:
+                    release_session_start_gate(session_gate_lease)
+                except SessionStartGateError:
+                    result = _blocked(
+                        "session_start_gate_release_unverified",
+                        **public_status(action),
+                    )
+            if result is None:
+                return _blocked("runner_exception", **public_status(action))
+            return result
     except (OfflineRolloutActionError, OfflineRolloutActionStoreError) as exc:
         return _blocked(str(exc))
     except Exception as exc:  # noqa: BLE001 - never leave an untyped runner crash
@@ -480,7 +674,7 @@ def status_offline_rollout_action(
     *, action_id: str, home: Path
 ) -> OfflineRolloutCommandResult:
     try:
-        action = OfflineRolloutActionStore(home).load(action_id)
+        action = OfflineRolloutActionStore(home).load_for_status(action_id)
     except OfflineRolloutActionStoreError as exc:
         return _blocked(str(exc))
     status = public_status(action)

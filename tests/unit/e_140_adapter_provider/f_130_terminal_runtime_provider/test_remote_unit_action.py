@@ -83,13 +83,7 @@ def armed_wait_observation() -> dict:
             "provider": "codex",
             "assigned_name": assigned_name,
             "locator": locator,
-            "terminal_id": terminal_id,
             "row_revision": revision,
-            "process_generation": (
-                f"{len(assigned_name)}:{assigned_name}:"
-                f"{len(terminal_id)}:{terminal_id}:"
-                f"{len(locator)}:{locator}:r{revision}"
-            ),
             "attestation_observed_at": "2026-08-10T05:00:00Z",
             "startup_action_id": "startup-abc123",
         },

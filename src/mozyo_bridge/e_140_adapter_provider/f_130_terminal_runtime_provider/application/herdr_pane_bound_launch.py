@@ -8,7 +8,7 @@ import shlex
 import tempfile
 import time
 from contextlib import ExitStack, contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Iterator, Mapping, Optional, Sequence
 
@@ -53,7 +53,7 @@ class PreparedPane:
     locator: str
     workspace_id: str
     tab_id: str
-    terminal_id: str
+    terminal_id: str = field(repr=False)
 
 
 @dataclass(frozen=True)
@@ -276,15 +276,19 @@ def split_prepared_pane(
     runner: Runner,
     timeout: float,
     env: Mapping[str, str],
+    effect_fence: Optional[Callable[[], None]] = None,
 ) -> PreparedPane:
+    argv = build_pane_split_argv(
+        anchor_locator=anchor_locator,
+        direction=direction,
+        repo_root=repo_root,
+        env_entries=env_entries,
+    )
+    if effect_fence is not None:
+        effect_fence()
     completed = _invoke(
         binary,
-        build_pane_split_argv(
-            anchor_locator=anchor_locator,
-            direction=direction,
-            repo_root=repo_root,
-            env_entries=env_entries,
-        ),
+        argv,
         runner,
         timeout,
         env=dict(env),
@@ -333,12 +337,15 @@ def prepare_provider_shell_function(
     runner: Runner,
     timeout: float,
     env: Mapping[str, str],
+    effect_fence: Optional[Callable[[], None]] = None,
 ) -> None:
     """Install the action-private canonical function in one exact prepared pane."""
     if not valid_target(pane_locator):
         raise HerdrSessionStartError(
             "pane-local provider preparation requires one exact valid pane locator"
         )
+    if effect_fence is not None:
+        effect_fence()
     _invoke(
         binary,
         [
@@ -396,6 +403,7 @@ def start_agent_in_prepared_pane(
     timeout: float,
     env: Mapping[str, str],
     sleeper: Optional[Callable[[float], None]] = None,
+    effect_fence: Optional[Callable[[], None]] = None,
 ) -> object:
     """Start in this run's exact pane, tolerating only the shell-startup race.
 
@@ -411,6 +419,8 @@ def start_agent_in_prepared_pane(
     def _retrying_runner(argv, *args, **kwargs):
         nonlocal retries
         while True:
+            if effect_fence is not None:
+                effect_fence()
             completed = runner(argv, *args, **kwargs)
             if not _agent_pane_busy(completed) or retries >= AGENT_PANE_BUSY_RETRIES:
                 return completed

@@ -135,6 +135,7 @@ AGENT_REVISION = 4
 LANE_GENERATION = 1
 LIFECYCLE_REVISION = 1
 ACTION = quarantine_action_id(lane_id=LANE, role=ROLE, locator=OLD_LOCATOR)
+STARTUP_ACTION = "startup-quarantine-current"
 
 #: The measured axis in j#102624: the worker was live but the gateway/worker pair did not
 #: resolve to one shared placement, so `generation_matches` folded to False.
@@ -198,6 +199,14 @@ class _FakeOps:
 
     def approval_verified(self, request, inspection) -> bool:
         return self._approval_verified
+
+    def current_close_pin(self, request: QuarantineRequest) -> ReleasePin:
+        return ReleasePin(
+            role=request.role,
+            assigned_name=request.assigned_name,
+            locator=request.locator,
+            startup_action_id=STARTUP_ACTION,
+        )
 
     def close_receiver(self, request, pin) -> CloseReceiverResult:
         self.closed_pins.append(pin)
@@ -757,7 +766,12 @@ class StaleApprovalTest(_Case):
             self.key,
             expected_revision=LIFECYCLE_REVISION,
             action_id=ACTION,
-            pins=(ReleasePin(role=ROLE, assigned_name=NAME, locator=OLD_LOCATOR),),
+            pins=(ReleasePin(
+                role=ROLE,
+                assigned_name=NAME,
+                locator=OLD_LOCATOR,
+                startup_action_id=STARTUP_ACTION,
+            ),),
             decision=DecisionPointer(
                 source="redmine", issue_id=ISSUE, journal_id=APPROVAL_JOURNAL
             ),

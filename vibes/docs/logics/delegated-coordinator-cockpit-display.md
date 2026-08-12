@@ -118,8 +118,9 @@ host workspace 内の lane slot (`mzb1_<project-ws>_<role>_<lane>` — identity 
 project workspace segment のまま、#13377 model 不変) として着地し、herdr workspace
 数は「project 1 + sublane host 1」の定数 (lane 数に比例しない。owner 裁定: #13377
 description / #13081)。host は最初の lane 作成時に on demand で mint され (operator
-可読 label 付き、label は join key ではない)、lane ゼロで herdr が自動 close する
-(実測、#13380)。tmux 側の `(workspace_id, lane_id)` unit 概念がそのまま herdr の
+可読 label 付き、label は join key ではない)、laneゼロでもterminal generationへ束縛
+できないbase rootはcosmetic residueとして保存する (#15227)。tmux 側の
+`(workspace_id, lane_id)` unit 概念がそのまま herdr の
 route / projection identity になるため、`shared` 既定は herdr では表示 policy で
 あると同時に配置の実装既定でもある。`separate` opt-in は tmux window 配置の knob
 であり、herdr 側に per-lane workspace を復活させる knob ではない。
@@ -133,8 +134,8 @@ split pair として並置する (`herdr tab create --workspace <host> --label <
 実測済み、#13411 で採用)。tab は live inventory の `tab_id` のみを join authority と
 し、label は cosmetic (lane key 由来、join key ではない)。fresh lane は tab を mint、
 heal / 混在 adopt+launch は生存 slot の `tab_id` を読んで**同一 tab へ復帰** (pair 不
-分裂)。tab root pane は #13330 の base pane と同型で全 launch 成功後に reclaim し、
-tab 内最終 pane close で tab は herdr が自動消滅させる (workspace 自動消滅と対称)。
+分裂)。tab root pane は #13330 の base pane と同型でgeneration-bound private pinを
+持たないためlocator-only closeを行わず、cosmetic residueとして保存する。
 identity model (`mzb1_<project-ws>_<role>_<lane>`) / route authority / projection は
 不変で、細分化されるのは herdr 上の**配置**のみ。#13380 以前に loose pane として
 起動された legacy lane は heal でも loose のまま (pair 不分裂優先)、full relaunch で

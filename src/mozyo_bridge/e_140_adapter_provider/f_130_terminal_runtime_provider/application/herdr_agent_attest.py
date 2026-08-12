@@ -63,9 +63,11 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
+    AGENT_KEY_TERMINAL_ID,
     DEFAULT_LANE,
     _agent_locator,
     _norm,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
     _extract_list_rows,
@@ -92,6 +94,8 @@ SELF_LOOKUP_REASON_BINARY_UNRESOLVED = "binary_unresolved"
 SELF_LOOKUP_REASON_LIST_UNREADABLE = "list_unreadable"
 SELF_LOOKUP_REASON_ROW_ABSENT = "row_absent"
 SELF_LOOKUP_REASON_ROW_AMBIGUOUS = "row_ambiguous"
+SELF_LOOKUP_REASON_TERMINAL_ID_MISSING = "terminal_id_missing"
+SELF_LOOKUP_REASON_TERMINAL_ID_MALFORMED = "terminal_id_malformed"
 
 #: The attestation write did not happen because no exact locator was resolved (Redmine
 #: #14231 coordinator interpretation j#84865). Distinct from a store write that RAISED:
@@ -159,33 +163,49 @@ def _build_event_appender(action_id: str, *, participant: str = ""):
     return _append
 
 
-def _match_own_locator(
+def _match_own_identity(
     assigned_name: str, rows: Optional[Sequence[Mapping[str, object]]]
-) -> tuple[str, str]:
-    """Pick THIS agent's locator out of one ``agent list`` payload (pure, never raises).
+) -> tuple[str, str, str]:
+    """Pick THIS agent's locator and terminal id from one inventory snapshot.
 
     Returns ``(locator, reason)`` — exactly one is non-empty. ``rows is None`` is an
     unreadable read (:data:`SELF_LOOKUP_REASON_LIST_UNREADABLE`), zero matches is
     :data:`SELF_LOOKUP_REASON_ROW_ABSENT` (herdr may not have surfaced the just-started
     agent yet — the ONLY retryable case), more than one is
     :data:`SELF_LOOKUP_REASON_ROW_AMBIGUOUS`, and an exactly-one match carrying an empty
-    locator is ``row_absent`` too (a row without a locator identifies nothing).
+    locator is ``row_absent`` too (a row without a locator identifies nothing). The
+    unique row must also carry a canonical server-owned terminal id; absence and
+    malformed evidence are separate value-free failures.
     """
     if rows is None:
-        return "", SELF_LOOKUP_REASON_LIST_UNREADABLE
+        return "", "", SELF_LOOKUP_REASON_LIST_UNREADABLE
     matches = [
         row
         for row in rows
         if isinstance(row, Mapping) and _norm(row.get(AGENT_KEY_NAME)) == assigned_name
     ]
     if len(matches) > 1:
-        return "", SELF_LOOKUP_REASON_ROW_AMBIGUOUS
+        return "", "", SELF_LOOKUP_REASON_ROW_AMBIGUOUS
     if not matches:
-        return "", SELF_LOOKUP_REASON_ROW_ABSENT
+        return "", "", SELF_LOOKUP_REASON_ROW_ABSENT
     locator = _norm(_agent_locator(matches[0]))
     if not locator:
-        return "", SELF_LOOKUP_REASON_ROW_ABSENT
-    return locator, ""
+        return "", "", SELF_LOOKUP_REASON_ROW_ABSENT
+    locator_claims = [
+        row
+        for row in rows
+        if isinstance(row, Mapping) and _norm(_agent_locator(row)) == locator
+    ]
+    if len(locator_claims) != 1 or locator_claims[0] is not matches[0]:
+        return "", "", SELF_LOOKUP_REASON_ROW_AMBIGUOUS
+    terminal_id = matches[0].get(AGENT_KEY_TERMINAL_ID)
+    if terminal_id is None or terminal_id == "":
+        return "", "", SELF_LOOKUP_REASON_TERMINAL_ID_MISSING
+    if type(terminal_id) is not str or terminal_id.strip() != terminal_id:
+        return "", "", SELF_LOOKUP_REASON_TERMINAL_ID_MALFORMED
+    if terminal_identity_of_live_slot(assigned_name, locator, rows) is None:
+        return "", "", SELF_LOOKUP_REASON_ROW_AMBIGUOUS
+    return locator, terminal_id, ""
 
 
 def bounded_self_lookup(
@@ -195,10 +215,10 @@ def bounded_self_lookup(
     runner=None,
     monotonic=None,
     total_budget_seconds: float = SELF_LOOKUP_TOTAL_BUDGET_SECONDS,
-) -> tuple[str, str, str]:
+) -> tuple[str, str, str, str]:
     """Resolve THIS agent's live locator under a total wall-clock budget (never raises).
 
-    Returns ``(locator, stage, bounded_reason)`` where ``stage`` is one of
+    Returns ``(locator, terminal_id, stage, bounded_reason)`` where ``stage`` is one of
     :data:`STAGE_SELF_LOOKUP_SUCCEEDED` / :data:`STAGE_SELF_LOOKUP_TIMED_OUT` /
     :data:`STAGE_SELF_LOOKUP_FAILED` and ``bounded_reason`` is a closed
     ``SELF_LOOKUP_REASON_*`` token (empty on success).
@@ -237,13 +257,13 @@ def bounded_self_lookup(
     try:
         binary = resolve_herdr_binary(env).path
     except TerminalTransportError:
-        return "", STAGE_SELF_LOOKUP_FAILED, SELF_LOOKUP_REASON_BINARY_UNRESOLVED
+        return "", "", STAGE_SELF_LOOKUP_FAILED, SELF_LOOKUP_REASON_BINARY_UNRESOLVED
 
     last_reason = SELF_LOOKUP_REASON_ROW_ABSENT
     while True:
         remaining = deadline - clock()
         if remaining <= 0:
-            return "", STAGE_SELF_LOOKUP_TIMED_OUT, last_reason
+            return "", "", STAGE_SELF_LOOKUP_TIMED_OUT, last_reason
         # Cap each attempt's own timeout to the remaining budget so no single call can
         # outlive it; never exceed the shared command timeout either.
         attempt_timeout = min(remaining, float(COMMAND_TIMEOUT_SECONDS))
@@ -266,12 +286,12 @@ def bounded_self_lookup(
                 if getattr(completed, "returncode", 1) == 0
                 else None
             )
-        locator, reason = _match_own_locator(assigned_name, rows)
+        locator, terminal_id, reason = _match_own_identity(assigned_name, rows)
         if locator:
-            return locator, STAGE_SELF_LOOKUP_SUCCEEDED, ""
+            return locator, terminal_id, STAGE_SELF_LOOKUP_SUCCEEDED, ""
         if reason != SELF_LOOKUP_REASON_ROW_ABSENT:
             # Not a registration-lag case; a retry inside this budget cannot change it.
-            return "", STAGE_SELF_LOOKUP_FAILED, reason
+            return "", "", STAGE_SELF_LOOKUP_FAILED, reason
         last_reason = reason
 
 
@@ -343,7 +363,7 @@ def perform_self_attestation(
             )
             return None
     lookup_name = observed_native or assigned_name
-    locator, stage, reason = bounded_self_lookup(
+    locator, terminal_id, stage, reason = bounded_self_lookup(
         lookup_name,
         env,
         runner=runner,
@@ -425,6 +445,7 @@ def perform_self_attestation(
         observed_at=now,
         replacement_action_id=_norm(replacement_action_id),
         lane_epoch=observed_epoch,
+        terminal_id=terminal_id,
     )
     persisted = record_identity_attestation(record, home=home)
     if persisted is None:

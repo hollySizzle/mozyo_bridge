@@ -836,9 +836,10 @@ def process_generation_of_locator(
     as a conservative mutation fence, not as identity proof.
 
     A successful token is an injective length-prefixed encoding of
-    ``(assigned_name, terminal_id, locator, row_revision)``. It is opaque: telemetry
-    may persist or render the complete token for exact comparison, but consumers must
-    not parse it or treat it as durable process identity. Missing or malformed terminal-
+    ``(assigned_name, terminal_id, locator, row_revision)``. It is private, opaque
+    action-time evidence: public telemetry, logs, errors, and dataclass reprs must not
+    persist or render it. Consumers must not parse it or treat it as durable process
+    identity. Missing or malformed terminal-
     id or revision evidence fails closed. A terminal id must be an exact, non-blank JSON
     string with no surrounding whitespace. Herdr exposes revision as a non-negative
     JSON integer, so strings, booleans, floats, and negative integers are rejected
@@ -851,8 +852,11 @@ def process_generation_of_locator(
     name and locator are unchanged; revision-only drift may conservatively withhold an
     otherwise safe resend, which is preferable to sending on incomplete evidence.
     """
-    wanted = _norm(locator)
-    if not wanted:
+    if type(locator) is not str or not locator or locator.strip() != locator:
+        return None
+    wanted = locator
+    agents = tuple(agents)
+    if not terminal_identity_snapshot_complete(agents):
         return None
     matches = [
         agent
@@ -875,6 +879,14 @@ def process_generation_of_locator(
         or revision < 0
     ):
         return None
+    terminal_claims = [
+        agent
+        for agent in agents
+        if isinstance(agent, Mapping)
+        and agent.get(AGENT_KEY_TERMINAL_ID) == terminal_id
+    ]
+    if len(terminal_claims) != 1:
+        return None
     return (
         f"{len(assigned_name)}:{assigned_name}:"
         f"{len(terminal_id)}:{terminal_id}:"
@@ -890,6 +902,16 @@ def _agent_locator(agent: Mapping[str, object]) -> str:
     if not locator:
         locator = _norm(agent.get(AGENT_KEY_LOCATOR_ALIAS_2))
     return locator
+
+
+# Compatibility re-export: authority callers keep the established import path while
+# the terminal-identity policy lives in a focused module below the health ceiling.
+from .herdr_terminal_identity import (  # noqa: E402
+    terminal_identity_of_live_slot,
+    terminal_identity_of_locator,
+    terminal_identity_of_row,
+    terminal_identity_snapshot_complete,
+)
 
 
 __all__ = (
@@ -931,5 +953,9 @@ __all__ = (
     "encode_field",
     "occupant_of_locator",
     "process_generation_of_locator",
+    "terminal_identity_of_locator",
+    "terminal_identity_of_live_slot",
+    "terminal_identity_of_row",
+    "terminal_identity_snapshot_complete",
     "rebind_by_name",
 )

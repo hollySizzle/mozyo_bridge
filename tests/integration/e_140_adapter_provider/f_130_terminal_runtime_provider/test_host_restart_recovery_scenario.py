@@ -119,6 +119,7 @@ class HostRestartRecoveryScenarioTest(unittest.TestCase):
                 role="claude",
                 lane_id=LANE,
                 locator="w19:p4",
+                terminal_id="terminal:w19:p4",
                 verdict=VERDICT_PRESENT,
                 observed_at="2026-07-12T00:00:00+00:00",
             )
@@ -142,11 +143,13 @@ class HostRestartRecoveryScenarioTest(unittest.TestCase):
                     {
                         "name": encode_assigned_name(ws, "codex", LANE),
                         "pane_id": "w19:p3",
+                        "terminal_id": "terminal:w19:p3",
                         "agent_status": "unknown",
                     },
                     {
                         "name": encode_assigned_name(ws, "claude", LANE),
                         "pane_id": "w19:p4",
+                        "terminal_id": "terminal:w19:p4",
                         "agent": "claude",
                         "agent_status": "idle",
                     },

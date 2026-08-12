@@ -65,6 +65,7 @@ def run_guarded_retire_close(
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
         ACTUATION_CLOSED,
+        ACTUATION_BLOCKED,
         REASON_INVENTORY_UNREADABLE,
         REASON_LANE_TARGET_UNRESOLVED,
         REASON_NO_WORKTREE_ANCHOR,
@@ -75,6 +76,8 @@ def run_guarded_retire_close(
         decide_retire_actuation,
         execute_herdr_retire_close,
         expected_live_slots,
+        HerdrRetireCloseResult,
+        RetireActuation,
         plan_herdr_retire_close,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
@@ -86,6 +89,9 @@ def run_guarded_retire_close(
         HerdrSessionStartError,
         herdr_workspace_segment,
     )
+    from mozyo_bridge.shared.paths import mozyo_bridge_home
+
+    store_home = Path(getattr(args, "home", None) or mozyo_bridge_home())
 
     if not repo_backend_is_herdr(repo_root):
         return None
@@ -106,7 +112,7 @@ def run_guarded_retire_close(
     try:
         resolved_worktree = Path(worktree).expanduser().resolve()
         workspace_id = herdr_workspace_segment(
-            resolved_worktree, home=getattr(args, "home", None)
+            resolved_worktree, home=store_home
         )
     except (OSError, ValueError) as exc:
         return blocked_actuation(
@@ -171,7 +177,7 @@ def run_guarded_retire_close(
             worktree_identity=metadata_token,
             expected_generation=getattr(evidence_target, "lane_generation", None),
             expected_revision=getattr(evidence_target, "revision", None),
-            home=getattr(args, "home", None),
+            home=store_home,
         )
 
     # The owner / worktree axes run FIRST so their precise #13754 diagnoses survive: a lane with
@@ -208,13 +214,13 @@ def run_guarded_retire_close(
         )
     try:
         rows = list_herdr_agent_rows(os.environ)
-    except HerdrSessionStartError as exc:
+    except HerdrSessionStartError:
         # An unreadable inventory is NOT an empty one: folding it to "nothing live" is
         # how an unreadable runtime became a successful retire (Redmine #13682 R1-F1
         # pins the same distinction for hibernate).
         return blocked_actuation(
             REASON_INVENTORY_UNREADABLE,
-            detail=f"live herdr inventory unreadable ({exc}); liveness cannot be measured",
+            detail="live herdr inventory unreadable; liveness cannot be measured",
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
@@ -253,13 +259,6 @@ def run_guarded_retire_close(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    plan = plan_herdr_retire_close(
-        rows,
-        workspace_id=workspace_id,
-        lane_id=lane_label,
-        legacy_workspace_id=legacy_token,
-        managed_roles=managed_roles,
-    )
     # THE COMMIT POINT (review j#91896 finding 1). The attestation above ran before the inventory
     # read and the plan; everything between is a window in which the row can advance a generation
     # or be recreated. Re-reading it here — immediately before the only destructive call — is what
@@ -270,7 +269,89 @@ def run_guarded_retire_close(
         return blocked_actuation(
             reason, detail=detail, workspace_id=workspace_id, lane_id=lane_label
         )
-    result = execute_herdr_retire_close(plan)
+    try:
+        close_rows = tuple(list_herdr_agent_rows(os.environ))
+    except HerdrSessionStartError:
+        return blocked_actuation(
+            REASON_INVENTORY_UNREADABLE,
+            detail="destructive-edge live inventory unreadable; zero-close",
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        AGENT_KEY_NAME, _agent_locator, _norm,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_terminal_identity import terminal_identity_snapshot_complete  # noqa: E501
+    from .herdr_destructive_close_identity import current_generation_release_pins
+
+    if not terminal_identity_snapshot_complete(close_rows):
+        return blocked_actuation(
+            REASON_INVENTORY_UNREADABLE,
+            detail="destructive-edge live inventory is incomplete; zero-close",
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
+    plan = plan_herdr_retire_close(
+        close_rows,
+        workspace_id=workspace_id,
+        lane_id=lane_label,
+        legacy_workspace_id=legacy_token,
+        managed_roles=managed_roles,
+    )
+    targets = []
+    for role, locator in plan.close_targets:
+        matching = [
+            row for row in close_rows
+            if _agent_locator(row) == locator and _norm(row.get(AGENT_KEY_NAME))
+        ]
+        if len(matching) != 1:
+            return blocked_actuation(
+                REASON_INVENTORY_UNREADABLE,
+                detail="destructive-edge target identity is ambiguous; zero-close",
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+            )
+        targets.append((role, _norm(matching[0].get(AGENT_KEY_NAME)), locator))
+    generation_pins = current_generation_release_pins(
+        close_rows,
+        home=store_home,
+        workspace_id=workspace_id,
+        lane_id=lane_label,
+        targets=tuple(targets),
+    )
+    if generation_pins is None:
+        return blocked_actuation(
+            REASON_INVENTORY_UNREADABLE,
+            detail="destructive-edge current-generation proof is incomplete; zero-close",
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+        )
+    try:
+        raw_result = execute_herdr_retire_close(plan)
+    except Exception:  # noqa: BLE001 - provider detail is never rendered
+        raw_result = HerdrRetireCloseResult(
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            failed=tuple((role, locator, "close_failed") for role, locator in plan.close_targets),
+        )
+    result = HerdrRetireCloseResult(
+        workspace_id=workspace_id,
+        lane_id=lane_label,
+        closed=raw_result.closed,
+        failed=tuple((role, locator, "close_failed") for role, locator, _ in raw_result.failed),
+        foreign_names=plan.foreign_names,
+    )
+    try:
+        post_rows = tuple(list_herdr_agent_rows(os.environ))
+        from .herdr_destructive_close_identity import pinned_generations_absent
+        absence_proven = terminal_identity_snapshot_complete(
+            post_rows
+        ) and pinned_generations_absent(
+            generation_pins, post_rows, home=store_home,
+            workspace_id=workspace_id, lane_id=lane_label,
+        )
+    except Exception:  # noqa: BLE001 - unreadable is not absence
+        absence_proven = False
     # The zero-close fence (Redmine #13754): a close that closed nothing is a retire ONLY
     # when both authorities agree the lane is gone — the durable lifecycle records it
     # retired (read fail-closed) AND the live inventory shows zero expected managed slots.
@@ -279,9 +360,20 @@ def run_guarded_retire_close(
         result,
         expected_live=expected_live_slots(rows, plan, managed_roles=managed_roles),
         already_retired=lane_retired_durably(
-            workspace_id, lane_label, home=getattr(args, "home", None)
+            workspace_id, lane_label, home=store_home
         ),
     )
+    if actuation.state == ACTUATION_CLOSED and not absence_proven:
+        return RetireActuation(
+            state=ACTUATION_BLOCKED,
+            reason=REASON_INVENTORY_UNREADABLE,
+            detail="close ran but fresh full-snapshot target absence is unproven",
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            closed=result.closed,
+            failed=result.failed,
+            foreign_names=result.foreign_names,
+        )
     if actuation.state == ACTUATION_CLOSED:
         # A real close is what makes the lane retired; record that fact in the durable
         # lifecycle so the NEXT run can prove the idempotent no-op instead of guessing it
@@ -293,7 +385,7 @@ def run_guarded_retire_close(
                 lane_label=lane_label,
                 issue=getattr(args, "issue", "") or "",
                 journal=getattr(args, "journal", "") or "",
-                home=getattr(args, "home", None),
+                home=store_home,
             ),
         )
         # Best-effort lane metadata tombstone (Redmine #13356 j#73386 Q2): the retire
@@ -307,7 +399,7 @@ def run_guarded_retire_close(
         # lifecycle disposition recorded above.
         from mozyo_bridge.core.state.lane_metadata import record_lane_retired
 
-        record_lane_retired(metadata_token, home=getattr(args, "home", None))
+        record_lane_retired(metadata_token, home=store_home)
     return actuation
 
 

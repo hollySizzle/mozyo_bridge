@@ -108,6 +108,9 @@ class _FakeOps:
     def read_inventory(self):
         return [], True
 
+    def live_rows(self):
+        return []
+
     def read_attestation(self, assigned_name):
         return None
 

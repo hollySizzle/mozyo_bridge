@@ -19,7 +19,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
-OFFLINE_ROLLOUT_PLAN_SCHEMA_VERSION = 3
+OFFLINE_ROLLOUT_PLAN_SCHEMA_VERSION = 4
 
 PLAN_READY = "planned"
 PLAN_REFUSED = "refused"
@@ -37,13 +37,16 @@ REASON_SUPERVISOR_SET_INVALID = "supervisor_set_invalid"
 
 STORE_ATTESTATION = "attestation"
 STORE_LANE_LIFECYCLE = "lane_lifecycle"
+STORE_LAUNCH_GENERATION = "launch_generation"
 STORE_STARTUP_TRANSACTION = "startup_transaction"
 STORE_NAMES = frozenset(
-    {STORE_ATTESTATION, STORE_LANE_LIFECYCLE, STORE_STARTUP_TRANSACTION}
+    {STORE_ATTESTATION, STORE_LANE_LIFECYCLE, STORE_LAUNCH_GENERATION,
+     STORE_STARTUP_TRANSACTION}
 )
 STORE_TARGET_VERSIONS = {
-    STORE_ATTESTATION: 3,
-    STORE_LANE_LIFECYCLE: 10,
+    STORE_ATTESTATION: 4,
+    STORE_LANE_LIFECYCLE: 11,
+    STORE_LAUNCH_GENERATION: 2,
     STORE_STARTUP_TRANSACTION: 2,
 }
 
@@ -485,12 +488,18 @@ def _validate_capture(capture: OfflineRolloutCapture) -> Optional[OfflineRollout
 
     stores = {store.name: store for store in capture.stores}
     if len(stores) != len(capture.stores) or set(stores) != STORE_NAMES:
-        return refused(REASON_STORE_SET_INVALID, "three_store_set_required")
+        return refused(REASON_STORE_SET_INVALID, "four_store_set_required")
     for store in stores.values():
         if store.state not in _ADMISSIBLE_STORE_STATES:
             return refused(REASON_STORE_UNREADABLE, store.name)
         if store.state == STORE_RECOGNIZED and (
             not isinstance(store.version, int) or isinstance(store.version, bool)
+        ):
+            return refused(REASON_STORE_UNREADABLE, store.name)
+        if (
+            store.name == STORE_LAUNCH_GENERATION
+            and store.state == STORE_RECOGNIZED
+            and store.version not in (1, 2)
         ):
             return refused(REASON_STORE_UNREADABLE, store.name)
         if store.state == STORE_ABSENT and store.version is not None:
@@ -611,9 +620,10 @@ def build_offline_rollout_plan(
             {"phase": "top_workspace_stop", "assigned_names": [top_name]},
             {"phase": "consumer_zero", "required_readback": "zero"},
             {"phase": "verified_backup", "stores": sorted(stores)},
-            {"phase": "migrate_attestation", "target_version": 3},
-            {"phase": "migrate_lane_lifecycle", "target_version": 10},
+            {"phase": "migrate_attestation", "target_version": 4},
+            {"phase": "migrate_lane_lifecycle", "target_version": 11},
             {"phase": "migrate_startup_transaction", "target_version": 2},
+            {"phase": "rebuild_launch_generation", "target_version": 2},
             {"phase": "exact_runtime_install"},
             {
                 "phase": "legacy_lane_epoch_adoption",
@@ -665,6 +675,7 @@ __all__ = (
     "OfflineRolloutCapture",
     "OfflineRolloutPlanResult",
     "StoreSnapshot",
+    "STORE_LAUNCH_GENERATION",
     "SupervisorAgentSnapshot",
     "TopIdentitySnapshot",
     "WorkspaceSnapshot",

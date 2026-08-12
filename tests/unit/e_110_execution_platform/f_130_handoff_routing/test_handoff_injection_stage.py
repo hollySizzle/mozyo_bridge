@@ -162,9 +162,8 @@ class InjectionStageTruthTableTest(unittest.TestCase):
         self.assertEqual(injection_stage_for(" sent ", " ok "), STAGE_SUBMITTED_CONFIRMED)
 
 
-#: A generation-coherent gateway binding, in the shape `observe_queue_enter_gateway_binding`
-#: returns. The rail writes it together with `event_wait_kind` ONLY when the pre-arm and
-#: post-collect generations match, so its presence is what makes the wait attributable.
+#: The redaction-safe public projection emitted after the private terminal-aware
+#: pre-arm/post-collect comparison succeeds.
 _BINDING_NAME = "mzb1_ws_codex_lane"
 _BINDING_TERMINAL = "terminal-test"
 _BINDING_LOCATOR = "w4B:p4T"
@@ -173,13 +172,7 @@ _BINDING = {
     "provider": "codex",
     "assigned_name": _BINDING_NAME,
     "locator": _BINDING_LOCATOR,
-    "terminal_id": _BINDING_TERMINAL,
     "row_revision": _BINDING_REVISION,
-    "process_generation": (
-        f"{len(_BINDING_NAME)}:{_BINDING_NAME}:"
-        f"{len(_BINDING_TERMINAL)}:{_BINDING_TERMINAL}:"
-        f"{len(_BINDING_LOCATOR)}:{_BINDING_LOCATOR}:r{_BINDING_REVISION}"
-    ),
     "attestation_observed_at": "2026-07-29T20:10:01+00:00",
     "startup_action_id": "startup-abc",
 }

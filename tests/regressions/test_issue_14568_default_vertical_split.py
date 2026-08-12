@@ -245,7 +245,7 @@ class ProductDefaultPolicyTest(unittest.TestCase):
 
 
 class UndeclaredPairLandsVerticalTest(unittest.TestCase):
-    """The close conditions at the LAYOUT layer, after the root-pane reclaim."""
+    """The close conditions at the layout layer with an unbound root preserved."""
 
     def test_undeclared_default_pair_is_down_with_codex_on_top(self) -> None:
         herdr = _LayoutHerdr(created_workspace="wZ")
@@ -255,7 +255,7 @@ class UndeclaredPairLandsVerticalTest(unittest.TestCase):
             _, _, panes = _prepare(
                 tmp, herdr=herdr, providers=["claude", "codex"], lane=""
             )
-        self.assertTrue(herdr.pane_closes, "the root pane must still be reclaimed")
+        self.assertEqual(herdr.pane_closes, [], "an unbound root has no close authority")
         self.assertEqual(herdr.direction_between(panes["codex"], panes["claude"]), "down")
         self.assertEqual(_launched_role(herdr.start_argvs[0]), "codex")
 
@@ -383,14 +383,15 @@ class RollbackAndSafetyContractsTest(unittest.TestCase):
         self.assertNotIn("--focus", split)
         self.assertEqual(herdr.pane_closes, [])
 
-    def test_an_undeclared_fresh_pair_still_reclaims_the_root_pane(self) -> None:
+    def test_an_undeclared_fresh_pair_preserves_the_unbound_root_pane(self) -> None:
         herdr = _Herdr(created_workspace="wZ")
         with tempfile.TemporaryDirectory() as tmp:
             result, _, _ = _prepare(
                 tmp, herdr=herdr, providers=["codex", "claude"], lane=""
             )
-        self.assertEqual(herdr.pane_closes, [["pane", "close", "wZ:p1"]])
-        self.assertTrue(result.base_pane_reclaimed)
+        self.assertEqual(herdr.pane_closes, [])
+        self.assertFalse(result.base_pane_reclaimed)
+        self.assertIn("generation_unproven_root_preserved", result.base_pane_detail)
 
     def test_a_failing_launch_still_fails_closed_and_leaves_the_root_pane(self) -> None:
         # The product default runs before the first launch and must not disturb the

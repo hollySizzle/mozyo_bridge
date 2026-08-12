@@ -81,6 +81,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
     lane_root_identity,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
@@ -298,6 +299,7 @@ def _resolve_attested_slot(
     join = evaluate_attestation(
         record,
         live_locator=locator,
+        live_terminal_id=terminal_identity_of_live_slot(assigned_name, locator, rows),
         expected_workspace_id=workspace_id,
         expected_role=provider,
         expected_lane=lane_id,

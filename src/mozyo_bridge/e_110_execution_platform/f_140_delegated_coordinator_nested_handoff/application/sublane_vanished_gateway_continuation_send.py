@@ -92,6 +92,7 @@ class VanishedGatewaySendAuthority:
     fresh_locator: str
     old_locator: str
     observed_at: str
+    startup_action_id: str
     revision: int
 
 
@@ -252,6 +253,22 @@ class VanishedGatewayContinuationOps:
         )
         if not root_ok:
             return None
+        from .herdr_live_attestation_time import fresh_attestation_identity
+        boundary = fresh_attestation_identity(
+            home=None,
+            rows=rows,
+            assigned_name=inventory.assigned_name,
+            workspace_id=inventory.workspace_id,
+            role=inventory.provider,
+            lane=inventory.lane_id,
+        )
+        if (
+            boundary is None
+            or boundary.locator != inventory.fresh_locator
+            or boundary.observed_at != evidence.observed_at
+            or boundary.row_revision != str(revision)
+        ):
+            return None
         return VanishedGatewaySendAuthority(
             action_id=axes[0],
             workspace_id=axes[1],
@@ -261,6 +278,7 @@ class VanishedGatewayContinuationOps:
             fresh_locator=axes[5],
             old_locator=axes[6],
             observed_at=axes[7],
+            startup_action_id=boundary.startup_action_id,
             revision=revision,
         )
 

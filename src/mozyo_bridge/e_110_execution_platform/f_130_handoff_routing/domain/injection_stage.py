@@ -263,9 +263,7 @@ _BINDING_FIELDS: tuple[str, ...] = (
     "provider",
     "assigned_name",
     "locator",
-    "terminal_id",
     "row_revision",
-    "process_generation",
     "attestation_observed_at",
     "startup_action_id",
 )
@@ -279,8 +277,12 @@ _QUEUE_ENTER_CAUSAL_BASELINE_STATES: frozenset[str] = frozenset(
 
 
 def canonical_queue_enter_generation_binding(binding: object) -> bool:
-    """Whether ``binding`` is the current terminal-aware producer shape."""
+    """Whether ``binding`` is the redaction-safe public producer shape."""
     if not isinstance(binding, dict):
+        return False
+    if not set(_BINDING_FIELDS).issubset(binding):
+        return False
+    if {"terminal_id", "process_generation"}.intersection(binding):
         return False
     for field in _BINDING_FIELDS:
         value = binding.get(field)
@@ -293,15 +295,7 @@ def canonical_queue_enter_generation_binding(binding: object) -> bool:
         return False
     if len(revision) > 1 and revision.startswith("0"):
         return False
-    assigned_name = binding["assigned_name"]
-    terminal_id = binding["terminal_id"]
-    locator = binding["locator"]
-    expected_generation = (
-        f"{len(assigned_name)}:{assigned_name}:"
-        f"{len(terminal_id)}:{terminal_id}:"
-        f"{len(locator)}:{locator}:r{revision}"
-    )
-    return binding["process_generation"] == expected_generation
+    return True
 
 
 def canonical_v2_generation_binding(observation: object) -> bool:

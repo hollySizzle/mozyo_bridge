@@ -1373,7 +1373,11 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         self.assertEqual(obs.get("first_event_wait_kind"), "timeout", msg=out)
         self.assertEqual(obs.get("final_event_wait_kind"), "changed", msg=out)
         self.assertEqual(obs.get("event_wait_kind"), "changed", msg=out)
-        self.assertEqual(obs.get("gateway_binding"), binding, msg=out)
+        self.assertEqual(
+            obs.get("gateway_binding"),
+            {k: v for k, v in binding.items() if k not in {"terminal_id", "process_generation"}},
+            msg=out,
+        )
         self.assertIsNone(outcome.get("turn_start_outcome"), msg=out)
 
     def test_busy_snapshot_without_causal_authority_is_non_success(self) -> None:

@@ -12,7 +12,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Sequence
+from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.core.state.coordinator_placement_fence import (
     CoordinatorSharedCreateLockUnavailable,
@@ -291,6 +291,7 @@ def _resolve_project_coordinator_workspace_under_lock(
     runner,
     timeout: float,
     env: Mapping[str, str],
+    effect_fence: Optional[Callable[[], None]] = None,
 ) -> SharedProjectCoordinatorWorkspace:
     """Resolve/create while the session or public wrapper owns the shared fence."""
     own_target = _shared_project_coordinator_own_target(
@@ -316,6 +317,7 @@ def _resolve_project_coordinator_workspace_under_lock(
         timeout,
         env,
         label=PROJECT_COORDINATOR_WORKSPACE_LABEL,
+        effect_fence=effect_fence,
     )
     return SharedProjectCoordinatorWorkspace(target, base_pane)
 

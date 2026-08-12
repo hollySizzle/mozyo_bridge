@@ -6,6 +6,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -15,6 +16,8 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_COMPLETED_ROLLED_BACK,
+    PHASE_COMPLETED_SUCCESS,
+    PHASE_HEALTH_CHECK,
     PHASE_ROLLBACK_OWED,
     Participant,
     StartupTransactionBusy,
@@ -22,7 +25,13 @@ from mozyo_bridge.core.state.startup_transaction_fence import (
     StartupTransactionFence,
     StartupUnit,
 )
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+)
 from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
+from tests.support.current_launch_authority import seed_current_generation
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
@@ -75,7 +84,7 @@ class _Fence:
         self.outcomes = list(outcomes)
         self.record_calls = []
 
-    def reserve(self, _unit, _nonce):
+    def reserve(self, _unit, _nonce, **_kwargs):
         return self.action
 
     def record_participant(self, action_id, participant):
@@ -187,6 +196,28 @@ class StartupTransactionRecordLaunchTest(unittest.TestCase):
             recorded = fence.read(transaction.action_id)
             self.assertEqual(recorded.participant_for("codex").locator, "w1:p2")
 
+    def test_completion_fence_failure_leaves_health_nonterminal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fence = StartupTransactionFence(home=Path(directory))
+            transaction = StartupTransaction(
+                fence=fence,
+                unit=StartupUnit("workspace", "default", ("codex",)),
+                nonce="completion-fence",
+                completion_fence=lambda: (_ for _ in ()).throw(
+                    StartupTransactionError("generation remains pending")
+                ),
+            )
+            transaction.reserve()
+
+            with self.assertRaisesRegex(
+                StartupTransactionError, "generation remains pending"
+            ):
+                transaction.settle(owed=False, launched=True)
+
+            action = fence.read(transaction.action_id)
+            self.assertEqual(action.phase, PHASE_HEALTH_CHECK)
+            self.assertNotEqual(action.phase, PHASE_COMPLETED_SUCCESS)
+
 
 class _PreparedRollbackOps:
     def __init__(
@@ -196,6 +227,8 @@ class _PreparedRollbackOps:
         remove_after_close=True,
         agent_rows=(),
         conditional_close_supported=True,
+        terminal_reclaimed=False,
+        reclaim_after_close=False,
     ) -> None:
         self.observation = observation
         self.remove_after_close = remove_after_close
@@ -206,6 +239,8 @@ class _PreparedRollbackOps:
         self.agent_close_checks = []
         self.swap_terminal_before_agent_close = ""
         self._conditional_close_supported = conditional_close_supported
+        self.terminal_reclaimed = terminal_reclaimed
+        self.reclaim_after_close = reclaim_after_close
 
     def supports_conditional_close(self):
         return self._conditional_close_supported
@@ -259,9 +294,16 @@ class _PreparedRollbackOps:
             self.rows = []
         return True, ""
 
-    def prepared_pane(self, *, locator, workspace_id, tab_id):
+    def prepared_pane(
+        self, *, locator, workspace_id, tab_id, expected_terminal_id=""
+    ):
         self.prepared_calls.append((locator, workspace_id, tab_id))
-        return self.observation
+        return replace(
+            self.observation,
+            terminal_reclaimed=(
+                self.terminal_reclaimed if expected_terminal_id else None
+            ),
+        )
 
     def close_prepared_pane(
         self,
@@ -276,6 +318,8 @@ class _PreparedRollbackOps:
         )
         if self.remove_after_close:
             self.observation = PreparedPaneObservation(state=PREPARED_PANE_ABSENT)
+        if self.reclaim_after_close:
+            self.terminal_reclaimed = True
         return True, ""
 
 
@@ -300,6 +344,31 @@ def _rollback_action(home: Path, receipt: str):
     )
     fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
     return fence, action.action_id
+
+
+def _seed_rollback_current_authority(home: Path, action_id: str) -> None:
+    seed_current_generation(
+        home,
+        workspace_id="logical-workspace",
+        lane_id="default",
+        role="codex",
+        assigned_name=LOGICAL_NAME,
+        locator="w1:p2",
+        action_id=action_id,
+        terminal_id="terminal-A",
+    )
+    HerdrIdentityAttestationStore(home=home).upsert(
+        IdentityAttestationRecord(
+            assigned_name=LOGICAL_NAME,
+            workspace_id="logical-workspace",
+            role="codex",
+            lane_id="default",
+            locator="w1:p2",
+            verdict=VERDICT_PRESENT,
+            observed_at="2026-08-11T00:00:00+00:00",
+            terminal_id="terminal-A",
+        )
+    )
 
 
 class PaneBoundReceiptTest(unittest.TestCase):
@@ -382,6 +451,7 @@ class LivePreparedPaneObservationTest(unittest.TestCase):
                         "pane_id": "w1:p2",
                         "workspace_id": "w1",
                         "tab_id": "w1:t1",
+                        "terminal_id": "terminal-A",
                         "agent_status": "unknown",
                     }
                 ],
@@ -427,6 +497,7 @@ class LivePreparedPaneObservationTest(unittest.TestCase):
         self.assertTrue(observation.agent_absent)
         self.assertTrue(observation.shell_only)
         self.assertIsNone(observation.input_empty)
+        self.assertEqual(observation.terminal_id, "terminal-A")
         self.assertEqual(
             calls,
             [
@@ -598,6 +669,60 @@ class PreparedPaneRollbackTest(unittest.TestCase):
                 fence.read(action_id).phase, PHASE_COMPLETED_ROLLED_BACK
             )
 
+    def test_v2_absent_pane_terminal_reclaimed_elsewhere_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fence, action_id = _rollback_action(
+                Path(directory), self._receipt(terminal_id="terminal-A")
+            )
+            ops = _PreparedRollbackOps(
+                PreparedPaneObservation(state=PREPARED_PANE_ABSENT),
+                terminal_reclaimed=True,
+            )
+
+            result = run_session_rollback(
+                action_id=action_id, ops=ops, fence=fence, execute=True
+            )
+
+            self.assertEqual(result.state, "blocked")
+            self.assertEqual(ops.prepared_close_calls, [])
+            self.assertEqual(fence.read(action_id).phase, PHASE_ROLLBACK_OWED)
+
+    def test_prepared_close_terminal_reclaim_during_close_stays_incomplete(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fence, action_id = _rollback_action(
+                Path(directory), self._receipt(terminal_id="terminal-A")
+            )
+            ops = _PreparedRollbackOps(
+                self._present(input_empty=True, terminal_id="terminal-A"),
+                reclaim_after_close=True,
+            )
+
+            result = run_session_rollback(
+                action_id=action_id, ops=ops, fence=fence, execute=True
+            )
+
+            self.assertEqual(result.state, "incomplete")
+            self.assertEqual(fence.read(action_id).phase, PHASE_ROLLBACK_OWED)
+
+    def test_completed_v2_pane_reclaim_is_revalidated_and_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            fence, action_id = _rollback_action(
+                Path(directory), self._receipt(terminal_id="terminal-A")
+            )
+            fence.set_phase(action_id, PHASE_COMPLETED_ROLLED_BACK)
+            ops = _PreparedRollbackOps(
+                PreparedPaneObservation(state=PREPARED_PANE_ABSENT),
+                terminal_reclaimed=True,
+            )
+
+            result = run_session_rollback(
+                action_id=action_id, ops=ops, fence=fence, execute=True
+            )
+
+            self.assertFalse(result.ok)
+            self.assertEqual(result.state, "incomplete")
+            self.assertEqual(ops.prepared_close_calls, [])
+
     def test_present_prepared_shell_is_preserved_without_conditional_close(self):
         with tempfile.TemporaryDirectory() as directory:
             fence, action_id = _rollback_action(
@@ -642,6 +767,7 @@ class PreparedPaneRollbackTest(unittest.TestCase):
                     }
                 ],
             )
+            _seed_rollback_current_authority(Path(directory), action_id)
 
             result = run_session_rollback(
                 action_id=action_id, ops=ops, fence=fence, execute=True
@@ -794,6 +920,9 @@ class PreparedPaneRollbackTest(unittest.TestCase):
             self.assertEqual(result.state, "completed")
             self.assertEqual(ops.prepared_close_calls, [])
             self.assertEqual(ops.agent_close_calls, [])
+            self.assertEqual(
+                fence.read(action_id).phase, PHASE_COMPLETED_ROLLED_BACK
+            )
 
     def test_v2_receipt_terminal_replacement_blocks_without_close(self):
         logical_name = LOGICAL_NAME
@@ -815,6 +944,7 @@ class PreparedPaneRollbackTest(unittest.TestCase):
                     }
                 ],
             )
+            _seed_rollback_current_authority(Path(directory), action_id)
 
             result = run_session_rollback(
                 action_id=action_id, ops=ops, fence=fence, execute=True
@@ -849,6 +979,7 @@ class PreparedPaneRollbackTest(unittest.TestCase):
                     }
                 ],
             )
+            _seed_rollback_current_authority(Path(directory), action_id)
             ops.swap_terminal_before_agent_close = "terminal-B"
 
             result = run_session_rollback(
@@ -870,7 +1001,8 @@ class PreparedPaneRollbackTest(unittest.TestCase):
                 action_id=action_id, ops=ops, fence=fence, execute=True
             )
 
-            self.assertTrue(result.ok)
+            self.assertFalse(result.ok)
+            self.assertEqual(result.state, "blocked")
             self.assertEqual(ops.prepared_calls, [])
             self.assertEqual(ops.prepared_close_calls, [])
 

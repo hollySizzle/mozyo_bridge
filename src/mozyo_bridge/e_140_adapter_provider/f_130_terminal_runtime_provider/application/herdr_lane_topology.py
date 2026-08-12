@@ -183,9 +183,8 @@ def _launch_target_for_lane(
        cohabiting lanes are still alive.
     3. nothing pins one -> ``""``: the caller creates the workspace explicitly
        (the project workspace for the default lane, the labelled sublane host
-       for a lane slot). A lane-zero host cannot linger to be rejoined — herdr
-       auto-closes a workspace with its last pane (live-measured, #13380) — so
-       the next lane simply re-mints it on demand.
+       for a lane slot). A lane-zero host may retain an unbound cosmetic root;
+       that root cannot pin placement, so the next lane re-mints on demand.
 
     The default lane only ever joins its own pins (rule 1): the coordinator
     pair never lands in the sublane host, mirroring the separation.
@@ -676,16 +675,11 @@ def resolve_focus_first_launch(
     """True iff this run's FIRST launch must carry ``--focus`` (pure).
 
     The R1-F1 fix (review j#76613, Design Answer R1 j#76616). herdr splits a container's
-    ACTIVE pane and ``agent start`` has no pane-target flag, so when every launch is
-    ``--no-focus`` the container's empty ROOT pane stays active: the second slot's
-    ``--split <dir>`` splits the root rather than the first agent, and reclaiming the root
-    (after all launches, #13330) collapses that split away — leaving only the outer default
-    ``right`` split the first agent implicitly created. The intended direction silently
-    never applies (live-measured on BOTH the tab-less default pair and the lane tab: the
-    pre-#13646 ``--split right`` literal only *looked* correct because it coincides with
-    herdr's default direction, j#76622). Focusing the first launch pins the container's
-    split target to that agent, so the second slot splits the AGENT and the direction
-    survives the reclaim.
+    ACTIVE pane and ``agent start`` has no pane-target flag. With every launch
+    ``--no-focus``, the preserved empty root stays active and the second slot splits the
+    root instead of the first agent, so the managed pair never forms one independent
+    subtree. Focusing the first launch pins the split target to that agent; the second
+    slot then splits the AGENT while the unbound root remains outside the pair.
 
     The three conditions:
 
@@ -787,8 +781,8 @@ def slot_placement(
 
     ``focus`` is set on the FIRST launch into a fresh container when ``focus_first`` applies
     (see :func:`resolve_focus_first_launch`): that pins the container's split target to the
-    first agent so the later slots split the AGENT, not the empty root pane that would be
-    reclaimed out from under the split (R1-F1, j#76613 / j#76616). Only the first launch is
+    first agent so later slots split the AGENT, not the preserved empty root pane
+    (R1-F1, j#76613 / j#76616). Only the first launch is
     ever focused — a splitting slot never is.
 
     ``order_deferred`` (Design Answer j#76564 Q2) flags the one case the configured order
@@ -814,7 +808,7 @@ def _host_workspace_label(repo_root: Path) -> str:
     operator recognises — not the lane worktree's (whose basename carries the
     lane). Purely observability: every join decision keys on the live mzb1
     inventory, never on this label (a herdr label is neither unique nor durable
-    identity, and a lane-zero host auto-closes anyway).
+    identity, and a lane-zero cosmetic root may persist).
     """
     try:
         resolved = Path(repo_root).expanduser().resolve()
@@ -834,9 +828,10 @@ def _parse_workspace_created(stdout: object) -> Optional[tuple[str, str]]:
                     "workspace": {"workspace_id": "w3", ...},
                     "root_pane": {"pane_id": "w3:p1", ...}, ...}}
 
-    Every fresh workspace is born with exactly this ``root_pane`` — the empty base
-    shell #13330 reclaims. Returns ``None`` (so the caller fails closed and reclaims
-    nothing) when the payload is not JSON, not a ``workspace_created`` envelope, or
+    Every fresh workspace is born with exactly this ``root_pane``.  It is an exact
+    observation, not terminal-generation close authority, so #15227 preserves it.
+    Returns ``None`` (so the caller fails closed and closes nothing) when the payload
+    is not JSON, not a ``workspace_created`` envelope, or
     either id is missing / blank / malformed — never a guessed pane handle.
     """
     if not isinstance(stdout, str):
@@ -934,8 +929,8 @@ def _parse_tab_created(stdout: object) -> Optional[tuple[str, str]]:
                     "root_pane": {"pane_id": "w3:p2", ...}}}
 
     A freshly created tab is born with exactly this empty ``root_pane`` — the tab
-    analogue of the #13330 workspace base pane, reclaimed once the lane's agents
-    land. Returns ``None`` (so the caller fails closed and reclaims nothing) when
+    analogue of the #13330 workspace base pane, preserved because it has no terminal-
+    generation pin. Returns ``None`` (so the caller fails closed and closes nothing) when
     the payload is not JSON, not a ``tab_created`` envelope, or either id is
     missing / blank / malformed — never a guessed pane handle.
     """

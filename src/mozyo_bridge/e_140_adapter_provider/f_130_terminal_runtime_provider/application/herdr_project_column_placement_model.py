@@ -16,6 +16,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     governing_split,
     ratio_verdict,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_managed_column_scope import (  # noqa: E501
+    ManagedColumnScope,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_plan import (  # noqa: E501
     ProjectColumnPlan,
     UnitColumnKey,
@@ -152,7 +155,13 @@ def outer_ratio(
     target: float,
 ) -> tuple[bool, Optional[SplitInfo]]:
     column = evidence.by_key.get(key)
-    bounds = tab_bounds(evidence.layout)
+    scope_rect = evidence.managed_scope.bounds
+    bounds = (
+        scope_rect.x,
+        scope_rect.y,
+        scope_rect.x + scope_rect.width,
+        scope_rect.y + scope_rect.height,
+    )
     if column is None or bounds is None:
         return False, None
     rect = evidence.layout.panes.get(column.top.pane_id)
@@ -230,6 +239,7 @@ class ProjectColumnPlacementEvidence:
     columns: tuple[LiveUnitColumn, ...] = field(repr=False)
     layout: LayoutSnapshot = field(repr=False)
     plan: ProjectColumnPlan = field(repr=False)
+    managed_scope: ManagedColumnScope = field(repr=False)
 
     @property
     def current_order(self) -> tuple[UnitColumnKey, ...]:
@@ -254,6 +264,21 @@ class ProjectColumnPlacementEvidence:
                     for column in self.columns
                 ),
                 key=lambda item: (item[0], item[1], item[2]),
+            )
+        )
+
+    @property
+    def internal_topology_fingerprint(self) -> tuple[object, ...]:
+        """Unit pair membership and divider ratios, independent of column order."""
+        return tuple(
+            sorted(
+                (
+                    column.key,
+                    column.top.pane_id,
+                    column.lower.pane_id,
+                    column.internal_ratio,
+                )
+                for column in self.columns
             )
         )
 

@@ -490,7 +490,11 @@ class ReviewR2AdversarialTests(unittest.TestCase):
 
         ops.ledger = _Ledger()
         with patch.object(ops, "_providers", return_value=("claude", "codex")), \
-                patch.object(ops, "_same_lane_worker_locator", return_value="w:4"):
+                patch.object(ops, "_rows", return_value=()), \
+                patch.object(live_mod, "repo_scope_workspace_id", return_value="ws"), \
+                patch("mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_live_attestation_time.fresh_attestation_identity",
+                      return_value=SimpleNamespace(
+                          locator="w:4", matches_delivery=lambda record: True)):
             # Readable, no forward record -> absence positively confirmed.
             self.assertEqual(ops._expected_gate_facts(req), (False, True, True))
             # The exact-anchor worker-forward record lands.
@@ -519,7 +523,9 @@ class ReviewR2AdversarialTests(unittest.TestCase):
             self.assertEqual(ops._expected_gate_facts(req), (True, False, True))
         # An unresolvable same-lane worker is UNOBSERVABLE, never a guess.
         with patch.object(ops, "_providers", return_value=("claude", "codex")), \
-                patch.object(ops, "_same_lane_worker_locator", return_value=""):
+                patch.object(ops, "_rows", return_value=()), \
+                patch("mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_live_attestation_time.fresh_attestation_identity",
+                      return_value=None):
             self.assertEqual(ops._expected_gate_facts(req), (False, False, False))
 
 
@@ -585,6 +591,8 @@ class TurnStartAuthorityTests(unittest.TestCase):
             repo_root=self.repo, request=_request(gateway_revision="4"),
             attestation_home=self.attn_home,
         )
+        self.ops._rows = lambda: ({"name": "gw", "pane_id": "w:3",
+                                   "terminal_id": "terminal:w:3"},)
         # A REAL launch-generation store + startup-transaction fence (design j#87472: the
         # generation authority is an ATTESTED row whose token names a completed-success
         # startup transaction with this exact participant — not a mocked timestamp, and not
@@ -646,6 +654,7 @@ class TurnStartAuthorityTests(unittest.TestCase):
         store.finalize(
             assigned_name=assigned_name, startup_action_id=token,
             workspace_id=ws, role=role, lane_id=lane_id, locator=locator,
+            terminal_id=f"terminal:{locator}",
             verdict=verdict or VERDICT_PRESENT,
             observed_at=self.live_attestation_observed_at,
         )
@@ -801,7 +810,7 @@ class TurnStartAuthorityTests(unittest.TestCase):
         # authority for THIS request (which is codex / ws / issue_x_lane). A mocked timestamp
         # would have hidden this; the store is real.
         observed = {
-            "event_wait_kind": "changed",
+            "event_wait_kind": "changed", "observation_version": 2,
             "gateway_binding": self._binding(),  # observed_at matches the seeded timestamp
         }
         # Baseline: the legitimate record (seeded in setUp) binds.
@@ -831,7 +840,8 @@ class TurnStartAuthorityTests(unittest.TestCase):
         # one, and the delivery-time binding must equal THAT — the shared second is irrelevant.
         # Generation A (seeded in setUp) is live; the binding carries token A -> binds.
         observed_A = {
-            "event_wait_kind": "changed", "gateway_binding": self._binding(),
+            "event_wait_kind": "changed", "observation_version": 2,
+            "gateway_binding": self._binding(),
         }
         _, started = self._facts_with([self._rec(queue_enter_observation=observed_A)])
         self.assertTrue(started)

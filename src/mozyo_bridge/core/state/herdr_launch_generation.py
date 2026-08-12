@@ -55,7 +55,7 @@ import sqlite3
 import stat
 import tempfile
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -63,7 +63,7 @@ from typing import Optional
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 HERDR_LAUNCH_GENERATION_FILENAME = "herdr-launch-generation.sqlite"
-HERDR_LAUNCH_GENERATION_SCHEMA_VERSION = 1
+HERDR_LAUNCH_GENERATION_SCHEMA_VERSION = 2
 
 #: The wire version of the *generation protocol* a managed launcher must implement for the
 #: parent to be able to finalize a launch generation (Redmine #14203 review j#87479 F1):
@@ -87,7 +87,7 @@ GENERATION_ATTESTED = "attested"
 # --- Store status vocabulary (for the public maintenance rail, Redmine #14203 F2). ----
 #: No store file yet — a fresh / rebuilt home. The next managed launch creates it.
 GENERATION_STORE_ABSENT = "generation_store_absent"
-#: The file exists and presents the exact recognized v1 schema — usable.
+#: The file exists and presents the exact recognized terminal-bound v2 schema — usable.
 GENERATION_STORE_HEALTHY = "generation_store_healthy"
 #: The file exists but cannot be opened / validated (corrupt, partial, foreign, or a
 #: non-database). Reads fail closed; the ``rebuildable_cache`` policy admits a backup-first
@@ -103,6 +103,7 @@ _COLUMNS = (
     "role",
     "lane_id",
     "locator",
+    "terminal_id",
     "verdict",
     "observed_at",
     "reserved_at",
@@ -118,6 +119,7 @@ _EXPECTED_INFO = (
     ("role", "TEXT", 1, 0),
     ("lane_id", "TEXT", 1, 0),
     ("locator", "TEXT", 1, 0),
+    ("terminal_id", "TEXT", 1, 0),
     ("verdict", "TEXT", 1, 0),
     ("observed_at", "TEXT", 1, 0),
     ("reserved_at", "TEXT", 1, 0),
@@ -135,6 +137,7 @@ CREATE TABLE {_TABLE} (
     role TEXT NOT NULL,
     lane_id TEXT NOT NULL,
     locator TEXT NOT NULL DEFAULT '',
+    terminal_id TEXT NOT NULL DEFAULT '',
     verdict TEXT NOT NULL DEFAULT '',
     observed_at TEXT NOT NULL DEFAULT '',
     reserved_at TEXT NOT NULL,
@@ -143,10 +146,12 @@ CREATE TABLE {_TABLE} (
     CHECK (phase IN ('pending', 'attested')),
     CHECK (
         (phase = 'pending'
-            AND locator = '' AND verdict = '' AND observed_at = '' AND attested_at = '')
+            AND locator = '' AND terminal_id = '' AND verdict = ''
+            AND observed_at = '' AND attested_at = '')
         OR
         (phase = 'attested'
-            AND locator <> '' AND verdict <> '' AND observed_at <> '' AND attested_at <> '')
+            AND locator <> '' AND terminal_id <> '' AND verdict <> ''
+            AND observed_at <> '' AND attested_at <> '')
     )
 )
 """
@@ -179,6 +184,31 @@ def _rollback_quietly(conn: sqlite3.Connection) -> None:
 
 def herdr_launch_generation_path(home: Path | None = None) -> Path:
     return (home or mozyo_bridge_home()) / HERDR_LAUNCH_GENERATION_FILENAME
+
+
+def launch_generation_artifacts(path: Path) -> tuple[Path, ...]:
+    """Return the main SQLite path and every sidecar that can carry store state."""
+    return tuple(Path(str(path) + suffix) for suffix in ("", "-wal", "-shm", "-journal"))
+
+
+def launch_generation_artifacts_secure(path: Path) -> bool:
+    """Require a complete, operator-owned 0600 artifact set; orphan sidecars are unsafe."""
+    existing = []
+    for artifact in launch_generation_artifacts(path):
+        try:
+            metadata = artifact.lstat()
+        except FileNotFoundError:
+            continue
+        except OSError:
+            return False
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            return False
+        existing.append(artifact)
+    return not existing or path in existing
 
 
 class LaunchGenerationStoreLockBusy(RuntimeError):
@@ -306,12 +336,24 @@ def probe_launch_generation_store(path: Path) -> tuple[str, str]:
     """Read-only classify the store at ``path`` -> ``(state, detail)`` (never mutates).
 
     The read side of the public maintenance rail (Redmine #14203 F2). An absent file is a
-    legitimate fresh / rebuilt home; a file that opens and presents the exact v1 schema is
+    legitimate fresh / rebuilt home; a file that opens and presents the exact v2 schema is
     healthy; anything else (unopenable, wrong shape, wrong version) is corrupt and fails
     closed — the ``rebuildable_cache`` state a backup-first rebuild recovers.
     """
-    if not path.exists():
+    if not launch_generation_artifacts_secure(path):
+        return GENERATION_STORE_CORRUPT, "unsafe or orphan launch-generation artifact set"
+    try:
+        metadata = path.lstat()
+    except FileNotFoundError:
         return GENERATION_STORE_ABSENT, "no store yet"
+    except OSError as exc:
+        return GENERATION_STORE_CORRUPT, f"{exc.__class__.__name__}: {exc}"
+    if (
+        not stat.S_ISREG(metadata.st_mode)
+        or metadata.st_uid != os.geteuid()
+        or stat.S_IMODE(metadata.st_mode) != 0o600
+    ):
+        return GENERATION_STORE_CORRUPT, "store security metadata is not canonical"
     try:
         conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
         try:
@@ -335,6 +377,7 @@ class LaunchGeneration:
     role: str
     lane_id: str
     locator: str = ""
+    terminal_id: str = field(default="", repr=False)
     verdict: str = ""
     observed_at: str = ""
     reserved_at: str = ""
@@ -363,7 +406,9 @@ def _decode(row: tuple) -> LaunchGeneration:
         _token(
             value,
             name,
-            allow_empty=name in {"locator", "verdict", "observed_at", "attested_at"},
+            allow_empty=name in {
+                "locator", "terminal_id", "verdict", "observed_at", "attested_at"
+            },
         )
         for name, value in zip(_COLUMNS, row)
     )
@@ -371,12 +416,12 @@ def _decode(row: tuple) -> LaunchGeneration:
     if generation.phase not in (GENERATION_PENDING, GENERATION_ATTESTED):
         raise HerdrLaunchGenerationError("generation row has an unknown phase")
     if generation.phase == GENERATION_PENDING and any(
-        (generation.locator, generation.verdict, generation.observed_at,
+        (generation.locator, generation.terminal_id, generation.verdict, generation.observed_at,
          generation.attested_at)
     ):
         raise HerdrLaunchGenerationError("pending generation carries attested fields")
     if generation.phase == GENERATION_ATTESTED and not all(
-        (generation.locator, generation.verdict, generation.observed_at,
+        (generation.locator, generation.terminal_id, generation.verdict, generation.observed_at,
          generation.attested_at)
     ):
         raise HerdrLaunchGenerationError("attested generation is incomplete")
@@ -415,6 +460,10 @@ class HerdrLaunchGenerationStore:
 
     def _validate_file_security(self) -> None:
         """Require an operator-owned regular 0600 file; never repair it implicitly."""
+        if not launch_generation_artifacts_secure(self.path):
+            raise HerdrLaunchGenerationError(
+                "herdr launch-generation artifact set is unsafe or incomplete"
+            )
         try:
             metadata = self.path.lstat()
         except OSError as exc:
@@ -487,6 +536,10 @@ class HerdrLaunchGenerationStore:
 
     def _ensure_store(self) -> None:
         try:
+            if not launch_generation_artifacts_secure(self.path):
+                raise HerdrLaunchGenerationError(
+                    "herdr launch-generation artifact set is unsafe or incomplete"
+                )
             if not self.path.exists():
                 self._publish_fresh()
             conn = self._connect_existing(readonly=True)
@@ -548,6 +601,10 @@ class HerdrLaunchGenerationStore:
         a corrupt file as "no generation".
         """
         name = _token(assigned_name, "assigned_name")
+        if not launch_generation_artifacts_secure(self.path):
+            raise HerdrLaunchGenerationError(
+                "herdr launch-generation artifact set is unsafe or incomplete"
+            )
         if not self.path.exists():
             return None
         try:
@@ -572,6 +629,8 @@ class HerdrLaunchGenerationStore:
         fleet (Redmine #14203 F2). ``None`` is a measured "unreadable", never folded into an
         empty set — a corrupt store while agents are live must fail the rebuild gate closed.
         """
+        if not launch_generation_artifacts_secure(self.path):
+            return None
         if not self.path.exists():
             return frozenset()
         try:
@@ -648,6 +707,7 @@ class HerdrLaunchGenerationStore:
                     fields["role"],
                     fields["lane_id"],
                     "",  # locator
+                    "",  # terminal_id
                     "",  # verdict
                     "",  # observed_at
                     now,  # reserved_at
@@ -681,6 +741,7 @@ class HerdrLaunchGenerationStore:
         role: str,
         lane_id: str,
         locator: str,
+        terminal_id: str,
         verdict: str,
         observed_at: str,
     ) -> LaunchGeneration:
@@ -702,6 +763,7 @@ class HerdrLaunchGenerationStore:
                 role=role,
                 lane_id=lane_id,
                 locator=locator,
+                terminal_id=terminal_id,
                 verdict=verdict,
                 observed_at=observed_at,
             )
@@ -716,6 +778,7 @@ class HerdrLaunchGenerationStore:
         role: str,
         lane_id: str,
         locator: str,
+        terminal_id: str,
         verdict: str,
         observed_at: str,
     ) -> LaunchGeneration:
@@ -726,6 +789,7 @@ class HerdrLaunchGenerationStore:
             "role": _token(role, "role"),
             "lane_id": _token(lane_id, "lane_id"),
             "locator": _token(locator, "locator"),
+            "terminal_id": _token(terminal_id, "terminal_id"),
             "verdict": _token(verdict, "verdict"),
             "observed_at": _token(observed_at, "observed_at"),
         }
@@ -738,13 +802,14 @@ class HerdrLaunchGenerationStore:
             conn.execute("BEGIN IMMEDIATE")
             now = _utc_now()
             conn.execute(
-                f"UPDATE {_TABLE} SET phase=?, locator=?, verdict=?, observed_at=?, "
+                f"UPDATE {_TABLE} SET phase=?, locator=?, terminal_id=?, verdict=?, observed_at=?, "
                 "attested_at=? "
                 "WHERE assigned_name=? AND startup_action_id=? AND phase=? "
                 "AND workspace_id=? AND role=? AND lane_id=?",
                 (
                     GENERATION_ATTESTED,
                     fields["locator"],
+                    fields["terminal_id"],
                     fields["verdict"],
                     fields["observed_at"],
                     now,
@@ -781,6 +846,53 @@ class HerdrLaunchGenerationStore:
             conn.close()
 
 
+def completed_generation_startup_token(
+    home, generation, *, norm, norm_lane, participant_receipt_matches=None
+) -> str:
+    """Return the generation token only after exact startup success."""
+    from mozyo_bridge.core.state.startup_transaction_fence import (
+        PHASE_COMPLETED_SUCCESS, StartupTransactionError, StartupTransactionFence,
+    )
+
+    token = norm(getattr(generation, "startup_action_id", "") or "")
+    if norm(getattr(generation, "phase", "")) != GENERATION_ATTESTED or not token:
+        return ""
+    try:
+        action = StartupTransactionFence(home=home).read(token)
+    except (StartupTransactionError, Exception):  # noqa: BLE001
+        return ""
+    if action is None or norm(getattr(action, "phase", "")) != PHASE_COMPLETED_SUCCESS:
+        return ""
+    role = norm(getattr(generation, "role", ""))
+    unit = getattr(action, "unit", None)
+    if not (
+        unit is not None
+        and norm(getattr(unit, "workspace_id", ""))
+        == norm(getattr(generation, "workspace_id", ""))
+        and norm_lane(getattr(unit, "lane_id", ""))
+        == norm_lane(getattr(generation, "lane_id", ""))
+        and role in tuple(getattr(unit, "providers", ()) or ())
+    ):
+        return ""
+    participant = action.participant_for(role)
+    if participant is None or getattr(participant, "closed", True):
+        return ""
+    if not (
+        norm(getattr(participant, "assigned_name", ""))
+        == norm(getattr(generation, "assigned_name", ""))
+        and norm(getattr(participant, "locator", ""))
+        == norm(getattr(generation, "locator", ""))
+    ):
+        return ""
+    if participant_receipt_matches is not None:
+        try:
+            if not participant_receipt_matches(getattr(participant, "receipt", "")):
+                return ""
+        except Exception:  # noqa: BLE001 - malformed receipt grants no authority
+            return ""
+    return token
+
+
 def verified_generation_token(
     home: Path | None,
     *,
@@ -789,6 +901,7 @@ def verified_generation_token(
     role: str,
     lane_id: str,
     locator: str,
+    live_terminal_id: object,
     norm,
     norm_lane,
     participant_receipt_matches=None,
@@ -812,11 +925,6 @@ def verified_generation_token(
     / absent / pending / mismatched input yields ``""``.
     """
     from mozyo_bridge.core.state.herdr_identity_attestation import VERDICT_PRESENT
-    from mozyo_bridge.core.state.startup_transaction_fence import (
-        PHASE_COMPLETED_SUCCESS,
-        StartupTransactionError,
-        StartupTransactionFence,
-    )
 
     try:
         generation = HerdrLaunchGenerationStore(home=home).read(norm(assigned_name))
@@ -833,32 +941,20 @@ def verified_generation_token(
         and norm(getattr(generation, "role", "")) == norm(role)
         and norm_lane(getattr(generation, "lane_id", "")) == norm_lane(lane_id)
         and norm(getattr(generation, "locator", "")) == norm(locator)
+        and type(live_terminal_id) is str
+        and bool(live_terminal_id)
+        and live_terminal_id.strip() == live_terminal_id
+        and getattr(generation, "terminal_id", "") == live_terminal_id
         and norm(getattr(generation, "workspace_id", "")) == norm(workspace_id)
     ):
         return ""
-    try:
-        action = StartupTransactionFence(home=home).read(token)
-    except (StartupTransactionError, Exception):  # noqa: BLE001 - unreadable => none
-        return ""
-    if action is None or norm(getattr(action, "phase", "")) != PHASE_COMPLETED_SUCCESS:
-        return ""
-    participant = action.participant_for(norm(role))
-    if participant is None or getattr(participant, "closed", True):
-        return ""
-    if not (
-        norm(getattr(participant, "assigned_name", "")) == norm(assigned_name)
-        and norm(getattr(participant, "locator", "")) == norm(locator)
-    ):
-        return ""
-    if participant_receipt_matches is not None:
-        try:
-            if not participant_receipt_matches(
-                getattr(participant, "receipt", "")
-            ):
-                return ""
-        except Exception:  # noqa: BLE001 - malformed receipt cannot grant authority
-            return ""
-    return token
+    return completed_generation_startup_token(
+        home,
+        generation,
+        norm=norm,
+        norm_lane=norm_lane,
+        participant_receipt_matches=participant_receipt_matches,
+    )
 
 
 __all__ = (
@@ -879,8 +975,11 @@ __all__ = (
     "LaunchGenerationStoreLockReleaseError",
     "LaunchGenerationStoreLockUnavailable",
     "herdr_launch_generation_path",
+    "launch_generation_artifacts",
+    "launch_generation_artifacts_secure",
     "launch_generation_store_lock",
     "launch_generation_store_lock_path",
     "probe_launch_generation_store",
+    "completed_generation_startup_token",
     "verified_generation_token",
 )

@@ -13,6 +13,7 @@ import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
@@ -224,6 +225,12 @@ class _PlanCase(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(tempfile.mkdtemp())
         self.store_opens = 0
+        self.completed_startup = patch(
+            "mozyo_bridge.core.state.herdr_launch_generation.completed_generation_startup_token",
+            side_effect=lambda _home, generation, **_kw: generation.startup_action_id,
+        )
+        self.completed_startup.start()
+        self.addCleanup(self.completed_startup.stop)
 
     def _store_factory(self):
         """Lazy by construction: a refusal must not create the transaction database."""
@@ -255,6 +262,7 @@ class _PlanCase(unittest.TestCase):
             home=self.home if home is _UNSET else home,
             anchor=anchor or _anchor(),
             authority=authority or _authority(),
+            live_rows=(),
         )
 
     def _seed_generation(self, action_id=LEGACY_ACTION_ID, **kw):
@@ -359,6 +367,12 @@ class LegacyPathTest(_PlanCase):
 
 
 class AuthorityRefusalTest(_PlanCase):
+    def test_attested_generation_without_completed_startup_is_refused(self):
+        self.completed_startup.stop()
+        self._seed_generation()
+        plan = self._plan()
+        self.assertEqual(plan.decision.refusal, REFUSE_GENERATION_MISMATCH)
+
     def test_the_refusal_matrix_writes_nothing(self) -> None:
         cases = (
             ("no generation row", None, {}, REFUSE_GENERATION_UNAVAILABLE),
@@ -533,7 +547,7 @@ class ReceiptPlanTest(_PlanCase):
 
         plan = plan_fresh_recovery(
             store_factory=lambda: _RacingStore(), home=self.home,
-            anchor=_anchor(), authority=_evidenced(),
+            anchor=_anchor(), authority=_evidenced(), live_rows=(),
         )
         self.assertEqual(plan.decision.outcome, OUTCOME_RECEIPT_PLANNED)
         self.assertTrue(peer_rows, "the peer really inserted inside the plan call")
@@ -568,7 +582,7 @@ class ReceiptPlanTest(_PlanCase):
 
         again = plan_fresh_recovery(
             store_factory=lambda: _ObservingStore(), home=self.home,
-            anchor=_anchor(), authority=_evidenced(),
+            anchor=_anchor(), authority=_evidenced(), live_rows=(),
         )
         self.assertEqual(again.decision.outcome, OUTCOME_REPLAYED)
         self.assertEqual(again.action_id, peer.action_id)
@@ -603,7 +617,7 @@ class ReceiptPlanTest(_PlanCase):
 
         plan = plan_fresh_recovery(
             store_factory=lambda: _Foreign(), home=self.home,
-            anchor=_anchor(), authority=_evidenced(),
+            anchor=_anchor(), authority=_evidenced(), live_rows=(),
         )
         self.assertEqual(plan.decision.refusal, REFUSE_FOREIGN_TRANSACTION)
 
@@ -626,7 +640,7 @@ class ReceiptPlanTest(_PlanCase):
         self._seed_bound_evidence()
         plan = plan_fresh_recovery(
             store_factory=lambda: _Store(), home=self.home,
-            anchor=_anchor(), authority=_evidenced(),
+            anchor=_anchor(), authority=_evidenced(), live_rows=(),
         )
         self.assertEqual(plan.decision.refusal, REFUSE_TRANSACTION_UNAVAILABLE)
         rendered = f"{plan.decision.detail}{plan.decision.refusal}"
@@ -706,7 +720,7 @@ class ReceiptPlanTest(_PlanCase):
         self._seed_bound_evidence()
         first = plan_fresh_recovery(
             store_factory=self._store_factory(), home=self.home,
-            anchor=_anchor(), authority=_evidenced(),
+            anchor=_anchor(), authority=_evidenced(), live_rows=(),
         )
         self.assertEqual(first.decision.outcome, OUTCOME_RECEIPT_PLANNED)
         second = self._plan(_evidenced())
@@ -763,7 +777,7 @@ class ZeroWriteBoundaryTest(_PlanCase):
 
         plan = plan_fresh_recovery(
             store_factory=lambda: _Hostile(), home=self.home,
-            anchor=_anchor(), authority=_evidenced(),
+            anchor=_anchor(), authority=_evidenced(), live_rows=(),
         )
         self.assertEqual(plan.decision.refusal, REFUSE_TRANSACTION_UNAVAILABLE)
         rendered = f"{plan.decision.detail}{plan.decision.refusal}"
@@ -782,7 +796,7 @@ class ZeroWriteBoundaryTest(_PlanCase):
         with self.assertRaises(KeyboardInterrupt):
             plan_fresh_recovery(
                 store_factory=lambda: _Dying(), home=self.home,
-                anchor=_anchor(), authority=_evidenced(),
+                anchor=_anchor(), authority=_evidenced(), live_rows=(),
             )
 
 

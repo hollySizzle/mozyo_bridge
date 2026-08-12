@@ -108,11 +108,11 @@ LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
 #: has to live in the storage class: the bytes written are the bytes returned. The CAS also
 #: matches on the raw bytes and ``typeof(lane_epoch) = 'text'``, so a concurrent writer that
 #: changed either the value or its type loses. Semantics: :mod:`...lane_epoch`.
-LANE_LIFECYCLE_SCHEMA_VERSION = 10
-#: The component shapes this build can read and write. ``1``–``9`` are migrated
-#: additively to ``10``; anything else — a newer version from a future build, or a foreign
+LANE_LIFECYCLE_SCHEMA_VERSION = 11
+#: The component shapes this build can read and write. ``1``–``10`` are migrated
+#: additively to ``11``; anything else — a newer version from a future build, or a foreign
 #: value — fails closed and the store is left untouched (R3-F1).
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
@@ -157,6 +157,7 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     lane_generation INTEGER NOT NULL DEFAULT 1,
     declared_slots TEXT NOT NULL DEFAULT '',
     reconcile_phase TEXT NOT NULL DEFAULT '',
+    reconcile_close_pin TEXT NOT NULL DEFAULT '',
     lane_kind TEXT NOT NULL DEFAULT '',
     hibernated_at TEXT NOT NULL DEFAULT '',
     release_observation TEXT NOT NULL DEFAULT '',
@@ -196,6 +197,7 @@ _COLUMNS = (
     "replacement_action_id, replacement_pins, decision_source, "
     "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity, "
     "binding_kind, project_scope, lane_generation, declared_slots, reconcile_phase, "
+    "reconcile_close_pin, "
     "lane_kind, hibernated_at, release_observation, lane_epoch"
 )
 
@@ -876,6 +878,14 @@ def ensure_lane_lifecycle_schema(path: Path) -> LifecycleSchemaOutcome:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN lane_epoch BLOB NOT NULL DEFAULT '0'"
+                )
+            # v11 (#15227 j#103467): an immutable, versioned current-generation pin for
+            # reconcile-owned owed closes. Legacy rows stay empty and may prove absence,
+            # but are never back-filled from live inventory into destructive authority.
+            if "reconcile_close_pin" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN reconcile_close_pin TEXT NOT NULL DEFAULT ''"
                 )
             conn.execute(_OWNER_INDEX_SQL)
             conn.execute(_PROJECT_OWNER_INDEX_SQL)

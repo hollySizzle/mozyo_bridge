@@ -57,6 +57,7 @@ def _report(*, success: bool) -> dict:
         "residue_agents": 0 if success else -1,
         "residue_verified": success,
         "cleanup_attempted": True,
+        "cleanup_completed": success,
         "converged": success,
         "residue_clear": success,
         "projects": [

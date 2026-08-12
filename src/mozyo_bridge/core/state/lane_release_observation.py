@@ -22,7 +22,7 @@ legacy write) and resume fails closed on it. A recorded observation carrying zer
 *the driver looked and found nothing live* — positive evidence that the lane had no processes at
 hibernate, which resume may accept. Collapsing those two into "empty" is exactly the
 "absence of evidence read as evidence" mistake the #14477 review chain kept catching, so the
-envelope is explicit: ``''`` is absent, ``{"v":1,"slots":[]}`` is complete-empty.
+envelope is explicit: ``''`` is absent, ``{"v":2,"slots":[]}`` is complete-empty.
 
 The snapshot is **write-once per release generation** (j#94582 item 5): only opening a new
 generation replaces it, and no metadata / decision / revision / outcome writer may touch it.
@@ -43,11 +43,12 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     ReleasePin,
     ReleasePinError,
     norm,
+    validate_release_pins,
 )
 
 #: Envelope version. A row written by a future build with a different version is unreadable
 #: here rather than silently reinterpreted.
-RELEASE_OBSERVATION_VERSION = 1
+RELEASE_OBSERVATION_VERSION = 2
 
 
 class ReleaseObservationError(ValueError):
@@ -64,6 +65,7 @@ class ReleaseObservation:
     """
 
     slots: tuple[ReleasePin, ...] = ()
+    version: int = RELEASE_OBSERVATION_VERSION
 
     @property
     def is_complete_empty(self) -> bool:
@@ -83,6 +85,11 @@ def build_release_observation(pins: Iterable[ReleasePin]) -> ReleaseObservation:
     programming / corruption error at the writer, refused here rather than stored.
     """
     slots = tuple(pins)
+    if slots:
+        try:
+            validate_release_pins(slots)
+        except ReleasePinError as exc:
+            raise ReleaseObservationError("release observation axes are ambiguous") from exc
     seen: set[str] = set()
     for pin in slots:
         locator = norm(pin.locator)
@@ -96,11 +103,22 @@ def build_release_observation(pins: Iterable[ReleasePin]) -> ReleaseObservation:
                 "distinct live slots"
             )
         seen.add(locator)
+        if not pin.current_generation_bound:
+            raise ReleaseObservationError(
+                "a release observation v2 slot requires startup_action_id; legacy pins "
+                "are diagnostic-only and cannot open a destructive generation"
+            )
     return ReleaseObservation(slots=slots)
 
 
 def encode_release_observation(observation: ReleaseObservation) -> str:
     """Serialise for the v9 column. A complete-empty observation is a PRESENT envelope."""
+    if (
+        type(observation.version) is not int
+        or observation.version != RELEASE_OBSERVATION_VERSION
+    ):
+        raise ReleaseObservationError("legacy observations are read-only")
+    current = build_release_observation(observation.slots)
     return json.dumps(
         {
             "v": RELEASE_OBSERVATION_VERSION,
@@ -109,8 +127,9 @@ def encode_release_observation(observation: ReleaseObservation) -> str:
                     "role": pin.role,
                     "assigned_name": pin.assigned_name,
                     "locator": pin.locator,
+                    "startup_action_id": pin.startup_action_id,
                 }
-                for pin in observation.slots
+                for pin in current.slots
             ],
         },
         sort_keys=True,
@@ -134,7 +153,10 @@ def decode_release_observation(raw: str) -> Optional[ReleaseObservation]:
         ) from exc
     if not isinstance(loaded, dict):
         raise ReleaseObservationError("release observation must be an object")
-    if loaded.get("v") != RELEASE_OBSERVATION_VERSION:
+    if set(loaded) != {"v", "slots"}:
+        raise ReleaseObservationError("release observation has an unknown or missing field")
+    version = loaded.get("v")
+    if type(version) is not int or version not in (1, RELEASE_OBSERVATION_VERSION):
         raise ReleaseObservationError(
             f"release observation version {loaded.get('v')!r} is not readable by this build"
         )
@@ -145,17 +167,40 @@ def decode_release_observation(raw: str) -> Optional[ReleaseObservation]:
     for item in raw_slots:
         if not isinstance(item, dict):
             raise ReleaseObservationError(f"release observation slot is not an object: {item!r}")
+        expected_keys = (
+            {"role", "assigned_name", "locator", "startup_action_id"}
+            if version == RELEASE_OBSERVATION_VERSION
+            else {"role", "assigned_name", "locator"}
+        )
+        if set(item) != expected_keys:
+            raise ReleaseObservationError(
+                "release observation slot does not have the exact versioned shape"
+            )
+        if version == RELEASE_OBSERVATION_VERSION and not all(
+            type(item[key]) is str and bool(item[key]) and item[key].strip() == item[key]
+            for key in expected_keys
+        ):
+            raise ReleaseObservationError(
+                "release observation v2 values must be canonical non-empty strings"
+            )
         try:
             pins.append(
                 ReleasePin(
                     role=norm(item.get("role")),
                     assigned_name=norm(item.get("assigned_name")),
                     locator=norm(item.get("locator")),
+                    startup_action_id=(
+                        norm(item.get("startup_action_id"))
+                        if version == RELEASE_OBSERVATION_VERSION
+                        else ""
+                    ),
                 )
             )
         except ReleasePinError as exc:
             raise ReleaseObservationError(f"release observation slot unusable: {exc}") from exc
     try:
+        if version == 1:
+            return ReleaseObservation(slots=tuple(pins), version=1)
         return build_release_observation(pins)
     except ReleaseObservationError:
         raise
@@ -175,8 +220,11 @@ def observation_matches_pins(
     stored = tuple(pins)
     if len(stored) != len(observation.slots):
         return False
-    def key(pin: ReleasePin) -> tuple[str, str, str]:
-        return (norm(pin.role), norm(pin.assigned_name), norm(pin.locator))
+    def key(pin: ReleasePin) -> tuple[str, str, str, str]:
+        return (
+            norm(pin.role), norm(pin.assigned_name), norm(pin.locator),
+            norm(pin.startup_action_id),
+        )
     return sorted(key(p) for p in stored) == sorted(key(p) for p in observation.slots)
 
 

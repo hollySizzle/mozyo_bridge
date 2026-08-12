@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -23,7 +24,7 @@ from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
     ReplacementTransactionStore,
 )
 from tests.support.current_launch_authority import (  # noqa: E402
-    seed_current_generation,
+    seed_completed_current_launch_authority,
 )
 from mozyo_bridge.core.state.replacement_transaction_model import (  # noqa: E402
     PHASE_COMPLETED,
@@ -63,11 +64,26 @@ class GatewayRefreshResumeScenario(unittest.TestCase):
         self.home = Path(tempfile.mkdtemp())
         self.store = ReplacementTransactionStore(home=self.home)
         self.port = FakeActuatorPort()
-        # Ruling j#97105: seed this gateway's CURRENT (pre-#14741, untagged) row.
-        seed_current_generation(
+        self.terminal_id = f"terminal:{GATEWAY['old_locator']}"
+        inventory = patch(
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "sublane_herdr_projection.list_herdr_agent_rows",
+            return_value=[{
+                "name": GATEWAY["assigned_name"],
+                "pane_id": GATEWAY["old_locator"],
+                "terminal_id": self.terminal_id,
+            }],
+        )
+        inventory.start()
+        self.addCleanup(inventory.stop)
+        seed_completed_current_launch_authority(
             self.home, workspace_id="ws", lane_id=GATEWAY["lane_id"],
             role=GATEWAY["role"], assigned_name=GATEWAY["assigned_name"],
             locator=GATEWAY["old_locator"],
+            terminal_id=self.terminal_id,
+            target_workspace="w1",
+            target_tab="w1:t1",
         )
 
     def _request(self) -> GatewayRefreshRequest:

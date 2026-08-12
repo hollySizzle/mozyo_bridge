@@ -68,6 +68,7 @@ def _capture() -> OfflineRolloutCapture:
             ),
             StoreSnapshot("attestation", "recognized", 1, content_digest="3" * 64),
             StoreSnapshot("lane_lifecycle", "recognized", 9, content_digest="4" * 64),
+            StoreSnapshot("launch_generation", "recognized", 1, content_digest="5" * 64),
         ),
         supervisors=(
             SupervisorAgentSnapshot(
@@ -108,9 +109,10 @@ class OfflineRolloutPlanTests(unittest.TestCase):
             first.plan["restore_order"],
             ["mzb1_ws_a__codex__default", "mzb1_ws_b__claude__lane_1"],
         )
-        self.assertEqual(first.plan["stores"]["attestation"]["target_version"], 3)
-        self.assertEqual(first.plan["stores"]["lane_lifecycle"]["target_version"], 10)
+        self.assertEqual(first.plan["stores"]["attestation"]["target_version"], 4)
+        self.assertEqual(first.plan["stores"]["lane_lifecycle"]["target_version"], 11)
         self.assertEqual(first.plan["stores"]["startup_transaction"]["target_version"], 2)
+        self.assertEqual(first.plan["stores"]["launch_generation"]["target_version"], 2)
         self.assertEqual(
             first.plan["stores"]["startup_transaction"]["migration_plan_digest"],
             "2" * 64,
@@ -127,6 +129,7 @@ class OfflineRolloutPlanTests(unittest.TestCase):
                 "migrate_attestation",
                 "migrate_lane_lifecycle",
                 "migrate_startup_transaction",
+                "rebuild_launch_generation",
                 "exact_runtime_install",
                 "legacy_lane_epoch_adoption",
                 "top_restore_action_bootstrap",
@@ -217,8 +220,7 @@ class OfflineRolloutPlanTests(unittest.TestCase):
         source = _capture()
         stores = (
             replace(source.stores[0], state="unsupported"),
-            source.stores[1],
-            source.stores[2],
+            *source.stores[1:],
         )
         result = build_offline_rollout_plan(replace(source, stores=stores))
         self.assertFalse(result.ok)
@@ -228,8 +230,7 @@ class OfflineRolloutPlanTests(unittest.TestCase):
         source = _capture()
         stores = (
             replace(source.stores[0], content_digest=""),
-            source.stores[1],
-            source.stores[2],
+            *source.stores[1:],
         )
         result = build_offline_rollout_plan(replace(source, stores=stores))
         self.assertFalse(result.ok)

@@ -10,6 +10,7 @@ dispatch — never a real managed pair.
 from __future__ import annotations
 
 import sys
+import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
@@ -62,6 +63,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     build_recovery_delivery_authorization_marker,
     build_recovery_delivery_zero_send_marker,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.hibernated_pair_recovery import (  # noqa: E501
+    SLOT_PRESERVE_AMBIGUOUS,
+    decide_slot_recovery,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
     RedmineJournalEntry,
 )
@@ -75,6 +80,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
     SublaneHealError,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_launch_authority,
+)
 
 _WS = "wsA"
 _LANE = "issue_13847_x"
@@ -87,6 +95,7 @@ def _row(name, locator, *, status="idle", cwd="/wt", revision="7"):
         "agent_status": status,
         "cwd": cwd,
         "revision": revision,
+        "terminal_id": f"terminal:{locator}",
     }
 
 
@@ -108,6 +117,22 @@ def _rec(revision=3, disposition=DISPOSITION_HIBERNATED):
     return SimpleNamespace(revision=revision, lane_disposition=disposition, lane_generation=2)
 
 
+def _seed_close_authority(tmp, *, assigned_name, locator, provider):
+    terminal_id = f"terminal:{locator}"
+    seed_completed_current_launch_authority(
+        Path(tmp),
+        workspace_id=_WS,
+        lane_id=_LANE,
+        role=provider,
+        assigned_name=assigned_name,
+        locator=locator,
+        terminal_id=terminal_id,
+        target_workspace="wZ",
+        target_tab="wZ:t1",
+    )
+    return [_row(assigned_name, locator)]
+
+
 class ObserveJoin(unittest.TestCase):
     """observe_slot joins inventory + attestation + lifecycle into the pure observation."""
 
@@ -118,6 +143,7 @@ class ObserveJoin(unittest.TestCase):
                 IdentityAttestationRecord(
                     assigned_name=name, workspace_id=_WS, role=provider, lane_id=_LANE,
                     locator=attested_locator, verdict=VERDICT_PRESENT,
+                    terminal_id=f"terminal:{attested_locator}",
                 )
             )
         with patch.object(live, "list_herdr_agent_rows", return_value=rows), \
@@ -152,25 +178,24 @@ class ObserveJoin(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ops = _ops(tmp)
             name = encode_assigned_name(_WS, "claude", _LANE)
-            fake_store = SimpleNamespace(
-                read=lambda action, assigned: SimpleNamespace(
-                    phase=BINDING_RESERVED
-                )
+            path = Path(tmp) / "herdr-identity-attestation.sqlite"
+            with sqlite3.connect(path) as conn:
+                conn.execute("PRAGMA user_version=1")
+                conn.execute("CREATE TABLE herdr_identity_attestations (assigned_name TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, role TEXT NOT NULL, lane_id TEXT NOT NULL, locator TEXT NOT NULL, verdict TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', observed_at TEXT NOT NULL)")
+                conn.execute("INSERT INTO herdr_identity_attestations VALUES (?,?,?,?,?,?,?,?)",
+                             (name, _WS, "claude", _LANE, "wZ:p3H", "present", "", "now"))
+            obs, locator, an = self._observe(
+                tmp, ops, "claude", rows=[_row(name, "wZ:p3H")],
             )
-            with patch.object(
-                live, "selected_attestation_store_is_v1", return_value=True
-            ), patch.object(
-                live, "HerdrIdentityReplacementBindingStore",
-                return_value=fake_store,
-            ):
-                obs, locator, an = self._observe(
-                    tmp, ops, "claude", rows=[_row(name, "wZ:p3H")],
-                    attested_locator="wZ:p3H",
-                )
             self.assertFalse(obs.already_healthy)
             self.assertFalse(
                 obs.is_bad_generation,
-                "a reserved v1 launch may owe rollback and must never be closed/replayed",
+                "a legacy row is diagnostic-only and must never be closed/replayed",
+            )
+            self.assertEqual(
+                decide_slot_recovery(obs),
+                SLOT_PRESERVE_AMBIGUOUS,
+                "the public recovery decision must preserve a legacy live slot",
             )
 
     def test_absent_slot_is_unresolved(self):
@@ -568,16 +593,25 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ops = _ops(tmp)
             calls = []
+            assigned_name = encode_assigned_name(_WS, "claude", _LANE)
+            rows = _seed_close_authority(
+                tmp,
+                assigned_name=assigned_name,
+                locator="wZ:p3H",
+                provider="claude",
+            )
 
             class _FakeQ:
                 def close_receiver(self, request, pin):
                     calls.append((request.assigned_name, pin.locator))
                     return SimpleNamespace(closed=True, old_absent=False)
 
-            with patch.object(type(ops), "_quarantine", return_value=_FakeQ()):
+            with patch.object(type(ops), "_quarantine", return_value=_FakeQ()), \
+                    patch.object(type(ops), "workspace_id", return_value=_WS), \
+                    patch.object(live, "list_herdr_agent_rows", return_value=rows):
                 ok = ops.close_bad_slot(
                     role="worker", provider="claude",
-                    assigned_name=encode_assigned_name(_WS, "claude", _LANE),
+                    assigned_name=assigned_name,
                     locator="wZ:p3H", action_id="a",
                 )
             self.assertTrue(ok)
@@ -586,20 +620,29 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
     def test_close_old_absent_is_byte_preserving_success(self):
         with tempfile.TemporaryDirectory() as tmp:
             ops = _ops(tmp)
+            assigned_name = encode_assigned_name(_WS, "claude", _LANE)
+            rows = _seed_close_authority(
+                tmp,
+                assigned_name=assigned_name,
+                locator="wZ:p3H",
+                provider="claude",
+            )
 
             class _FakeQ:
                 def close_receiver(self, request, pin):
                     return SimpleNamespace(closed=False, old_absent=True)
 
-            with patch.object(type(ops), "_quarantine", return_value=_FakeQ()):
+            with patch.object(type(ops), "_quarantine", return_value=_FakeQ()), \
+                    patch.object(type(ops), "workspace_id", return_value=_WS), \
+                    patch.object(live, "list_herdr_agent_rows", return_value=rows):
                 ok = ops.close_bad_slot(
                     role="worker", provider="claude",
-                    assigned_name=encode_assigned_name(_WS, "claude", _LANE),
+                    assigned_name=assigned_name,
                     locator="wZ:p3H", action_id="a",
                 )
             self.assertTrue(ok, "a positively-absent exact slot is byte-preserving, not a failure")
 
-    def test_v1_relaunch_carries_exact_role_binding_context(self):
+    def test_legacy_store_relaunch_uses_only_the_current_managed_launch_path(self):
         with tempfile.TemporaryDirectory() as tmp:
             ops = _ops(tmp)
             calls = []
@@ -624,27 +667,16 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
                     disposition="recover_bad_generation",
                 ),
             )
-            with patch.object(live, "selected_attestation_store_is_v1", return_value=True), \
-                 patch.object(live, "HerdrSublaneActuatorOps", _FakeActuator):
+            with patch.object(live, "HerdrSublaneActuatorOps", _FakeActuator):
                 ok = ops.relaunch_pair(action_id="recover-a", slots=slots)
 
             self.assertTrue(ok)
-            self.assertEqual([call[2] for call in calls], ["codex", "claude"])
-            self.assertEqual(
-                [
-                    (
-                        call[0]["replacement_action_id"],
-                        call[0]["replacement_assigned_name"],
-                        call[0]["replacement_old_locator"],
-                        call[0]["replacement_target_only"],
-                    )
-                    for call in calls
-                ],
-                [
-                    ("recover-a", slots[0].assigned_name, "wZ:pOldG", True),
-                    ("recover-a", slots[1].assigned_name, "wZ:pOldH", True),
-                ],
-            )
+            self.assertEqual(len(calls), 1)
+            self.assertIsNone(calls[0][2])
+            self.assertEqual(calls[0][0]["replacement_action_id"], "recover-a")
+            self.assertNotIn("replacement_assigned_name", calls[0][0])
+            self.assertNotIn("replacement_old_locator", calls[0][0])
+            self.assertNotIn("replacement_target_only", calls[0][0])
 
     def test_v2_relaunch_preserves_single_unscoped_heal(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -663,8 +695,7 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
                 assigned_name=encode_assigned_name(_WS, "claude", _LANE),
                 declared_locator="wZ:pOldH", locator="", disposition="recover_absent",
             )
-            with patch.object(live, "selected_attestation_store_is_v1", return_value=False), \
-                 patch.object(live, "HerdrSublaneActuatorOps", _FakeActuator):
+            with patch.object(live, "HerdrSublaneActuatorOps", _FakeActuator):
                 ok = ops.relaunch_pair(action_id="recover-a", slots=(slot,))
 
             self.assertTrue(ok)
@@ -675,7 +706,7 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
             self.assertNotIn("replacement_old_locator", calls[0][0])
             self.assertNotIn("replacement_target_only", calls[0][0])
 
-    def test_v1_missing_binding_context_fails_before_heal(self):
+    def test_current_relaunch_does_not_require_legacy_side_binding_context(self):
         with tempfile.TemporaryDirectory() as tmp:
             ops = _ops(tmp)
             slot = SlotPlan(
@@ -683,16 +714,11 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
                 assigned_name=encode_assigned_name(_WS, "claude", _LANE),
                 declared_locator="", locator="", disposition="recover_absent",
             )
-            with patch.object(live, "selected_attestation_store_is_v1", return_value=True), \
-                 patch.object(live, "HerdrSublaneActuatorOps") as actuator:
+            with patch.object(live, "HerdrSublaneActuatorOps") as actuator:
                 ok = ops.relaunch_pair(action_id="recover-a", slots=(slot,))
 
-            self.assertFalse(ok)
-            self.assertEqual(
-                ops.relaunch_failure_reason,
-                "replacement_binding_context_missing",
-            )
-            actuator.assert_not_called()
+            self.assertTrue(ok)
+            actuator.assert_called_once()
 
     def test_v1_heal_failure_preserves_reason_startup_and_rollback_debt(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -726,9 +752,7 @@ class CloseAndRelaunchDelegate(unittest.TestCase):
                 declared_locator="wZ:pOldH", locator="",
                 disposition="recover_absent",
             )
-            with patch.object(
-                live, "selected_attestation_store_is_v1", return_value=True
-            ), patch.object(live, "HerdrSublaneActuatorOps", _FakeActuator):
+            with patch.object(live, "HerdrSublaneActuatorOps", _FakeActuator):
                 ok = ops.relaunch_pair(action_id="recover-a", slots=(slot,))
 
             self.assertFalse(ok)

@@ -73,6 +73,8 @@ RESIDUE_LAUNCH_IN_FLIGHT = "launch_in_flight"
 #: slots that looked like residue moments ago, and reporting "no residue" would be the
 #: unproven-no-op misread this surface exists to avoid.
 RESIDUE_IDENTITY_MOVED = "residue_identity_moved"
+#: Planned residue lacks a current v4/completed-v2 destructive license.
+RESIDUE_GENERATION_UNVERIFIED = "residue_generation_unverified"
 #: Advisory file locking is unavailable, so the launch/close exclusion cannot be honored.
 RESIDUE_EXCLUSION_UNAVAILABLE = "exclusion_unavailable"
 
@@ -179,9 +181,10 @@ def run_residue_close(
     )
     from mozyo_bridge.shared.paths import mozyo_bridge_home
 
+    home = mozyo_bridge_home()
     try:
         with attestation_store_lock(
-            mozyo_bridge_home(), exclusive=True, blocking=False
+            home, exclusive=True, blocking=False
         ):
             return _close_under_exclusion(
                 args,
@@ -190,23 +193,24 @@ def run_residue_close(
                 lane_label=lane_label,
                 issue=issue,
                 execute=execute,
+                home=home,
             )
-    except AttestationStoreLockBusy as exc:
+    except AttestationStoreLockBusy:
         return _blocked(
             RESIDUE_LAUNCH_IN_FLIGHT,
             detail=(
-                f"the home's attestation-store lock is held by another operation ({exc}); a "
+                "the home's attestation-store lock is held by another operation; a "
                 "managed launch or attestation write is in flight, so a slot classified now "
                 "could be a live pane by the time it is closed. Nothing was read or written"
             ),
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
-    except AttestationStoreLockUnavailable as exc:
+    except AttestationStoreLockUnavailable:
         return _blocked(
             RESIDUE_EXCLUSION_UNAVAILABLE,
             detail=(
-                f"advisory file locking is unavailable on this platform ({exc}), so the "
+                "advisory file locking is unavailable on this platform, so the "
                 "launch / close exclusion cannot be honored; closing without it could close "
                 "a pane that was relaunched under the read"
             ),
@@ -223,6 +227,7 @@ def _close_under_exclusion(
     lane_label: str,
     issue: str,
     execute: bool,
+    home: Path,
 ) -> ResidueCloseVerdict:
     """The action-time half, run while HOLDING the exclusive launch-exclusion lock."""
     from mozyo_bridge.core.state.lane_lifecycle import (
@@ -252,7 +257,7 @@ def _close_under_exclusion(
     # working lane's panes (the #13754 R2-F1 foreign-close lesson, applied to this rail).
     try:
         key = LaneLifecycleKey(workspace_id, lane_label)
-        record = LaneLifecycleStore().get(key)
+        record = LaneLifecycleStore(home=home).get(key)
     except ValueError:
         return _blocked(
             RESIDUE_WORKSPACE_UNRESOLVED,
@@ -285,10 +290,10 @@ def _close_under_exclusion(
 
     try:
         rows = list_herdr_agent_rows(os.environ)
-    except HerdrSessionStartError as exc:
+    except HerdrSessionStartError:
         return _blocked(
             RESIDUE_INVENTORY_UNREADABLE,
-            detail=f"live herdr inventory unreadable ({exc}); residue cannot be classified",
+            detail="live herdr inventory unreadable; residue cannot be classified",
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
@@ -297,11 +302,11 @@ def _close_under_exclusion(
             resolve_gateway_provider(str(repo_root)),
             resolve_worker_provider(str(repo_root)),
         )
-    except WorkflowProviderUnresolved as exc:
+    except WorkflowProviderUnresolved:
         return _blocked(
             RESIDUE_PROVIDER_UNRESOLVED,
             detail=(
-                f"workflow provider binding unresolved ({exc}); the lane's expected slot "
+                "workflow provider binding unresolved; the lane's expected slot "
                 "names cannot be minted, so nothing can be matched exactly"
             ),
             workspace_id=workspace_id,
@@ -349,6 +354,18 @@ def _close_under_exclusion(
             lane_id=lane_label,
             plan=plan,
         )
+    if _residue_current_pins(
+        plan, rows, home=home, workspace_id=workspace_id, lane_id=lane_label,
+        legacy_workspace_id=legacy_token, managed_roles=managed_roles,
+    ) is None:
+        return _blocked(
+            RESIDUE_GENERATION_UNVERIFIED,
+            detail="one or more residue targets lack exact v4/completed-v2 current "
+            "generation authority; nothing would be closed",
+            workspace_id=workspace_id,
+            lane_id=lane_label,
+            plan=plan,
+        )
     if not execute:
         return ResidueCloseVerdict(
             state=RESIDUE_PREFLIGHT,
@@ -368,6 +385,7 @@ def _close_under_exclusion(
         lane_id=lane_label,
         legacy_workspace_id=legacy_token,
         managed_roles=managed_roles,
+        home=home,
     )
     if failed:
         return ResidueCloseVerdict(
@@ -430,6 +448,7 @@ def _execute_closes(
     lane_id: str,
     legacy_workspace_id: str,
     managed_roles,
+    home: Path,
 ):
     """Close each planned pane, re-verifying its identity immediately first (#14499).
 
@@ -471,6 +490,10 @@ def _execute_closes(
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
         COMMAND_TIMEOUT_SECONDS,
     )
+    from .herdr_destructive_close_identity import (
+        current_generation_release_pin,
+        pinned_generations_absent,
+    )
 
     binary = _resolve_binary_or_die(os.environ)
     closed: list[tuple[str, str]] = []
@@ -479,12 +502,12 @@ def _execute_closes(
     for name, locator in plan.close_targets:
         try:
             fresh_rows = list_herdr_agent_rows(os.environ)
-        except HerdrSessionStartError as exc:
+        except HerdrSessionStartError:
             skipped.append(
                 (
                     name,
                     locator,
-                    f"the live inventory could not be re-read before closing ({exc}); the "
+                    "the live inventory could not be re-read before closing; the "
                     "target's identity could not be re-verified, so it was left alone",
                 )
             )
@@ -512,14 +535,82 @@ def _execute_closes(
                 )
             )
             continue
-        ok, detail = _close_base_pane(
+        target_identity = _residue_target_identity(
+            name, workspace_id=workspace_id, lane_id=lane_id,
+            legacy_workspace_id=legacy_workspace_id, managed_roles=managed_roles,
+        )
+        target_workspace, target_lane, role = target_identity or ("", "", "")
+        pin = current_generation_release_pin(
+            tuple(fresh_rows), home=home, workspace_id=target_workspace,
+            lane_id=target_lane, role=role, assigned_name=name, locator=locator,
+        ) if role else None
+        if pin is None:
+            skipped.append((
+                name, locator,
+                "the residue lacks exact v4/completed-v2 current-generation authority",
+            ))
+            continue
+        ok, _detail = _close_base_pane(
             binary, locator, subprocess.run, COMMAND_TIMEOUT_SECONDS, os.environ
         )
         if ok:
-            closed.append((name, locator))
+            try:
+                post_rows = tuple(list_herdr_agent_rows(os.environ))
+                absent = pinned_generations_absent(
+                    (pin,), post_rows, home=home, workspace_id=target_workspace,
+                    lane_id=target_lane,
+                )
+            except Exception:  # noqa: BLE001 - a close report is not absence proof
+                absent = False
+            if absent:
+                closed.append((name, locator))
+            else:
+                failed.append((name, locator, "terminal-bound close absence unproven"))
         else:
-            failed.append((name, locator, detail))
+            failed.append((name, locator, "provider close failed"))
     return tuple(closed), tuple(failed), tuple(skipped)
+
+
+def _residue_target_identity(
+    name: str, *, workspace_id: str, lane_id: str,
+    legacy_workspace_id: str, managed_roles,
+):
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        DEFAULT_LANE, encode_assigned_name,
+    )
+    for role in managed_roles:
+        if lane_id != DEFAULT_LANE and name == encode_assigned_name(
+            workspace_id, role, lane_id
+        ):
+            return workspace_id, lane_id, role
+        if legacy_workspace_id and name == encode_assigned_name(
+            legacy_workspace_id, role, DEFAULT_LANE
+        ):
+            return legacy_workspace_id, DEFAULT_LANE, role
+    return None
+
+
+def _residue_current_pins(
+    plan, rows, *, home: Path, workspace_id: str, lane_id: str,
+    legacy_workspace_id: str, managed_roles,
+):
+    from .herdr_destructive_close_identity import current_generation_release_pin
+    pins = []
+    snapshot = tuple(rows)
+    for name, locator in plan.close_targets:
+        identity = _residue_target_identity(
+            name, workspace_id=workspace_id, lane_id=lane_id,
+            legacy_workspace_id=legacy_workspace_id, managed_roles=managed_roles,
+        )
+        target_workspace, target_lane, role = identity or ("", "", "")
+        pin = current_generation_release_pin(
+            snapshot, home=home, workspace_id=target_workspace, lane_id=target_lane,
+            role=role, assigned_name=name, locator=locator,
+        ) if role else None
+        if pin is None:
+            return None
+        pins.append(pin)
+    return tuple(pins)
 
 
 def format_residue_close_text(verdict: ResidueCloseVerdict) -> str:
@@ -620,6 +711,7 @@ __all__ = (
     "RESIDUE_CLOSE_FAILED",
     "RESIDUE_EXCLUSION_UNAVAILABLE",
     "RESIDUE_IDENTITY_MOVED",
+    "RESIDUE_GENERATION_UNVERIFIED",
     "RESIDUE_INVENTORY_UNREADABLE",
     "RESIDUE_LANE_OWNER_UNVERIFIED",
     "RESIDUE_LAUNCH_IN_FLIGHT",

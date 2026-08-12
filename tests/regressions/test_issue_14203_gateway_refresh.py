@@ -15,6 +15,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -35,8 +36,8 @@ from mozyo_bridge.core.state.launch_identity_receipt import (  # noqa: E402
     LAUNCH_IDENTITY_RECEIPT_FILENAME,
 )
 from tests.support.current_launch_authority import (  # noqa: E402
-    LEGACY_ACTION_ID,
     RECEIPT_CAPABLE_ACTION_ID,
+    seed_completed_current_launch_authority,
     seed_current_generation,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.fresh_coordinator_drain import (  # noqa: E402,E501
@@ -233,10 +234,25 @@ class _RefreshCase(unittest.TestCase):
         self.store = ReplacementTransactionStore(home=self.home)
         self.workspace_id = "ws"
         self.port = FakeActuatorPort()
-        # Ruling j#97105: a refresh reads the participant's CURRENT launch-generation row,
-        # and a home without one is not a production lane -- it is a lane whose current
-        # authority is missing, which refuses. So the pre-#14741 path is stated as a fact
-        # about this exact slot: a canonical untagged `startup-<64hex>` row.
+        self.terminal_id = f"terminal:{GATEWAY['old_locator']}"
+        # The evidence planner now joins the generation against one fresh, globally unique
+        # terminal snapshot.  Keep that authority explicit at this shared fixture seam so
+        # every positive refresh case exercises the same v4 + generation-v2 contract as
+        # production.  Tests below that replace the store with legacy / pending / mismatched
+        # rows retain this live observation and therefore continue to fail closed.
+        rows = [{
+            "name": GATEWAY["assigned_name"],
+            "pane_id": GATEWAY["old_locator"],
+            "terminal_id": self.terminal_id,
+        }]
+        inventory = patch(
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "sublane_herdr_projection.list_herdr_agent_rows",
+            return_value=rows,
+        )
+        inventory.start()
+        self.addCleanup(inventory.stop)
         self._seed_current_authority()
 
     def _seed_current_authority(self, **overrides):
@@ -246,7 +262,19 @@ class _RefreshCase(unittest.TestCase):
             locator=GATEWAY["old_locator"],
         )
         base.update(overrides)
-        seed_current_generation(self.home, **base)
+        # Explicit action / pending overrides are the hostile legacy fixtures.  The default
+        # is the only positive current-authority fixture and must carry the exact terminal,
+        # completed startup action and v4 self-attestation together.
+        if "action_id" in overrides or overrides.get("attested") is False:
+            seed_current_generation(self.home, **base)
+            return
+        seed_completed_current_launch_authority(
+            self.home,
+            **base,
+            terminal_id=self.terminal_id,
+            target_workspace="w1",
+            target_tab="w1:t1",
+        )
 
     def _request(self, **overrides) -> GatewayRefreshRequest:
         base = dict(
@@ -400,10 +428,16 @@ class ExecuteRefusalTests(_RefreshCase):
         # against a throwaway store so this test states a stored-row conflict rather than
         # re-implementing how the pointers are built.
         scratch_home = Path(tempfile.mkdtemp())
-        seed_current_generation(
-            scratch_home, workspace_id=self.workspace_id, lane_id=GATEWAY["lane_id"],
-            role=GATEWAY["role"], assigned_name=GATEWAY["assigned_name"],
+        seed_completed_current_launch_authority(
+            scratch_home,
+            workspace_id=self.workspace_id,
+            lane_id=GATEWAY["lane_id"],
+            role=GATEWAY["role"],
+            assigned_name=GATEWAY["assigned_name"],
             locator=GATEWAY["old_locator"],
+            terminal_id=self.terminal_id,
+            target_workspace="w1",
+            target_tab="w1:t1",
         )
         scratch = ReplacementTransactionStore(home=scratch_home)
         GatewayRefreshUseCase(
@@ -444,8 +478,8 @@ class CurrentLaunchAuthorityTests(_RefreshCase):
         self.assertEqual(self.port.launched, [])
         self.assertEqual(ops.resumes, [])
 
-    def test_a_canonical_legacy_current_row_refreshes_byte_invariantly(self):
-        """The positive control the seeded authority buys: unchanged pre-#14741 behaviour."""
+    def test_a_terminal_bound_pre_receipt_action_refreshes_byte_invariantly(self):
+        """A completed v2 generation may still carry the pre-receipt action shape."""
         ops = FakeGatewayOps()
         outcome = self._run(ops)
         self.assertEqual(outcome.status, REFRESH_STATUS_COMPLETED)

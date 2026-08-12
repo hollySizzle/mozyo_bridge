@@ -1201,7 +1201,7 @@ class LiveQueueEnterBindingTest(unittest.TestCase):
         return row
 
     @staticmethod
-    def _record() -> SimpleNamespace:
+    def _record(terminal_id: str) -> SimpleNamespace:
         return SimpleNamespace(
             verdict="present",
             workspace_id="ws",
@@ -1209,6 +1209,7 @@ class LiveQueueEnterBindingTest(unittest.TestCase):
             role=RECEIVER,
             assigned_name=LiveQueueEnterBindingTest.assigned_name,
             locator=TARGET,
+            terminal_id=terminal_id,
             observed_at="2026-08-10T00:00:00+00:00",
         )
 
@@ -1216,12 +1217,13 @@ class LiveQueueEnterBindingTest(unittest.TestCase):
         from mozyo_bridge.application import commands as commands_mod
 
         ops = LiveHerdrQueueEnterOpsMixin()
+        terminal_id = str(rail.reader.rows[0][0]["terminal_id"])
         with patch.object(
             commands_mod, "active_herdr_turn_start_rail", rail
         ), patch(
             "mozyo_bridge.core.state.herdr_identity_attestation."
             "HerdrIdentityAttestationStore.read",
-            return_value=self._record(),
+            return_value=self._record(terminal_id),
         ), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_launch_generation_binding."

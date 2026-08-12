@@ -303,8 +303,8 @@ class PublicRailTests(unittest.TestCase):
             action_id="release-14716",
             observation=build_release_observation(
                 (
-                    ReleasePin("gateway", "codex", "w1:p1"),
-                    ReleasePin("worker", "claude", "w1:p2"),
+                    ReleasePin("gateway", "codex", "w1:p1", "startup-action-current"),
+                    ReleasePin("worker", "claude", "w1:p2", "startup-action-current"),
                 )
             ),
         )

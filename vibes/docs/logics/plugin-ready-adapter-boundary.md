@@ -1190,15 +1190,20 @@ convention + mapping type + re-bind procedure for later US's to build on.
 
 ### Design decisions (enforced in code)
 
-- **Assigned name is the sole durable handle; pane/terminal ids are never held.**
+- **Assigned name is the sole durable logical handle; pane/terminal ids are never lookup
+  identity.**
   `HerdrAgentIdentity` has only `(workspace_id, lane_id, role)` fields — there is
   structurally no `pane_id` / `terminal_id` slot — so a caller cannot persist a
-  session-local locator as identity. This encodes PoC E10 directly.
+  session-local locator as logical identity. PoC E10 remains the handle contract. A later
+  hardening (#15227) persists server-owned `terminal_id` only in private attestation v4 and
+  launch-generation v2 rows as generation-bound evidence joined to one fresh inventory;
+  it is hidden from public payloads and never replaces assigned name as a key/handle.
 - **Consistent with the route-identity ledger (#12553).** The stable slot is the
   same tuple the ledger uses `(workspace_id, lane_id, role)`, normalised the same
   way (empty lane -> `default`). The herdr assigned name is the durable analogue
-  of the ledger's `pane_name`; pane/terminal ids are the disposable analogue of
-  its `last_seen_pane_id` (cache, never authority). The two identity contracts do
+  of the ledger's `pane_name`; locator/terminal values remain disposable process-generation
+  evidence, not durable route identity. They may be required as a fail-closed current-process
+  conjunct, but cannot select a slot or become a public handle. The two identity contracts do
   not drift.
 - **Naming convention: deterministic, round-trippable, collision-free.** A name
   is `mzb1_<f(workspace)>_<f(role)>_<f(lane)>` where `_` is the sole delimiter and

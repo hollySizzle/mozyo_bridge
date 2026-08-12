@@ -607,9 +607,19 @@ class InstalledFaultHarness:
         the same store the public rollback command reads — never a raw fence mutation.
         """
         from mozyo_bridge.core.state.startup_transaction_fence import (
+            PHASE_HEALTH_CHECK,
+            PHASE_ROLLBACK_OWED,
             Participant,
             StartupTransactionFence,
             StartupUnit,
+        )
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            IdentityAttestationRecord,
+            VERDICT_PRESENT,
+        )
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            HerdrLaunchGenerationStore,
         )
         from mozyo_bridge.core.state.herdr_native_identity_binding import (
             HerdrNativeIdentityBindingStore,
@@ -621,9 +631,12 @@ class InstalledFaultHarness:
         fence = StartupTransactionFence(home=self.home)
         unit = StartupUnit(workspace_id=self.workspace_id, lane_id=lane_id, providers=providers)
         action = fence.reserve(unit, nonce)
-        # A fresh launch that did NOT come up healthy sits idle (never attested), satisfying the
-        # rollback's identity/content candidate fences. The live public adapter still preserves a
-        # present pane without conditional-close capability; a busy slot is always refused too.
+        generations = HerdrLaunchGenerationStore(home=self.home)
+        attestations = HerdrIdentityAttestationStore(home=self.home)
+        # A fresh launch came up far enough to publish its terminal-bound authority, but its
+        # bounded health decision failed and left this same action in rollback_owed. The live
+        # public adapter still preserves a present pane without conditional-close capability; a
+        # busy slot is always refused too.
         status = STATUS_WORKING if busy else DEFAULT_START_STATUS
         locators: dict[str, str] = {}
         for role in providers:
@@ -651,8 +664,42 @@ class InstalledFaultHarness:
                     ),
                 ),
             )
+            terminal_id = self.fake.terminal_id_of(locator)
+            generations.reserve_pending(
+                assigned_name=name,
+                startup_action_id=action.action_id,
+                workspace_id=self.workspace_id,
+                role=role,
+                lane_id=lane_id,
+            )
+            generations.finalize(
+                assigned_name=name,
+                startup_action_id=action.action_id,
+                workspace_id=self.workspace_id,
+                role=role,
+                lane_id=lane_id,
+                locator=locator,
+                terminal_id=terminal_id,
+                verdict=VERDICT_PRESENT,
+                observed_at="2026-01-01T00:00:00+00:00",
+            )
+            attestations.upsert(
+                IdentityAttestationRecord(
+                    assigned_name=name,
+                    workspace_id=self.workspace_id,
+                    role=role,
+                    lane_id=lane_id,
+                    locator=locator,
+                    terminal_id=terminal_id,
+                    verdict=VERDICT_PRESENT,
+                    observed_at="2026-01-01T00:00:00+00:00",
+                    replacement_action_id=action.action_id,
+                )
+            )
             locators[role] = locator
             self._locators[name] = locator
+        fence.set_phase(action.action_id, PHASE_HEALTH_CHECK)
+        fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
         return action.action_id, locators
 
     # -- stale-worker recovery driving (#13806) -------------------------------
@@ -758,8 +805,14 @@ class InstalledFaultHarness:
         rec = store.get(key)
         store.request_release(
             key, expected_revision=rec.revision, action_id="rel-1",
-            observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w1:p1"),
-                  ReleasePin("worker", "claude-mzb1", "w1:p2")]),
+            observation=build_release_observation([
+                ReleasePin(
+                    "gateway", "codex-mzb1", "w1:p1", "startup-action-current"
+                ),
+                ReleasePin(
+                    "worker", "claude-mzb1", "w1:p2", "startup-action-current"
+                ),
+            ]),
         )
         rec = store.get(key)
         from mozyo_bridge.core.state.lane_lifecycle import RELEASE_RELEASED
@@ -923,15 +976,37 @@ class InstalledFaultHarness:
         from mozyo_bridge.core.state.herdr_launch_generation import (
             HerdrLaunchGenerationStore,
         )
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            IdentityAttestationRecord,
+            VERDICT_PRESENT,
+        )
         from mozyo_bridge.core.state.startup_transaction_fence import (
+            PHASE_COMPLETED_SUCCESS,
+            PHASE_HEALTH_CHECK,
+            Participant,
+            StartupTransactionFence,
             StartupUnit,
-            startup_action_id,
         )
 
-        legacy_action_id = startup_action_id(
+        startup_fence = StartupTransactionFence(home=self.home)
+        startup_action = startup_fence.reserve(
             StartupUnit(workspace_id=ws_id, lane_id=lane_id, providers=("claude",)),
             "installed-fault-harness-legacy-generation",
         )
+        legacy_action_id = startup_action.action_id
+        terminal_id = self.fake.terminal_id_of(locator)
+        startup_fence.record_participant(
+            legacy_action_id,
+            Participant(
+                role="claude",
+                assigned_name=name,
+                locator=locator,
+                receipt=f"workspace={lane_ws}",
+            ),
+        )
+        startup_fence.set_phase(legacy_action_id, PHASE_HEALTH_CHECK)
+        startup_fence.set_phase(legacy_action_id, PHASE_COMPLETED_SUCCESS)
         generations = HerdrLaunchGenerationStore(home=self.home)
         generations.reserve_pending(
             assigned_name=name,
@@ -947,8 +1022,21 @@ class InstalledFaultHarness:
             role="claude",
             lane_id=lane_id,
             locator=locator,
-            verdict="present",
+            terminal_id=terminal_id,
+            verdict=VERDICT_PRESENT,
             observed_at="2026-01-01T00:00:00.000000+00:00",
+        )
+        HerdrIdentityAttestationStore(home=self.home).upsert(
+            IdentityAttestationRecord(
+                assigned_name=name,
+                workspace_id=ws_id,
+                role="claude",
+                lane_id=lane_id,
+                locator=locator,
+                terminal_id=terminal_id,
+                verdict=VERDICT_PRESENT,
+                observed_at="2026-01-01T00:00:00.000000+00:00",
+            )
         )
         # The surviving same-lane codex gateway the heal adopts + pins the tab on (a heal never
         # splits the pair; without a live gateway the fresh worker launch has nothing to adopt).
@@ -1075,6 +1163,7 @@ class InstalledFaultHarness:
                 assigned_name=ctx.worker_name, workspace_id=ctx.workspace_id, role="claude",
                 lane_id=ctx.lane_id, locator=locator, verdict=VERDICT_PRESENT,
                 observed_at=observed_at, replacement_action_id=ctx.action_id,
+                terminal_id=self.fake.terminal_id_of(locator),
             )
         )
         generations = HerdrLaunchGenerationStore(home=self.home)

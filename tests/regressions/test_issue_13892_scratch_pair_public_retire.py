@@ -14,6 +14,8 @@ Acceptance 5 asks for deterministic coverage of success / identity ambiguity / f
 from __future__ import annotations
 
 import argparse
+import json
+import os
 import shutil
 import tempfile
 import unittest
@@ -33,6 +35,7 @@ from mozyo_bridge.core.state.scratch_retirement_fence import (  # noqa: E501
     ScratchRetirementFenceError,
     slot_digest,
 )
+from mozyo_bridge.core.state.scratch_retirement_pin import ScratchRetirementPin
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_retire import (  # noqa: E501
     REASON_CLOSE_FAILED,
     REASON_COMPLETION_UNPROVEN,
@@ -114,6 +117,10 @@ class FakeOps:
         obligations=(),
         rows_raise_after_close=False,
         residue_after_close=False,
+        generation_pins_available=True,
+        generation_replayable=True,
+        generation_absent=None,
+        failure_detail="herdr refused",
     ):
         self._rows = list(rows)
         self._record_absent = record_absent
@@ -124,6 +131,10 @@ class FakeOps:
         self._obligations = obligations
         self._rows_raise_after_close = rows_raise_after_close
         self._residue_after_close = residue_after_close
+        self._generation_pins_available = generation_pins_available
+        self._generation_replayable = generation_replayable
+        self._generation_absent = generation_absent
+        self._failure_detail = failure_detail
         self._closed_any = False
         self.close_calls = []
         self.recorded = []
@@ -163,7 +174,7 @@ class FakeOps:
         closed, failed = [], []
         for role, locator in targets:
             if role in self._fail_roles:
-                failed.append((role, locator, "herdr refused"))
+                failed.append((role, locator, self._failure_detail))
             else:
                 closed.append((role, locator))
         self._closed_any = bool(closed)
@@ -174,6 +185,61 @@ class FakeOps:
                 row for row in self._rows if row.get("pane") not in closed_locators
             ]
         return _CloseResult(closed=tuple(closed), failed=tuple(failed))
+
+    def current_generation_pins(self, workspace_id, lane_id, targets):
+        if not self._generation_pins_available:
+            return None
+        return tuple(
+            ScratchRetirementPin(
+                role,
+                encode_assigned_name(workspace_id, role, lane_id),
+                locator,
+                f"startup:{role}:{locator}",
+            )
+            for role, locator in targets
+        )
+
+    def close_current_generations(self, workspace_id, lane_id, pins):
+        live = {
+            (row.get("name"), row.get("pane")) for row in self.agent_rows()
+        }
+        return self.close(
+            workspace_id,
+            lane_id,
+            tuple(
+                (pin.role, pin.locator)
+                for pin in pins
+                if (pin.assigned_name, pin.locator) in live
+            ),
+        )
+
+    def current_generation_pins_absent(self, workspace_id, lane_id, pins):
+        if self._generation_absent is not None:
+            return self._generation_absent
+        names = {row.get("name") for row in self.agent_rows()}
+        return all(pin.assigned_name not in names for pin in pins)
+
+    def current_generation_pins_replayable(self, workspace_id, lane_id, pins):
+        if not self._generation_replayable:
+            return False
+        names = {row.get("name") for row in self.agent_rows()}
+        return all(
+            pin.assigned_name not in names
+            or (pin.assigned_name, pin.locator)
+            in {(row.get("name"), row.get("pane")) for row in self.agent_rows()}
+            for pin in pins
+        )
+
+    def legacy_retirement_pins_absent(self, workspace_id, lane_id, pins):
+        rows = self.agent_rows()
+        return bool(pins) and all(
+            not any(
+                row.get("name") == encode_assigned_name(workspace_id, role, lane_id)
+                or row.get("pane") == locator
+                for row in rows
+            )
+            for role, locator in pins
+        )
 
     def record_retirement(self, *, workspace_id, lane_id, intent):
         self.recorded.append(intent)
@@ -633,7 +699,11 @@ class ScratchRetirementFenceTest(unittest.TestCase):
         self.home = Path(d)
         self.fence = ScratchRetirementFence(home=self.home)
         self.unit = RetirementUnit("ws1", "lane1", slot_digest(["mzb1_a", "mzb1_b"]))
-        self.pins = (("codex", "%1"), ("claude", "%2"))
+        self.pins = (
+            ScratchRetirementPin("codex", "mzb1_a", "%1", "startup-a"),
+            ScratchRetirementPin("claude", "mzb1_b", "%2", "startup-a"),
+        )
+        self.public_pins = (("codex", "%1"), ("claude", "%2"))
 
     def _open(self, *, live=True):
         return self.fence.transaction(self.unit, live_pair_present=live)
@@ -650,7 +720,7 @@ class ScratchRetirementFenceTest(unittest.TestCase):
     def test_a_different_slot_set_is_a_different_unit(self):
         with self._open() as txn:
             txn.reserve(pinned=self.pins)
-            txn.mark_completed(attempt_id=txn.current().attempt_id, closed=self.pins)
+            txn.mark_completed(attempt_id=txn.current().attempt_id, closed=self.public_pins)
         other = RetirementUnit("ws1", "lane1", slot_digest(["mzb1_a", "mzb1_c"]))
         with self.fence.transaction(other, live_pair_present=False) as txn:
             self.assertIsNone(txn.current(), "a different pair must not inherit the proof")
@@ -679,15 +749,15 @@ class ScratchRetirementFenceTest(unittest.TestCase):
         self._bootstrap()
         self.fence.path.unlink()
         with self.assertRaises(ScratchRetirementFenceError):
-            with self._open(live=True):
-                pass
+            with self._open(live=True) as txn:
+                txn.current()
 
     def test_db_without_seal_fails_closed(self):
         self._bootstrap()
         self.fence.seal_path.unlink()
         with self.assertRaises(ScratchRetirementFenceError):
-            with self._open(live=True):
-                pass
+            with self._open(live=True) as txn:
+                txn.current()
 
     def test_orphan_wal_is_not_read_as_absent(self):
         """A stray SQLite sidecar is evidence something was here — never a fresh world."""
@@ -725,6 +795,26 @@ class ScratchRetirementFenceTest(unittest.TestCase):
     def test_corrupt_db_fails_closed(self):
         self._bootstrap()
         self.fence.path.write_bytes(b"not sqlite")
+        with self.assertRaises(ScratchRetirementFenceError):
+            with self._open(live=True) as txn:
+                txn.current()
+
+    def test_world_readable_primary_is_never_opened(self):
+        self._bootstrap()
+        os.chmod(self.fence.path, 0o666)
+        with self.assertRaises(ScratchRetirementFenceError):
+            self.fence.peek(self.unit)
+        with self.assertRaises(ScratchRetirementFenceError):
+            with self._open(live=True) as txn:
+                txn.current()
+
+    def test_symlink_primary_is_never_opened(self):
+        self._bootstrap()
+        moved = self.home / "foreign.sqlite3"
+        self.fence.path.rename(moved)
+        self.fence.path.symlink_to(moved)
+        with self.assertRaises(ScratchRetirementFenceError):
+            self.fence.peek(self.unit)
         with self.assertRaises(ScratchRetirementFenceError):
             with self._open(live=True) as txn:
                 txn.current()
@@ -792,7 +882,7 @@ class ScratchRetirementFenceTest(unittest.TestCase):
         with self._open(live=True) as txn:
             a = txn.reserve(pinned=self.pins)
             self.assertTrue(a.pending)
-            txn.mark_completed(attempt_id=a.attempt_id, closed=self.pins)
+            txn.mark_completed(attempt_id=a.attempt_id, closed=self.public_pins)
             self.assertTrue(txn.current().completed)
 
     def test_crash_at_reserve_leaves_a_resumable_pending(self):
@@ -815,13 +905,13 @@ class ScratchRetirementFenceTest(unittest.TestCase):
             stale = txn.reserve(pinned=self.pins).attempt_id
             txn.reserve(pinned=self.pins)  # a newer attempt supersedes it
             with self.assertRaises(ScratchRetirementFenceError):
-                txn.mark_completed(attempt_id=stale, closed=self.pins)
+                txn.mark_completed(attempt_id=stale, closed=self.public_pins)
 
     def test_relaunch_after_completed_opens_a_new_attempt(self):
         """The same deterministic names relaunched must NOT inherit the old completion."""
         with self._open(live=True) as txn:
             a = txn.reserve(pinned=self.pins)
-            txn.mark_completed(attempt_id=a.attempt_id, closed=self.pins)
+            txn.mark_completed(attempt_id=a.attempt_id, closed=self.public_pins)
             first_rev = txn.current().revision
         with self._open(live=True) as txn:
             b = txn.reserve(pinned=self.pins)  # a live pair reappeared at the same names
@@ -858,6 +948,51 @@ class ScratchPairRetireReplayTest(ScratchPairRetireTest):
         self.assertEqual(second.state, STATE_ALREADY_RETIRED)
         self.assertTrue(second.ok, "a proven replay must exit 0")
         self.assertEqual(second_ops.close_calls, [], "and close nothing")
+
+    def test_completed_v2_replay_requires_terminal_bound_absence(self):
+        fence = self._fence()
+        first_ops = FakeOps(self._pair_rows())
+        first_ops.fence = fence
+        self.assertEqual(self._run(first_ops, execute=True).state, STATE_GREEN)
+        moved = self._row(
+            encode_assigned_name(self.ws, GATEWAY, "other-lane"),
+            locator="%9",
+            agent=GATEWAY,
+        ) | {"terminal_id": "private-terminal-from-completed-generation"}
+        for execute in (False, True):
+            with self.subTest(execute=execute):
+                replay = FakeOps([moved], generation_absent=False)
+                replay.fence = fence
+                verdict = self._run(replay, execute=execute)
+                self.assertEqual(verdict.reason, REASON_POST_CLOSE_RESIDUE)
+                self.assertEqual(replay.close_calls, [])
+                self.assertEqual(replay.recorded, [])
+
+    def test_missing_current_generation_refuses_before_bootstrap(self):
+        for execute in (False, True):
+            with self.subTest(execute=execute):
+                fence = self._fence()
+                ops = FakeOps(
+                    self._pair_rows(), generation_pins_available=False
+                )
+                ops.fence = fence
+                verdict = self._run(ops, execute=execute)
+                self.assertEqual(verdict.reason, REASON_PIN_DRIFT)
+                self.assertEqual(ops.close_calls, [])
+                self.assertFalse(fence.path.exists())
+                self.assertFalse(fence.seal_path.exists())
+                self.assertFalse(fence.lock_path.exists())
+
+    def test_provider_failure_detail_cannot_render_private_terminal(self):
+        secret = "terminal-secret-T"
+        ops = FakeOps(
+            self._pair_rows(), fail_roles=(GATEWAY,), failure_detail=secret
+        )
+        verdict = self._run(ops, execute=True)
+        self.assertEqual(verdict.reason, REASON_CLOSE_FAILED)
+        rendered = repr(verdict) + json.dumps(verdict.as_payload(), sort_keys=True)
+        self.assertNotIn(secret, rendered)
+        self.assertIn("provider close failed", rendered)
 
     def test_completion_failure_is_not_success_then_repairs(self):
         """j#80506 F2: the load-bearing write fails -> non-success; the next run repairs."""

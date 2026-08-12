@@ -44,6 +44,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     COMPLETION_UNAVAILABLE,
     build_update_evidence_completion,
 )
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_launch_authority,
+)
 
 WORKSPACE = "ws"
 LANE = "issue_14741"
@@ -569,6 +572,7 @@ class SiteRuntimeWiringTest(unittest.TestCase):
         self, site: str, fixture_module: str, fixture_class: str, method: str
     ):
         import importlib
+        from unittest import mock
 
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
             ReplacementActuatorUseCase,
@@ -586,8 +590,44 @@ class SiteRuntimeWiringTest(unittest.TestCase):
         ReplacementActuatorUseCase.__init__ = spy
         try:
             fixture = importlib.import_module(fixture_module)
+            case_class = getattr(fixture, fixture_class)
+            if site == "sublane_stale_worker_recovery":
+                worker = fixture.WORKER
+                base_case = case_class
+
+                class _TerminalBoundFixture(base_case):
+                    def _seed_current_authority(self, **_overrides):
+                        terminal_id = f"terminal:{worker['old_locator']}"
+                        seed_completed_current_launch_authority(
+                            self.home,
+                            workspace_id=self.workspace_id,
+                            lane_id=worker["lane_id"],
+                            role=worker["provider"],
+                            assigned_name=worker["assigned_name"],
+                            locator=worker["old_locator"],
+                            terminal_id=terminal_id,
+                            target_workspace="w1",
+                            target_tab="w1:t1",
+                        )
+
+                    def setUp(self):
+                        super().setUp()
+                        terminal_id = f"terminal:{worker['old_locator']}"
+                        inventory = mock.patch(
+                            "mozyo_bridge.e_110_execution_platform."
+                            "f_140_delegated_coordinator_nested_handoff.application."
+                            "sublane_herdr_projection.list_herdr_agent_rows",
+                            return_value=[{
+                                "name": worker["assigned_name"],
+                                "pane_id": worker["old_locator"],
+                                "terminal_id": terminal_id,
+                            }],
+                        )
+                        inventory.start()
+                        self.addCleanup(inventory.stop)
+                case_class = _TerminalBoundFixture
             suite = unittest.TestLoader().loadTestsFromName(
-                method, getattr(fixture, fixture_class)
+                method, case_class
             )
             result = unittest.TestResult()
             suite.run(result)
@@ -664,8 +704,6 @@ class SiteRuntimeWiringTest(unittest.TestCase):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.replacement_actuation import (  # noqa: E501
             ACTUATION_RECOVERED,
         )
-        from tests.support.current_launch_authority import seed_current_generation
-
         family = importlib.import_module(
             "tests.regressions.test_issue_13933_bound_stale_pair_convergence"
         )
@@ -680,16 +718,32 @@ class SiteRuntimeWiringTest(unittest.TestCase):
         initial = authorising.observe(family.REQ)
         _preflight, fields = family._authorize(authorising)
         expectation = family._expectation_from(authorising, fields)
+        rows = []
         for slot in initial.slots:
-            seed_current_generation(
+            terminal_id = f"terminal:{slot.locator}"
+            seed_completed_current_launch_authority(
                 home, workspace_id=initial.workspace_id, lane_id=family.REQ.lane,
                 role=slot.provider, assigned_name=slot.assigned_name, locator=slot.locator,
+                terminal_id=terminal_id,
+                target_workspace="w1",
+                target_tab="w1:t1",
             )
+            rows.append({
+                "name": slot.assigned_name,
+                "pane_id": slot.locator,
+                "terminal_id": terminal_id,
+            })
 
         captured = []
         original_init = ReplacementActuatorUseCase.__init__
         original_drive = ReplacementActuatorUseCase.drive_worker_recovery
         original_rows = site.list_herdr_agent_rows
+        projection = importlib.import_module(
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "sublane_herdr_projection"
+        )
+        original_projection_rows = projection.list_herdr_agent_rows
 
         def spy(self, transaction_store, port, **kwargs):
             caller = sys._getframe(1).f_globals.get("__name__", "")
@@ -703,7 +757,8 @@ class SiteRuntimeWiringTest(unittest.TestCase):
         ReplacementActuatorUseCase.drive_worker_recovery = (
             lambda self, *a, **k: ActuationResult(status=ACTUATION_RECOVERED)
         )
-        site.list_herdr_agent_rows = lambda *a, **k: ()
+        site.list_herdr_agent_rows = lambda *a, **k: tuple(rows)
+        projection.list_herdr_agent_rows = lambda *a, **k: tuple(rows)
         try:
             ops = site.LiveBoundPairConvergenceOps(
                 repo_root=Path("/coordinator"), env={}, transaction_store=store
@@ -714,6 +769,7 @@ class SiteRuntimeWiringTest(unittest.TestCase):
             ReplacementActuatorUseCase.__init__ = original_init
             ReplacementActuatorUseCase.drive_worker_recovery = original_drive
             site.list_herdr_agent_rows = original_rows
+            projection.list_herdr_agent_rows = original_projection_rows
 
         self.assertTrue(drive.ok, f"{drive.status}: {drive.detail}")
         self.assertEqual(len(captured), 1, "exactly one actuator construction")

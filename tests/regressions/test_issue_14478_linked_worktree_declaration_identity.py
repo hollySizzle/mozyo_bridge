@@ -375,7 +375,11 @@ class DivergentBindingIsStillNeverOverwrittenTests(_RealWorktreeFixture):
 
     def _live_pair_rows(self) -> list:
         return [
-            {"name": encode_assigned_name(WORKSPACE_ID, provider, LANE), "pane_id": loc}
+            {
+                "name": encode_assigned_name(WORKSPACE_ID, provider, LANE),
+                "pane_id": loc,
+                "terminal_id": f"terminal:14478:{provider}",
+            }
             for provider, loc in (("codex", self.GW_LOC), ("claude", self.WK_LOC))
         ]
 
@@ -389,6 +393,7 @@ class DivergentBindingIsStillNeverOverwrittenTests(_RealWorktreeFixture):
                     role=provider,
                     lane_id=LANE,
                     locator=locator,
+                    terminal_id=f"terminal:14478:{provider}",
                     verdict=VERDICT_PRESENT,
                     observed_at=self.ATTESTED_AT,
                 )

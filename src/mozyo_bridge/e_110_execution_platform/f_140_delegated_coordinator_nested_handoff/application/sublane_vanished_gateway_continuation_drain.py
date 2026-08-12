@@ -131,6 +131,7 @@ def _authority_is_for_preparation(
         authority.fresh_locator,
         authority.old_locator,
         authority.observed_at,
+        authority.startup_action_id,
     )
     return (
         all(_plain(value) for value in axes)
@@ -214,6 +215,15 @@ class VanishedGatewayContinuationDrain:
         ):
             return None
         try:
+            from .herdr_live_attestation_time import FreshGenerationBoundary
+            boundary = FreshGenerationBoundary(
+                assigned_name=authority.assigned_name,
+                locator=authority.fresh_locator,
+                provider=authority.provider,
+                row_revision=str(authority.revision),
+                observed_at=authority.observed_at,
+                startup_action_id=authority.startup_action_id,
+            )
             marker = build_marker(
                 RedmineAnchor(
                     issue=pointer.issue_id,
@@ -251,6 +261,7 @@ class VanishedGatewayContinuationDrain:
                     and record.status == "sent"
                     and record.reason == "ok"
                     and _strictly_after(record.recorded_at, authority.observed_at)
+                    and boundary.matches_delivery(record)
                 ):
                     return True
             except (Exception, SystemExit):

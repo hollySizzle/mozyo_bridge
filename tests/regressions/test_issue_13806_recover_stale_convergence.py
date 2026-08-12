@@ -36,6 +36,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -45,6 +46,7 @@ from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
     PreservationObservation,
 )
 from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_launch_authority,
     seed_current_generation,
 )
 from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
@@ -574,11 +576,32 @@ class _ConvergenceCase(unittest.TestCase):
         self.port = _FakeActuatorPort()
         # Ruling j#97105: the recovery reads this worker's CURRENT launch-generation row,
         # and this lane is a pre-#14741 one -- stated as a canonical untagged row for the
-        # exact slot rather than left as an absent authority (which now refuses).
+        # exact slot rather than left as an absent authority (which now refuses). Fresh-plan
+        # tests explicitly supersede it with completed v2 authority; pre-existing residue
+        # fixtures intentionally stay on this legacy row.
         seed_current_generation(
             self.home, workspace_id=WS, lane_id=LANE, role=PROVIDER,
             assigned_name=NAME, locator=LOCATOR,
         )
+
+    def _seed_fresh_destructive_authority(self) -> None:
+        """Opt a fresh plan into the complete, inventory-bound current authority."""
+        terminal_id = f"terminal:{LOCATOR}"
+        seed_completed_current_launch_authority(
+            self.home, workspace_id=WS, lane_id=LANE, role=PROVIDER,
+            assigned_name=NAME, locator=LOCATOR, terminal_id=terminal_id,
+            target_workspace="w28", target_tab="w28:t1",
+        )
+        inventory = mock.patch(
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "sublane_herdr_projection.list_herdr_agent_rows",
+            return_value=[{
+                "name": NAME, "pane_id": LOCATOR, "terminal_id": terminal_id,
+            }],
+        )
+        inventory.start()
+        self.addCleanup(inventory.stop)
 
     def _seed_a10_residue(self, *, lane_revision="0"):
         """The durable mis-bound residue the installed a10 left: replacing_nonself, worker
@@ -723,6 +746,7 @@ class UseCaseConvergenceTests(_ConvergenceCase):
 
     def test_fresh_key_ignores_supersede_and_drives_normally(self):
         # No residue: --supersede is a no-op; a fresh plan drives straight through.
+        self._seed_fresh_destructive_authority()
         outcome = self._use_case(_FakeRecoveryOps(_all_clear())).run(
             self._request(supersede=True), execute=True
         )
@@ -754,6 +778,7 @@ class PreservationSurfaceTests(_ConvergenceCase):
         # A fresh plan whose close boundary observes a lane-lifecycle identity mismatch: the
         # public outcome must name the CLOSED reason (identity_mismatch) and the comparison axis
         # (never a generic preservation_blocked).
+        self._seed_fresh_destructive_authority()
         self.port.pres[WK_IDENTITY] = PreservationObservation(
             identity_matches=False, attestation_fresh=True,
             detail="lane_lifecycle_revision observed='5' pinned='0'",

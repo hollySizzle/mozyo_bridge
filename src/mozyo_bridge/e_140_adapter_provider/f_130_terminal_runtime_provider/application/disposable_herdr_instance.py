@@ -100,6 +100,26 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E501
     SharedSpaceSmokeError,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_workspace_cleanup import (  # noqa: E501
+    REFUSAL_CAPABILITY_ABSENT,
+    REFUSAL_CAPABILITY_NOT_MINTED,
+    REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER,
+    REFUSAL_COMMAND_NOT_ALLOWLISTED,
+    REFUSAL_ENDPOINT_OUTSIDE_OWNED_ROOT,
+    REFUSAL_ENDPOINT_UNBOUND,
+    REFUSAL_OPERATOR_ENDPOINT_TARGET,
+    REFUSAL_OWNED_CHILD_NOT_ALIVE,
+    REFUSAL_WORKERS_NOT_CONTAINED,
+    REFUSAL_WORKSPACE_CLEANUP_CONSUMED,
+    REFUSAL_WORKSPACE_CLEANUP_NOT_MINTED,
+    REFUSAL_WORKSPACE_CLOSE_FAILED,
+    REFUSAL_WORKSPACE_NOT_RECEIPTED,
+    REFUSAL_WORKSPACE_RECEIPT_ABSENT,
+    REFUSAL_WORKSPACE_RECEIPT_INVALID,
+    OwnedWorkspaceCleanupCapability,
+    OwnedWorkspaceCleanupController,
+    SmokeEndpointEscapeError,
+)
 
 
 HERDR_SOCKET_PATH_ENV = "HERDR_SOCKET_PATH"
@@ -118,27 +138,10 @@ _DEFAULT_XDG_SUFFIX = {
     "XDG_STATE_HOME": ".local/state",
 }
 
-# Closed refusal vocabulary.  Every refusal names WHY the call was not dispatched, so
-# evidence and tests assert on a reason rather than a bare boolean.
-REFUSAL_CAPABILITY_ABSENT = "capability_absent"
-REFUSAL_CAPABILITY_NOT_MINTED = "capability_not_minted"
-REFUSAL_ENDPOINT_UNBOUND = "endpoint_unbound"
-REFUSAL_ENDPOINT_OUTSIDE_OWNED_ROOT = "endpoint_outside_owned_root"
-REFUSAL_OPERATOR_ENDPOINT_TARGET = "operator_endpoint_target"
-#: The owned server child is no longer running, so the capability would degrade into
-#: bare socket-path addressing (review j#85841 F2).
-REFUSAL_OWNED_CHILD_NOT_ALIVE = "owned_child_not_alive"
-#: A destructive control request was issued by a process that did not launch the
-#: server (typically a forked smoke worker), which never holds cleanup authority.
-REFUSAL_CLEANUP_AUTHORITY_NOT_OWNER = "cleanup_authority_not_owner"
-#: The request is not one of the client calls the smoke is allowed to make at all.
-#: An *allowlist* miss, so a Herdr control the smoke never needed — including one added
-#: after this code was written — is refused rather than silently permitted.
-REFUSAL_COMMAND_NOT_ALLOWLISTED = "command_not_allowlisted"
-
-#: The closed set of endpoint-bound client calls the shared-space smoke needs, as
-#: ``(group, subcommand)`` pairs measured from what the harness and the production
-#: session-start path actually issue.
+#: The closed set of non-destructive endpoint-bound client calls the shared-space
+#: workflow needs.  Destructive close commands are intentionally absent: a raw pane
+#: locator is generation-unbound, while owned workspace cleanup has its separate,
+#: receipt-bound minter capability below.
 #:
 #: This is an **allowlist, and that is the point** (review j#91604 F1).  The previous
 #: version denylisted a single control (``server stop``) and was therefore fail-open by
@@ -161,7 +164,6 @@ CLIENT_CALL_SUBCOMMANDS: frozenset = frozenset(
         ("agent", "target"),
         ("pane", "split"),
         ("pane", "run"),
-        ("pane", "close"),
         ("pane", "layout"),
         ("pane", "move"),
         ("pane", "resize"),
@@ -199,21 +201,6 @@ _ENDPOINT_CAPABILITY_TOKEN = object()
 # Identity registry for minted capabilities.  ``isinstance`` alone is forgeable through
 # a subclass or a copy; membership here is not.
 _MINTED_CAPABILITIES: "weakref.WeakSet[OwnedEndpointCapability]" = weakref.WeakSet()
-
-
-class SmokeEndpointEscapeError(SharedSpaceSmokeError):
-    """A Herdr CLI request was refused because it was not provably endpoint-owned.
-
-    Raised strictly *before* the request is dispatched, so a caller that sees this
-    error knows the external request count for that call is zero.
-    """
-
-    def __init__(self, reason: str, detail: str = "") -> None:
-        self.reason = reason
-        message = f"refused unbound herdr request ({reason})"
-        if detail:
-            message = f"{message}: {detail}"
-        super().__init__(message)
 
 
 class OwnedServerProcess(Protocol):
@@ -351,6 +338,7 @@ class EndpointBoundHerdrRunner:
         agent_env: Mapping[str, str],
         operator_socket_paths: Sequence[str] = (),
         lifecycle_authority: Optional[Callable[[Sequence[str]], str]] = None,
+        workspace_cleanup_authority: Optional[Callable[[object, str], str]] = None,
     ) -> None:
         self._inner = inner
         self._capability_provider = capability_provider
@@ -363,6 +351,10 @@ class EndpointBoundHerdrRunner:
         # It answers the questions only the lifecycle can answer — is the owned child
         # still alive, and may *this* process issue a destructive control request.
         self._lifecycle_authority = lifecycle_authority or (lambda command: "")
+        self._workspace_cleanup_authority = (
+            workspace_cleanup_authority
+            or (lambda capability, workspace_id: REFUSAL_WORKSPACE_CLEANUP_NOT_MINTED)
+        )
         self.calls = 0
         self.dispatched_calls = 0
         self.bound_calls = 0
@@ -374,6 +366,25 @@ class EndpointBoundHerdrRunner:
         self.refusal_reasons: set = set()
 
     def __call__(self, argv, *args, **kwargs):
+        return self._dispatch(argv, args, kwargs)
+
+    def _close_owned_workspace(
+        self,
+        binary: str,
+        capability: OwnedWorkspaceCleanupCapability,
+        workspace_id: str,
+        *,
+        timeout: float,
+    ):
+        """Dedicated non-generic dispatch for one capability-fixed workspace id."""
+        return self._dispatch(
+            [binary, "workspace", "close", workspace_id],
+            (),
+            {"capture_output": True, "text": True, "timeout": timeout},
+            workspace_cleanup=(capability, workspace_id),
+        )
+
+    def _dispatch(self, argv, args, kwargs, *, workspace_cleanup=None):
         command = list(argv)
         if command[1:3] == ["pane", "split"] and "--help" not in command:
             command = self._restore_pane_environment(command)
@@ -383,7 +394,9 @@ class EndpointBoundHerdrRunner:
         kwargs["env"] = merged
         self.calls += 1
         effective = merged.get(HERDR_SOCKET_PATH_ENV, "")
-        refusal = self._refusal_reason(effective, command)
+        refusal = self._refusal_reason(
+            effective, command, workspace_cleanup=workspace_cleanup
+        )
         if refusal:
             self.escape_refusals += 1
             self.last_refusal_reason = refusal
@@ -412,7 +425,13 @@ class EndpointBoundHerdrRunner:
             return False
         return bool(effective) and effective == str(capability.socket_path)
 
-    def _refusal_reason(self, effective: str, command: Sequence[str] = ()) -> str:
+    def _refusal_reason(
+        self,
+        effective: str,
+        command: Sequence[str] = (),
+        *,
+        workspace_cleanup=None,
+    ) -> str:
         capability = self._capability_provider()
         if capability is None:
             return REFUSAL_CAPABILITY_ABSENT
@@ -425,6 +444,11 @@ class EndpointBoundHerdrRunner:
             return REFUSAL_ENDPOINT_OUTSIDE_OWNED_ROOT
         if effective in self._operator_sockets:
             return REFUSAL_OPERATOR_ENDPOINT_TARGET
+        if workspace_cleanup is not None:
+            cleanup_capability, workspace_id = workspace_cleanup
+            return self._workspace_cleanup_authority(
+                cleanup_capability, workspace_id
+            )
         return self._lifecycle_authority(list(command))
 
     @property
@@ -495,6 +519,14 @@ class DisposableHerdrInstance:
         # (review j#91687 F1).  It starts permitted only because no worker exists yet.
         self._root_release_permitted = True
         self._root_withhold_reason = ""
+        self._workspace_cleanup = OwnedWorkspaceCleanupController(
+            endpoint_provider=self._current_capability,
+            is_minting_process=self._is_minting_process,
+            process_provider=lambda: self._process,
+            runner_provider=lambda: self.runner,
+            binary=self.binary,
+            timeout=self.shutdown_timeout,
+        )
         #: Observed AFTER teardown, never inferred from a flag: the two used to
         #: disagree in both directions (review j#91687 F4).
         self.owned_root_present = True
@@ -522,6 +554,7 @@ class DisposableHerdrInstance:
             agent_env=self._operator_agent_env(),
             operator_socket_paths=self._operator_sockets,
             lifecycle_authority=self._lifecycle_authority_refusal,
+            workspace_cleanup_authority=self._workspace_cleanup.refusal_reason,
         )
 
     def _current_capability(self) -> Optional[OwnedEndpointCapability]:
@@ -586,6 +619,10 @@ class DisposableHerdrInstance:
         if process is None or process.poll() is not None:
             return REFUSAL_OWNED_CHILD_NOT_ALIVE
         return ""
+
+    def mint_workspace_cleanup(self, receipts):
+        """Delegate minting to the receipt-bound cleanup controller."""
+        return self._workspace_cleanup.mint(receipts)
 
     @property
     def capability(self) -> Optional[OwnedEndpointCapability]:
@@ -717,11 +754,13 @@ class DisposableHerdrInstance:
             )
         self._root_release_permitted = False
         self._root_withhold_reason = token
+        self._workspace_cleanup.withhold_workers()
 
     def permit_root_release(self) -> None:
         """Record that containment was positively established, so the tree may go."""
         self._root_release_permitted = True
         self._root_withhold_reason = ""
+        self._workspace_cleanup.contain_workers()
 
     @property
     def root_release_withheld(self) -> bool:
@@ -830,6 +869,7 @@ class DisposableHerdrInstance:
             self._observe_root()
         self._process = None
         self._capability = None
+        self._workspace_cleanup.invalidate()
 
     def gate_evidence(self) -> EndpointGateEvidence:
         """This process's own endpoint-gate counters, as a single-process aggregate."""
@@ -871,6 +911,7 @@ class DisposableHerdrInstance:
                 self.owned_root_observation == ROOT_OBSERVATION_ABSENT
             ),
             "root_withhold_reason": self._root_withhold_reason,
+            **self._workspace_cleanup.as_evidence(),
         }
 
 
@@ -889,6 +930,7 @@ __all__ = (
     "EndpointGateCounters",
     "EndpointGateEvidence",
     "OwnedEndpointCapability",
+    "OwnedWorkspaceCleanupCapability",
     "SmokeEndpointEscapeError",
     "HERDR_CLIENT_SOCKET_PATH_ENV",
     "HERDR_CONFIG_PATH_ENV",
@@ -901,4 +943,11 @@ __all__ = (
     "REFUSAL_ENDPOINT_UNBOUND",
     "REFUSAL_OPERATOR_ENDPOINT_TARGET",
     "REFUSAL_OWNED_CHILD_NOT_ALIVE",
+    "REFUSAL_WORKERS_NOT_CONTAINED",
+    "REFUSAL_WORKSPACE_CLEANUP_CONSUMED",
+    "REFUSAL_WORKSPACE_CLEANUP_NOT_MINTED",
+    "REFUSAL_WORKSPACE_CLOSE_FAILED",
+    "REFUSAL_WORKSPACE_NOT_RECEIPTED",
+    "REFUSAL_WORKSPACE_RECEIPT_ABSENT",
+    "REFUSAL_WORKSPACE_RECEIPT_INVALID",
 )

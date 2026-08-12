@@ -176,6 +176,7 @@ class _DivergentSenderWorld:
         """Represent the worker as one completed, attested managed generation."""
         name = encode_assigned_name(self.workspace_id, "claude", LANE)
         observed_at = "2026-08-10T00:00:00+00:00"
+        terminal_id = self.fake.terminal_id_of(self.worker_locator)
         HerdrIdentityAttestationStore(home=self.home).upsert(
             IdentityAttestationRecord(
                 assigned_name=name,
@@ -183,6 +184,7 @@ class _DivergentSenderWorld:
                 role="claude",
                 lane_id=LANE,
                 locator=self.worker_locator,
+                terminal_id=terminal_id,
                 verdict=VERDICT_PRESENT,
                 observed_at=observed_at,
             )
@@ -196,7 +198,6 @@ class _DivergentSenderWorld:
             ),
             "scenario-managed-stable-worker-generation",
         )
-        terminal_id = f"terminal-{self.worker_locator}"
         target_workspace = self.worker_locator.split(":", 1)[0]
         fence.record_participant(
             action.action_id,
@@ -228,6 +229,7 @@ class _DivergentSenderWorld:
             role="claude",
             lane_id=LANE,
             locator=self.worker_locator,
+            terminal_id=terminal_id,
             verdict=VERDICT_PRESENT,
             observed_at=observed_at,
         )

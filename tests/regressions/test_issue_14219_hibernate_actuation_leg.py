@@ -67,6 +67,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain import (
     hibernate_candidate as hc,
 )
+from tests.support.current_launch_authority import (
+    seed_completed_current_launch_authority,
+)
 
 WS = "ws-auto"
 ISSUE = "14219"
@@ -77,11 +80,13 @@ JOURNAL = "85508"
 class _FakeOps:
     """Minimal SublaneHibernateOps: a clean, quiescent lane (optionally with live slots)."""
 
-    def __init__(self, rows=None, close_result=None):
+    def __init__(self, rows=None, close_result=None, inventory_script=None):
         self._rows = list(rows) if rows is not None else []
         self._close_result = close_result
+        self._inventory_script = list(inventory_script or ())
         self.close_calls: list = []
         self.executed_reads = 0
+        self.inventory_reads = 0
 
     def workspace_id(self) -> str:
         return WS
@@ -89,7 +94,16 @@ class _FakeOps:
     def read_inventory(self):
         # No rows -> release is not_requested -> clean success. Rows + a partial close_result ->
         # RELEASE_PARTIAL (CAS applied, is_success False).
+        self.inventory_reads += 1
+        if self._inventory_script:
+            rows, readable = self._inventory_script.pop(0)
+            if readable:
+                self._rows = list(rows)
+            return list(rows), readable
         return list(self._rows), True
+
+    def live_rows(self):
+        return list(self._rows)
 
     def read_attestation(self, assigned_name):
         return None
@@ -104,15 +118,50 @@ class _FakeOps:
     def execute_close(self, plan):
         self.close_calls.append(plan)
         if self._close_result is not None:
-            return self._close_result
-        return HerdrRetireCloseResult(
-            workspace_id=plan.workspace_id, lane_id=plan.lane_id,
-            closed=tuple(plan.close_targets), failed=(), foreign_names=plan.foreign_names,
-        )
+            result = self._close_result
+        else:
+            result = HerdrRetireCloseResult(
+                workspace_id=plan.workspace_id, lane_id=plan.lane_id,
+                closed=tuple(plan.close_targets), failed=(), foreign_names=plan.foreign_names,
+            )
+        closed = set(result.closed)
+        self._rows = [
+            row
+            for row in self._rows
+            if not any(
+                row.get("name") == encode_assigned_name(WS, role, plan.lane_id)
+                and row.get("pane_id") == locator
+                for role, locator in closed
+            )
+        ]
+        return result
+
+
+def _terminal(role: str, lane: str) -> str:
+    return f"terminal:{lane}:{role}:{WS}:{role}"
 
 
 def _row(role: str, lane: str) -> dict:
-    return {"name": encode_assigned_name(WS, role, lane), "pane_id": f"{WS}:{role}"}
+    return {
+        "name": encode_assigned_name(WS, role, lane),
+        "pane_id": f"{WS}:{role}",
+        "terminal_id": _terminal(role, lane),
+    }
+
+
+def _seed_current_pair(home: Path, lane: str) -> None:
+    for role in ("codex", "claude"):
+        seed_completed_current_launch_authority(
+            home,
+            workspace_id=WS,
+            lane_id=lane,
+            role=role,
+            assigned_name=encode_assigned_name(WS, role, lane),
+            locator=f"{WS}:{role}",
+            terminal_id=_terminal(role, lane),
+            target_workspace="w1",
+            target_tab="w1:t1",
+        )
 
 
 def _request_all_gates(lane=LANE, issue=ISSUE) -> HibernateRequest:
@@ -179,6 +228,8 @@ class HibernateActuationLegTests(unittest.TestCase):
         store.declare_active(
             LaneLifecycleKey(ws, lane), decision=_decision(issue=issue), issue_id=issue
         )
+        if ws == WS:
+            _seed_current_pair(home, lane)
         return store
 
     def _disposition(self, store, lane=LANE, ws=WS):
@@ -424,6 +475,102 @@ class HibernateActuationLegTests(unittest.TestCase):
             self.assertEqual(ops2.close_calls, [])
             self.assertGreaterEqual(calls["n"], 2)  # early guard + commit-point guard both ran
             self.assertEqual(self._disposition(store), DISPOSITION_HIBERNATED)
+
+    def test_redrive_close_fence_catches_takeover_during_driver_fresh_read(self):
+        """The effect guard runs after the release driver's own fresh inventory read."""
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = self._seed(home)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:claude"),),
+                failed=(("codex", f"{WS}:codex", "close_failed"),),
+            )
+            rows = [_row("codex", LANE), _row("claude", LANE)]
+            first = SublaneHibernateUseCase(
+                ops=_FakeOps(rows=rows, close_result=partial), store=store
+            ).run(_request_all_gates(), execute=True)
+            self.assertTrue(first.transition.applied)
+
+            ops = _FakeOps(rows=rows)
+            outcome = SublaneHibernateUseCase(
+                ops=ops, store=store,
+                lease_guard=lambda: ops.inventory_reads < 3,
+            ).run(_request_all_gates(), execute=True)
+
+            self.assertTrue(outcome.lease_lost)
+            self.assertTrue(outcome.is_blocked)
+            self.assertEqual(ops.inventory_reads, 3)
+            self.assertEqual(ops.close_calls, [])
+
+    def test_close_edge_unreadable_inventory_is_zero_close(self):
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = self._seed(home)
+            rows = [_row("codex", LANE), _row("claude", LANE)]
+            ops = _FakeOps(
+                rows=rows,
+                inventory_script=[(rows, True), (rows, True), ((), False)],
+            )
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request_all_gates(), execute=True
+            )
+            self.assertTrue(outcome.transition.applied)
+            self.assertFalse(outcome.is_success)
+            self.assertEqual(ops.close_calls, [])
+            self.assertEqual(outcome.release.closed, ())
+
+    def test_same_locator_terminal_replacement_is_zero_close(self):
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = self._seed(home)
+            rows = [_row("codex", LANE), _row("claude", LANE)]
+            replaced = [dict(row, terminal_id=row["terminal_id"] + ":replacement") for row in rows]
+            ops = _FakeOps(
+                rows=rows,
+                inventory_script=[(rows, True), (rows, True), (replaced, True)],
+            )
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request_all_gates(), execute=True
+            )
+            self.assertFalse(outcome.is_success)
+            self.assertEqual(ops.close_calls, [])
+            self.assertEqual(outcome.release.closed, ())
+
+    def test_duplicate_close_edge_snapshot_is_zero_close(self):
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = self._seed(home)
+            rows = [_row("codex", LANE), _row("claude", LANE)]
+            duplicate = rows + [dict(rows[0])]
+            ops = _FakeOps(
+                rows=rows,
+                inventory_script=[(rows, True), (rows, True), (duplicate, True)],
+            )
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request_all_gates(), execute=True
+            )
+            self.assertFalse(outcome.is_success)
+            self.assertEqual(ops.close_calls, [])
+
+    def test_post_close_unreadable_inventory_withholds_release_completion(self):
+        with TemporaryDirectory() as raw:
+            home = Path(raw)
+            store = self._seed(home)
+            rows = [_row("codex", LANE), _row("claude", LANE)]
+            ops = _FakeOps(
+                rows=rows,
+                inventory_script=[
+                    (rows, True), (rows, True), (rows, True), ((), False),
+                ],
+            )
+            outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
+                _request_all_gates(), execute=True
+            )
+            self.assertEqual(len(ops.close_calls), 1)
+            self.assertFalse(outcome.is_success)
+            self.assertTrue(outcome.success_withheld)
+            self.assertEqual(len(outcome.release.closed), 2)
 
     def test_use_case_lease_guard_outcome_is_blocked_and_not_success(self):
         # R1-F2 at the use-case boundary: a commit-point lease loss is a typed blocked, zero-mutation

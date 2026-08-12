@@ -59,6 +59,23 @@ def _tagged_action() -> str:
     )
 
 
+def _tagged_two_bound_action() -> str:
+    manifest = IdentityManifest(
+        workspace_id="wA",
+        lane_id="issue_14741",
+        slots=(
+            IdentityManifestSlot("codex", "mzb1_wA_codex_lane", True, DIGEST),
+            IdentityManifestSlot("claude", "mzb1_wA_claude_lane", True, DIGEST),
+        ),
+    )
+    return startup_action_id(
+        UNIT,
+        "nonce-two-bound",
+        capability=CAPABILITY_IDENTITY_RECEIPT,
+        manifest_digest=manifest.digest(),
+    )
+
+
 class _Plan:
     def __init__(self, provider, assigned):
         self.provider = provider
@@ -145,6 +162,55 @@ class Bracket1ReserveTest(unittest.TestCase):
             binding._pinned_identity = real_identity
             receipts.LaunchIdentityReceiptStore.reserve = real_reserve
         self.assertIn("nothing was actuated", str(ctx.exception))
+
+    def test_each_identity_reserve_row_has_its_own_immediate_effect_fence(self) -> None:
+        import mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_identity_binding as binding
+
+        action_id = _tagged_two_bound_action()
+        self.plans = [
+            _Plan("codex", "mzb1_wA_codex_lane"),
+            _Plan("claude", "mzb1_wA_claude_lane"),
+        ]
+        self.resolved["claude"] = SimpleNamespace(exec_target="/nowhere/claude")
+        calls = 0
+
+        def effect_fence():
+            nonlocal calls
+            calls += 1
+            if calls == 2:
+                raise RuntimeError("partition drift before second identity reserve")
+
+        real = binding._pinned_identity
+        binding._pinned_identity = lambda _provider, _resolved: DIGEST
+        try:
+            with self.assertRaisesRegex(RuntimeError, "second identity reserve"):
+                self._reserve(action_id, effect_fence=effect_fence)
+        finally:
+            binding._pinned_identity = real
+
+        store = LaunchIdentityReceiptStore(home=self.home)
+        self.assertIsNotNone(
+            store.read_receipt(
+                GenerationKey(
+                    "wA",
+                    "issue_14741",
+                    "codex",
+                    "mzb1_wA_codex_lane",
+                    action_id,
+                )
+            )
+        )
+        self.assertIsNone(
+            store.read_receipt(
+                GenerationKey(
+                    "wA",
+                    "issue_14741",
+                    "claude",
+                    "mzb1_wA_claude_lane",
+                    action_id,
+                )
+            )
+        )
 
 
 class Bracket3FinalizeTest(unittest.TestCase):

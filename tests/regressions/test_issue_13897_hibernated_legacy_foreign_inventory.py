@@ -132,8 +132,8 @@ def _seed_hibernated_released(store: LaneLifecycleStore, *, key: LaneLifecycleKe
         expected_revision=rec.revision,
         action_id="rel-1",
         observation=build_release_observation([
-            ReleasePin("gateway", "codex-mzb1", "w1:p1"),
-            ReleasePin("worker", "claude-mzb1", "w1:p2"),
+            ReleasePin("gateway", "codex-mzb1", "w1:p1", "startup-action-current"),
+            ReleasePin("worker", "claude-mzb1", "w1:p2", "startup-action-current"),
         ]),
     )
     rec = store.get(key)

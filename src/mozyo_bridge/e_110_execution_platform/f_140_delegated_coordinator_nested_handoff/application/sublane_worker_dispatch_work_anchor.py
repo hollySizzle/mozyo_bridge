@@ -17,6 +17,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     evaluate_attestation,
 )
+from mozyo_bridge.core.state.herdr_launch_generation import verified_generation_token
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source import (  # noqa: E501
     LiveRedmineJournalError,
     LiveRedmineJournalSource,
@@ -35,7 +36,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     AGENT_KEY_NAME,
+    AGENT_KEY_REVISION,
     _agent_locator,
+    _norm_lane,
+    terminal_identity_of_live_slot,
     encode_assigned_name,
 )
 
@@ -52,6 +56,9 @@ def gateway_delivery_receipt_matches(
     assigned_name: str,
     locator: str,
     provider: str,
+    row_revision: str,
+    startup_action_id: str,
+    attestation_observed_at: str,
 ) -> bool:
     """True only for a positive delivery receipt bound to this gateway generation.
 
@@ -64,6 +71,9 @@ def gateway_delivery_receipt_matches(
         "assigned_name": _norm(assigned_name),
         "locator": _norm(locator),
         "provider": _norm(provider),
+        "row_revision": _norm(row_revision),
+        "startup_action_id": _norm(startup_action_id),
+        "attestation_observed_at": _norm(attestation_observed_at),
     }
     if not all(wanted.values()) or not _norm(issue) or not _norm(journal):
         return False
@@ -88,6 +98,11 @@ def gateway_delivery_receipt_matches(
         observation = getattr(record, "queue_enter_observation", None)
         if not isinstance(observation, Mapping):
             continue
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (  # noqa: E501
+            canonical_v2_generation_binding,
+        )
+        if not canonical_v2_generation_binding(observation):
+            continue
         if observation.get("read_ok") is not True:
             continue
         if observation.get("runtime_state") != "busy":
@@ -96,13 +111,6 @@ def gateway_delivery_receipt_matches(
         if not isinstance(binding, Mapping):
             continue
         if any(_norm(binding.get(key)) != value for key, value in wanted.items()):
-            continue
-        # The v2 receipt carries both process-generation observation tokens. They are
-        # not caller authority; requiring them excludes older generic ACK rows that never
-        # observed a managed gateway generation.
-        if not _norm(binding.get("startup_action_id")):
-            continue
-        if not _norm(binding.get("row_revision")):
             continue
         return True
     return False
@@ -146,16 +154,35 @@ def received_work_anchor_is_current(
     locator = _agent_locator(matches[0])
     if not locator or locator != _norm(lane.gateway_pane):
         return False
+    revision_raw = matches[0].get(AGENT_KEY_REVISION)
+    row_revision = "" if isinstance(revision_raw, bool) else _norm(revision_raw)
+    terminal_id = terminal_identity_of_live_slot(assigned_name, locator, rows)
+    if not row_revision or not terminal_id:
+        return False
 
     attestation = HerdrIdentityAttestationStore().read(assigned_name)
     joined = evaluate_attestation(
         attestation,
         live_locator=locator,
+        live_terminal_id=terminal_id,
         expected_workspace_id=lane.workspace_id,
         expected_role=gateway_provider,
         expected_lane=lane.lane_id,
     )
     if not joined.ok:
+        return False
+    generation_token = verified_generation_token(
+        None,
+        assigned_name=assigned_name,
+        workspace_id=lane.workspace_id,
+        role=gateway_provider,
+        lane_id=lane.lane_id,
+        locator=locator,
+        live_terminal_id=terminal_id,
+        norm=_norm,
+        norm_lane=_norm_lane,
+    )
+    if not generation_token:
         return False
     if not gateway_delivery_receipt_matches(
         delivery_records,
@@ -164,6 +191,9 @@ def received_work_anchor_is_current(
         assigned_name=assigned_name,
         locator=locator,
         provider=gateway_provider,
+        row_revision=row_revision,
+        startup_action_id=generation_token,
+        attestation_observed_at=_norm(getattr(attestation, "observed_at", "")),
     ):
         return False
 

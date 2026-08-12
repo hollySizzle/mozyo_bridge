@@ -64,6 +64,7 @@ def _rec(**over) -> IdentityAttestationRecord:
         role="claude",
         lane_id="default",
         locator="wY:p2",
+        terminal_id="terminal-1",
         verdict=VERDICT_PRESENT,
     )
     base.update(over)
@@ -133,6 +134,7 @@ class EvaluateAttestationTest(unittest.TestCase):
         join = evaluate_attestation(
             _rec(),
             live_locator="wY:p2",
+            live_terminal_id="terminal-1",
             expected_workspace_id="ws1",
             expected_role="claude",
             expected_lane="default",
@@ -144,6 +146,7 @@ class EvaluateAttestationTest(unittest.TestCase):
         join = evaluate_attestation(
             None,
             live_locator="wY:p2",
+            live_terminal_id="terminal-1",
             expected_workspace_id="ws1",
             expected_role="claude",
             expected_lane="default",
@@ -151,12 +154,42 @@ class EvaluateAttestationTest(unittest.TestCase):
         self.assertFalse(join.ok)
         self.assertEqual(join.state, ATTEST_ABSENT)
 
+    def test_same_locator_different_terminal_is_stale(self) -> None:
+        join = evaluate_attestation(
+            _rec(),
+            live_locator="wY:p2",
+            live_terminal_id="terminal-recreated",
+            expected_workspace_id="ws1",
+            expected_role="claude",
+            expected_lane="default",
+        )
+        self.assertFalse(join.ok)
+        self.assertEqual(join.state, ATTEST_STALE)
+
+    def test_missing_or_malformed_terminal_is_stale(self) -> None:
+        for live_terminal_id in (None, "", " padded ", 7):
+            with self.subTest(live_terminal_id=live_terminal_id):
+                join = evaluate_attestation(
+                    _rec(), live_locator="wY:p2",
+                    live_terminal_id=live_terminal_id,
+                    expected_workspace_id="ws1", expected_role="claude",
+                    expected_lane="default",
+                )
+                self.assertFalse(join.ok)
+                self.assertEqual(join.state, ATTEST_STALE)
+
+    def test_terminal_identity_is_not_publicly_rendered(self) -> None:
+        record = _rec(terminal_id="sentinel-terminal-secret")
+        self.assertNotIn("sentinel-terminal-secret", repr(record))
+        self.assertNotIn("sentinel-terminal-secret", repr(record.as_payload()))
+
     def test_locator_moved_is_stale(self) -> None:
         # A present record from an earlier generation whose live locator moved is
         # never re-used as this process's attestation.
         join = evaluate_attestation(
             _rec(locator="wY:p2"),
             live_locator="wY:p9",
+            live_terminal_id="terminal-1",
             expected_workspace_id="ws1",
             expected_role="claude",
             expected_lane="default",
@@ -168,6 +201,7 @@ class EvaluateAttestationTest(unittest.TestCase):
         join = evaluate_attestation(
             _rec(locator=""),
             live_locator="wY:p2",
+            live_terminal_id="terminal-1",
             expected_workspace_id="ws1",
             expected_role="claude",
             expected_lane="default",
@@ -178,6 +212,7 @@ class EvaluateAttestationTest(unittest.TestCase):
         join = evaluate_attestation(
             _rec(verdict=VERDICT_MISSING),
             live_locator="wY:p2",
+            live_terminal_id="terminal-1",
             expected_workspace_id="ws1",
             expected_role="claude",
             expected_lane="default",
@@ -188,6 +223,7 @@ class EvaluateAttestationTest(unittest.TestCase):
         join = evaluate_attestation(
             _rec(verdict=VERDICT_CONFLICT),
             live_locator="wY:p2",
+            live_terminal_id="terminal-1",
             expected_workspace_id="ws1",
             expected_role="claude",
             expected_lane="default",
@@ -200,6 +236,7 @@ class EvaluateAttestationTest(unittest.TestCase):
         join = evaluate_attestation(
             _rec(role="codex"),
             live_locator="wY:p2",
+            live_terminal_id="terminal-1",
             expected_workspace_id="ws1",
             expected_role="claude",
             expected_lane="default",
@@ -273,6 +310,9 @@ class StoreRoundTripTest(unittest.TestCase):
                     # of the privacy whitelist is argued in the store module's docstring;
                     # this guard still pins that NOTHING ELSE crept in.
                     "lane_epoch",
+                    # v4 (#15227): server-owned generation identity; stored but never
+                    # exposed by the public payload/repr surfaces.
+                    "terminal_id",
                 },
             )
 

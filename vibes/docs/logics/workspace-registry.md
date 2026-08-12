@@ -144,11 +144,11 @@ declaration:
   - `herdr_session_start.prepare_session` の最初 — public entry。request validation・
     home lock・binary 解決・capability probe より**前**に評価するので、拒否は zero-launch
     かつ zero-side-effect になる。
-  - `herdr_session_start._prepare_session_locked` の最初 — **実際に全 launch が到達する
-    境界**。v1 replacement driver (`sublane_actuator_herdr_ops`) は
+  - `herdr_session_start._prepare_session_locked` の最初 — **実際に全 current launch が到達する
+    境界**。replacement actuator (`sublane_actuator_herdr_ops`) は
     `prepare_actuator_lane_session(admission_lock_held=True)` 経由で public wrapper を
     通さず本 entry を直接呼ぶため、public entry だけに rail を置くと live replacement 経路が
-    素通りする。
+    素通りする。旧 v1-v3 side-binding driver は diagnostic-only で launch authorityを持たない。
   再適用は idempotent (canonical root は宣言を持たないので、既に畳まれた root は自分自身へ
   解決する)。後続の読者が「重複」と見なして 2 つ目を削除すると bypass が復活するため、
   docstring と本節の双方に理由を残す。`--dry-run` と live action-time は同一 rail。

@@ -806,7 +806,10 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
         self.assertEqual(obs.get("runtime_state"), "turn_ended")
         self.assertEqual(obs.get("event_wait_kind"), "changed")
-        self.assertEqual(obs.get("gateway_binding"), binding)
+        self.assertEqual(
+            obs.get("gateway_binding"),
+            {k: v for k, v in binding.items() if k not in {"terminal_id", "process_generation"}},
+        )
         self.assertEqual(obs.get("observation_version"), 2)
 
     def test_a_wait_timeout_is_persisted_as_uncertain_non_success(self) -> None:
@@ -831,7 +834,10 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         self.assertEqual(obs.get("final_event_wait_kind"), "timeout")
         self.assertEqual(obs.get("resend_skipped_reason"), RESEND_SKIP_BODY_ABSENT)
         self.assertEqual(obs.get("enter_attempts"), 1)
-        self.assertEqual(obs.get("gateway_binding"), binding)
+        self.assertEqual(
+            obs.get("gateway_binding"),
+            {k: v for k, v in binding.items() if k not in {"terminal_id", "process_generation"}},
+        )
 
     def test_timeout_rechecks_then_stops_after_the_confirming_retry(self) -> None:
         binding = self._binding()

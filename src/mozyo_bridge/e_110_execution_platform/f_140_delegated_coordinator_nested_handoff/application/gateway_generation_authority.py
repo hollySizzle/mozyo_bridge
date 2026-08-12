@@ -56,7 +56,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 
 
 def record_observed_turn_start(
-    rec, *, request, repo_root, attestation_home, pin_revision
+    rec, *, request, repo_root, attestation_home, pin_revision, live_terminal_id
 ) -> bool:
     """Did the ANCHOR delivery's QUEUE-ENTER rail OBSERVE the turn start, GENERATION-BOUND?
 
@@ -80,12 +80,12 @@ def record_observed_turn_start(
         return False
     return record_generation_bound(
         rec, request=request, repo_root=repo_root, attestation_home=attestation_home,
-        pin_revision=pin_revision,
+        pin_revision=pin_revision, live_terminal_id=live_terminal_id,
     )
 
 
 def record_generation_bound(
-    rec, *, request, repo_root, attestation_home, pin_revision
+    rec, *, request, repo_root, attestation_home, pin_revision, live_terminal_id
 ) -> bool:
     """The record's persisted binding is the SAME generation as THIS request's LIVE gateway.
 
@@ -104,7 +104,10 @@ def record_generation_bound(
     error. An empty ``pin_revision`` still fails closed, as before.
     """
     qe = getattr(rec, "queue_enter_observation", None)
-    if not isinstance(qe, dict):
+    from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (  # noqa: E501
+        canonical_v2_generation_binding,
+    )
+    if not canonical_v2_generation_binding(qe):
         return False
     binding = qe.get("gateway_binding")
     if not isinstance(binding, dict):
@@ -119,14 +122,30 @@ def record_generation_bound(
     ):
         return False
     binding_token = _norm(str(binding.get("startup_action_id") or ""))
-    if not binding_token:
+    current_token = current_request_generation_token(
+        request=request, repo_root=repo_root, attestation_home=attestation_home,
+        live_terminal_id=live_terminal_id,
+    )
+    if not binding_token or binding_token != current_token:
         return False
-    return binding_token == current_request_generation_token(
-        request=request, repo_root=repo_root, attestation_home=attestation_home
+    from mozyo_bridge.core.state.herdr_launch_generation import HerdrLaunchGenerationStore
+    try:
+        generation = HerdrLaunchGenerationStore(home=attestation_home).read(
+            request.assigned_name
+        )
+    except Exception:  # noqa: BLE001 - unreadable generation never binds a receipt
+        return False
+    return bool(
+        generation is not None
+        and _norm(generation.startup_action_id) == current_token
+        and _norm(generation.observed_at)
+        == _norm(binding.get("attestation_observed_at"))
     )
 
 
-def current_request_generation_token(*, request, repo_root, attestation_home) -> str:
+def current_request_generation_token(
+    *, request, repo_root, attestation_home, live_terminal_id
+) -> str:
     """The LIVE startup GENERATION TOKEN for THIS request's pinned gateway, gated by a
     SINGLE VERIFIED IDENTITY JOIN + a terminally-successful startup transaction (j#87472).
     (read-only, fail-closed)
@@ -163,6 +182,7 @@ def current_request_generation_token(*, request, repo_root, attestation_home) ->
         role=request.provider,
         lane_id=request.lane,
         locator=request.locator,
+        live_terminal_id=live_terminal_id,
         norm=_norm,
         norm_lane=_norm_lane,
     )

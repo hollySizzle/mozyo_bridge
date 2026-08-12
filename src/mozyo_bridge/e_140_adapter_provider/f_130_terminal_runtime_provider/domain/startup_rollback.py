@@ -170,6 +170,8 @@ class ParticipantFacts:
 
     #: The record already proves this one closed (a resumed / replayed rollback).
     recorded_closed: bool = False
+    #: The action's completed startup generation and private terminal are both absent.
+    absence_generation_bound: bool = False
     #: The live inventory was readable at all. False => nothing below can be trusted.
     inventory_readable: bool = True
     #: How many live agents carry this participant's exact durable name.
@@ -210,7 +212,7 @@ def classify_rollback(facts: ParticipantFacts) -> str:
     6. busy before composer: a running turn is a reason on its own;
     7. composer last, three-valued, and only `empty` or `startup_blocker` may pass.
     """
-    if facts.recorded_closed:
+    if facts.recorded_closed and facts.absence_generation_bound:
         return ROLLBACK_ALREADY_CLOSED
     if not facts.inventory_readable:
         return ROLLBACK_INVENTORY_UNREADABLE
@@ -223,7 +225,7 @@ def classify_rollback(facts: ParticipantFacts) -> str:
         # partial-close discipline) — but it is NOT a close target. The recorded locator
         # is an address we once launched at, not a claim on whoever holds it now
         # (review j#81070 R1-F2: a foreign agent on that pane id was closed).
-        return ROLLBACK_ABSENT
+        return ROLLBACK_ABSENT if facts.absence_generation_bound else ROLLBACK_IDENTITY_DRIFT
     recorded = (facts.recorded_locator or "").strip()
     live = (facts.live_locator or "").strip()
     if not recorded or not live or recorded != live:

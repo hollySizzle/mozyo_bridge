@@ -108,6 +108,9 @@ from mozyo_bridge.core.state.lane_pin_repair import (  # noqa: E402
 from mozyo_bridge.core.state.lane_reconcile_binding import (  # noqa: E402
     LaneReconcileBindingStore,
 )
+from mozyo_bridge.core.state.lane_reconcile_close_pin import (  # noqa: E402
+    build_reconcile_close_pin,
+)
 from mozyo_bridge.core.state.lane_replacement import (  # noqa: E402
     LaneReplacementStore,
 )
@@ -213,6 +216,20 @@ def _pins(gw: str = _GW_LOC, wk: str = _WK_LOC) -> tuple[ProcessGenerationPin, .
     )
 
 
+def _close_pin():
+    return build_reconcile_close_pin(
+        tuple(
+            ReleasePin(
+                pin.provider,
+                pin.assigned_name,
+                pin.locator,
+                f"startup-{pin.provider}",
+            )
+            for pin in _pins()
+        )
+    )
+
+
 def _seed_hibernated_released_bound(
     *,
     path: Path | None,
@@ -257,8 +274,8 @@ def _seed_hibernated_released_bound(
         expected_revision=rec.revision,
         action_id="rel-1",
         observation=build_release_observation([
-            ReleasePin("gateway", _gw_name(), "w28:p3S"),
-            ReleasePin("worker", _wk_name(), "w28:p3T"),
+            ReleasePin("codex", _gw_name(), "w28:p3S", "startup-gateway"),
+            ReleasePin("claude", _wk_name(), "w28:p3T", "startup-worker"),
         ]),
     )
     assert out.applied, f"seed request_release refused: {out.reason}"
@@ -588,7 +605,7 @@ class PinRepairCasMatrix(unittest.TestCase):
             self.key,
             expected_revision=rec.revision,
             action_id="repl-1",
-            pins=[ReleasePin("worker", _wk_name(), _WK_LOC)],
+            pins=[ReleasePin("claude", _wk_name(), _WK_LOC, "startup-worker")],
             decision=dec,
         )
         self.assertTrue(opened.applied)
@@ -682,6 +699,7 @@ class PinRepairDoesNotErodeSiblings(unittest.TestCase):
             issue_id=_ISSUE,
             worktree_identity=_BOUND_WT,
             declared_slots=_pins(),
+            close_pin=_close_pin(),
             decision=_decision(),
         )
         self.assertFalse(out.applied, "a BOUND row is not #13842's legacy target")
@@ -756,11 +774,17 @@ class _FakeOps:
             locator=locator,
             verdict=VERDICT_PRESENT,
             observed_at=_ATTESTED_AT,
+            terminal_id=f"terminal:{locator}",
         )
 
 
 def _row(name: str, locator: str, *, agent: str = "claude") -> dict:
-    return {"name": name, "pane_id": locator, "agent": agent}
+    return {
+        "name": name,
+        "pane_id": locator,
+        "terminal_id": f"terminal:{locator}",
+        "agent": agent,
+    }
 
 
 def _live_pair(gw: str = _GW_LOC, wk: str = _WK_LOC) -> list:

@@ -150,6 +150,9 @@ def _seed_v5(home: Path, *, disposition: str = DISPOSITION_ACTIVE) -> Path:
         conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
         # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
         conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
+        # v11 (#15227) added the generation-bound reconcile owed-close pin. A faithful v5
+        # rewind cannot retain a column introduced six schema generations later.
+        conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
         conn.execute(
             "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
             (LANE_LIFECYCLE_COMPONENT,),
@@ -988,6 +991,8 @@ class UniversalWriteGateTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
             # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
+            # v11 (#15227) added the generation-bound reconcile owed-close pin.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1042,7 +1047,14 @@ class UniversalWriteGateTest(unittest.TestCase):
             LaneLifecycleKey(WS, LANE),
             expected_revision=rec2.revision,
             action_id="act-1",
-            observation=build_release_observation([ReleasePin(role="codex", assigned_name="n", locator="wProj:p2")]),
+            observation=build_release_observation([
+                ReleasePin(
+                    role="codex",
+                    assigned_name="n",
+                    locator="wProj:p2",
+                    startup_action_id="startup-act-1",
+                )
+            ]),
         )
         # Redmine #13844 R5-F1: ``last_write_preparation`` is MOST-RECENT (this write's), NOT a
         # store-lifetime accumulator — the release write found the store already v6, so it is
@@ -1180,6 +1192,8 @@ class RealCommandMigrationAdvisoryTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
             # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
+            # v11 (#15227) added the generation-bound reconcile owed-close pin.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1272,6 +1286,8 @@ class PreMigrationAdvisoryTimingTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
             # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
+            # v11 (#15227) added the generation-bound reconcile owed-close pin.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1356,6 +1372,8 @@ class ComposingStoreMigrationSurfaceTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
             # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
+            # v11 (#15227) added the generation-bound reconcile owed-close pin.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1395,8 +1413,14 @@ class ComposingStoreMigrationSurfaceTest(unittest.TestCase):
         from mozyo_bridge.core.state.lane_reconcile_binding import (
             LaneReconcileBindingStore,
         )
+        from mozyo_bridge.core.state.lane_reconcile_close_pin import (
+            build_reconcile_close_pin,
+        )
 
-        from mozyo_bridge.core.state.lane_lifecycle import ProcessGenerationPin
+        from mozyo_bridge.core.state.lane_lifecycle import (
+            ProcessGenerationPin,
+            ReleasePin,
+        )
 
         self._seed_v5_with_peer()
         store = LaneReconcileBindingStore(home=self.home)
@@ -1409,8 +1433,33 @@ class ComposingStoreMigrationSurfaceTest(unittest.TestCase):
             worktree_identity="wt_x",
             declared_slots=(
                 ProcessGenerationPin(
-                    role="codex", provider="codex", assigned_name="n", locator="wProj:p2"
+                    role="gateway",
+                    provider="codex",
+                    assigned_name="n-gateway",
+                    locator="wProj:p2",
                 ),
+                ProcessGenerationPin(
+                    role="worker",
+                    provider="claude",
+                    assigned_name="n-worker",
+                    locator="wProj:p3",
+                ),
+            ),
+            close_pin=build_reconcile_close_pin(
+                (
+                    ReleasePin(
+                        role="codex",
+                        assigned_name="n-gateway",
+                        locator="wProj:p2",
+                        startup_action_id="startup-reconcile-gateway",
+                    ),
+                    ReleasePin(
+                        role="claude",
+                        assigned_name="n-worker",
+                        locator="wProj:p3",
+                        startup_action_id="startup-reconcile-worker",
+                    ),
+                )
             ),
             decision=_issue_decision(),
         )
@@ -1428,7 +1477,14 @@ class ComposingStoreMigrationSurfaceTest(unittest.TestCase):
             LaneLifecycleKey(WS, LANE),
             expected_revision=1,
             action_id="act",
-            pins=[ReleasePin(role="codex", assigned_name="n", locator="wProj:p2")],
+            pins=[
+                ReleasePin(
+                    role="codex",
+                    assigned_name="n",
+                    locator="wProj:p2",
+                    startup_action_id="startup-act",
+                )
+            ],
             decision=_issue_decision(),
         )
         prep = store.last_write_preparation

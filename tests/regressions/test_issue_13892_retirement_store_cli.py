@@ -23,6 +23,7 @@ from mozyo_bridge.core.state.scratch_retirement_fence import (
     ScratchRetirementFence,
     slot_digest,
 )
+from mozyo_bridge.core.state.scratch_retirement_pin import ScratchRetirementPin
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.cli_retirement_store import (  # noqa: E501
     cmd_herdr_retirement_store_status,
 )
@@ -60,7 +61,13 @@ class RetirementStoreCliTest(unittest.TestCase):
     def test_pending_attempt_is_visible(self):
         f = ScratchRetirementFence(home=self.home)
         with f.transaction(self.unit, live_pair_present=True) as txn:
-            txn.reserve(pinned=(("codex", "%1"),))
+            txn.reserve(
+                pinned=(
+                    ScratchRetirementPin(
+                        "codex", "mzb1_a", "%1", "startup:codex:%1"
+                    ),
+                )
+            )
         code, out = self._run()
         self.assertEqual(code, 0)
         self.assertIn("present", out)

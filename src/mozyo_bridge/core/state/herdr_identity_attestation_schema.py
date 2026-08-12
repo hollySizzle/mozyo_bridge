@@ -16,20 +16,14 @@ verify then failed closed with no public recovery. The launcher-capability probe
 (#13847) could not see it: it joins the launcher's *advertised* schema against the
 *source runtime's required* schema — both **code** — and never opens the selected store.
 
-**Read-compatible / write-conservative** (``managed-state-model.md``
-``#### attestation store: read-compatible / write-conservative (#13882)``):
+**Read-compatible / v4-write-only** (``managed-state-model.md``):
 
 - **Reads never migrate.** :func:`readonly_compatible_select` projects an older shape up
   to the current column vocabulary, padding absent columns with their *migration default
   literal*, inside one pinned read transaction (the #13844 ``BEGIN`` discipline).
-- **Writes never migrate either** — the divergence from ``lane_lifecycle``. There, every
-  mutation migrates through one write gate, because that store's readers all ship in the
-  same runtime. Here an auto-migration on the shared home would leave every *older
-  installed* launcher hitting its own exact-version guard, silently dropping its
-  attestation and booting live-but-unattested: the very defect #13882 exists to kill,
-  merely inverted onto the old runtimes. So a v1 store stays v1 until an operator runs
-  the explicit backup-first migration command; a normal launch instead writes the
-  **v1-shaped** row (:func:`writable_projection`).
+- **Managed writes require v4.** Older recognized shapes remain readable only for diagnosis
+  and the approved four-store offline rollout. No normal/replacement/epoch launch writes
+  them; losing ``terminal_id`` would make a recycled process falsely current.
 - **Nothing is ever fabricated.** Each newer shape adds exactly one column whose *absence*
   from an older row is that row's true value, so the projection pads with a fact rather than
   a guess: ``replacement_action_id`` (v2, #13806) is empty for a row whose writer had no
@@ -67,13 +61,17 @@ from mozyo_bridge.core.state.state_store import BACKUPS_DIRNAME, StateStoreError
 _TABLE = "herdr_identity_attestations"
 
 #: The shape this build writes for a fresh store and reads as native.
-HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION = 3
+HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION = 4
 
 #: The store shapes this build can read (and, per the write policy above, write
 #: *conservatively* without migrating). v1 = pre-#13806, v2 = additive
 #: ``replacement_action_id``, v3 = additive ``lane_epoch`` (#14756). A version outside this
 #: set is unsupported and fails closed with the file byte-untouched.
-RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3})
+RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4})
+# A v4 observation always carries the server-owned terminal identity.  Older
+# shapes remain readable, but writing one would silently discard that mandatory
+# generation axis, so managed launch advertises only v4 as writable.
+WRITABLE_SCHEMA_VERSIONS = frozenset({HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION})
 
 #: Recovery policy (``managed-state-model.md`` ``### recovery policy vocabulary``): a
 #: rebuildable projection — losing it degrades to fail-closed (adopt refuses, doctor
@@ -98,14 +96,19 @@ _V2_ADDS = frozenset({"replacement_action_id"})
 #: v3 (#14756) is purely additive over v2: the lane epoch the agent observed in its OWN
 #: process env at boot — the clock-free, locator-free half of the resume generation proof.
 _V3_ADDS = frozenset({"lane_epoch"})
+#: v4 (#15227) binds the startup observation to Herdr's server-owned terminal
+#: identity.  The locator text may survive a cold restore while the terminal does not.
+_V4_ADDS = frozenset({"terminal_id"})
 _SHAPE_V1 = _V1_COLUMNS
 _SHAPE_V2 = _V1_COLUMNS | _V2_ADDS
 _SHAPE_V3 = _SHAPE_V2 | _V3_ADDS
+_SHAPE_V4 = _SHAPE_V3 | _V4_ADDS
 
 _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     1: (_SHAPE_V1,),
     2: (_SHAPE_V2,),
     3: (_SHAPE_V3,),
+    4: (_SHAPE_V4,),
 }
 
 #: The current column vocabulary, in the order every read projects and every native write
@@ -122,6 +125,7 @@ COLUMNS_V3 = (
     "replacement_action_id",
     "lane_epoch",
 )
+COLUMNS_V4 = COLUMNS_V3 + ("terminal_id",)
 #: The v2 write vocabulary — the current order minus the #14756 additive column.
 COLUMNS_V2 = tuple(c for c in COLUMNS_V3 if c not in _V3_ADDS)
 #: The v1 write vocabulary — v2's minus the #13806 additive column.
@@ -140,15 +144,17 @@ COLUMNS_V1 = tuple(c for c in COLUMNS_V2 if c not in _V2_ADDS)
 _COLUMN_DEFAULTS: dict[str, Optional[str]] = {
     "replacement_action_id": "''",
     "lane_epoch": "''",
+    "terminal_id": "''",
 }
 
 #: The DDL each additive column is migrated in with (must agree with ``_TABLE_SQL_V3``).
 _COLUMN_MIGRATION_DDL: dict[str, str] = {
     "replacement_action_id": "TEXT NOT NULL DEFAULT ''",
     "lane_epoch": "TEXT NOT NULL DEFAULT ''",
+    "terminal_id": "TEXT NOT NULL DEFAULT ''",
 }
 
-_TABLE_SQL_V3 = f"""
+_TABLE_SQL_V4 = f"""
 CREATE TABLE IF NOT EXISTS {_TABLE} (
     assigned_name TEXT PRIMARY KEY,
     workspace_id TEXT NOT NULL,
@@ -159,7 +165,8 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     detail TEXT NOT NULL DEFAULT '',
     observed_at TEXT NOT NULL,
     replacement_action_id TEXT NOT NULL DEFAULT '',
-    lane_epoch TEXT NOT NULL DEFAULT ''
+    lane_epoch TEXT NOT NULL DEFAULT '',
+    terminal_id TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -232,7 +239,7 @@ def attestation_store_lock(home: Path, *, exclusive: bool, blocking: bool):
     **Residual, accepted and documented** (j#80190 Q2): a runtime of another vintage does
     not know this protocol, so an *uncooperative old-runtime launch concurrent with explicit
     maintenance* is not excluded. That residual is bounded to that case — normal
-    mixed-runtime reads and writes are unaffected — and the operator-facing rule is simply
+    diagnostic reads are unaffected — and the operator-facing rule is simply
     not to launch non-lock-aware launchers while maintenance runs.
     """
     try:
@@ -374,7 +381,7 @@ def readonly_compatible_select(conn: sqlite3.Connection) -> Optional[str]:
         return None
     present = _present_columns(conn)
     parts: list[str] = []
-    for column in COLUMNS_V3:
+    for column in COLUMNS_V4:
         if column in present:
             parts.append(column)
             continue
@@ -386,13 +393,11 @@ def readonly_compatible_select(conn: sqlite3.Connection) -> Optional[str]:
 
 
 def writable_projection(version: int) -> Optional[tuple[str, ...]]:
-    """The column vocabulary a write must use against a store at ``version``.
+    """The historical column vocabulary at ``version`` (not launch admission).
 
     ``COLUMNS_V3`` for a v3 store, ``COLUMNS_V2`` for a v2 one, ``COLUMNS_V1`` for a v1 one
-    (the conservative, non-migrating write), or ``None`` for an unrecognized version. The
-    caller is responsible for refusing a write whose payload cannot survive the returned
-    projection — see :func:`write_drops_replacement_action_id` /
-    :func:`write_drops_lane_epoch`.
+    or ``None`` for an unrecognized version. Managed-write admission separately requires v4;
+    this helper supports read/migration shape reasoning and drop diagnostics.
 
     Selected by an **exact, ordered ladder rather than ``>=``**: each recognized version maps
     to the vocabulary that version's shape actually has. A bare ``>= 2`` would hand a future
@@ -400,7 +405,9 @@ def writable_projection(version: int) -> Optional[tuple[str, ...]]:
     """
     if version not in RECOGNIZED_SCHEMA_VERSIONS:
         return None
-    if version >= 3:
+    if version == 4:
+        return COLUMNS_V4
+    if version == 3:
         return COLUMNS_V3
     if version == 2:
         return COLUMNS_V2
@@ -410,11 +417,8 @@ def writable_projection(version: int) -> Optional[tuple[str, ...]]:
 def write_drops_replacement_action_id(version: int, replacement_action_id: str) -> bool:
     """Whether writing ``replacement_action_id`` at ``version`` would silently drop it.
 
-    The single predicate separating the two launch kinds of acceptance 2: a **normal**
-    launch carries an empty action id, so the v1 projection loses nothing and is a proven
-    backward-compatible path; a **replacement** launch carries a non-empty one, which the
-    v1 shape has nowhere to put — the write must be refused visibly rather than land a row
-    a replacement recovery would later fail to match.
+    This is a historical shape predicate. Managed writes still require v4 even when this
+    particular optional field is empty, because terminal identity is mandatory.
     """
     if not (replacement_action_id or "").strip():
         return False
@@ -435,14 +439,27 @@ def write_drops_lane_epoch(version: int, lane_epoch: str) -> bool:
     visibly is the only outcome that names the operator's next rail
     (``mozyo-bridge herdr attestation-store migrate --write``).
 
-    An epoch-less launch (the pre-#14756 shape, or a lane whose lifecycle row has minted no
-    epoch) carries ``''`` and loses nothing, so it still writes the older shape and the
-    mixed-runtime home keeps working exactly as #13882 requires.
+    An empty epoch loses no epoch field, but does not make v1-v3 writable: terminal identity
+    remains mandatory for every managed launch.
     """
     if not (lane_epoch or "").strip():
         return False
     projection = writable_projection(version)
     return projection is not None and "lane_epoch" not in projection
+
+
+def write_drops_terminal_id(version: int, terminal_id: object) -> bool:
+    """Whether a startup observation would lose its server-owned terminal identity.
+
+    Unlike the optional historical fields, every v4 self-attestation must carry a
+    canonical non-blank terminal id observed in the wrapper's own unique inventory row.
+    Therefore every write to a v1-v3 store is refused: projecting the row down would
+    recreate the same-pane/different-terminal false-green that #15227 closes.
+    """
+    if type(terminal_id) is not str or not terminal_id or terminal_id.strip() != terminal_id:
+        return True
+    projection = writable_projection(version)
+    return projection is None or "terminal_id" not in projection
 
 
 @dataclass(frozen=True)
@@ -514,7 +531,7 @@ def probe_store_schema(path: Path) -> StoreSchemaObservation:
 
 def create_schema(conn: sqlite3.Connection) -> None:
     """Create a fresh store at the current version (used only when nothing exists)."""
-    conn.execute(_TABLE_SQL_V3)
+    conn.execute(_TABLE_SQL_V4)
     conn.execute(f"PRAGMA user_version = {HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}")
 
 
@@ -843,7 +860,7 @@ def migrate_attestation_store(path: Path) -> AttestationMigrationOutcome:
             ) from exc
         try:
             present = _present_columns(conn)
-            for column in COLUMNS_V3:
+            for column in COLUMNS_V4:
                 if column in present:
                     continue
                 ddl = _COLUMN_MIGRATION_DDL.get(column)
@@ -881,12 +898,14 @@ __all__ = (
     "COLUMNS_V1",
     "COLUMNS_V2",
     "COLUMNS_V3",
+    "COLUMNS_V4",
     "HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY",
     "HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION",
     "MIGRATION_ABSENT",
     "MIGRATION_APPLIED",
     "MIGRATION_INTACT",
     "RECOGNIZED_SCHEMA_VERSIONS",
+    "WRITABLE_SCHEMA_VERSIONS",
     "STORE_ABSENT",
     "STORE_RECOGNIZED",
     "STORE_UNREADABLE",
@@ -912,4 +931,5 @@ __all__ = (
     "writable_projection",
     "write_drops_lane_epoch",
     "write_drops_replacement_action_id",
+    "write_drops_terminal_id",
 )

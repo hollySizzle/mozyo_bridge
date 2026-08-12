@@ -1,11 +1,7 @@
-"""Action-bound v1 replacement drive for a managed sublane heal.
+"""Legacy replacement-store diagnostic fence for a managed sublane heal.
 
-The herdr actuator owns general lane placement and lifecycle behavior.  This module owns
-the narrower compatibility transaction required while the selected identity-attestation
-store is still v1: pin the store generation, reserve-before-launch, bind the exact startup
-receipt, and project any nested startup rollback debt into the execution-platform error
-vocabulary.  Keeping that transaction here prevents the general actuator from becoming a
-second implementation of the v1 binding state machine.
+v1-v3 side bindings are readable rollback diagnostics only. Current replacement launches
+delegate to the v4 managed-launch preflight and never reserve a legacy side row.
 """
 
 from __future__ import annotations
@@ -39,8 +35,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_v1_replacement_binding import (  # noqa: E501
     V1_BINDING_MAINTENANCE_BUSY,
     V1_BINDING_STORE_UNUSABLE,
-    V1ReplacementBindingFailure,
-    launch_or_resume_v1_replacement,
 )
 
 
@@ -77,33 +71,11 @@ class V1ReplacementDriver:
             with attestation_store_lock(
                 self.home, exclusive=False, blocking=False
             ):
-                if not selected_attestation_store_is_v1(self.home):
-                    return False
-                launch_or_resume_v1_replacement(
-                    home=self.home,
-                    action_id=request.action_id,
-                    assigned_name=request.assigned_name,
-                    old_locator=request.old_locator,
-                    target_provider=request.target_provider,
-                    workspace_id=request.workspace_id,
-                    lane_id=request.lane_id,
-                    managed_pair=request.managed_pair,
-                    rows=request.rows,
-                    existing=request.existing,
-                    launch=request.launch,
-                    target_only=request.target_only,
-                )
-                return True
-        except V1ReplacementBindingFailure as exc:
-            startup = (
-                project_sublane_startup(exc.startup_result)
-                if exc.startup_result is not None else None
-            )
-            raise SublaneHealError(
-                f"lane heal fenced ({exc.reason}): {exc.detail}",
-                reason=exc.reason,
-                startup=startup,
-            ) from exc
+                # v1-v3 side rows are diagnostic-only under the terminal-bound v4
+                # contract. Delegate to the general path, whose preflight refuses the
+                # legacy store before registry/startup/generation/Herdr writes.
+                selected_attestation_store_is_v1(self.home)
+                return False
         except AttestationStoreLockBusy as exc:
             raise SublaneHealError(
                 "lane heal fenced (replacement_binding_maintenance_busy): "
@@ -124,4 +96,19 @@ class V1ReplacementDriver:
             ) from exc
 
 
-__all__ = ("V1ReplacementDriver", "V1ReplacementRequest")
+def require_replacement_target_healthy(result, action_id, target_provider, assigned_name) -> None:
+    """Fence the exact v4 replacement participant, independent of sibling health."""
+    if not action_id:
+        return
+    launched = [slot for slot in result.slots if slot.provider == target_provider
+                and slot.assigned_name == assigned_name]
+    if len(launched) != 1 or launched[0].outcome != "launched" or not launched[0].healthy:
+        raise SublaneHealError(
+            "lane heal fenced (replacement_binding_launch_unhealthy): the fresh "
+            "replacement participant did not reach bounded startup health",
+            reason="replacement_binding_launch_unhealthy",
+            startup=project_sublane_startup(result),
+        )
+
+
+__all__ = ("V1ReplacementDriver", "V1ReplacementRequest", "require_replacement_target_healthy")

@@ -95,8 +95,9 @@ def register_herdr_launch_generation_store_parser(herdr_sub, *, add_repo_option=
         help=(
             "Redmine #14203: inspect / rebuild the home-scoped launch-generation store (the "
             "collision-free per-launch generation authority the gateway recovery binds on). "
-            "It is a rebuildable_cache: a corrupt store degrades to fail-closed rather than "
-            "bricking future launches, and this is the public backup-first recovery rail. "
+            "Terminal-bound schema v2 is a required current-process conjunct. Legacy v1 "
+            "is read only by the four-store offline rollout, which backup/rebuilds it before "
+            "restore; normal managed launch refuses v1 before durable reservation. "
             "Requires no raw SQLite; closes, sends to, and launches NO process; refuses "
             "while managed agents hold a generation here."
         ),
@@ -119,7 +120,8 @@ def register_herdr_launch_generation_store_parser(herdr_sub, *, add_repo_option=
             "Rotate a CORRUPT store into backups/ and remove it so the next managed launch "
             "re-creates it (legitimate only because this is a rebuildable_cache: the next "
             "reserve/finalize re-derives the generation, and until then reads degrade "
-            "fail-closed). Refuses a healthy store (it holds live generations) and refuses "
+            "fail-closed). Legacy v1 upgrade belongs to offline-rollout, not this live rail. "
+            "Refuses a healthy store (it holds live generations) and refuses "
             "while managed agents hold a generation here."
         ),
     )

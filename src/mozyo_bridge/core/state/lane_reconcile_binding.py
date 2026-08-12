@@ -77,6 +77,10 @@ from mozyo_bridge.core.state.lane_lifecycle_schema import (
     TABLE as _TABLE,
     LaneLifecycleError,
 )
+from mozyo_bridge.core.state.lane_reconcile_close_pin import (
+    ReconcileClosePin,
+    encode_reconcile_close_pin,
+)
 
 
 class LaneReconcileBindingStore:
@@ -107,6 +111,7 @@ class LaneReconcileBindingStore:
         issue_id: str,
         worktree_identity: str,
         declared_slots: Sequence[ProcessGenerationPin],
+        close_pin: ReconcileClosePin,
         decision: DecisionPointer,
         now: Optional[str] = None,
     ) -> CasOutcome:
@@ -170,6 +175,15 @@ class LaneReconcileBindingStore:
                 "declared slot set (the process binding it records)"
             )
         encoded_slots = encode_declared_slots(pinned)
+        if {
+            (slot.role, slot.assigned_name, slot.locator) for slot in close_pin.slots
+        } != {
+            (slot.provider, slot.assigned_name, slot.locator) for slot in pinned
+        }:
+            raise ValueError(
+                "reconcile close pin must identify the exact declared live pair"
+            )
+        encoded_close_pin = encode_reconcile_close_pin(close_pin)
         stamp = now or _utc_now()
         conn = self._lifecycle._connect_write(key)  # Redmine #13844 R2: shared write gate
         try:
@@ -193,6 +207,7 @@ class LaneReconcileBindingStore:
                 or current.project_scope
                 or current.worktree_identity
                 or current.declared_slots
+                or current.reconcile_close_pin
             ):
                 # Not the exact EMPTY-binding legacy signature (Redmine #13842 review j#79320
                 # R1): an active / superseded / retired row, a project-gateway binding, a
@@ -237,7 +252,8 @@ class LaneReconcileBindingStore:
             conn.execute(
                 f"UPDATE {_TABLE} SET lane_disposition = ?, worktree_identity = ?, "
                 "declared_slots = ?, decision_source = ?, decision_issue_id = ?, "
-                "decision_journal = ?, reconcile_phase = ?, revision = ?, updated_at = ? "
+                "decision_journal = ?, reconcile_phase = ?, reconcile_close_pin = ?, "
+                "revision = ?, updated_at = ? "
                 "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
                 (
                     DISPOSITION_RETIRED,
@@ -249,6 +265,7 @@ class LaneReconcileBindingStore:
                     # v6 provenance (Redmine #13842 R6): mark this retirement as the reconcile's,
                     # so its owed pane-close resume can be told apart from an ordinary retire.
                     RECONCILE_PHASE_RECONCILED,
+                    encoded_close_pin,
                     revision,
                     stamp,
                     key.repo_workspace_id,

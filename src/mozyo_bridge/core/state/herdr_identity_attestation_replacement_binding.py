@@ -1,22 +1,9 @@
-"""Action-bound replacement receipts for a v1 identity-attestation store (#13933).
+"""Legacy action-bound replacement receipt diagnostics (#13933).
 
-The shared identity-attestation store deliberately stays at its on-disk version while
-older installed launchers are live (Redmine #13882).  Its v1 shape therefore cannot
-carry ``replacement_action_id``.  General replacement launches remain refused there:
-silently dropping that field would make a new process unverifiable.
-
-The reviewed bound-pair convergence rail has stronger evidence than a general launch.
-It owns an immutable replacement action and the startup transaction records the exact
-``agent start`` participant immediately after the provider returns a locator.  For that
-one rail, a replacement can be decomposed safely into:
-
-1. a normal, v1-shaped self-attestation write (no migration and no dropped field), and
-2. this separate action-binding projection, written only after the startup receipt and
-   the v1 row agree on assigned name, identity, live locator, and observation generation.
-
-Readers accept the projection only while the main store is still recognized v1 and all
-of those fields still match.  A migration to v2, another process generation, another
-action, a torn/unknown binding schema, or a missing receipt therefore fails closed.
+The v1-v3 attestation shapes cannot bind the server-owned terminal identity required by
+the current v4 authority contract.  Their historical side records remain readable for
+diagnosis and rollback-debt projection, but never make a live process current or green.
+Managed launches write only v4 after the approved four-store offline rollout.
 
 The file contains identity tokens and timestamps only.  It has no argv, environment,
 credential, message, or pane-content field.  Initial publication is atomic and mode
@@ -631,6 +618,7 @@ def replacement_action_is_bound(
     *,
     action_id: str,
     live_locator: str,
+    live_terminal_id: object,
     expected_workspace_id: str,
     expected_role: str,
     expected_lane: str,
@@ -638,7 +626,7 @@ def replacement_action_is_bound(
     expected_old_locator: str = "",
     home: Path | None = None,
 ) -> bool:
-    """Exact direct-v2 or side-bound-v1 action match; never fabricates a binding."""
+    """Exact terminal-bound v4 direct action match; legacy sides stay non-green."""
     if record is None:
         return False
     action = (action_id or "").strip()
@@ -649,6 +637,10 @@ def replacement_action_is_bound(
         or record.role != expected_role
         or record.lane_id != expected_lane
         or record.locator != live_locator
+        or type(live_terminal_id) is not str
+        or not live_terminal_id
+        or live_terminal_id.strip() != live_terminal_id
+        or record.terminal_id != live_terminal_id
         or (expected_assigned_name and record.assigned_name != expected_assigned_name)
     ):
         return False
@@ -683,6 +675,7 @@ def replacement_action_bound_after_identity_join(
     *,
     action_id: str,
     live_locator: str,
+    live_terminal_id: object,
     workspace_id: str,
     role: str,
     lane: str,
@@ -690,24 +683,15 @@ def replacement_action_bound_after_identity_join(
     old_locator: str,
     home: Path | None = None,
 ) -> bool:
-    """Is this joined identity bound to ``action_id``? (native v2, or the exact v1 side record)
+    """Is this exact live identity bound to ``action_id``?
 
-    The caller has already established that ``record`` is the FRESH attestation of the exact
-    live participant (the identity / locator / freshness join).  What is left is the ACTION
-    binding, and its shape depends on which main store is selected:
+    This boundary performs the full identity / locator / terminal join itself before it
+    accepts either a native direct action or the exact legacy side record.  Callers must not
+    be able to turn a stale direct-action row green by claiming they joined it earlier.
 
-    - **v2 (native).**  The row carries ``replacement_action_id`` itself, so an exact match on
-      that field IS the binding, and the caller's join already covered the identity.
-    - **v1.**  The row cannot carry that field — #13882 keeps the on-disk shape while older
-      installed launchers are live — so a replacement launch writes a normal v1 attestation
-      PLUS a separate bound side record.  A v1 row with an EMPTY direct field is therefore the
-      *designed* shape of a correctly bound launch, not evidence of an unbound one.
-
-    Reading only the direct field makes every correctly-bound v1 replacement permanently
-    unverifiable.  That is the exact defect Redmine #14485 fixes, measured on the #14484
-    installed dogfood: the fresh gateway attested ``present`` with ``replacement_action_id=""``
-    while the side record was ``phase=bound`` on the same exact action, name, locator, and old
-    locator — and the recovery still stopped at ``attestation_mismatch``.
+    Current v4 rows carry ``replacement_action_id`` directly and must also match the live
+    terminal.  Older v1-v3 rows and their side records remain readable diagnostics only;
+    because they cannot prove the current server-owned terminal, they are never green.
 
     Both post-launch verifications call THIS function — the bound-pair convergence rail and
     the #13806 actuator port that ``recover-stale`` and ``recover-gateway`` share — so the two
@@ -718,16 +702,12 @@ def replacement_action_bound_after_identity_join(
     an absent / reserved / foreign / wrong-action / wrong-locator side record, a main store
     that is no longer recognized v1, and an unreadable binding store all return ``False``.
     """
-    if record is None:
-        return False
     action = (action_id or "").strip()
-    direct = (getattr(record, "replacement_action_id", "") or "").strip()
-    if direct:
-        return direct == action
     return replacement_action_is_bound(
         record,
         action_id=action,
         live_locator=live_locator,
+        live_terminal_id=live_terminal_id,
         expected_workspace_id=workspace_id,
         expected_role=role,
         expected_lane=lane,

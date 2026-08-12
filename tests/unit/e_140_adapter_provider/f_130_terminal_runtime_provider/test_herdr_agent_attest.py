@@ -43,6 +43,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.shared.paths import process_home_fence
 
 NAME = "mzb1_ws1_claude_default"
+TERMINAL_ID = "terminal:wY:p2"
 # MOZYO_HERDR_BINARY is part of the launcher-injected env (see herdr_launch_argv's
 # HERDR_BINARY_ENV): without it the bounded self-lookup stops at `binary_unresolved`
 # before it can reach the injected runner at all.
@@ -67,6 +68,21 @@ ARGV0_ALIAS_UNBOUND_MESSAGE = (
 )
 
 _CLI_DIAGNOSTIC_PREFIXES = ("error: ", "warning: ")
+
+
+def _agent_row(
+    *,
+    name: str = NAME,
+    pane_id: str = "wY:p2",
+    terminal_id: str = TERMINAL_ID,
+) -> dict[str, str]:
+    return {"name": name, "pane_id": pane_id, "terminal_id": terminal_id}
+
+
+def _rows_json(*rows) -> str:
+    import json
+
+    return json.dumps(list(rows))
 
 
 class ObservedCliDiagnostics:
@@ -160,10 +176,8 @@ def assert_cli_diagnostics(testcase, record, expected) -> None:
 
 def _runner(*rows):
     """A fake subprocess runner returning ``rows`` as an `agent list` JSON payload."""
-    import json as _json
-
     def _run(argv, **kwargs):
-        return argparse.Namespace(returncode=0, stdout=_json.dumps(list(rows)))
+        return argparse.Namespace(returncode=0, stdout=_rows_json(*rows))
 
     return _run
 
@@ -196,15 +210,17 @@ class PerformSelfAttestationTest(unittest.TestCase):
                 role="claude",
                 lane="default",
                 env=_GOOD_ENV,
-                runner=_runner({"name": NAME, "pane_id": "wY:p2"}),
+                runner=_runner(_agent_row()),
                 home=home,
             )
             self.assertEqual(rec.verdict, VERDICT_PRESENT)
             self.assertEqual(rec.locator, "wY:p2")
+            self.assertEqual(rec.terminal_id, TERMINAL_ID)
             # persisted and readable
             got = HerdrIdentityAttestationStore(home=home).read(NAME)
             self.assertEqual(got.verdict, VERDICT_PRESENT)
             self.assertEqual(got.locator, "wY:p2")
+            self.assertEqual(got.terminal_id, TERMINAL_ID)
 
     def test_native_identity_resolves_short_row_and_records_logical_authority(self) -> None:
         native = native_name_for(NAME)
@@ -216,12 +232,13 @@ class PerformSelfAttestationTest(unittest.TestCase):
                 role="claude",
                 lane="default",
                 env={**_GOOD_ENV, MOZYO_HERDR_NATIVE_NAME_ENV: native},
-                runner=_runner({"name": native, "pane_id": "wY:p2"}),
+                runner=_runner(_agent_row(name=native)),
                 home=home,
             )
             self.assertEqual(rec.verdict, VERDICT_PRESENT)
             self.assertEqual(rec.assigned_name, NAME)
             self.assertEqual(rec.locator, "wY:p2")
+            self.assertEqual(rec.terminal_id, TERMINAL_ID)
 
     def test_native_identity_mismatch_writes_no_attestation(self) -> None:
         events = []
@@ -236,9 +253,7 @@ class PerformSelfAttestationTest(unittest.TestCase):
                     **_GOOD_ENV,
                     MOZYO_HERDR_NATIVE_NAME_ENV: native_name_for(NAME + "-other"),
                 },
-                runner=_runner(
-                    {"name": native_name_for(NAME), "pane_id": "wY:p2"}
-                ),
+                runner=_runner(_agent_row(name=native_name_for(NAME))),
                 home=home,
                 append_event=lambda stage, reason="": events.append((stage, reason)),
             )
@@ -257,7 +272,7 @@ class PerformSelfAttestationTest(unittest.TestCase):
                 role="claude",
                 lane="default",
                 env={"MOZYO_HERDR_BINARY": "/x/herdr"},  # triplet absent
-                runner=_runner({"name": NAME, "pane_id": "wY:p2"}),
+                runner=_runner(_agent_row()),
                 home=Path(tmp),
             )
             self.assertEqual(rec.verdict, VERDICT_MISSING)
@@ -274,7 +289,7 @@ class PerformSelfAttestationTest(unittest.TestCase):
                     "MOZYO_AGENT_ROLE": "claude",
                     "MOZYO_LANE_ID": "default",
                 },
-                runner=_runner({"name": NAME, "pane_id": "wY:p2"}),
+                runner=_runner(_agent_row()),
                 home=Path(tmp),
             )
             self.assertEqual(rec.verdict, VERDICT_CONFLICT)
@@ -293,8 +308,10 @@ class PerformSelfAttestationTest(unittest.TestCase):
                 lane="default",
                 env=_GOOD_ENV,
                 runner=_runner(
-                    {"name": NAME, "pane_id": "wY:p2"},
-                    {"name": NAME, "pane_id": "wZ:p9"},
+                    _agent_row(),
+                    _agent_row(
+                        pane_id="wZ:p9", terminal_id="terminal:wZ:p9"
+                    ),
                 ),
                 home=home,
                 append_event=lambda stage, bounded_reason="": events.append(
@@ -344,7 +361,7 @@ class PerformSelfAttestationTest(unittest.TestCase):
                 lane="default",
                 env=_GOOD_ENV,
                 replacement_action_id="recover:l:worker:claude:wk:w2",
-                runner=_runner({"name": NAME, "pane_id": "wY:p2"}),
+                runner=_runner(_agent_row()),
                 home=home,
             )
             self.assertEqual(rec.replacement_action_id, "recover:l:worker:claude:wk:w2")
@@ -353,7 +370,8 @@ class PerformSelfAttestationTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             rec = perform_self_attestation(
                 assigned_name=NAME, workspace_id="ws1", role="claude", lane="default",
-                env=_GOOD_ENV, runner=_runner({"name": NAME, "pane_id": "wY:p2"}),
+                env=_GOOD_ENV,
+                runner=_runner(_agent_row()),
                 home=Path(tmp),
             )
             self.assertEqual(rec.replacement_action_id, "")
@@ -397,11 +415,13 @@ class BoundedSelfLookupTest(unittest.TestCase):
             self.assertTrue(kwargs.get("start_new_session"))
             self.assertTrue(kwargs.get("capture_output"))
             return argparse.Namespace(
-                returncode=0, stdout='[{"name": "' + NAME + '", "pane_id": "wY:p2"}]'
+                returncode=0,
+                stdout=_rows_json(_agent_row()),
             )
 
-        locator, stage, reason = self._lookup(_run)
+        locator, terminal_id, stage, reason = self._lookup(_run)
         self.assertEqual(locator, "wY:p2")
+        self.assertEqual(terminal_id, TERMINAL_ID)
         self.assertEqual(stage, "self_lookup_succeeded")
         self.assertEqual(reason, "")
 
@@ -420,8 +440,11 @@ class BoundedSelfLookupTest(unittest.TestCase):
             clock["t"] += 0.5
             return argparse.Namespace(returncode=0, stdout="[]")  # zero matches
 
-        locator, stage, reason = self._lookup(_run, monotonic=_monotonic)
+        locator, terminal_id, stage, reason = self._lookup(
+            _run, monotonic=_monotonic
+        )
         self.assertEqual(locator, "")
+        self.assertEqual(terminal_id, "")
         self.assertEqual(stage, "self_lookup_timed_out")
         self.assertEqual(reason, "row_absent")
         self.assertEqual(len(calls), 4)  # 0.0/0.5/1.0/1.5 -> the 2.0s check stops it
@@ -435,14 +458,20 @@ class BoundedSelfLookupTest(unittest.TestCase):
         def _monotonic():
             return clock["t"]
 
-        payloads = ["[]", '[{"name": "' + NAME + '", "pane_id": "wY:p2"}]']
+        payloads = [
+            "[]",
+            _rows_json(_agent_row()),
+        ]
 
         def _run(argv, **kwargs):
             clock["t"] += 0.9
             return argparse.Namespace(returncode=0, stdout=payloads.pop(0))
 
-        locator, stage, _ = self._lookup(_run, monotonic=_monotonic)
+        locator, terminal_id, stage, _ = self._lookup(
+            _run, monotonic=_monotonic
+        )
         self.assertEqual(locator, "wY:p2")
+        self.assertEqual(terminal_id, TERMINAL_ID)
         self.assertEqual(stage, "self_lookup_succeeded")
 
     def test_unreadable_read_fails_immediately_without_burning_budget(self) -> None:
@@ -452,8 +481,9 @@ class BoundedSelfLookupTest(unittest.TestCase):
             calls.append(1)
             return argparse.Namespace(returncode=1, stdout="")  # non-zero exit
 
-        locator, stage, reason = self._lookup(_run)
+        locator, terminal_id, stage, reason = self._lookup(_run)
         self.assertEqual(locator, "")
+        self.assertEqual(terminal_id, "")
         self.assertEqual(stage, "self_lookup_failed")
         self.assertEqual(reason, "list_unreadable")
         self.assertEqual(len(calls), 1)  # not retried: a retry cannot fix it
@@ -462,11 +492,15 @@ class BoundedSelfLookupTest(unittest.TestCase):
         def _run(argv, **kwargs):
             return argparse.Namespace(
                 returncode=0,
-                stdout='[{"name": "' + NAME + '", "pane_id": "wY:p2"}, '
-                '{"name": "' + NAME + '", "pane_id": "wZ:p9"}]',
+                stdout=_rows_json(
+                    _agent_row(),
+                    _agent_row(
+                        pane_id="wZ:p9", terminal_id="terminal:wZ:p9"
+                    ),
+                ),
             )
 
-        _, stage, reason = self._lookup(_run)
+        _, _, stage, reason = self._lookup(_run)
         self.assertEqual(stage, "self_lookup_failed")
         self.assertEqual(reason, "row_ambiguous")
 
@@ -479,10 +513,11 @@ class BoundedSelfLookupTest(unittest.TestCase):
             "application.herdr_agent_attest.resolve_herdr_binary",
             side_effect=TerminalTransportError("unresolved"),
         ):
-            locator, stage, reason = bounded_self_lookup(
+            locator, terminal_id, stage, reason = bounded_self_lookup(
                 NAME, self._ENV, runner=_explode, monotonic=lambda: 0.0
             )
         self.assertEqual(locator, "")
+        self.assertEqual(terminal_id, "")
         self.assertEqual(stage, "self_lookup_failed")
         self.assertEqual(reason, "binary_unresolved")
 
@@ -516,7 +551,7 @@ class CmdAgentAttestTest(unittest.TestCase):
         ), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_agent_attest.bounded_self_lookup",
-            return_value=("wY:p2", "self_lookup_succeeded", ""),
+            return_value=("wY:p2", TERMINAL_ID, "self_lookup_succeeded", ""),
         ), patch("os.execvp") as execvp:
             execvp.side_effect = SystemExit(0)
             with self.assertRaises(SystemExit):
@@ -535,7 +570,7 @@ class CmdAgentAttestTest(unittest.TestCase):
         ), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_agent_attest.bounded_self_lookup",
-            return_value=("wY:p2", "self_lookup_succeeded", ""),
+            return_value=("wY:p2", TERMINAL_ID, "self_lookup_succeeded", ""),
         ), patch(
             "os.execvp"
         ) as execvp:
@@ -672,7 +707,7 @@ class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
         with patch.dict("os.environ", base, clear=True), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_agent_attest.bounded_self_lookup",
-            return_value=("wY:p2", "self_lookup_succeeded", ""),
+            return_value=("wY:p2", TERMINAL_ID, "self_lookup_succeeded", ""),
         ), patch(
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_agent_attest.record_identity_attestation",

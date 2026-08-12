@@ -13,7 +13,7 @@ from __future__ import annotations
 import argparse
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -56,6 +56,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm_lane,
     decode_assigned_name,
     process_generation_of_locator,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (
     AGENT_PROVIDERS,
@@ -154,8 +155,8 @@ class ResolvedHerdrTargetCapability:
     purpose: str = RESOLVED_TARGET_CAPABILITY_PURPOSE
     # Project gateways bind these fields; the older external proxy leaves them empty.
     generation_token: str = ""
-    terminal_id: str = ""
-    process_generation: str = ""
+    terminal_id: str = field(default="", repr=False)
+    process_generation: str = field(default="", repr=False)
     project_scope: str = ""
     target_repo_root: str = ""
     target_cwd: str = ""
@@ -428,7 +429,9 @@ def _resolve_current_capability_row(
         raise _resolved_target_capability_error(
             "the project-gateway resolved target cwd changed before handoff"
         )
-    live_terminal_id = row.get(AGENT_KEY_TERMINAL_ID)
+    live_terminal_id = terminal_identity_of_live_slot(
+        cap.assigned_name, cap.locator, rows
+    )
     if (
         type(live_terminal_id) is not str
         or not live_terminal_id

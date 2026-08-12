@@ -60,13 +60,7 @@ def _canonical_binding(*, action_id: str, observed_at: str) -> dict[str, str]:
         "provider": "codex",
         "assigned_name": assigned_name,
         "locator": locator,
-        "terminal_id": terminal_id,
         "row_revision": revision,
-        "process_generation": (
-            f"{len(assigned_name)}:{assigned_name}:"
-            f"{len(terminal_id)}:{terminal_id}:"
-            f"{len(locator)}:{locator}:r{revision}"
-        ),
         "attestation_observed_at": observed_at,
         "startup_action_id": action_id,
     }

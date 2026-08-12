@@ -428,7 +428,10 @@ class TheEpochSurvivesTheLaunchToAttestationRoundTrip(unittest.TestCase):
                     (stage, bounded_reason)
                 ),
                 runner=lambda *a, **k: type(
-                    "P", (), {"returncode": 0, "stdout": '{"agents":[{"name":"n","pane_id":"%1"}]}'}
+                    "P", (), {
+                        "returncode": 0,
+                        "stdout": '{"agents":[{"name":"n","pane_id":"%1","terminal_id":"terminal:%1"}]}',
+                    },
                 )(),
             )
             self.assertIsNotNone(record)
@@ -452,6 +455,7 @@ class TheEpochSurvivesTheLaunchToAttestationRoundTrip(unittest.TestCase):
                             locator="%1",
                             verdict=VERDICT_PRESENT,
                             lane_epoch=token,
+                            terminal_id=f"terminal:{len(token)}:{token}",
                         )
                     )
                     back = store.read(f"n{len(token)}{token}")
@@ -529,29 +533,30 @@ class OldAttestationSchemasAreBlockedNotGuessed(unittest.TestCase):
                             locator="%1",
                             verdict=VERDICT_PRESENT,
                             lane_epoch="7",
+                            terminal_id="terminal:%1",
                         )
                     )
                 # The refusal must name the operator's rail, not merely complain.
                 self.assertIn("attestation-store migrate", str(caught.exception))
 
-    def test_an_epochless_launch_still_writes_the_old_shape(self) -> None:
-        # The mixed-runtime contract (#13882) must keep working: only the epoch-bearing
-        # write is refused, never every write.
+    def test_an_epochless_launch_cannot_write_the_old_shape(self) -> None:
+        # v1-v3 are readable diagnostic history only. A current launch may not silently
+        # drop its terminal identity onto an older locator-only store.
         with tempfile.TemporaryDirectory() as tmp:
             home = Path(tmp)
             self._legacy_store(home, 2)
             store = HerdrIdentityAttestationStore(home=home)
-            store.upsert(
-                IdentityAttestationRecord(
+            with self.assertRaises(HerdrIdentityAttestationError):
+                store.upsert(IdentityAttestationRecord(
                     assigned_name="n",
                     workspace_id=WS,
                     role="claude",
                     lane_id=LANE,
                     locator="%1",
                     verdict=VERDICT_PRESENT,
-                )
-            )
-            self.assertEqual(store.read("n").locator, "%1")
+                    terminal_id="terminal:%1",
+                ))
+            self.assertIsNone(store.read("n"))
 
     def test_the_predicate_is_about_the_shape_not_the_version_number(self) -> None:
         self.assertTrue(write_drops_lane_epoch(1, "7"))
@@ -591,6 +596,7 @@ class OldAttestationSchemasAreBlockedNotGuessed(unittest.TestCase):
                     locator="%2",
                     verdict=VERDICT_PRESENT,
                     lane_epoch="7",
+                    terminal_id="terminal:%2",
                 )
             )
             self.assertEqual(store.read("new").lane_epoch, "7")
@@ -606,6 +612,9 @@ class OldLifecycleRowsAreBlockedNotGuessed(unittest.TestCase):
             # Rewind to the v9 signature the way a real older build would have left it.
             conn = sqlite3.connect(path)
             try:
+                conn.execute(
+                    "ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin"
+                )
                 conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
                 conn.execute(
                     "UPDATE state_schema_components SET schema_version = 9 "
@@ -628,6 +637,9 @@ class OldLifecycleRowsAreBlockedNotGuessed(unittest.TestCase):
             store, key = _hibernated_lane(tmp)
             conn = sqlite3.connect(store.path)
             try:
+                conn.execute(
+                    "ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin"
+                )
                 conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
                 conn.execute("UPDATE lane_lifecycle_records SET lane_generation = 5")
                 conn.execute(
@@ -663,7 +675,7 @@ class TheEpochRefusalIsOnAnObservableBoundary(unittest.TestCase):
         return LauncherCapabilityObservation(
             subcommand_marker_present=True,
             advertised_schema_version=HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
-            advertised_store_versions=frozenset({1, 2, 3}),
+            advertised_store_versions=frozenset({4}),
         )
 
     def _verdict(self, store_version: int, *, epoch_launch: bool):
@@ -697,15 +709,15 @@ class TheEpochRefusalIsOnAnObservableBoundary(unittest.TestCase):
                 self.assertEqual(verdict.reason, STORE_EPOCH_UNSUPPORTED)
                 self.assertIn("migrate", verdict.detail)
 
-    def test_an_epochless_launch_onto_the_same_store_is_still_admitted(self) -> None:
-        # The #13882 mixed-runtime path must not be collateral damage: only the launch that
-        # would LOSE something is refused.
+    def test_an_epochless_launch_onto_an_old_store_is_also_refused(self) -> None:
+        # Terminal identity is mandatory even without an epoch; v1-v3 are diagnostic-only.
         for version in (1, 2, 3):
             with self.subTest(version=version):
-                self.assertTrue(self._verdict(version, epoch_launch=False).ok)
+                self.assertFalse(self._verdict(version, epoch_launch=False).ok)
 
-    def test_an_epoch_launch_onto_a_v3_store_is_admitted(self) -> None:
-        self.assertTrue(self._verdict(3, epoch_launch=True).ok)
+    def test_epoch_and_epochless_launches_require_v4(self) -> None:
+        self.assertTrue(self._verdict(4, epoch_launch=True).ok)
+        self.assertTrue(self._verdict(4, epoch_launch=False).ok)
 
     def test_the_launch_boundary_actually_passes_the_flag(self) -> None:
         # The conjunct has to be SUPPLIED, not merely available (#14477 R9: fixing the
@@ -943,7 +955,7 @@ class ConditionalCSplitsOnTheAuthorityFactNotCallerIntent(unittest.TestCase):
             LauncherCapabilityObservation(
                 subcommand_marker_present=True,
                 advertised_schema_version=HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
-                advertised_store_versions=frozenset({1, 2, 3}),
+                advertised_store_versions=frozenset({4}),
             ),
             StoreSchemaObservation(STORE_RECOGNIZED, store_version),
             required_schema_version=HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
@@ -952,10 +964,10 @@ class ConditionalCSplitsOnTheAuthorityFactNotCallerIntent(unittest.TestCase):
             epoch_launch=lane_epoch > 0,
         )
 
-    def test_true_legacy_epoch_zero_keeps_the_v1_heal_rail(self) -> None:
-        for version in (1, 2):
+    def test_true_legacy_epoch_zero_is_diagnostic_only(self) -> None:
+        for version in (1, 2, 3):
             with self.subTest(version=version):
-                self.assertTrue(self._store_verdict(version, lane_epoch=0).ok)
+                self.assertFalse(self._store_verdict(version, lane_epoch=0).ok)
 
     def test_but_a_successful_v1_heal_still_does_not_make_resume_possible(self) -> None:
         # Rule 1's second half, and the part most easily lost: keeping the heal available must
@@ -966,7 +978,7 @@ class ConditionalCSplitsOnTheAuthorityFactNotCallerIntent(unittest.TestCase):
             store.declare_active(key, decision=_decision(), issue_id=ISSUE)
             rec = store.get(key)
             self.assertEqual(rec.lane_epoch, "0")
-            self.assertTrue(self._store_verdict(1, lane_epoch=0).ok)  # heal: allowed
+            self.assertFalse(self._store_verdict(1, lane_epoch=0).ok)
             self.assertEqual(  # resume: still refused
                 lane_epoch_verdict(rec, "1"), (False, EPOCH_AUTHORITY_UNAVAILABLE)
             )
@@ -991,7 +1003,7 @@ class ConditionalCSplitsOnTheAuthorityFactNotCallerIntent(unittest.TestCase):
             home = Path(tmp)
             path = OldAttestationSchemasAreBlockedNotGuessed._legacy_store(home, 1)
             self.assertTrue(migrate_attestation_store(path).migrated)
-            self.assertTrue(self._store_verdict(3, lane_epoch=1).ok)
+            self.assertTrue(self._store_verdict(4, lane_epoch=1).ok)
             store, key = _hibernated_lane(tmp)
             rec = store.get(key)
             self.assertEqual(lane_epoch_verdict(rec, str(rec.lane_epoch)), (True, EPOCH_OK))
@@ -1035,7 +1047,7 @@ class ConditionalCSplitsOnTheAuthorityFactNotCallerIntent(unittest.TestCase):
             adopted = store.get(key)
             # The epoch is now issued, so the v1 store can no longer take this lane's launch.
             self.assertFalse(self._store_verdict(1, lane_epoch=1).ok)
-            self.assertTrue(self._store_verdict(3, lane_epoch=1).ok)
+            self.assertTrue(self._store_verdict(4, lane_epoch=1).ok)
             # Survivor: still refused. Relaunch: admitted.
             self.assertEqual(
                 lane_epoch_verdict(adopted, ""), (False, EPOCH_ATTESTATION_ABSENT)
@@ -1117,6 +1129,40 @@ class TheReplacementRefusalHappensBeforeAnyIrreversibleEffect(unittest.TestCase)
         # The whole point: not one observation, close, launch or CAS was reached.
         self.assertEqual(recorder, [])
         self.assertEqual(outcome.revision, 3)  # the transaction did not move
+
+    def test_an_old_launcher_refuses_before_close_and_cas(self) -> None:
+        import subprocess
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.replacement_actuator import (  # noqa: E501
+            PARTICIPANT_CLOSE_OWED,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_replacement_launch_admission import (  # noqa: E501
+            replacement_managed_launch_admission,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            refusal = replacement_managed_launch_admission(
+                WS,
+                LANE,
+                repo_root=home,
+                env={"MOZYO_BRIDGE_LAUNCHER": "/usr/bin/false"},
+                runner=subprocess.run,
+                timeout=1.0,
+                lifecycle_home=str(home),
+                attestation_home=str(home),
+            )
+            self.assertTrue(refusal)
+            recorder: list = []
+            pin = self._pin(PARTICIPANT_CLOSE_OWED, "gw")
+            rec = self._rec("close_owed", 13, (pin,))
+            outcome = self._actuator(refusal, recorder)._actuate_participant(
+                key=None, rec=rec, pin=pin, holder="h", gen=1,
+                now="2026-01-01T00:00:00+00:00",
+            )
+            self.assertEqual(outcome.detail, refusal)
+            self.assertEqual(outcome.revision, 13)
+            self.assertEqual(recorder, [])
 
     def test_the_same_gate_is_reached_on_a_launch_owed_replay(self) -> None:
         # Crash replay must not slip past the refusal by re-entering at a later owed phase
@@ -1256,23 +1302,21 @@ class ThePreCloseFenceIsActuallyArmedOnEveryReplacementPath(unittest.TestCase):
         )
 
     def test_an_epoch_bearing_replacement_onto_a_v1_store_is_refused(self) -> None:
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
-            STORE_EPOCH_UNSUPPORTED,
-        )
-
         for version in (1, 2):
             with self.subTest(version=version), tempfile.TemporaryDirectory() as tmp:
                 self.assertEqual(
                     self._admission(tmp, store_version=version, epoch=True),
-                    STORE_EPOCH_UNSUPPORTED,
+                    "attestation_store_launcher_cannot_write",
                 )
 
-    def test_a_true_legacy_lane_is_not_refused_by_the_pre_close_fence(self) -> None:
-        # Conditional-C rule 1 (j#96844) at the fence itself, not only at the launch join:
-        # a lane with no minted epoch keeps its v1 heal rail. Refusing it here would delete a
-        # working recovery path without making a single epoch storable.
+    def test_an_epochless_legacy_lane_is_refused_before_close(self) -> None:
+        # Terminal-bound replacement authority is required independently of lane epochs.
+        # A v1 store is diagnostic-only and must not let the old slot be closed first.
         with tempfile.TemporaryDirectory() as tmp:
-            self.assertIsNone(self._admission(tmp, store_version=1, epoch=False))
+            self.assertEqual(
+                self._admission(tmp, store_version=1, epoch=False),
+                "attestation_store_launcher_cannot_write",
+            )
 
     def test_a_store_that_can_hold_the_epoch_is_admitted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -1310,6 +1354,9 @@ class ThePreCloseFenceIsActuallyArmedOnEveryReplacementPath(unittest.TestCase):
             herdr_identity_attestation_path,
         )
         from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+            probe_store_schema,
+        )
+        from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
             STORE_ABSENT,
             STORE_RECOGNIZED,
             probe_store_schema,
@@ -1331,12 +1378,13 @@ class ThePreCloseFenceIsActuallyArmedOnEveryReplacementPath(unittest.TestCase):
                 state,
             )
 
-    def test_an_unknowable_store_is_only_refused_when_an_epoch_is_at_stake(self) -> None:
-        # The scope line. A lane with no minted epoch loses nothing on any store shape, so
-        # refusing it here would change behaviour on a path this issue never touched — and
-        # would break the v1 mixed-runtime heal that conditional-C rule 1 preserves.
+    def test_an_unknowable_store_is_refused_even_without_an_epoch(self) -> None:
+        # Replacement close authority always needs a current terminal-bound store shape.
         from mozyo_bridge.core.state.herdr_identity_attestation import (
             herdr_identity_attestation_path,
+        )
+        from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+            probe_store_schema,
         )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
             replacement_store_admission,
@@ -1348,10 +1396,12 @@ class ThePreCloseFenceIsActuallyArmedOnEveryReplacementPath(unittest.TestCase):
                 LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
             )
             herdr_identity_attestation_path(home).write_bytes(b"not a database")
-            self.assertIsNone(
+            state = probe_store_schema(herdr_identity_attestation_path(home)).state
+            self.assertEqual(
                 replacement_store_admission(
                     WS, LANE, lifecycle_home=str(home), attestation_home=str(home)
-                )
+                ),
+                state,
             )
 
     def test_the_fence_reads_the_homes_it_is_given_not_the_ambient_ones(self) -> None:
@@ -1359,7 +1409,6 @@ class ThePreCloseFenceIsActuallyArmedOnEveryReplacementPath(unittest.TestCase):
         # real shared home while the lane under test lives in an isolated one. It would then
         # answer confidently about a store that has nothing to do with the action.
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
-            STORE_EPOCH_UNSUPPORTED,
             replacement_store_admission,
         )
 
@@ -1370,14 +1419,14 @@ class ThePreCloseFenceIsActuallyArmedOnEveryReplacementPath(unittest.TestCase):
                 replacement_store_admission(
                     WS, LANE, lifecycle_home=str(life), attestation_home=str(att)
                 ),
-                STORE_EPOCH_UNSUPPORTED,
+                "attestation_store_launcher_cannot_write",
             )
-            # Swap only the lifecycle home: no epoch is minted there, so nothing is refused.
-            # If the function ignored its arguments both calls would agree.
-            self.assertIsNone(
+            # Swapping only the lifecycle home does not launder the selected v1 store.
+            self.assertEqual(
                 replacement_store_admission(
                     WS, LANE, lifecycle_home=str(att), attestation_home=str(att)
-                )
+                ),
+                "attestation_store_launcher_cannot_write",
             )
 
     # -- the census the previous round failed ---------------------------------
@@ -1386,8 +1435,8 @@ class ThePreCloseFenceIsActuallyArmedOnEveryReplacementPath(unittest.TestCase):
     #: one either arms the fence or provably cannot. Held as data so a NEW construction site
     #: fails this test instead of quietly joining the un-gated majority.
     _SITES = {
-        "sublane_hibernated_bound_pair_convergence_live.py": "store_admission=self.store_admission",
-        "sublane_hibernated_bound_pair_composer_discard_live.py": "store_admission=self.store_admission",
+        "sublane_hibernated_bound_pair_convergence_live.py": "store_admission=lambda key, pin: self.store_admission",
+        "sublane_hibernated_bound_pair_composer_discard_live.py": "store_admission=lambda key, pin: self.store_admission",
         "sublane_stale_worker_recovery.py": "store_admission=self._ops.replacement_store_admission",
         "sublane_worker_refresh.py": "store_admission=self._ops.replacement_store_admission",
         "sublane_gateway_recovery.py": "store_admission=self._ops.replacement_store_admission",
@@ -1493,7 +1542,7 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
     def _agent(name, *, role="claude", locator="%1", workspace=WS, lane=LANE):
         return SimpleNamespace(
             name=name, role=role, locator=locator, workspace_id=workspace,
-            lane_id=lane, managed=True,
+            lane_id=lane, managed=True, terminal_id=f"terminal:{locator}",
         )
 
     @classmethod
@@ -1501,6 +1550,8 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
         return SimpleNamespace(
             backend_selected=backend, ok=ok, reason="", detail="",
             managed_agents=tuple(agents),
+            agents=tuple(agents), unmanaged_agents=(),
+            raw_row_count=len(tuple(agents)), invalid_row_count=0,
         )
 
     @staticmethod
@@ -1510,6 +1561,7 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
                 assigned_name=name, workspace_id=workspace, role=role, lane_id=lane,
                 locator=locator, verdict=VERDICT_PRESENT, detail="",
                 observed_at="2026-01-01T00:00:00+00:00",
+                terminal_id=f"terminal:{locator}",
             )
         )
 
@@ -1642,9 +1694,10 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             home, store, key, pins, agents = self._ready_world(tmp)
             foreigners = ("other-coordinator", "another-workspace-agent")
-            for name in foreigners:
-                self._attest(home, name, locator="%99")
-                agents.append(self._agent(name, locator="%99"))
+            for index, name in enumerate(foreigners, start=90):
+                locator = f"%{index}"
+                self._attest(home, name, locator=locator)
+                agents.append(self._agent(name, locator=locator))
             view = self._view(agents=agents)
 
             everything = tuple(a.name for a in agents)
@@ -1831,8 +1884,14 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
             observation = encode_release_observation(
                 build_release_observation(
                     (
-                        ReleasePin(role="claude", assigned_name="pair-worker", locator="%10"),
-                        ReleasePin(role="codex", assigned_name="pair-gateway", locator="%11"),
+                        ReleasePin(
+                            role="claude", assigned_name="pair-worker", locator="%10",
+                            startup_action_id="startup-action-current",
+                        ),
+                        ReleasePin(
+                            role="codex", assigned_name="pair-gateway", locator="%11",
+                            startup_action_id="startup-action-current",
+                        ),
                     )
                 )
             )
@@ -1942,7 +2001,7 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
             self._attest(home, "pair-worker", role="claude", locator="%stale")
             plan = self._plan(home, store, key, self._view(agents=agents))
             self.assertEqual(plan.state, BLOCKED_PAIR_IDENTITY_MISMATCH)
-            self.assertIn("attested locator", plan.detail)
+            self.assertIn("terminal-bound live attestation", plan.detail)
 
     # -- j#96866: the blocker itself -------------------------------------------
 
@@ -2139,8 +2198,19 @@ class TheLegacyRecoveryPlanRefusesBeforeItCloses(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             home = pathlib.Path(tmp)
-            OldAttestationSchemasAreBlockedNotGuessed._legacy_store(home, 1)
-            self._attest(home, "live-one")
+            path = OldAttestationSchemasAreBlockedNotGuessed._legacy_store(home, 1)
+            conn = sqlite3.connect(path)
+            try:
+                conn.execute(
+                    "INSERT INTO herdr_identity_attestations "
+                    "(assigned_name, workspace_id, role, lane_id, locator, verdict, "
+                    "detail, observed_at) VALUES (?,?,?,?,?,?,?,?)",
+                    ("live-one", WS, "claude", LANE, "%1", VERDICT_PRESENT, "",
+                     "2026-01-01T00:00:00+00:00"),
+                )
+                conn.commit()
+            finally:
+                conn.close()
             blocked = run_attestation_store_migrate(
                 home=home, view=self._view(agents=[self._agent("live-one")]), write=True
             )
@@ -2460,7 +2530,7 @@ class ForgedEpochsAndUnboundedTokensFailClosed(unittest.TestCase):
             runner=lambda *a, **k: type(
                 "R", (), {
                     "returncode": 0,
-                    "stdout": '{"agents":[{"name":"n","pane_id":"%1"}]}',
+                    "stdout": '{"agents":[{"name":"n","pane_id":"%1","terminal_id":"terminal:%1"}]}',
                 }
             )(),
         )
@@ -2920,7 +2990,7 @@ class R12ReviewFindingsStayClosed(unittest.TestCase):
                 runner=lambda *a, **k: type(
                     "R", (), {
                         "returncode": 0,
-                        "stdout": '{"agents":[{"name":"n","pane_id":"%1"}]}',
+                        "stdout": '{"agents":[{"name":"n","pane_id":"%1","terminal_id":"terminal:%1"}]}',
                     }
                 )(),
             )

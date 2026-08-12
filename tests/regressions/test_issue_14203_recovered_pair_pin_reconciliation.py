@@ -315,6 +315,7 @@ class _FakeLiveOps(LiveRecoveredPairPinReconciliationOps):
             {
                 "name": _name("codex"),
                 "pane_id": f"{WS}:p17",
+                "terminal_id": "terminal:14203:codex",
                 "provider": "codex",
                 "agent": "codex",
                 "revision": "r17",
@@ -322,6 +323,7 @@ class _FakeLiveOps(LiveRecoveredPairPinReconciliationOps):
             {
                 "name": _name("claude"),
                 "pane_id": f"{WS}:p18",
+                "terminal_id": "terminal:14203:claude",
                 "provider": "claude",
                 "agent": "claude",
                 "revision": "r18",
@@ -337,6 +339,7 @@ class _FakeLiveOps(LiveRecoveredPairPinReconciliationOps):
             role=provider,
             lane_id=LANE,
             locator=locator,
+            terminal_id=f"terminal:14203:{provider}",
             verdict=VERDICT_PRESENT,
             observed_at="2026-07-26T09:00:00+00:00",
         )

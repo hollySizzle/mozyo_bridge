@@ -46,7 +46,6 @@ from __future__ import annotations
 
 import errno
 import fcntl
-import json
 import os
 import secrets
 import sqlite3
@@ -55,6 +54,29 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
+from mozyo_bridge.core.state.scratch_retirement_pin import (
+    ScratchRetirementPin,
+    ScratchRetirementPinError,
+    decode_scratch_retirement_pin_projection,
+    encode_scratch_retirement_pins,
+)
+from mozyo_bridge.core.state.scratch_retirement_migration import (
+    ScratchRetirementMigrationError,
+    migrate_scratch_retirement_v1_locked,
+)
+from mozyo_bridge.core.state.scratch_retirement_store_security import (
+    ScratchRetirementStoreSecurityError,
+    classify_artifacts,
+    primary_artifact_paths,
+    primary_security_snapshot,
+)
+from mozyo_bridge.core.state.scratch_retirement_attempt_codec import (
+    ScratchRetirementAttemptCodecError,
+    decode_attempt_detail as _decode_attempt_detail,
+    decode_close_pairs as _decode_pairs,
+    encode_attempt_detail as _encode_attempt_detail,
+    encode_close_pairs as _encode_pairs,
+)
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 SCRATCH_RETIREMENT_FENCE_FILENAME = "scratch-retirement-fence.sqlite"
@@ -66,7 +88,7 @@ SCRATCH_RETIREMENT_FENCE_LOCK_SUFFIX = ".lock"
 #: The bootstrap staging artifact. A bootstrap builds here and renames into place, so a crash
 #: mid-write leaves THIS behind rather than a half-built authority at the real path.
 SCRATCH_RETIREMENT_FENCE_TEMP_SUFFIX = ".tmp"
-SCRATCH_RETIREMENT_FENCE_SCHEMA_VERSION = 1
+SCRATCH_RETIREMENT_FENCE_SCHEMA_VERSION = 2
 
 #: A retirement is authorized and in flight: its close may be partially done and its fate is
 #: not yet proven. A crash leaves this row, and that is what makes the flow resumable.
@@ -170,9 +192,12 @@ class RetirementAttempt:
     attempt_id: str
     revision: int = 1
     pinned: tuple[tuple[str, str], ...] = ()
+    pin_version: int = 0
+    generation_pins: tuple[ScratchRetirementPin, ...] = field(
+        default_factory=tuple, repr=False
+    )
     closed: tuple[tuple[str, str], ...] = ()
-    #: Canonical, caller-verified destructive-approval evidence.  The core store treats this
-    #: as opaque bytes; the composer-discard domain owns its schema and comparison semantics.
+    #: Canonical, caller-verified destructive-approval evidence.
     approval_evidence: str = ""
     detail: str = ""
     reserved_at: str = ""
@@ -195,6 +220,7 @@ class RetirementAttempt:
             "attempt_id": self.attempt_id,
             "revision": self.revision,
             "pinned": [{"role": r, "locator": loc} for r, loc in self.pinned],
+            "pin_version": self.pin_version,
             "closed": [{"role": r, "locator": loc} for r, loc in self.closed],
             "approval_evidence": self.approval_evidence,
             "detail": self.detail,
@@ -248,75 +274,12 @@ class ScratchRetirementFence:
 
     # -- artifact inventory ------------------------------------------------
 
-    def _artifact_paths(self) -> tuple[tuple[str, Path], ...]:
-        """Every artifact whose presence is evidence the store was operated.
-
-        SQLite's sidecars (``-wal`` / ``-shm`` / ``-journal``) are included because a crash or
-        a partial delete can leave one behind with the main DB gone: treating that as "nothing
-        was ever here" would let a normal execute silently re-create a *lost* authority and
-        forget prior retirements. The **temp** entry is included for the same reason (j#80526 /
-        review j#80523 R3-F5): a bootstrap that dies mid-write leaves its temp behind, and an
-        inventory blind to it would call that world "absent" and bootstrap over the wreckage.
-
-        The lock file is excluded — taking a lock is not evidence of a retirement, and
-        including it would make the fence structurally un-bootstrappable.
-        """
-        return (
-            ("db", self.path),
-            ("wal", self.path.with_name(self.path.name + "-wal")),
-            ("shm", self.path.with_name(self.path.name + "-shm")),
-            ("journal", self.path.with_name(self.path.name + "-journal")),
-            ("seal", self.seal_path),
-            ("temp", self.temp_path),
-        )
-
     def store_shape(self) -> StoreShape:
-        """Classify the artifact set as absent / present / damaged. (never collapses)
-
-        Uses ``lexists`` semantics: a **broken symlink** is still evidence that something was
-        placed here, so it counts as present rather than vanishing from the inventory.
-        """
-        present = tuple(
-            name for name, p in self._artifact_paths() if os.path.lexists(p)
+        """Classify primary plus migration evidence without collapsing damage to absence."""
+        state, present, detail = classify_artifacts(
+            self.path, self.seal_path, self.temp_path
         )
-        if not present:
-            return StoreShape(state=STORE_ABSENT)
-        row_bearing = {"db", "wal", "shm", "journal"} & set(present)
-        if "temp" in present:
-            # A bootstrap builds in `temp`, renames, then seals — so a healthy store NEVER has
-            # a temp beside it. Its presence is interrupted-bootstrap or foreign residue: an
-            # ambiguous shape, which is damaged (review j#80594 R4-F4). Inventorying the temp
-            # without letting it change the verdict was the bug: it showed up in
-            # `present_artifacts` while `present` was still returned.
-            return StoreShape(
-                state=STORE_DAMAGED,
-                present_artifacts=present,
-                detail=(
-                    "a bootstrap staging artifact is present beside the authority "
-                    f"(present: {', '.join(present)}); a healthy store never carries one, so "
-                    "this is an interrupted bootstrap or foreign residue"
-                ),
-            )
-        if "db" in present and "seal" in present:
-            return StoreShape(state=STORE_PRESENT, present_artifacts=present)
-        # Anything else is an orphaned / partial set: a DB with no seal (identity unpinnable),
-        # a seal with no DB (store loss), or a stray -wal from an interrupted write.
-        return StoreShape(
-            state=STORE_DAMAGED,
-            present_artifacts=present,
-            detail=(
-                "the retirement authority's artifacts are incomplete "
-                f"(present: {', '.join(present)}"
-                + (
-                    "; row-bearing data exists without its identity seal"
-                    if row_bearing and "seal" not in present
-                    else "; the identity seal exists without its database"
-                    if "seal" in present and "db" not in present
-                    else ""
-                )
-                + ")"
-            ),
-        )
+        return StoreShape(state=state, present_artifacts=present, detail=detail)
 
     # -- store identity ----------------------------------------------------
 
@@ -339,6 +302,7 @@ class ScratchRetirementFence:
 
     def _connect_ro(self) -> sqlite3.Connection:
         """A strict read-only connection over a present, identity-matched store."""
+        identity = self._primary_security_snapshot()
         try:
             conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -347,22 +311,53 @@ class ScratchRetirementFence:
                 f"the retirement authority {self.path} is unreadable ({exc}); fail closed "
                 "rather than treat an unreadable store as an empty one"
             ) from exc
-        return self._verify_identity(conn, version)
+        self._recheck_primary_security(identity, conn)
+        return self._verify_identity(conn, version, writable=False)
 
     def _connect_rw(self) -> sqlite3.Connection:
+        identity = self._primary_security_snapshot()
         try:
-            conn = sqlite3.connect(self.path, isolation_level=None)
+            conn = sqlite3.connect(
+                f"file:{self.path}?mode=rw", uri=True, isolation_level=None
+            )
             conn.execute("PRAGMA busy_timeout = 2000")
             version = int(conn.execute("PRAGMA user_version").fetchone()[0])
         except (sqlite3.DatabaseError, TypeError, ValueError) as exc:
             raise ScratchRetirementFenceError(
                 f"the retirement authority {self.path} is unreadable ({exc}); fail closed"
             ) from exc
-        return self._verify_identity(conn, version)
+        self._recheck_primary_security(identity, conn)
+        return self._verify_identity(conn, version, writable=True)
 
-    def _verify_identity(self, conn: sqlite3.Connection, version: int):
+    def _primary_security_snapshot(self) -> dict[str, tuple[int, int, int]]:
         try:
-            if version != SCRATCH_RETIREMENT_FENCE_SCHEMA_VERSION:
+            return primary_security_snapshot(
+                self.path, self.seal_path, self.temp_path
+            )
+        except ScratchRetirementStoreSecurityError as exc:
+            raise ScratchRetirementFenceError(str(exc)) from exc
+
+    def _recheck_primary_security(
+        self, identity: dict[str, tuple[int, int, int]], conn: sqlite3.Connection
+    ) -> None:
+        try:
+            current = self._primary_security_snapshot()
+        except ScratchRetirementFenceError:
+            conn.close()
+            raise
+        if current != identity:
+            conn.close()
+            raise ScratchRetirementFenceError(
+                "the retirement authority artifact identity changed while it was opened"
+            )
+
+    def _verify_identity(
+        self, conn: sqlite3.Connection, version: int, *, writable: bool
+    ):
+        try:
+            if version not in (1, SCRATCH_RETIREMENT_FENCE_SCHEMA_VERSION) or (
+                writable and version != SCRATCH_RETIREMENT_FENCE_SCHEMA_VERSION
+            ):
                 raise ScratchRetirementFenceError(
                     f"the retirement authority {self.path} is at schema version {version}, "
                     f"not {SCRATCH_RETIREMENT_FENCE_SCHEMA_VERSION}; an unknown schema is "
@@ -426,33 +421,9 @@ class ScratchRetirementFence:
         lane_id: str,
         target_assigned_name: str,
         live_locator: str = "",
+        live_generation_token: Optional[str] = None,
     ) -> Optional[RetirementAttempt]:
-        """The attempt (if any) that forbids sending to this slot RIGHT NOW. (read-only)
-
-        The dispatch side knows one target, not the pair's whole assigned-name set, so it
-        cannot rebuild a :class:`RetirementUnit` digest. This answers the question it can ask:
-        "is the slot I am about to send into inside a retirement?"
-
-        **Locator-correlated** (review j#80594 R4-F2). Returning any attempt that merely *names*
-        the slot was an over-block: herdr assigned names are deterministic, so a **relaunched**
-        pair occupies the same name, and an old `completed` attempt then blocked the new pair's
-        dispatches forever — the exact "an old completion must never be reused for a relaunched
-        pair" rule this component enforces on the retire side, violated on the dispatch side.
-        So:
-
-        - **pending** — a close is in flight for this unit. Block regardless of locator: even a
-          send to a slot whose locator we cannot compare could land in a pane about to close.
-        - **completed** — the close is done. Block ONLY when the target's live locator is one
-          this attempt pinned, i.e. a stale pre-close dispatch aimed at the pane that was
-          closed. A **different** locator is a relaunched pair the old completion has no say
-          over, and it must be allowed through.
-        - an unknown live locator with a completed attempt is ambiguous, so it blocks.
-
-        Read-only and creates nothing: a send must never bring the retirement authority into
-        existence. A genuinely absent store returns ``None`` (no retirement was ever recorded
-        — the ordinary case for every non-scratch lane, which must not be over-blocked); a
-        damaged store raises, and the caller treats that as "do not send".
-        """
+        """Read-only send guard: pending blocks; v2 completed binds the current token."""
         shape = self.store_shape()
         if shape.absent:
             return None
@@ -475,6 +446,25 @@ class ScratchRetirementFence:
         for row in rows:
             unit = RetirementUnit(workspace_id, lane_id, str(row[8]))
             attempt = _row_to_attempt(unit, row)
+            current_pin = next(
+                (
+                    pin
+                    for pin in attempt.generation_pins
+                    if pin.assigned_name == want
+                ),
+                None,
+            )
+            if current_pin is not None:
+                if attempt.pending:
+                    return attempt
+                if live_generation_token is None:
+                    return attempt
+                return (
+                    attempt
+                    if current_pin.locator == live_locator
+                    and current_pin.startup_action_id == live_generation_token
+                    else None
+                )
             # `pinned` holds (role, locator); the assigned name is rebuilt from the unit's
             # identity, so match on the encoded name for each pinned role.
             for role, locator in attempt.pinned:
@@ -488,7 +478,7 @@ class ScratchRetirementFence:
                 except Exception:  # noqa: BLE001 - an unencodable role cannot match
                     continue
                 if attempt.pending:
-                    return attempt  # a close is in flight: never send into it
+                    return attempt
                 # completed: only the pane this attempt actually closed is off limits.
                 if not live_locator:
                     return attempt  # cannot compare -> ambiguous -> fail closed
@@ -500,19 +490,46 @@ class ScratchRetirementFence:
         return None
 
     def transaction(self, unit: RetirementUnit, *, live_pair_present: bool):
-        """Open the exclusive retirement transaction for a unit.
-
-        Use as a context manager. Acquires an exclusive **non-blocking** advisory lock held
-        for the whole body, so the authority stays exclusive across the external close. A
-        second caller does not wait and does not steal: it raises
-        :class:`ScratchRetirementBusy` and closes nothing.
-
-        ``live_pair_present`` gates the one situation that may create the store: a **true
-        first bootstrap** requires a positively present live exact pair AND a completely
-        absent artifact set (j#80526). A zero-slot run never bootstraps — that is what stops a
-        lost authority from being silently re-created and a mistyped lane from minting a store.
-        """
+        """Open the non-blocking exclusive retirement transaction for one unit."""
         return _RetirementTransaction(self, unit, live_pair_present=live_pair_present)
+
+    def migrate_v1_backup_first(self) -> int:
+        """Explicitly migrate exact v1 after publishing a durable logical backup."""
+        lock = self.lock_path
+        lock.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    raise ScratchRetirementBusy(
+                        "another retirement transaction holds the authority"
+                    ) from exc
+                raise
+            primary = {
+                name for name, path in primary_artifact_paths(
+                    self.path, self.seal_path, self.temp_path
+                ) if os.path.lexists(path)
+            }
+            if (
+                not {"db", "seal"}.issubset(primary)
+                or "temp" in primary
+            ):
+                raise ScratchRetirementFenceError(
+                    "the retirement authority is absent or damaged; migration refused"
+                )
+            try:
+                return migrate_scratch_retirement_v1_locked(self.path, self.seal_path)
+            except (ScratchRetirementMigrationError, OSError, sqlite3.DatabaseError) as exc:
+                raise ScratchRetirementFenceError(
+                    "the retirement authority could not be migrated backup-first"
+                ) from exc
+        finally:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            finally:
+                os.close(fd)
 
     def _create_fresh(self, nonce: str) -> None:
         """Build the store in a temp and rename it into place, then seal it.
@@ -537,12 +554,14 @@ class ScratchRetirementFence:
             conn.execute(f"PRAGMA user_version = {SCRATCH_RETIREMENT_FENCE_SCHEMA_VERSION}")
         finally:
             conn.close()
+        os.chmod(temp, 0o600)
         self._bootstrap_hook("built_temp")
         os.replace(temp, self.path)
         self._bootstrap_hook("renamed")
         # The seal is written LAST: an interrupted bootstrap then leaves a db-without-seal,
         # which `store_shape` reports as DAMAGED (fail-closed) rather than as a healthy store.
         self.seal_path.write_text(nonce, encoding="utf-8")
+        os.chmod(self.seal_path, 0o600)
 
     def _bootstrap_hook(self, stage: str) -> None:
         """Crash-injection seam: tests raise here to drive REAL interrupted-bootstrap boundaries.
@@ -587,80 +606,34 @@ class ScratchRetirementFence:
         return out
 
 
-_DETAIL_ENVELOPE_PREFIX = "mozyo-retirement-attempt-v1:"
-
-
-def _encode_attempt_detail(*, approval_evidence: str, detail: str) -> str:
-    """Persist approval and narrative in the existing load-bearing attempt row.
-
-    The fence schema stays at v1 so already-deployed authorities remain readable.  Old rows
-    keep their plain-text ``detail`` representation; only approval-bearing attempts use this
-    unambiguous canonical envelope.
-    """
-    if not approval_evidence:
-        return detail
-    payload = json.dumps(
-        {"approval_evidence": approval_evidence, "detail": detail},
-        sort_keys=True,
-        separators=(",", ":"),
-        ensure_ascii=True,
-    )
-    return _DETAIL_ENVELOPE_PREFIX + payload
-
-
-def _decode_attempt_detail(value: str) -> tuple[str, str]:
-    raw = str(value or "")
-    if not raw.startswith(_DETAIL_ENVELOPE_PREFIX):
-        return "", raw
-    try:
-        payload = json.loads(raw[len(_DETAIL_ENVELOPE_PREFIX) :])
-    except (TypeError, ValueError) as exc:
-        raise ScratchRetirementFenceError(
-            "the retirement attempt's approval envelope is unreadable; fail closed"
-        ) from exc
-    if (
-        not isinstance(payload, dict)
-        or set(payload) != {"approval_evidence", "detail"}
-        or not isinstance(payload.get("approval_evidence"), str)
-        or not payload["approval_evidence"]
-        or not isinstance(payload.get("detail"), str)
-    ):
-        raise ScratchRetirementFenceError(
-            "the retirement attempt's approval envelope has an invalid schema; fail closed"
-        )
-    return payload["approval_evidence"], payload["detail"]
-
-
 def _row_to_attempt(unit: "RetirementUnit", row) -> "RetirementAttempt":
-    approval_evidence, detail = _decode_attempt_detail(row[5])
+    try:
+        approval_evidence, detail = _decode_attempt_detail(row[5])
+        projection = decode_scratch_retirement_pin_projection(row[3])
+        closed = _decode_pairs(row[4])
+    except (ScratchRetirementPinError, ScratchRetirementAttemptCodecError) as exc:
+        raise ScratchRetirementFenceError(
+            "the retirement attempt's private generation pins are unreadable; fail closed"
+        ) from exc
+    public_pins = (
+        tuple((pin.role, pin.locator) for pin in projection.pins)
+        if projection.current_authority
+        else projection.legacy_pairs
+    )
     return RetirementAttempt(
         unit=unit,
         state=str(row[0]),
         attempt_id=str(row[1]),
         revision=int(row[2]),
-        pinned=_decode_pairs(row[3]),
-        closed=_decode_pairs(row[4]),
+        pinned=public_pins,
+        pin_version=projection.version,
+        generation_pins=projection.pins,
+        closed=closed,
         approval_evidence=approval_evidence,
         detail=detail,
         reserved_at=str(row[6] or ""),
         updated_at=str(row[7] or ""),
     )
-
-
-def _decode_pairs(blob: str) -> tuple[tuple[str, str], ...]:
-    out: list[tuple[str, str]] = []
-    for chunk in (blob or "").split("\n"):
-        if not chunk:
-            continue
-        role, _, locator = chunk.partition("\t")
-        out.append((role, locator))
-    return tuple(out)
-
-
-def _encode_pairs(pairs: Sequence[tuple[str, str]]) -> str:
-    return "\n".join(f"{role}\t{locator}" for role, locator in pairs)
-
-
 class _RetirementTransaction:
     """The held, exclusive retirement transaction (see :meth:`ScratchRetirementFence.transaction`)."""
 
@@ -767,7 +740,7 @@ class _RetirementTransaction:
     def reserve(
         self,
         *,
-        pinned: Sequence[tuple[str, str]],
+        pinned: Sequence[ScratchRetirementPin],
         approval_evidence: str = "",
         now: Optional[str] = None,
     ) -> RetirementAttempt:
@@ -805,7 +778,7 @@ class _RetirementTransaction:
                         attempt,
                         revision,
                         RETIRE_PENDING,
-                        _encode_pairs(pinned),
+                        encode_scratch_retirement_pins(pinned),
                         stored_detail,
                         stamp,
                         stamp,
@@ -821,7 +794,7 @@ class _RetirementTransaction:
                         attempt,
                         revision,
                         RETIRE_PENDING,
-                        _encode_pairs(pinned),
+                        encode_scratch_retirement_pins(pinned),
                         stored_detail,
                         stamp,
                         stamp,
@@ -844,7 +817,9 @@ class _RetirementTransaction:
             state=RETIRE_PENDING,
             attempt_id=attempt,
             revision=revision,
-            pinned=tuple(pinned),
+            pinned=tuple((pin.role, pin.locator) for pin in pinned),
+            pin_version=2,
+            generation_pins=tuple(pinned),
             approval_evidence=approval_evidence,
             reserved_at=stamp,
             updated_at=stamp,
@@ -952,12 +927,20 @@ class _RetirementTransaction:
             ) from exc
         finally:
             conn.close()
+        pin_projection = decode_scratch_retirement_pin_projection(row[1])
+        public_pins = (
+            tuple((pin.role, pin.locator) for pin in pin_projection.pins)
+            if pin_projection.current_authority
+            else pin_projection.legacy_pairs
+        )
         return RetirementAttempt(
             unit=self._unit,
             state=RETIRE_COMPLETED,
             attempt_id=attempt_id,
             revision=int(row[0]),
-            pinned=_decode_pairs(row[1]),
+            pinned=public_pins,
+            pin_version=pin_projection.version,
+            generation_pins=pin_projection.pins,
             closed=tuple(closed),
             approval_evidence=approval_evidence,
             detail=detail,

@@ -101,8 +101,18 @@ _UNBOUND = ""
 def _pins() -> tuple[ReleasePin, ...]:
     """The lane's two managed slots, given to the store in arbitrary order."""
     return (
-        ReleasePin(role="codex", assigned_name=f"mzb1_{WS}_codex_{LANE_A}", locator="%1"),
-        ReleasePin(role="claude", assigned_name=f"mzb1_{WS}_claude_{LANE_A}", locator="%2"),
+        ReleasePin(
+            role="codex",
+            assigned_name=f"mzb1_{WS}_codex_{LANE_A}",
+            locator="%1",
+            startup_action_id="startup-codex",
+        ),
+        ReleasePin(
+            role="claude",
+            assigned_name=f"mzb1_{WS}_claude_{LANE_A}",
+            locator="%2",
+            startup_action_id="startup-claude",
+        ),
     )
 
 
@@ -116,6 +126,7 @@ def _replacement_pin(locator: str = "%1") -> ReleasePin:
         role="codex",
         assigned_name=f"mzb1_{WS}_codex_{LANE_A}",
         locator=locator,
+        startup_action_id="startup-codex",
     )
 
 
@@ -1054,7 +1065,7 @@ class R1RegressionTest(unittest.TestCase):
         self.assertTrue(opened.applied, opened.reason)
         rec = self.store.get(self.key_a)
         self.assertEqual(rec.process_release, RELEASE_REQUESTED)
-        self.assertEqual(rec.release_pins, "")  # no pins to close
+        self.assertEqual(rec.release_pins, encode_release_pins(()))  # v2 complete-empty
         self.assertNotEqual(rec.release_observation, "")  # but the observation IS recorded
 
     # -- R1-F5: every authority write names its durable record --
@@ -1435,6 +1446,7 @@ class R3RegressionTest(unittest.TestCase):
                 "lane_generation",
                 "declared_slots",
                 "reconcile_phase",
+                "reconcile_close_pin",
                 "lane_kind",
                 "hibernated_at",
         "release_observation",
@@ -1484,6 +1496,7 @@ class R3RegressionTest(unittest.TestCase):
                 "lane_generation",
                 "declared_slots",
                 "reconcile_phase",
+                "reconcile_close_pin",
                 "lane_kind",
                 "hibernated_at",
         "release_observation",
@@ -1923,6 +1936,7 @@ class BackupFirstMigrationTest(unittest.TestCase):
         "lane_generation",
         "declared_slots",
         "reconcile_phase",
+        "reconcile_close_pin",
         "lane_kind",
         "hibernated_at",
         "release_observation",

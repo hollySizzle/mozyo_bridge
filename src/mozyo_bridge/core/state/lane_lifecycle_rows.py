@@ -82,9 +82,10 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         lane_generation=int(row[19]),
         declared_slots=str(row[20] or ""),
         reconcile_phase=str(row[21] or ""),
-        lane_kind=str(row[22] or ""),
-        hibernated_at=str(row[23] or ""),
-        release_observation=str(row[24] or ""),
+        reconcile_close_pin=str(row[22] or ""),
+        lane_kind=str(row[23] or ""),
+        hibernated_at=str(row[24] or ""),
+        release_observation=str(row[25] or ""),
         # RAW-typed, never coerced (Redmine #14756). ``int(row[25] or 0)`` would turn a
         # corrupt REAL / TEXT cell into a plausible threshold; the epoch classifier
         # (:mod:`...lane_epoch`) requires an exact ``int`` and treats anything else as
@@ -92,7 +93,7 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         # authority decide. The same reasoning as ``binding_kind`` above (review j#94992
         # R11-F1): a decoder that manufactures a canonical value defeats every byte-exact
         # classifier downstream.
-        lane_epoch=row[25],
+        lane_epoch=row[26],
     )
 
 
@@ -160,6 +161,7 @@ def _insert_active_row(
             lane_generation,
             declared_slots,
             "",  # reconcile_phase: a fresh lane is never reconcile-retired (v6, #13842)
+            "",  # reconcile_close_pin: no reconcile-owned owed close (v11, #15227)
             lane_kind,  # v7 (#13647): generation-bound lane-role heal authority
             # v8 (#14477): a brand-new ACTIVE lane has never hibernated, so it holds no
             # freshness boundary. Only the disposition CAS into ``hibernated`` writes one.
