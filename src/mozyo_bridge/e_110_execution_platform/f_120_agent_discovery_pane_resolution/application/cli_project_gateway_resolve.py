@@ -45,6 +45,9 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     discover_project_gateway_inventory,
     render_inventory_error,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_route_binding import (
+    resolve_scope_route_provider,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client import (
     require_tmux,
 )
@@ -162,26 +165,52 @@ def render_gateway_resolution(resolution, route, *, as_json: bool) -> int:
     return 1
 
 
+def _route_provider(
+    *, repo_root: str, project_scope: str, selector: str = SELECT_GATEWAY
+) -> str:
+    """The provider_binding-bound receiver for this scope's route. Patched in tests.
+
+    Redmine #15414: derived from the same durable authority the Herdr inventory
+    gate re-verifies (``resolve_scope_route_provider``), never a hard-coded
+    provider constant.
+    """
+    return resolve_scope_route_provider(
+        repo_root=repo_root, project_scope=project_scope, selector=selector
+    )
+
+
 def cmd_project_gateway_resolve(args: argparse.Namespace) -> int:
     """Resolve (read-only) the project gateway target by semantic identity.
 
-    The project gateway role is fixed to ``codex`` (the design doc's
-    ``role="codex"`` route): a project gateway is a Codex coordinator unit, and
-    the implementation worker (Claude) is reached only after the gateway decides
-    implementation is needed. So this command never resolves a Claude target
-    (Redmine #12668 review j#66626 blocker 2).
+    The resolved receiver is the GATEWAY ROLE's bound provider — historically the
+    hard-coded ``role="codex"`` route (Redmine #12668 review j#66626 blocker 2),
+    now the workspace's ``provider_binding`` resolution for the scope's
+    coordinator/project-gateway role (Redmine #15414 — a coordinator bound to
+    ``claude`` resolves its gateway instead of failing closed on the constant).
+    The role-canonical invariant is unchanged: this command resolves the gateway
+    route only, never the implementation-worker route; the worker is reached only
+    after the gateway decides implementation is needed and a Redmine anchor
+    exists.
     """
+    try:
+        provider = _route_provider(
+            repo_root=args.repo, project_scope=args.project
+        )
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
     route = _route_from_args(
         repo_root=args.repo,
         project_scope=args.project,
-        role=AGENT_KIND_CODEX,
+        role=provider,
         session=getattr(args, "session", None),
     )
     try:
         inventory = _discover_candidates(
             repo_root=args.repo,
             project_scope=args.project,
-            provider=AGENT_KIND_CODEX,
+            provider=provider,
             session=getattr(args, "session", None),
         )
     except ProjectGatewayInventoryError as exc:
@@ -215,8 +244,10 @@ def register_resolve(gateway_sub) -> None:
         required=True,
         help="Adopted project scope id (redmine_project) to resolve the gateway for.",
     )
-    # No --role: the project gateway role is fixed to codex (design doc route).
-    # Resolving a Claude target is off-contract and removed (review j#66626).
+    # No --role: the receiver is always the GATEWAY role, whose provider comes
+    # from the workspace's provider_binding (Redmine #15414; historically the
+    # fixed codex route). Resolving the implementation-worker route is
+    # off-contract and removed (review j#66626).
     resolve.add_argument(
         "--session",
         default=None,

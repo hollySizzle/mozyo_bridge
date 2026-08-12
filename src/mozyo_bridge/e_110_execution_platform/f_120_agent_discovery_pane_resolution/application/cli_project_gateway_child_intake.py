@@ -33,6 +33,9 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
     ChildIntakeRouteError,
     resolve_child_intake_route,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_resolve import (
+    _route_provider,
+)
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (
     ProjectGatewayInventoryError,
     RESOLVED_TARGET_CAPABILITY_ARG,
@@ -118,19 +121,6 @@ def cmd_project_gateway_child_intake(args: argparse.Namespace) -> int:
     ``callback_to_role=project_gateway``). The worker-dispatch Redmine-anchor gate is
     NOT relaxed (this rail forwards a work-intake only; no anchor, no dispatch token).
     """
-    # The child / implementation gateway is a Codex coordinator unit (the same live
-    # identity as the project gateway). The grandchild worker (Claude) is reached
-    # only after the child mints a Redmine anchor, so a direct project-Claude
-    # work-intake send is forbidden.
-    if args.to != AGENT_KIND_CODEX:
-        die(
-            "`project-gateway child-intake` delivers to the child coordinator, "
-            f"which is a Codex unit; `--to {args.to}` is not allowed. The grandchild "
-            "worker (Claude) is reached only after the child creates a Redmine "
-            "anchor — use `--to codex`. Direct project-Claude send is forbidden by "
-            "the ticketless project gateway contract."
-        )
-
     if not args.target_repo or args.target_repo == "auto":
         die(
             "`project-gateway child-intake` resolves the child pane semantically, so "
@@ -143,6 +133,31 @@ def cmd_project_gateway_child_intake(args: argparse.Namespace) -> int:
             "<project_scope>` to resolve the child coordinator. To gate on the Git "
             "repo root only, use `handoff ticketless-callback` with an explicit "
             "`--target`."
+        )
+    # The child / delegated coordinator is the coordinator role's bound provider
+    # (Redmine #15414; historically the fixed codex route). The grandchild worker
+    # is reached only after the child mints a Redmine anchor, so a direct
+    # project-worker work-intake send stays forbidden — the gate names the
+    # provider the workspace's provider_binding binds to the child route instead
+    # of a constant.
+    try:
+        child_provider = _route_provider(
+            repo_root=args.target_repo,
+            project_scope=args.target_project,
+            selector=SELECT_CHILD_INTAKE,
+        )
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
+    if args.to != child_provider:
+        die(
+            "`project-gateway child-intake` delivers to the child coordinator; "
+            f"this scope's provider_binding binds the child route to "
+            f"`{child_provider}`, so `--to {args.to}` is not allowed. The "
+            "grandchild worker is reached only after the child creates a Redmine "
+            f"anchor — use `--to {child_provider}`. A direct project-worker send "
+            "is forbidden by the ticketless project gateway contract."
         )
     if getattr(args, "target", None):
         die(

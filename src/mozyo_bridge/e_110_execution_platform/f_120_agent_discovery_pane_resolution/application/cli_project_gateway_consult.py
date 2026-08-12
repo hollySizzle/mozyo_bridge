@@ -36,6 +36,7 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_resolve import (
     _route_from_args,
+    _route_provider,
     render_gateway_resolution,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (
@@ -116,15 +117,6 @@ def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
     # Same boundary as `project-gateway handoff`: the gateway is a Codex unit. The
     # implementation worker (Claude) is reached only after the gateway mints a
     # Redmine anchor, so a direct project-Claude consultation send is forbidden.
-    if args.to != AGENT_KIND_CODEX:
-        die(
-            "`project-gateway consult` delivers to the project gateway, which is a "
-            f"Codex unit; `--to {args.to}` is not allowed. The implementation "
-            "worker (Claude) is reached only after the gateway creates a Redmine "
-            "anchor — use `--to codex`. Direct project-Claude send is forbidden by "
-            "the ticketless project gateway contract."
-        )
-
     if not args.target_repo or args.target_repo == "auto":
         die(
             "`project-gateway consult` resolves the pane semantically, so it needs "
@@ -136,6 +128,29 @@ def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
             "`project-gateway consult` requires `--target-project <project_scope>` "
             "to resolve the project gateway. To gate on the Git repo root only, use "
             "`handoff ticketless-callback` with an explicit `--target`."
+        )
+    # The receiver must be the GATEWAY role's bound provider (Redmine #15414;
+    # historically the fixed codex route). The role-canonical boundary is
+    # unchanged: the implementation worker is reached only after the gateway
+    # creates a Redmine anchor, so a direct worker send stays forbidden — the
+    # gate now names the provider the workspace's provider_binding actually
+    # binds to the gateway instead of a constant.
+    try:
+        gateway_provider = _route_provider(
+            repo_root=args.target_repo, project_scope=args.target_project
+        )
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
+    if args.to != gateway_provider:
+        die(
+            "`project-gateway consult` delivers to the project gateway; this "
+            f"scope's provider_binding binds the gateway to `{gateway_provider}`, "
+            f"so `--to {args.to}` is not allowed. The implementation worker is "
+            "reached only after the gateway creates a Redmine anchor — use "
+            f"`--to {gateway_provider}`. A direct project-worker send is "
+            "forbidden by the ticketless project gateway contract."
         )
     if getattr(args, "target", None):
         die(

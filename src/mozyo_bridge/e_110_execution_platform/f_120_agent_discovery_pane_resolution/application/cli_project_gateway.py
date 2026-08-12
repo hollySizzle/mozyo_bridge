@@ -81,6 +81,7 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_resolve import (
     _discover_candidates,
     _route_from_args,
+    _route_provider,
     cmd_project_gateway_resolve,
     register_resolve,
     render_gateway_resolution,
@@ -189,7 +190,11 @@ def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
         inventory = _discover_candidates(
             repo_root=args.repo,
             project_scope=args.project,
-            provider=AGENT_KIND_CODEX,
+            provider=_route_provider(
+                repo_root=args.repo,
+                project_scope=args.project,
+                selector=SELECT_GATEWAY,
+            ),
             session=getattr(args, "session", None),
             selector=SELECT_GATEWAY,
         )
@@ -304,21 +309,6 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
     :func:`orchestrate_handoff`, where the Git repo + project-scope gates re-verify
     the pane before delivery.
     """
-    # The project gateway role is codex (design doc `role="codex"` route). This
-    # command must NOT direct-send to the project Claude worker: the root ->
-    # project gateway -> implementation worker boundary requires the gateway
-    # (Codex) to decide implementation need and create the Redmine anchor first.
-    # Reject `--to claude` so the Redmine-anchor boundary cannot be bypassed
-    # (Redmine #12668 review j#66626 blocker 2).
-    if args.to != AGENT_KIND_CODEX:
-        die(
-            "`project-gateway handoff` delivers to the project gateway, which is a "
-            f"Codex unit; `--to {args.to}` is not allowed. The implementation "
-            "worker (Claude) is reached only after the gateway creates a Redmine "
-            "anchor — use `--to codex`. Direct project-Claude send is forbidden by "
-            "the ticketless project gateway contract."
-        )
-
     if not args.target_repo or args.target_repo == "auto":
         die(
             "`project-gateway handoff` resolves the pane semantically, so it needs "
@@ -330,6 +320,32 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
             "`project-gateway handoff` requires `--target-project <project_scope>` "
             "to resolve the project gateway. To gate on the Git repo root only, use "
             "`handoff send` with an explicit `--target`."
+        )
+    # The receiver must be the GATEWAY role's bound provider (Redmine #15414;
+    # historically the fixed codex route, #12668 review j#66626 blocker 2). This
+    # command must NOT direct-send to the implementation worker: the root ->
+    # project gateway -> implementation worker boundary requires the gateway to
+    # decide implementation need and create the Redmine anchor first. The gate
+    # names the provider the workspace's provider_binding binds to the gateway
+    # instead of a constant, so a claude-bound coordinator stays reachable while
+    # the worker-bypass refusal is unchanged.
+    try:
+        gateway_provider = _route_provider(
+            repo_root=args.target_repo, project_scope=args.target_project
+        )
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
+    if args.to != gateway_provider:
+        die(
+            "`project-gateway handoff` delivers to the project gateway; this "
+            f"scope's provider_binding binds the gateway to "
+            f"`{gateway_provider}`, so `--to {args.to}` is not allowed. The "
+            "implementation worker is reached only after the gateway creates "
+            f"a Redmine anchor — use `--to {gateway_provider}`. A direct "
+            "project-worker send is forbidden by the ticketless project "
+            "gateway contract."
         )
     if getattr(args, "target", None):
         die(
@@ -427,7 +443,19 @@ def cmd_project_gateway_route_plan(args: argparse.Namespace) -> int:
         inventory = _discover_candidates(
             repo_root=args.repo,
             project_scope=args.project,
-            provider=AGENT_KIND_CODEX,
+            # SELECT_NONE returns an empty inventory without a route resolution;
+            # its provider token is unused for filtering, so the historical
+            # constant satisfies the non-empty request shape. Routed selectors
+            # follow the scope's provider_binding (Redmine #15414).
+            provider=(
+                AGENT_KIND_CODEX
+                if selector == SELECT_NONE
+                else _route_provider(
+                    repo_root=args.repo,
+                    project_scope=args.project,
+                    selector=selector,
+                )
+            ),
             session=getattr(args, "session", None),
             selector=selector,
         )

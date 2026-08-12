@@ -31,9 +31,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_role_authority_source import (
     load_parsed_role_bindings,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
-    ROLE_COORDINATOR as PROVIDER_ROLE_COORDINATOR,
-    ROLE_PROJECT_GATEWAY as PROVIDER_ROLE_PROJECT_GATEWAY,
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_route_binding import (
+    GATEWAY_AUTHORITY_ROLES,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
     DEFAULT_LANE,
@@ -408,6 +407,29 @@ class ProjectGatewayBackendInventoryUseCase:
     def _error(reason: str, detail: str, backend: str = BACKEND_HERDR):
         raise ProjectGatewayInventoryError(reason, detail, backend=backend)
 
+    # The scope's durable binding resolution lives in the sibling
+    # `project_gateway_route_binding` module (Redmine #15414): the CLI family
+    # derives its requested receiver from the SAME resolution this gate
+    # verifies, so the two cannot drift apart. Imported lazily — that module
+    # reads this module's typed refusal / selector vocabulary back.
+    def _parsed_role_bindings(self, repo_root: Path, *, backend: str):
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_route_binding import (  # noqa: E501
+            parsed_scope_role_bindings,
+        )
+
+        return parsed_scope_role_bindings(self._ops, repo_root, backend=backend)
+
+    def _scope_route_providers(
+        self, repo_root: Path, scope: str, *, parsed, backend: str, selector: str
+    ):
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_route_binding import (  # noqa: E501
+            scope_route_providers,
+        )
+
+        return scope_route_providers(
+            self._ops, repo_root, scope, parsed=parsed, backend=backend, selector=selector
+        )
+
     def discover(
         self, request: ProjectGatewayInventoryRequest
     ) -> ProjectGatewayBackendInventory:
@@ -476,62 +498,10 @@ class ProjectGatewayBackendInventoryUseCase:
                 candidates=(),
             )
 
-        try:
-            parsed = self._ops.parsed_role_bindings(repo_root)
-        except Exception as exc:  # noqa: BLE001 - durable authority unavailable
-            raise ProjectGatewayInventoryError(
-                "workflow_role_binding_unavailable",
-                "the durable workflow-role binding could not be read",
-                backend=backend,
-            ) from exc
-        if not getattr(parsed, "ok", False):
-            self._error(
-                "workflow_role_binding_invalid",
-                "the durable workflow-role binding is malformed",
-            )
-
-        gateway_roles = frozenset({ROLE_PROJECT_GATEWAY, ROLE_COORDINATOR})
-        authority_matches = [
-            binding
-            for binding in parsed.bindings
-            if binding.role in gateway_roles and binding.project_scope == scope
-        ]
-        if len(authority_matches) != 1:
-            self._error(
-                "project_scope_binding_ambiguous"
-                if authority_matches
-                else "project_scope_binding_missing",
-                "the project scope must have exactly one durable coordinator/project-gateway binding",
-            )
-        authority = authority_matches[0]
-
-        try:
-            role_binding = self._ops.provider_binding(repo_root)
-        except Exception as exc:  # noqa: BLE001 - provider authority unavailable
-            raise ProjectGatewayInventoryError(
-                "provider_binding_unavailable",
-                "the workflow provider binding could not be read",
-                backend=backend,
-            ) from exc
-        gateway_provider_key = (
-            PROVIDER_ROLE_COORDINATOR
-            if authority.role == ROLE_COORDINATOR
-            else PROVIDER_ROLE_PROJECT_GATEWAY
+        parsed = self._parsed_role_bindings(repo_root, backend=backend)
+        authority, gateway_provider, child_provider = self._scope_route_providers(
+            repo_root, scope, parsed=parsed, backend=backend, selector=request.selector
         )
-        gateway_provider = _norm(role_binding.provider_for(gateway_provider_key))
-        child_provider = _norm(role_binding.provider_for(PROVIDER_ROLE_COORDINATOR))
-        required_providers = (
-            (gateway_provider,)
-            if request.selector == SELECT_GATEWAY
-            else (child_provider,)
-            if request.selector == SELECT_CHILD_ROUTE
-            else (gateway_provider, child_provider)
-        )
-        if any(not item for item in required_providers):
-            self._error(
-                "provider_binding_unresolved",
-                "provider_binding resolves no provider for the requested project-gateway route",
-            )
         target_provider = (
             gateway_provider
             if request.selector == SELECT_GATEWAY
@@ -569,7 +539,7 @@ class ProjectGatewayBackendInventoryUseCase:
         gateway_lane_ids = {
             _norm_lane(binding.lane_id)
             for binding in parsed.bindings
-            if binding.role in gateway_roles
+            if binding.role in GATEWAY_AUTHORITY_ROLES
         }
         gateway_lane_ids.add(_norm_lane(authority.lane_id))
         selected_rows: list[tuple[Mapping[str, object], object, str, str]] = []
