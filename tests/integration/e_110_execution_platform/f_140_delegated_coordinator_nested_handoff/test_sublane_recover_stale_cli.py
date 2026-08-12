@@ -17,7 +17,9 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -37,6 +39,30 @@ ROLE = "claude"
 LOCATOR = "w9:p5"
 NAME = encode_assigned_name(WS, ROLE, LANE)
 
+# The shared config-less repo root the command classifies against. The fixture pins the
+# DEFAULT worker binding (ROLE="claude"), so `--repo` and the live row's foreground_cwd
+# must NOT point at the live checkout (ROOT): its committed .mozyo-bridge/config.yaml
+# carries an operational rebind these tests must be independent of. It is `git init`-ed
+# with one empty commit (an unborn HEAD fails the probe) so the worktree-readable
+# preflight still resolves it; no .mozyo-bridge config exists in it.
+_REPO_TMP = tempfile.TemporaryDirectory()
+REPO_DIR = _REPO_TMP.name
+subprocess.run(
+    ["git", "init", "-q", REPO_DIR], check=True, capture_output=True, text=True
+)
+subprocess.run(
+    [
+        "git", "-C", REPO_DIR,
+        "-c", "user.email=test@example.invalid", "-c", "user.name=test",
+        "commit", "-q", "--allow-empty", "-m", "init",
+    ],
+    check=True, capture_output=True, text=True,
+)
+
+
+def tearDownModule():  # noqa: N802 - unittest module hook
+    _REPO_TMP.cleanup()
+
 BASE = [
     "sublane", "recover-stale",
     "--issue", "13806", "--lane", LANE, "--role", ROLE,
@@ -47,7 +73,7 @@ BASE = [
 def _stale_row():
     return {
         "name": NAME, "pane_id": LOCATOR, "agent": "", "status": "unknown",
-        "revision": 3, "foreground_cwd": str(ROOT),
+        "revision": 3, "foreground_cwd": REPO_DIR,
     }
 
 
@@ -67,7 +93,7 @@ class RecoverStaleCliTests(unittest.TestCase):
     def _run(self, argv, rows):
         live.list_herdr_agent_rows = lambda env: rows
         parser = build_parser(None)
-        ns = parser.parse_args(argv + ["--repo", str(ROOT)])
+        ns = parser.parse_args(argv + ["--repo", REPO_DIR])
         out = io.StringIO()
         with contextlib.redirect_stdout(out):
             rc = ns.func(ns)

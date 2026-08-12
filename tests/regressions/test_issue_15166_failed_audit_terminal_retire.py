@@ -94,9 +94,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     DEFAULT_LANE,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (  # noqa: E501
-    resolve_coordinator_provider,
-)
 from mozyo_bridge.core.state.audit_failure_terminal_decision import (  # noqa: E501
     AuditFailureTerminalDecisionError,
     AuditFailureTerminalDecisionStore,
@@ -186,10 +183,12 @@ WORKSPACE = "mozyo_bridge"
 LANE = "issue_15164_fresh_session_resume_verification"
 GENERATION = 1
 INTEGRATION_BRANCH = "main"
-#: The provider the committed config binds to the coordinator role, and the lane it sits on. The
-#: writer attestation compares the process identity against BOTH, so a test that only sets env
-#: presence is refused exactly as a non-coordinator caller is.
-COORDINATOR_PROVIDER = resolve_coordinator_provider(str(ROOT))
+#: The provider the `_attested_repo` fixture config binds to the coordinator role (the default
+#: binding), and the lane it sits on. The writer attestation compares the process identity against
+#: BOTH, so a test that only sets env presence is refused exactly as a non-coordinator caller is.
+#: Deliberately a fixture-declared constant, independent of the live checkout's operational
+#: `.mozyo-bridge/config.yaml` — the gate under test resolves the binding from the fixture repo.
+COORDINATOR_PROVIDER = "codex"
 
 
 def declaration_marker(**overrides) -> str:
@@ -3670,7 +3669,13 @@ def _attested_repo(root: Path) -> Path:
     )
     if not (anchor_dir / "config.yaml").exists():
         (anchor_dir / "config.yaml").write_text(
-            f"version: 2\nsublane_integration:\n  integration_branch: {INTEGRATION_BRANCH}\n",
+            "version: 2\n"
+            "agents:\n"
+            "  profiles:\n"
+            "    coordination:\n"
+            f"      provider: {COORDINATOR_PROVIDER}\n"
+            "sublane_integration:\n"
+            f"  integration_branch: {INTEGRATION_BRANCH}\n",
             encoding="utf-8",
         )
     return root

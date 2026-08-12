@@ -23,6 +23,7 @@ import contextlib
 import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -182,14 +183,19 @@ class JsonTest(unittest.TestCase):
     def test_route_identity_resolves_and_omits_pane_id(self):
         # A supplied --route-identity (with a pane_id cache) resolves the next action's
         # route via the owner_role provider match; the pane id never appears in the JSON.
-        rc, text = _run(
-            [
-                "workflow", "runtime",
-                "--event", "12857:review_request,id=12857:j1,commit=1",
-                "--route-identity", "route_id=r,issue=12857,ws=ws1,role=codex,pane_name=gw,pane_id=%17",
-                "--json",
-            ]
-        )
+        # `--repo` points at a config-less temp dir so the *default* role->provider
+        # binding applies: the role=codex route must not depend on the live checkout's
+        # committed `.mozyo-bridge/config.yaml` rebind.
+        with tempfile.TemporaryDirectory() as tmp:
+            rc, text = _run(
+                [
+                    "workflow", "runtime",
+                    "--repo", tmp,
+                    "--event", "12857:review_request,id=12857:j1,commit=1",
+                    "--route-identity", "route_id=r,issue=12857,ws=ws1,role=codex,pane_name=gw,pane_id=%17",
+                    "--json",
+                ]
+            )
         self.assertEqual(rc, 0)
         na = json.loads(text)["workflow"]["next_action"]
         self.assertEqual(na["action"], "perform_review")

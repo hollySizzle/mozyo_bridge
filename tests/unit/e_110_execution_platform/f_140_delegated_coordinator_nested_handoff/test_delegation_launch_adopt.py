@@ -507,6 +507,13 @@ class HandlerIntegrationTest(unittest.TestCase):
         ), mock.patch(
             "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.tmux_client.require_tmux",
             return_value=None,
+        ), mock.patch(
+            # The handler resolves the gateway provider from the cwd git root —
+            # the live checkout's committed operational config. Pin the default
+            # binding (codex gateway) so this test does not depend on the live
+            # checkout's .mozyo-bridge/config.yaml.
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution.resolve_gateway_provider",
+            return_value=ROLE_CODEX,
         ), contextlib.redirect_stdout(buf):
             code = cmd_handoff_delegate_launch_adopt(ns)
         return code, buf.getvalue()

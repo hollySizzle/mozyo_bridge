@@ -20,6 +20,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -44,6 +45,18 @@ from mozyo_bridge.application.cli import build_parser  # noqa: E402
 
 class MainLaneGuardIntegrationTest(unittest.TestCase):
     """`handoff send` orchestration with tmux patched at the seams."""
+
+    def setUp(self) -> None:
+        # The guard resolves the implementer provider from MOZYO_REPO, falling back
+        # to the cwd git root — the live checkout's committed operational config.
+        # This fixture hardcodes the DEFAULT binding (claude implementer), so pin
+        # MOZYO_REPO to a config-less temp dir: the test must not depend on the
+        # live checkout's .mozyo-bridge/config.yaml.
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = patch.dict(os.environ, {"MOZYO_REPO": tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
 
     def _run(
         self,
