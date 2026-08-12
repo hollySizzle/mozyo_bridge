@@ -14,6 +14,8 @@ agents:
         sublane:
         - --model
         - claude-opus-5
+    # Owner memo (inactive; no runtime effect): future main coordinator candidate
+    # is Claude Fable 5 (`claude-fable-5`) with provider `claude`.
     coordination:
       provider: codex
       launch_argv:
