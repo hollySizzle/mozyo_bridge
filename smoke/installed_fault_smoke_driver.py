@@ -389,36 +389,45 @@ def _attest_fresh_recovery_generation(
     )
     generations = HerdrLaunchGenerationStore(home=home)
     generation = generations.read(assigned_name)
-    if generation is None or generation.phase != GENERATION_PENDING:
+    if generation is None:
         return False
-    fence = StartupTransactionFence(home=home)
-    action = fence.read(generation.startup_action_id)
-    if action is None:
+    if generation.phase == GENERATION_PENDING:
+        fence = StartupTransactionFence(home=home)
+        action = fence.read(generation.startup_action_id)
+        if action is None:
+            return False
+        append_execution_event(
+            fence,
+            generation.startup_action_id,
+            STAGE_ATTESTATION_WRITE_SUCCEEDED,
+            participant=assigned_name,
+        )
+        if not action.terminal:
+            fence.set_phase(generation.startup_action_id, PHASE_COMPLETED_SUCCESS)
+        finalize_launch_generations(
+            store_home=home,
+            startup_action_id=generation.startup_action_id,
+            slots=[
+                SimpleNamespace(
+                    assigned_name=assigned_name,
+                    provider="claude",
+                    locator=locator,
+                    launch_terminal_id=terminal_id,
+                )
+            ],
+            workspace_id=workspace_id,
+            lane_id=lane_id,
+            attestation_read=attestations.read,
+            inventory_rows=inventory_rows,
+        )
+    elif generation.phase != GENERATION_ATTESTED:
         return False
-    append_execution_event(
-        fence,
-        generation.startup_action_id,
-        STAGE_ATTESTATION_WRITE_SUCCEEDED,
-        participant=assigned_name,
-    )
-    if not action.terminal:
-        fence.set_phase(generation.startup_action_id, PHASE_COMPLETED_SUCCESS)
-    finalize_launch_generations(
-        store_home=home,
-        startup_action_id=generation.startup_action_id,
-        slots=[
-            SimpleNamespace(
-                assigned_name=assigned_name,
-                provider="claude",
-                locator=locator,
-                launch_terminal_id=terminal_id,
-            )
-        ],
-        workspace_id=workspace_id,
-        lane_id=lane_id,
-        attestation_read=attestations.read,
-        inventory_rows=inventory_rows,
-    )
+    # #15227 / #15418: the recovery launch now completes the terminal-bound generation
+    # itself when the wrapper protocol runs to completion (the fake provider binaries
+    # emit the same attestation writes a real worker does), so an already-``attested``
+    # row is the product's own proof and this fixture only re-verifies its identity
+    # below. The manual completion path above remains for a launch observed while the
+    # reservation is still ``pending``.
     finalized = generations.read(assigned_name)
     return bool(
         finalized is not None
@@ -488,18 +497,45 @@ def _recover_stale_outcome(
     # that process as legacy.  The hermetic source harness already seeds this exact row;
     # the installed harness must do the same or it refuses at `generation_unavailable`
     # before exercising any recovery leg.
+    from mozyo_bridge.core.state.herdr_identity_attestation import (
+        HerdrIdentityAttestationStore,
+        IdentityAttestationRecord,
+        VERDICT_PRESENT,
+    )
     from mozyo_bridge.core.state.herdr_launch_generation import (
         HerdrLaunchGenerationStore,
     )
     from mozyo_bridge.core.state.startup_transaction_fence import (
+        PHASE_COMPLETED_SUCCESS,
+        PHASE_HEALTH_CHECK,
+        Participant,
+        StartupTransactionFence,
         StartupUnit,
-        startup_action_id,
     )
 
-    legacy_action_id = startup_action_id(
+    # #15227 terminal-bound close authority: the legacy generation must be a COMPLETED
+    # launch (fence participant + health-check + completed phases) whose finalize and
+    # attestation carry the exact terminal identity, or the evidence-aware replacement
+    # planner refuses before any recovery leg. Mirrors the hermetic
+    # ``InstalledFaultHarness`` seeding byte-for-byte (Redmine #15418).
+    startup_fence = StartupTransactionFence(home=home)
+    startup_action = startup_fence.reserve(
         StartupUnit(workspace_id=ws_id, lane_id=lane, providers=("claude",)),
         f"installed-fault-smoke-{tag}-legacy-generation",
     )
+    legacy_action_id = startup_action.action_id
+    terminal_id = fake.terminal_id_of(locator)
+    startup_fence.record_participant(
+        legacy_action_id,
+        Participant(
+            role="claude",
+            assigned_name=name,
+            locator=locator,
+            receipt=f"workspace={fws}",
+        ),
+    )
+    startup_fence.set_phase(legacy_action_id, PHASE_HEALTH_CHECK)
+    startup_fence.set_phase(legacy_action_id, PHASE_COMPLETED_SUCCESS)
     generations = HerdrLaunchGenerationStore(home=home)
     generations.reserve_pending(
         assigned_name=name,
@@ -515,8 +551,21 @@ def _recover_stale_outcome(
         role="claude",
         lane_id=lane,
         locator=locator,
-        verdict="present",
+        terminal_id=terminal_id,
+        verdict=VERDICT_PRESENT,
         observed_at="2026-01-01T00:00:00.000000+00:00",
+    )
+    HerdrIdentityAttestationStore(home=home).upsert(
+        IdentityAttestationRecord(
+            assigned_name=name,
+            workspace_id=ws_id,
+            role="claude",
+            lane_id=lane,
+            locator=locator,
+            terminal_id=terminal_id,
+            verdict=VERDICT_PRESENT,
+            observed_at="2026-01-01T00:00:00.000000+00:00",
+        )
     )
     action_id = stale_worker_recovery_action_id(lane_id=lane, role="claude", provider="claude",
                                                 assigned_name=name, locator=locator)
@@ -769,10 +818,23 @@ def _seed_owed_rollback(
     fence, fake, home: Path, ws_id: str, lane: str, nonce: str
 ):
     """Record one terminal-bound fresh launch whose safe rollback remains owed."""
+    from mozyo_bridge.core.state.herdr_identity_attestation import (
+        HerdrIdentityAttestationStore,
+        IdentityAttestationRecord,
+        VERDICT_PRESENT,
+    )
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        HerdrLaunchGenerationStore,
+    )
     from mozyo_bridge.core.state.herdr_native_identity_binding import (
         HerdrNativeIdentityBindingStore,
     )
-    from mozyo_bridge.core.state.startup_transaction_fence import Participant, StartupUnit
+    from mozyo_bridge.core.state.startup_transaction_fence import (
+        PHASE_HEALTH_CHECK,
+        PHASE_ROLLBACK_OWED,
+        Participant,
+        StartupUnit,
+    )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
         pane_bound_receipt,
     )
@@ -788,6 +850,7 @@ def _seed_owed_rollback(
         provider="claude",
         detected_agent="claude",
     )
+    terminal_id = fake.terminal_id_of(locator)
     fence.record_participant(
         action.action_id,
         Participant(
@@ -798,10 +861,49 @@ def _seed_owed_rollback(
                 target_workspace=native_workspace,
                 target_tab=f"{native_workspace}:t1",
                 native_name=binding.native_name,
-                terminal_id=fake.terminal_id_of(locator),
+                terminal_id=terminal_id,
             ),
         ),
     )
+    # #15227 terminal-bound close authority: the fresh launch published its terminal-bound
+    # generation and attestation before its bounded health decision failed, leaving this
+    # same action in rollback_owed. Mirrors the hermetic ``InstalledFaultHarness`` seeding
+    # (Redmine #15418); without these rows the rollback preflight refuses before reaching
+    # the typed conditional-close blocker this leg asserts.
+    generations = HerdrLaunchGenerationStore(home=home)
+    generations.reserve_pending(
+        assigned_name=name,
+        startup_action_id=action.action_id,
+        workspace_id=ws_id,
+        role="claude",
+        lane_id=lane,
+    )
+    generations.finalize(
+        assigned_name=name,
+        startup_action_id=action.action_id,
+        workspace_id=ws_id,
+        role="claude",
+        lane_id=lane,
+        locator=locator,
+        terminal_id=terminal_id,
+        verdict=VERDICT_PRESENT,
+        observed_at="2026-01-01T00:00:00+00:00",
+    )
+    HerdrIdentityAttestationStore(home=home).upsert(
+        IdentityAttestationRecord(
+            assigned_name=name,
+            workspace_id=ws_id,
+            role="claude",
+            lane_id=lane,
+            locator=locator,
+            terminal_id=terminal_id,
+            verdict=VERDICT_PRESENT,
+            observed_at="2026-01-01T00:00:00+00:00",
+            replacement_action_id=action.action_id,
+        )
+    )
+    fence.set_phase(action.action_id, PHASE_HEALTH_CHECK)
+    fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
     return action.action_id, locator
 
 
