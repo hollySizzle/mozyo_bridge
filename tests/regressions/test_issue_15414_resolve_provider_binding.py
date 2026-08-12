@@ -37,6 +37,9 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application import (  # noqa: E402,E501
+    cli_project_gateway,
+    cli_project_gateway_child_intake,
+    cli_project_gateway_consult,
     cli_project_gateway_resolve,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (  # noqa: E402,E501
@@ -228,6 +231,168 @@ class ResolveCliFollowsBindingTest(unittest.TestCase):
         )
         self.assertEqual(1, rc)
         self.assertNotEqual("found", payload["status"])
+
+
+class AdoptAndRoutePlanFollowBindingTest(unittest.TestCase):
+    """Review j#104586 finding_routeidentity: launch-or-adopt and route-plan match
+    the SAME bound provider the inventory was fetched with — a live bound lane is
+    adopted, never refused as role_mismatch with a duplicate launch advised."""
+
+    def _adopt(self, *, provider, candidates):
+        args = argparse.Namespace(
+            repo=REPO, project=PROJECT, session=None, as_json=True
+        )
+        out = io.StringIO()
+        with patch.object(cli_project_gateway, "require_tmux", lambda: None):
+            with patch.object(
+                cli_project_gateway, "_route_provider", return_value=provider
+            ):
+                with patch.object(
+                    cli_project_gateway,
+                    "_discover_candidates",
+                    return_value=candidates,
+                ):
+                    with contextlib.redirect_stdout(out):
+                        cli_project_gateway.cmd_project_gateway_adopt(args)
+        return json.loads(out.getvalue())
+
+    def _route_plan(self, *, provider, candidates, from_role):
+        args = argparse.Namespace(
+            from_role=from_role, repo=REPO, project=PROJECT, session=None,
+            as_json=True,
+        )
+        out = io.StringIO()
+        with patch.object(cli_project_gateway, "require_tmux", lambda: None):
+            with patch.object(
+                cli_project_gateway, "_route_provider", return_value=provider
+            ):
+                with patch.object(
+                    cli_project_gateway,
+                    "_discover_candidates",
+                    return_value=candidates,
+                ):
+                    with contextlib.redirect_stdout(out):
+                        cli_project_gateway.cmd_project_gateway_route_plan(args)
+        return json.loads(out.getvalue())
+
+    def test_claude_bound_adopt_adopts_the_live_claude_lane(self) -> None:
+        payload = self._adopt(
+            provider="claude", candidates=[_candidate("%gw", role="claude")]
+        )
+        self.assertEqual("adopt", payload["action"])
+
+    def test_codex_bound_adopt_is_unchanged(self) -> None:
+        payload = self._adopt(
+            provider="codex", candidates=[_candidate("%gw", role="codex")]
+        )
+        self.assertEqual("adopt", payload["action"])
+
+    def test_claude_bound_grandparent_route_plan_adopts_the_live_lane(self) -> None:
+        payload = self._route_plan(
+            provider="claude",
+            candidates=[_candidate("%gw", role="claude")],
+            from_role="grandparent_coordinator",
+        )
+        self.assertEqual("adopt", payload["launch_or_adopt"]["action"])
+        self.assertEqual("claude", payload["step"]["target_role"])
+
+    def test_claude_bound_parent_route_plan_adopts_the_live_child_lane(self) -> None:
+        payload = self._route_plan(
+            provider="claude",
+            candidates=[_candidate("%child", role="claude")],
+            from_role="project_gateway",
+        )
+        self.assertEqual("adopt", payload["launch_or_adopt"]["action"])
+        self.assertEqual("claude", payload["step"]["target_role"])
+
+    def test_worker_step_keeps_its_own_contract(self) -> None:
+        # SELECT_NONE / implementation-worker leg: no coordinator override.
+        payload = self._route_plan(
+            provider="codex",
+            candidates=[],
+            from_role="delegated_coordinator",
+        )
+        self.assertEqual("claude", payload["step"]["target_role"])
+        self.assertIsNone(payload["launch_or_adopt"])
+
+
+class BoundReceiverGateMessageTest(unittest.TestCase):
+    """Review j#104586 finding_contracttext (behavioral half): the `--to` refusal
+    names the provider the binding actually resolves, in both directions."""
+
+    def _abort_message(self, module, cmd, args, *, provider):
+        # `die` raises CommandAbort, a SystemExit subclass that carries the
+        # operator message (#15149).
+        with patch.object(module, "_route_provider", return_value=provider):
+            with self.assertRaises(SystemExit) as caught:
+                cmd(args)
+        return str(caught.exception)
+
+    def test_consult_names_the_claude_bound_gateway(self) -> None:
+        message = self._abort_message(
+            cli_project_gateway_consult,
+            cli_project_gateway_consult.cmd_project_gateway_consult,
+            argparse.Namespace(
+                to="codex", target_repo=REPO, target_project=PROJECT,
+                target=None, as_json=False,
+            ),
+            provider="claude",
+        )
+        self.assertIn("`--to claude`", message)
+        self.assertIn("provider_binding", message)
+
+    def test_handoff_names_the_codex_bound_gateway(self) -> None:
+        message = self._abort_message(
+            cli_project_gateway,
+            cli_project_gateway.cmd_project_gateway_handoff,
+            argparse.Namespace(
+                to="claude", target_repo=REPO, target_project=PROJECT,
+                target=None, gateway_session=None, as_json=False,
+            ),
+            provider="codex",
+        )
+        self.assertIn("`--to codex`", message)
+        self.assertIn("provider_binding", message)
+
+    def test_child_intake_names_the_claude_bound_child(self) -> None:
+        message = self._abort_message(
+            cli_project_gateway_child_intake,
+            cli_project_gateway_child_intake.cmd_project_gateway_child_intake,
+            argparse.Namespace(
+                to="codex", target_repo=REPO, target_project=PROJECT,
+                target=None, as_json=False,
+            ),
+            provider="claude",
+        )
+        self.assertIn("`--to claude`", message)
+        self.assertIn("provider_binding", message)
+
+
+class HelpContractTextTest(unittest.TestCase):
+    """Review j#104586 finding_contracttext (authority-text half): the CLI help no
+    longer advertises the codex-fixed contract; it names the binding-derived
+    receiver (Close condition 4)."""
+
+    def _help_text(self, *argv):
+        from mozyo_bridge.application.cli import build_parser
+
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            with self.assertRaises(SystemExit):
+                build_parser().parse_args([*argv, "--help"])
+        return out.getvalue()
+
+    def test_family_listing_help_is_binding_derived(self) -> None:
+        # The per-command `help=` strings render in the PARENT subcommand listing.
+        text = self._help_text("project-gateway")
+        self.assertNotIn("Codex unit", text)
+        self.assertNotIn("--to codex (", text)
+        self.assertIn("provider_binding", text)
+
+    def test_child_intake_to_option_help_is_binding_derived(self) -> None:
+        text = self._help_text("project-gateway", "child-intake")
+        self.assertNotIn("Codex unit", text)
+        self.assertIn("provider_binding", text)
 
 
 if __name__ == "__main__":  # pragma: no cover

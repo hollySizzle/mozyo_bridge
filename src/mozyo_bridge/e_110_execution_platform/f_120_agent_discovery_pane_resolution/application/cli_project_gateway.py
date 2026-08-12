@@ -118,7 +118,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
 from mozyo_bridge.shared.errors import die
 
 
-def _gateway_identity(repo_root: str, project_scope: str) -> GatewayLaneIdentity:
+def _gateway_identity(
+    repo_root: str, project_scope: str, *, role: str = AGENT_KIND_CODEX
+) -> GatewayLaneIdentity:
     """Build the gateway lane identity for ``project_scope`` under ``repo_root``.
 
     Prefers the project's adopted metadata (#12658 ``adopted_scopes_for_repo``) so
@@ -126,7 +128,11 @@ def _gateway_identity(repo_root: str, project_scope: str) -> GatewayLaneIdentity
     Falls back to a metadata-thin identity from the flags when the project is not
     discoverable / not adopted (e.g. ``runtime_identity.enabled`` is off): the
     launch-or-adopt resolution still runs and fails closed honestly rather than
-    pretending the scope is adopted.
+    pretending the scope is adopted. ``role`` is the gateway's expected live
+    provider — callers pass the scope's provider_binding resolution (Redmine
+    #15414 finding_routeidentity: an inventory fetched with the bound provider
+    must be matched with the SAME role, or a live claude gateway is never
+    adopted and a duplicate launch is advised).
     """
     from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.project_discovery import (
         adopted_scopes_for_repo,
@@ -134,7 +140,9 @@ def _gateway_identity(repo_root: str, project_scope: str) -> GatewayLaneIdentity
 
     for scope in adopted_scopes_for_repo(repo_root):
         if scope.scope == project_scope:
-            return gateway_lane_identity_from_scope(scope, repo_root=repo_root)
+            return gateway_lane_identity_from_scope(
+                scope, repo_root=repo_root, role=role
+            )
     # Not adopted: derive a thin identity directly from the route inputs. The
     # project path is unknown, so the launch command names the project workdir
     # generically; this never invents an adoption that the metadata does not show.
@@ -143,6 +151,7 @@ def _gateway_identity(repo_root: str, project_scope: str) -> GatewayLaneIdentity
         project_label=project_scope,
         project_path="",
         repo_root=repo_root,
+        role=role,
     )
 
 
@@ -187,14 +196,15 @@ def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
     to an adopted gateway stays ``project-gateway handoff``.
     """
     try:
+        provider = _route_provider(
+            repo_root=args.repo,
+            project_scope=args.project,
+            selector=SELECT_GATEWAY,
+        )
         inventory = _discover_candidates(
             repo_root=args.repo,
             project_scope=args.project,
-            provider=_route_provider(
-                repo_root=args.repo,
-                project_scope=args.project,
-                selector=SELECT_GATEWAY,
-            ),
+            provider=provider,
             session=getattr(args, "session", None),
             selector=SELECT_GATEWAY,
         )
@@ -202,7 +212,10 @@ def cmd_project_gateway_adopt(args: argparse.Namespace) -> int:
         return render_inventory_error(
             exc, as_json=getattr(args, "as_json", False)
         )
-    identity = _gateway_identity(args.repo, args.project)
+    # The identity's expected role must be the SAME bound provider the inventory
+    # was fetched with (Redmine #15414 finding_routeidentity), or a live bound
+    # gateway is refused as role_mismatch and a duplicate launch is advised.
+    identity = _gateway_identity(args.repo, args.project, role=provider)
     decision = resolve_launch_or_adopt(
         inventory,
         identity,
@@ -440,22 +453,23 @@ def cmd_project_gateway_route_plan(args: argparse.Namespace) -> int:
         else SELECT_NONE
     )
     try:
+        # SELECT_NONE returns an empty inventory without a route resolution; its
+        # provider token is unused for filtering, so the historical constant
+        # satisfies the non-empty request shape. Routed selectors follow the
+        # scope's provider_binding (Redmine #15414).
+        provider = (
+            AGENT_KIND_CODEX
+            if selector == SELECT_NONE
+            else _route_provider(
+                repo_root=args.repo,
+                project_scope=args.project,
+                selector=selector,
+            )
+        )
         inventory = _discover_candidates(
             repo_root=args.repo,
             project_scope=args.project,
-            # SELECT_NONE returns an empty inventory without a route resolution;
-            # its provider token is unused for filtering, so the historical
-            # constant satisfies the non-empty request shape. Routed selectors
-            # follow the scope's provider_binding (Redmine #15414).
-            provider=(
-                AGENT_KIND_CODEX
-                if selector == SELECT_NONE
-                else _route_provider(
-                    repo_root=args.repo,
-                    project_scope=args.project,
-                    selector=selector,
-                )
-            ),
+            provider=provider,
             session=getattr(args, "session", None),
             selector=selector,
         )
@@ -469,6 +483,10 @@ def cmd_project_gateway_route_plan(args: argparse.Namespace) -> int:
         repo_root=args.repo,
         project_scope=args.project,
         session=getattr(args, "session", None),
+        # The coordinator-class target's expected role is the SAME bound
+        # provider the inventory was fetched with (Redmine #15414
+        # finding_routeidentity); the worker step keeps its own contract.
+        coordinator_provider=None if selector == SELECT_NONE else provider,
     )
 
     if getattr(args, "as_json", False):
@@ -604,10 +622,11 @@ def register(sub) -> None:
         help=(
             "Resolve the project gateway by semantic identity (no %%pane copy) and "
             "deliver a ticketless consultation through the gated handoff "
-            "orchestrator. Requires --target-repo + --target-project and --to codex "
-            "(the gateway is a Codex unit; --to claude is rejected so the project "
-            "Claude worker is never direct-sent). Fails closed (no delivery) on "
-            "missing / ambiguous resolution."
+            "orchestrator. Requires --target-repo + --target-project; --to must be "
+            "the provider the scope's provider_binding binds to the gateway "
+            "(historically codex) — a direct send to the implementation worker is "
+            "rejected. Fails closed (no delivery) on missing / ambiguous "
+            "resolution."
         ),
     )
     # Reuse the full handoff argument set; the route's repo/project/role come from

@@ -48,7 +48,7 @@ Design invariants (carried from #12668 / #12708, never weakened):
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Iterable, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
@@ -399,6 +399,7 @@ def resolve_relative_route(
     repo_root: str,
     project_scope: str,
     session: Optional[str] = None,
+    coordinator_provider: Optional[str] = None,
 ) -> RelativeRoutePlan:
     """Resolve the one-step-down delegation route from the current Unit (pure, #12699).
 
@@ -412,9 +413,22 @@ def resolve_relative_route(
     Fails closed via :class:`RelativeRouteError` when ``caller_role`` has no
     one-step-down delegation (so a grandparent can never reach a grandchild worker
     directly — the doc's direct-send prohibition).
+
+    ``coordinator_provider`` is the scope's provider_binding resolution for a
+    coordinator-class target (Redmine #15414): pass the same provider the live
+    ``candidates`` were fetched with, or omit it to keep the historical codex
+    contract. It never applies to the implementation-worker step.
     """
     step = resolve_relative_step(caller_role)
     candidates = list(candidates)
+
+    if step.coordinator_class and coordinator_provider:
+        # Redmine #15414 finding_routeidentity: the coordinator-class target's
+        # expected live role is the scope's provider_binding resolution, supplied
+        # by the caller that fetched the inventory with that same provider. The
+        # declared constant on the step is only the historical default; the
+        # worker step below keeps its own contract untouched.
+        step = replace(step, target_role=coordinator_provider)
 
     if not step.coordinator_class:
         # Implementation worker: anchor-gated dispatch, never a cockpit launch.
@@ -443,6 +457,7 @@ def resolve_relative_route(
         project_label=project_scope,
         project_path="",
         repo_root=repo_root,
+        role=step.target_role,
         target_kind=step.target_kind,
     )
     decision = resolve_launch_or_adopt(candidates, identity, session=session)

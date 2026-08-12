@@ -276,9 +276,10 @@ def cmd_project_gateway_child_intake(args: argparse.Namespace) -> int:
 # #12748 review j#67514 finding 1). Keyed by argparse ``dest``.
 _CHILD_INTAKE_HELP_OVERRIDES: dict[str, str] = {
     "to": (
-        "Semantic receiver: the CHILD / implementation coordinator, a Codex unit. "
-        "Use `--to codex`; `--to claude` is rejected — the grandchild worker is "
-        "reached only after the child mints a Redmine anchor, never direct-sent here."
+        "Semantic receiver: the CHILD / implementation coordinator. Must be the "
+        "provider the scope's provider_binding binds to the child route "
+        "(historically codex) — the grandchild worker is reached only after the "
+        "child mints a Redmine anchor, never direct-sent here."
     ),
     "target": (
         "Not used by child-intake. The child pane is resolved by semantic identity "
@@ -323,7 +324,7 @@ def register_child_intake(gateway_sub) -> None:
         description=(
             "Forward a no-anchor ticketless work-intake from the project gateway "
             "(parent) to the child / implementation coordinator. `--to` is the CHILD "
-            "Codex coordinator; `--target` is not used (the child is resolved by the "
+            "coordinator's bound provider (provider_binding); `--target` is not used (the child is resolved by the "
             "--target-repo + --target-project semantic route); `--from-pane` is the "
             "caller's own lane, a same-lane self-fence only. This is the internal "
             "primitive / compatibility surface for the parent -> child intake leg "
@@ -339,8 +340,9 @@ def register_child_intake(gateway_sub) -> None:
             "Resolves the child by semantic identity (--target-repo + "
             "--target-project) with a same-lane guard (--from-pane is the caller's "
             "OWN lane, a self-fence so the child cannot resolve back to the parent "
-            "lane — NOT the target authority). Delivers to the child Codex "
-            "coordinator (--to codex); fails closed (no delivery) on same-lane / "
+            "lane — NOT the target authority). Delivers to the child coordinator "
+            "on its provider_binding-bound provider (--to <bound provider>, "
+            "historically codex); fails closed (no delivery) on same-lane / "
             "missing / ambiguous child route, and delivers WITHOUT a Redmine anchor "
             "and without fabricating one (the worker-dispatch / implementation / "
             "domain-probe Redmine-anchor gate is NOT relaxed). This is the product "

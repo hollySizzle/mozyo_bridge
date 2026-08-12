@@ -96,7 +96,8 @@ def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
     The forward (department-root -> project-gateway) counterpart of the return
     ``handoff ticketless-callback`` rail. It resolves the single project gateway by
     semantic identity (the same fail-closed ``--target-repo`` + ``--target-project``
-    + ``--to codex`` resolution as ``project-gateway handoff``), then delivers the
+    + bound-``--to`` resolution as ``project-gateway handoff``; the gateway's
+    provider comes from the scope's provider_binding, Redmine #15414), then delivers the
     consultation through the gated :func:`orchestrate_handoff` **without a Redmine
     anchor and without fabricating one** — closing the GK3500 rerun blocker where
     the root coordinator had found exactly one gateway but the anchored
@@ -114,9 +115,10 @@ def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
     consultation_callback`` (#12703 / #12705 / #12737). Fails closed (no delivery,
     no payload injected) when no unique project gateway exists.
     """
-    # Same boundary as `project-gateway handoff`: the gateway is a Codex unit. The
-    # implementation worker (Claude) is reached only after the gateway mints a
-    # Redmine anchor, so a direct project-Claude consultation send is forbidden.
+    # Same boundary as `project-gateway handoff`: the gateway's provider is the
+    # scope's provider_binding resolution. The implementation worker is reached
+    # only after the gateway mints a Redmine anchor, so a direct project-worker
+    # consultation send is forbidden.
     if not args.target_repo or args.target_repo == "auto":
         die(
             "`project-gateway consult` resolves the pane semantically, so it needs "
@@ -234,11 +236,13 @@ def register_consult(gateway_sub) -> None:
             "(Redmine #12740). Resolves the gateway by semantic identity (no %%pane "
             "copy), then delivers WITHOUT a Redmine anchor and without fabricating "
             "one — the forward counterpart of `handoff ticketless-callback`. "
-            "Requires --target-repo + --target-project and --to codex. The "
-            "worker-dispatch / implementation / domain-probe Redmine-anchor gate is "
-            "NOT relaxed (this rail forwards a consultation only). Fails closed (no "
-            "delivery) on missing / ambiguous resolution. Use the anchored "
-            "`project-gateway handoff` once a Redmine anchor exists for worker work."
+            "Requires --target-repo + --target-project; --to must be the provider "
+            "the scope's provider_binding binds to the gateway (historically "
+            "codex). The worker-dispatch / implementation / domain-probe "
+            "Redmine-anchor gate is NOT relaxed (this rail forwards a consultation "
+            "only). Fails closed (no delivery) on missing / ambiguous resolution. "
+            "Use the anchored `project-gateway handoff` once a Redmine anchor "
+            "exists for worker work."
         ),
     )
     # Reuse the ticketless delivery knobs (no --source / --issue / --journal anchor
