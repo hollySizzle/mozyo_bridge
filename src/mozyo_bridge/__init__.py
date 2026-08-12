@@ -1,6 +1,6 @@
 """mozyo-bridge package."""
 
-__version__ = "1.0.0rc2"
+__version__ = "1.0.0rc3"
 
 # Redmine #13569 R3-F2: composition bootstrap. The e_110 discovery / pane-resolution
 # domain no longer imports the e_140 provider registry for its no-injected-snapshot
