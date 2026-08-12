@@ -134,7 +134,7 @@ discovery_cache:
   generated_at: "<timestamp>"
   entries:
     - cache_key: "project:cloud-drive-management@projects/cloud-drive-management"
-      source: "projects/cloud-drive-management/project.env"
+      source: "projects/cloud-drive-management/.mozyo-bridge/project.env"
       path: "projects/cloud-drive-management"
       redmine_project: "cloud-drive-management"
       display_label: "クラウドドライブ管理"
