@@ -1634,6 +1634,16 @@ file_conventions:
       - rule-codex-autonomous-guardrail-lane
       - logic-workspace-defaults-renderer
 
+  - id: fc-project-identity-descriptor
+    name: project-scoped runtime identity descriptor
+    patterns:
+      - .mozyo-bridge/project.env
+      - project.env
+    severity: block
+    document_refs:
+      - logic-project-scoped-workspace-identity
+      - spec-project-map
+
   - id: fc-public-readme
     name: public README and user-facing install guidance
     patterns:
