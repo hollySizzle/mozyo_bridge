@@ -139,9 +139,26 @@ class LiveProjectGatewayDeclareOps:
         # Canonicalize the repo root with the resolver's own normalization (R3 F4), so a
         # relative ``--repo .`` and the resolver's absolute repo root compare equal.
         canon_repo = _canonical_path(self.repo_root)
+        # The declaration's semantic identity and its candidate discovery use the
+        # SAME gateway provider the use case already resolved from the binding
+        # (Redmine #15414 finding_declareidentity) — the use case zero-writes on
+        # an unresolved binding before reaching here, and an unreadable binding
+        # below stays owner-unbound through the same except. Without this, an
+        # all-claude gateway is refused as role_mismatch and the declaration is
+        # permanently owner-unbound.
         try:
-            identity = _gateway_identity(canon_repo, project_scope)
-            decision = resolve_launch_or_adopt(_discover_candidates(), identity)
+            gateway_provider, _worker_provider = self.providers()
+            identity = _gateway_identity(
+                canon_repo, project_scope, role=gateway_provider
+            )
+            decision = resolve_launch_or_adopt(
+                _discover_candidates(
+                    repo_root=canon_repo,
+                    project_scope=project_scope,
+                    provider=gateway_provider,
+                ),
+                identity,
+            )
         except Exception:  # noqa: BLE001 — discovery / resolution unreadable -> owner-unbound
             return ("", "", None)
         observed: Optional[ObservedGatewayRoute] = None

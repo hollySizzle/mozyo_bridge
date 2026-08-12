@@ -191,6 +191,10 @@ def cmd_project_gateway_child_intake(args: argparse.Namespace) -> int:
             project_scope=args.target_project,
             caller_pane=caller_pane,
             session=getattr(args, "gateway_session", None),
+            # The child semantic identity must be the SAME bound provider the
+            # inventory was fetched with (Redmine #15414 finding_childidentity),
+            # or an all-claude child is refused as role_mismatch/child_missing.
+            provider=child_provider,
         )
     except ProjectGatewayInventoryError as exc:
         return render_inventory_error(

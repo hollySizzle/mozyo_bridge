@@ -368,6 +368,138 @@ class BoundReceiverGateMessageTest(unittest.TestCase):
         self.assertIn("provider_binding", message)
 
 
+class ChildIntakeIdentityFollowsBindingTest(unittest.TestCase):
+    """Review j#104593 finding_childidentity: the child semantic identity follows
+    the SAME bound provider the candidates were fetched with."""
+
+    def _route(self, candidates, *, provider=None, caller="%parent"):
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.child_intake_route import (  # noqa: E501
+            resolve_child_intake_route,
+        )
+
+        return resolve_child_intake_route(
+            candidates,
+            repo_root=REPO,
+            project_scope=PROJECT,
+            caller_pane=caller,
+            provider=provider,
+        )
+
+    def test_claude_bound_distinct_child_is_resolved(self) -> None:
+        route = self._route(
+            [_candidate("%parent", role="claude"), _candidate("%child", role="claude")],
+            provider="claude",
+        )
+        self.assertEqual("child_resolved", route.status)
+        self.assertEqual("%child", route.selected.pane_id)
+
+    def test_codex_bound_distinct_child_is_unchanged(self) -> None:
+        route = self._route(
+            [_candidate("%parent", role="codex"), _candidate("%child", role="codex")],
+            provider="codex",
+        )
+        self.assertEqual("child_resolved", route.status)
+        self.assertEqual("%child", route.selected.pane_id)
+
+    def test_omitted_provider_keeps_the_historical_codex_contract(self) -> None:
+        route = self._route(
+            [_candidate("%parent", role="claude"), _candidate("%child", role="claude")],
+        )
+        self.assertNotEqual("child_resolved", route.status)
+
+    def test_same_lane_guard_is_preserved_under_claude_binding(self) -> None:
+        route = self._route(
+            [_candidate("%parent", role="claude")], provider="claude"
+        )
+        self.assertEqual("same_lane", route.status)
+
+    def test_cli_delivers_to_the_claude_bound_child(self) -> None:
+        captured = {}
+
+        def fake_orch(args, **kwargs):
+            captured["target"] = args.target
+            return 0
+
+        args = argparse.Namespace(
+            to="claude", target_repo=REPO, target_project=PROJECT, target=None,
+            from_pane="%parent", work_shape=None, gateway_session=None,
+            as_json=False,
+        )
+        with patch.object(
+            cli_project_gateway_child_intake, "_route_provider",
+            return_value="claude",
+        ):
+            with patch.object(
+                cli_project_gateway_child_intake, "_discover_candidates",
+                return_value=[
+                    _candidate("%parent", role="claude"),
+                    _candidate("%child", role="claude"),
+                ],
+            ):
+                with patch.object(
+                    cli_project_gateway_child_intake, "orchestrate_handoff",
+                    side_effect=fake_orch,
+                ):
+                    rc = cli_project_gateway_child_intake.cmd_project_gateway_child_intake(args)
+        self.assertEqual(0, rc)
+        self.assertEqual("%child", captured["target"])
+
+
+class DeclareRouteFollowsBindingTest(unittest.TestCase):
+    """Review j#104593 finding_declareidentity: the declaration's semantic identity
+    and candidate discovery use the SAME gateway provider the use case resolved."""
+
+    def _resolve_route(self, *, gateway_provider, candidates):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            cli_project_gateway_declare,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            workflow_provider_resolution,
+        )
+
+        ops = cli_project_gateway_declare.LiveProjectGatewayDeclareOps(REPO)
+        with patch.object(
+            workflow_provider_resolution, "resolve_gateway_provider",
+            return_value=gateway_provider,
+        ):
+            with patch.object(
+                workflow_provider_resolution, "resolve_worker_provider",
+                return_value="claude",
+            ):
+                with patch.object(
+                    cli_project_gateway, "_discover_candidates",
+                    return_value=candidates,
+                ) as discovered:
+                    result = ops.resolve_route(PROJECT)
+        return result, discovered
+
+    def test_all_claude_gateway_resolves_the_observed_route(self) -> None:
+        (_repo, _path, observed), discovered = self._resolve_route(
+            gateway_provider="claude",
+            candidates=[_candidate("%gw", role="claude")],
+        )
+        self.assertIsNotNone(observed)
+        self.assertEqual("%gw", observed.locator)
+        self.assertEqual(
+            "claude", discovered.call_args.kwargs.get("provider")
+        )
+
+    def test_codex_bound_gateway_is_unchanged(self) -> None:
+        (_repo, _path, observed), _discovered = self._resolve_route(
+            gateway_provider="codex",
+            candidates=[_candidate("%gw", role="codex")],
+        )
+        self.assertIsNotNone(observed)
+        self.assertEqual("%gw", observed.locator)
+
+    def test_a_mismatched_live_provider_stays_owner_unbound(self) -> None:
+        (_repo, _path, observed), _discovered = self._resolve_route(
+            gateway_provider="claude",
+            candidates=[_candidate("%gw", role="codex")],
+        )
+        self.assertIsNone(observed)
+
+
 class HelpContractTextTest(unittest.TestCase):
     """Review j#104586 finding_contracttext (authority-text half): the CLI help no
     longer advertises the codex-fixed contract; it names the binding-derived
