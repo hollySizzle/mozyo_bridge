@@ -65,6 +65,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (  # noqa: E402,E501
     ROLE_COORDINATOR,
+    ROLE_IMPLEMENTER,
     RoleProviderBinding,
 )
 
@@ -500,6 +501,40 @@ class DeclareRouteFollowsBindingTest(unittest.TestCase):
             candidates=[_candidate("%gw", role="codex")],
         )
         self.assertIsNone(observed)
+
+    def test_provider_pair_derives_from_one_binding_snapshot(self) -> None:
+        # Review j#104607 finding_providerpairsnapshot: the (gateway, worker)
+        # pair must come from ONE binding load — per-role loads could hand the
+        # declaration a hybrid pair that never existed in any single binding
+        # state. The drifting loader returns a different binding on every load,
+        # so any second read is visible in both the count and the pair value.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            cli_project_gateway_declare,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            workflow_binding_source,
+        )
+
+        all_claude = RoleProviderBinding.default().with_overrides(
+            {ROLE_COORDINATOR: "claude", ROLE_IMPLEMENTER: "claude"}
+        )
+        all_codex = RoleProviderBinding.default().with_overrides(
+            {ROLE_COORDINATOR: "codex", ROLE_IMPLEMENTER: "codex"}
+        )
+        loads: list = []
+
+        def drifting_load(root):
+            loads.append(root)
+            return (all_claude if len(loads) == 1 else all_codex), ()
+
+        ops = cli_project_gateway_declare.LiveProjectGatewayDeclareOps(REPO)
+        with patch.object(
+            workflow_binding_source, "load_workflow_binding",
+            side_effect=drifting_load,
+        ):
+            pair = ops.providers()
+        self.assertEqual(1, len(loads))
+        self.assertEqual(("claude", "claude"), pair)
 
 
 class HelpContractTextTest(unittest.TestCase):

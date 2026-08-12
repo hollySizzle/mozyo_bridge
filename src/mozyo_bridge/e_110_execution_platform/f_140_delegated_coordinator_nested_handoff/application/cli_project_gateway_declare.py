@@ -101,16 +101,30 @@ class LiveProjectGatewayDeclareOps:
             return (), False
 
     def providers(self) -> tuple[str, str]:
-        """The ``(gateway, worker)`` provider pair from the binding, or ``("", "")`` unbound."""
+        """The ``(gateway, worker)`` provider pair from ONE binding snapshot, or ``("", "")``.
+
+        The binding is loaded exactly once and both providers derive from that
+        same immutable :class:`RoleProviderBinding` (Redmine #15414
+        finding_providerpairsnapshot): resolving each role through its own
+        ``load_workflow_binding`` read could hand the declaration a hybrid pair
+        that never existed in any single binding state.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_binding_source import (  # noqa: E501
+            load_workflow_binding,
+        )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
             WorkflowProviderUnresolved,
             resolve_gateway_provider,
             resolve_worker_provider,
         )
 
+        root = str(self.repo_root)
+        binding, _warnings = load_workflow_binding(root)
         try:
-            root = str(self.repo_root)
-            return (resolve_gateway_provider(root), resolve_worker_provider(root))
+            return (
+                resolve_gateway_provider(root, binding=binding),
+                resolve_worker_provider(root, binding=binding),
+            )
         except WorkflowProviderUnresolved:
             return ("", "")
 
