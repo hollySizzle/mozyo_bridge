@@ -214,9 +214,18 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   [--delivery-mode <mode>] [--apply]
 ```
 
-- 配送は対象 source 上で `project-gateway handoff --to codex --target-repo <root>
-  --target-project <scope>` を実行する。gateway は project の Codex unit を semantic に
-  解決し、`--to claude` を拒否する。client 側は remote pane を名指ししない。
+- 配送は対象 source 上で `project-gateway handoff --target-repo <root>
+  --target-project <scope>` を実行する (`--to` は送らない、Redmine #15420)。receiver は
+  **対象環境自身の provider_binding が gateway に bind する provider** を対象環境の CLI が
+  解決する。client は brand を pin せず、対象環境の設定も読まない (privacy boundary)。
+  明示 `--to` は対象環境側で binding と exact-match 検証され、worker への direct send は
+  従来どおり拒否される。client 側は remote pane を名指ししない。
+- **version skew は typed zero-send。** 配送前に client が対象 CLI の
+  `project-gateway handoff --help` を read-only probe し、capability token
+  (`mozyo_gateway_handoff_capability=binding_receiver_v1`、#13847 launcher capability と
+  同型の epilog contract) を確認する。token を広告しない旧 remote へは配送せず
+  `remote_gateway_contract_unsupported` で refuse する (silent に `--to` pin へ fallback
+  しない — pin の復活は claude-bound scope の恒常拒否 (#15414 gate) を再導入する)。
 - **`--target-repo` は registry の canonical path（= Git worktree root = workspace authority）から
   解決してよい。`--target-project` は解決しない。** registry の `project_name` は display
   metadata かつ dir 名 default であり、role / scope authority ではない（正本:

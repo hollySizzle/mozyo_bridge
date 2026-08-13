@@ -139,6 +139,7 @@ def configure_handoff_parser(
     *,
     kind_required: bool,
     include_to: bool = True,
+    to_required: bool = True,
     include_force: bool = True,
     target_required: bool = False,
     target_repo_required: bool = False,
@@ -146,11 +147,25 @@ def configure_handoff_parser(
     snapshot: "AgentProviderRuntimeSnapshot | None" = None,
 ) -> None:
     if include_to:
+        # ``to_required=False`` is reserved for commands that can resolve the
+        # receiver semantically themselves (`project-gateway handoff`, Redmine
+        # #15420: an omitted --to means "the provider this scope's
+        # provider_binding binds to the gateway"). `handoff send` and every
+        # explicit-pane rail keep the receiver mandatory.
         parser_.add_argument(
             "--to",
-            required=True,
+            required=to_required,
+            default=None,
             choices=receiver_choices(snapshot),
-            help="Semantic receiver agent",
+            help=(
+                "Semantic receiver agent"
+                if to_required
+                else (
+                    "Semantic receiver agent. Omit to use the provider the "
+                    "target scope's provider_binding binds to the gateway; an "
+                    "explicit value is still verified against that binding."
+                )
+            ),
         )
     parser_.add_argument(
         "--source",

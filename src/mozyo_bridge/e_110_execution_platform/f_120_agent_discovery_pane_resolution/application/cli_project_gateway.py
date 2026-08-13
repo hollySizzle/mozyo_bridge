@@ -102,6 +102,9 @@ __all__ = [
     "cmd_project_gateway_route_plan",
     "register",
 ]
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_handoff_capability import (
+    build_gateway_handoff_capability_epilog,
+)
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_child_intake import (
     register_child_intake,
 )
@@ -350,15 +353,23 @@ def cmd_project_gateway_handoff(args: argparse.Namespace) -> int:
         return render_inventory_error(
             exc, as_json=getattr(args, "as_json", False)
         )
-    if args.to != gateway_provider:
+    # Redmine #15420: an omitted --to means "whatever this scope's
+    # provider_binding binds to the gateway" — the only receiver this command
+    # may deliver to anyway. Resolving it here (instead of requiring the caller
+    # to know it) is what lets a remote client cross the host boundary without
+    # reading the target environment's configuration. An explicit --to keeps
+    # the exact-match verification (#15414) unchanged.
+    if args.to is None:
+        args.to = gateway_provider
+    elif args.to != gateway_provider:
         die(
             "`project-gateway handoff` delivers to the project gateway; this "
             f"scope's provider_binding binds the gateway to "
             f"`{gateway_provider}`, so `--to {args.to}` is not allowed. The "
             "implementation worker is reached only after the gateway creates "
-            f"a Redmine anchor — use `--to {gateway_provider}`. A direct "
-            "project-worker send is forbidden by the ticketless project "
-            "gateway contract."
+            f"a Redmine anchor — use `--to {gateway_provider}` or omit --to. "
+            "A direct project-worker send is forbidden by the ticketless "
+            "project gateway contract."
         )
     if getattr(args, "target", None):
         die(
@@ -622,18 +633,27 @@ def register(sub) -> None:
         help=(
             "Resolve the project gateway by semantic identity (no %%pane copy) and "
             "deliver a ticketless consultation through the gated handoff "
-            "orchestrator. Requires --target-repo + --target-project; --to must be "
-            "the provider the scope's provider_binding binds to the gateway "
-            "(historically codex) — a direct send to the implementation worker is "
-            "rejected. Fails closed (no delivery) on missing / ambiguous "
-            "resolution."
+            "orchestrator. Requires --target-repo + --target-project. --to may be "
+            "omitted (Redmine #15420): the receiver is then the provider the "
+            "scope's provider_binding binds to the gateway; an explicit --to is "
+            "verified against that binding — a direct send to the implementation "
+            "worker is rejected. Fails closed (no delivery) on missing / "
+            "ambiguous resolution."
         ),
+        # The capability epilog is a machine-readable contract line a remote
+        # client probes via `--help` before omitting --to (#15420); Raw
+        # formatting keeps it verbatim (no reflow), same as #13847's launcher
+        # capability contract.
+        epilog=build_gateway_handoff_capability_epilog(),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
     # Reuse the full handoff argument set; the route's repo/project/role come from
     # --target-repo / --target-project / --to, and --target is resolved, not typed.
+    # --to is optional here only: omitted means "the gateway's bound provider".
     configure_handoff_parser(
         handoff,
         kind_required=True,
+        to_required=False,
         target_required=False,
         target_repo_required=True,
     )

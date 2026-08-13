@@ -49,6 +49,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     MultiSourceUnitBoardRuntime,
 )
 
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_handoff_capability import (  # noqa: E501
+    build_gateway_handoff_capability_epilog,
+)
 from tests.unit.e_140_adapter_provider.f_130_terminal_runtime_provider.test_herdr_multi_source_unit_board import (
     NOW,
     REMOTE_CONFIG,
@@ -61,6 +64,25 @@ from tests.unit.e_140_adapter_provider.f_130_terminal_runtime_provider.test_herd
 
 
 GATEWAY_ARGS = ("project-gateway", "handoff")
+GATEWAY_PROBE_ARGS = ("project-gateway", "handoff", "--help")
+
+
+def gateway_probe_help(*, capable: bool = True) -> str:
+    """What the target CLI's ``--help`` prints (Redmine #15420).
+
+    ``capable=True`` advertises the binding-resolved receiver contract the way
+    the real parser epilog does; ``capable=False`` is an old remote whose help
+    carries no capability token.
+    """
+    lines = [
+        "usage: mozyo-bridge project-gateway handoff [-h] [--to {claude,codex}]",
+        "",
+        "options:",
+        "  --to {claude,codex}  Semantic receiver agent.",
+    ]
+    if capable:
+        lines += ["", build_gateway_handoff_capability_epilog()]
+    return "\n".join(lines) + "\n"
 
 
 def armed_wait_observation() -> dict:
@@ -149,6 +171,9 @@ class MovableClock:
 
 def answers(overrides=None):
     base = {
+        # The probe key precedes GATEWAY_ARGS: a `--help` invocation matches
+        # both token sets and the runner answers with the first match.
+        GATEWAY_PROBE_ARGS: gateway_probe_help(),
         REMOTE_BOARD_ARGS: remote_board_payload(),
         REMOTE_WORKSPACE_ARGS: WORKSPACE_PAYLOAD,
         GATEWAY_ARGS: delivery_record(),
@@ -195,7 +220,9 @@ class PreviewTests(unittest.TestCase):
         self.assertTrue(preview.applicable)
         payload = preview.as_payload()
         self.assertEqual(payload["host_label"], "dev host")
-        self.assertEqual(payload["receiver"], "codex")
+        # #15420: the receiver is resolved by the TARGET scope's
+        # provider_binding, so the preview names the boundary, not a brand.
+        self.assertEqual(payload["receiver"], "gateway_binding")
         self.assertFalse(payload["direct_worker_send"])
         rendered = json.dumps(payload)
         self.assertNotIn("SSH-DESTINATION-SENTINEL", rendered)
@@ -293,7 +320,7 @@ class PreviewTests(unittest.TestCase):
 
         self.assertEqual(preview.as_payload()["issue"], widest)
         command = next(
-            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         )
         self.assertIn(f"--issue {widest}", command)
         self.assertIn(f"--journal {widest}", command)
@@ -307,7 +334,7 @@ class PreviewTests(unittest.TestCase):
 
         self.assertEqual(preview.as_payload()["issue"], "999999999")
         command = next(
-            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         )
         self.assertIn("--issue 999999999", command)
         self.assertIn("--journal 1", command)
@@ -360,7 +387,7 @@ class PreviewTests(unittest.TestCase):
 
         self.assertEqual(preview.as_payload()["summary"], summary)
         command = next(
-            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         )
         self.assertIn(f"--summary '{summary}'", command)
 
@@ -377,7 +404,7 @@ class ApplyTests(unittest.TestCase):
 
         self.assertEqual(preview.as_payload()["target_project"], "scope-alpha")
         command = next(
-            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         )
         self.assertIn("--target-project scope-alpha", command)
         self.assertNotIn("--target-project mozyo_bridge", command)
@@ -442,7 +469,7 @@ class PreviewSubstitutionTests(unittest.TestCase):
                 self.assertEqual(result.state, ACTION_REFUSED)
                 self.assertEqual(result.reason, REASON_PREVIEW_MISMATCH)
                 self.assertFalse(
-                    [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+                    [argv for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]]
                 )
 
     def test_substituting_the_evidence_request_is_revalidated(self) -> None:
@@ -467,7 +494,7 @@ class PreviewSubstitutionTests(unittest.TestCase):
 
         self.assertEqual(result.reason, REASON_CONNECTION_VALUE_DISCLOSED)
         self.assertFalse(
-            [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+            [argv for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]]
         )
 
     def test_the_delivered_argv_comes_from_the_validated_request(self) -> None:
@@ -479,7 +506,7 @@ class PreviewSubstitutionTests(unittest.TestCase):
 
         self.assertEqual(result.state, ACTION_DELIVERED)
         command = next(
-            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         )
         self.assertIn("--issue 15138", command)
         self.assertIn("--summary 'board pointer'", command)
@@ -559,7 +586,7 @@ class DeliveryModeTests(unittest.TestCase):
         action.apply(action.preview(request(unit_id)))
 
         command = next(
-            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         )
         self.assertIn(f"--mode {MODE_QUEUE_ENTER}", command)
         self.assertNotIn("--mode standard", command)
@@ -586,7 +613,7 @@ class DeliveryModeTests(unittest.TestCase):
 
                 self.assertEqual(preview.as_payload()["delivery_mode"], mode)
                 command = next(
-                    argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+                    argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
                 )
                 self.assertIn(f"--mode {mode}", command)
 
@@ -622,7 +649,7 @@ class DeliveryModeTests(unittest.TestCase):
 
         self.assertEqual(result.reason, REASON_PREVIEW_MISMATCH)
         self.assertFalse(
-            [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+            [argv for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]]
         )
 
     def test_the_body_is_handed_to_the_gateway_exactly_once(self) -> None:
@@ -642,7 +669,9 @@ class DeliveryModeTests(unittest.TestCase):
                 action.apply(action.preview(request(unit_id)))
 
                 gateway = [
-                    argv for argv in runner.argvs if "project-gateway" in argv[-1]
+                    argv
+                    for argv in runner.argvs
+                    if "project-gateway" in argv[-1] and "--help" not in argv[-1]
                 ]
                 self.assertEqual(len(gateway), 1)
 
@@ -677,8 +706,11 @@ class DeliveryModeTests(unittest.TestCase):
         )
         self.assertEqual(base_timeout, 30)
         gateway_calls = [
-            call for call in runner.calls if "project-gateway" in call[0][-1]
+            call
+            for call in runner.calls
+            if "project-gateway" in call[0][-1] and "--help" not in call[0][-1]
         ]
+        probe_calls = [call for call in runner.calls if "--help" in call[0][-1]]
         observation_calls = [
             call for call in runner.calls if "project-gateway" not in call[0][-1]
         ]
@@ -687,6 +719,10 @@ class DeliveryModeTests(unittest.TestCase):
             gateway_calls[0][1],
             base_timeout + QUEUE_ENTER_RETRY_WINDOW_SECONDS,
         )
+        # The read-only capability probe (#15420) never inherits the delivery's
+        # completion window.
+        self.assertEqual(len(probe_calls), 1)
+        self.assertEqual(probe_calls[0][1], base_timeout)
         self.assertTrue(observation_calls)
         self.assertEqual({timeout for _, timeout in observation_calls}, {base_timeout})
         self.assertEqual(gateway_calls[0][0][-1].count(summary), 1)
@@ -698,10 +734,11 @@ class DeliveryModeTests(unittest.TestCase):
         action.apply(action.preview(request(unit_id)))
 
         command = next(
-            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+            argv[-1]
+            for argv in runner.argvs
+            if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         )
-        self.assertIn("--to codex", command)
-        for forbidden in ("--to claude", "--target %", " keys ", " type ", "--force"):
+        for forbidden in ("--to", "--target %", " keys ", " type ", "--force"):
             self.assertNotIn(forbidden, command)
 
 
@@ -746,7 +783,7 @@ class ZeroSendNonRegressionTests(unittest.TestCase):
                 self.assertEqual(result.injection_stage, STAGE_NOT_SENT)
                 self.assertNotEqual(result.reason, REASON_DELIVERY_UNCERTAIN)
                 self.assertFalse(
-                    [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+                    [argv for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]]
                 )
 
 
@@ -787,15 +824,22 @@ class ApplyDeliveryTests(unittest.TestCase):
         result = action.apply(preview)
 
         self.assertEqual(result.state, ACTION_DELIVERED)
-        gateway = [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
-        self.assertEqual(len(gateway), 1)
-        command = gateway[0][-1]
+        deliveries = [
+            argv
+            for argv in runner.argvs
+            if "project-gateway" in argv[-1] and "--help" not in argv[-1]
+        ]
+        probes = [argv for argv in runner.argvs if "--help" in argv[-1]]
+        self.assertEqual(len(deliveries), 1)
+        self.assertEqual(len(probes), 1)
+        command = deliveries[0][-1]
         self.assertIn("project-gateway handoff", command)
-        self.assertIn("--to codex", command)
+        # #15420: no receiver pin crosses the boundary; the target's own
+        # provider_binding resolves it.
+        self.assertNotIn("--to", command)
         self.assertIn("--target-repo /srv/checkouts/mozyo_bridge", command)
         self.assertIn("--target-project giken-3800-mozyo-bridge", command)
         self.assertIn("--issue 15138", command)
-        self.assertNotIn("--to claude", command)
         self.assertNotIn("--target %", command)
 
     def test_apply_requires_an_applicable_preview(self) -> None:
@@ -834,7 +878,7 @@ class ApplyDeliveryTests(unittest.TestCase):
 
         self.assertEqual(result.reason, REASON_IDENTITY_CHANGED)
         self.assertFalse(
-            [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+            [argv for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]]
         )
 
     def test_repository_identity_change_between_preview_and_apply_refuses(self) -> None:
@@ -856,7 +900,7 @@ class ApplyDeliveryTests(unittest.TestCase):
 
         self.assertEqual(result.reason, REASON_IDENTITY_CHANGED)
         self.assertFalse(
-            [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+            [argv for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]]
         )
 
     def test_source_that_stopped_answering_between_preview_and_apply_refuses(self) -> None:
@@ -921,7 +965,7 @@ class ApplyDeliveryTests(unittest.TestCase):
 
         class FailedPrimitiveRunner(RecordingRunner):
             def __call__(self, argv, **kwargs):
-                if "project-gateway" in argv[-1]:
+                if "project-gateway" in argv[-1] and "--help" not in argv[-1]:
                     self.argvs.append(list(argv))
                     stdout = delivery_record(
                         status="blocked",
@@ -961,7 +1005,7 @@ class ApplyDeliveryTests(unittest.TestCase):
 
         class FreeFormFailureRunner(RecordingRunner):
             def __call__(self, argv, **kwargs):
-                if "project-gateway" in argv[-1]:
+                if "project-gateway" in argv[-1] and "--help" not in argv[-1]:
                     self.argvs.append(list(argv))
                     stdout = delivery_record(
                         status="blocked",
@@ -1023,7 +1067,7 @@ class ApplyDeliveryTests(unittest.TestCase):
     def test_an_unreadable_gateway_answer_is_not_delivered(self) -> None:
         class Unreadable(RecordingRunner):
             def __call__(self, argv, **kwargs):
-                if "project-gateway" in argv[-1]:
+                if "project-gateway" in argv[-1] and "--help" not in argv[-1]:
                     self.argvs.append(list(argv))
                     return subprocess.CompletedProcess(argv, 0, "not json", "")
                 return super().__call__(argv, **kwargs)
@@ -1235,7 +1279,7 @@ class ApplyDeliveryTests(unittest.TestCase):
         action.apply(action.preview(request(unit_id)))
 
         command = next(
-            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1]
+            argv[-1] for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         )
         self.assertIn("--record-format json", command)
 
@@ -1254,7 +1298,7 @@ class ApplyDeliveryTests(unittest.TestCase):
 
         self.assertEqual(preview.reason, REASON_UNIT_UNRESOLVED)
         self.assertFalse(
-            [argv for argv in runner.argvs if "project-gateway" in argv[-1]]
+            [argv for argv in runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]]
         )
 
     def test_a_silent_nonzero_gateway_exit_is_unconfirmed_not_zero_send(self) -> None:
@@ -1292,7 +1336,7 @@ class ApplyDeliveryTests(unittest.TestCase):
         # withhold a confirmation the CLI's own shapes would never pair with it.
         class Contradictory(RecordingRunner):
             def __call__(self, argv, **kwargs):
-                if "project-gateway" in argv[-1]:
+                if "project-gateway" in argv[-1] and "--help" not in argv[-1]:
                     self.argvs.append(list(argv))
                     return subprocess.CompletedProcess(argv, 1, delivery_record(), "")
                 return super().__call__(argv, **kwargs)
