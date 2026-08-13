@@ -68,6 +68,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _agent_locator,
     _norm,
     terminal_identity_of_live_slot,
+    terminal_identity_snapshot_complete,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
     _extract_list_rows,
@@ -96,6 +97,12 @@ SELF_LOOKUP_REASON_ROW_ABSENT = "row_absent"
 SELF_LOOKUP_REASON_ROW_AMBIGUOUS = "row_ambiguous"
 SELF_LOOKUP_REASON_TERMINAL_ID_MISSING = "terminal_id_missing"
 SELF_LOOKUP_REASON_TERMINAL_ID_MALFORMED = "terminal_id_malformed"
+#: The inventory snapshot itself failed canonicalisation (a foreign row with a
+#: malformed axis, a duplicate locator / terminal, ...), so no slot-scoped join can
+#: run at all. Distinct from :data:`SELF_LOOKUP_REASON_ROW_AMBIGUOUS`, which asserts
+#: this agent's own row matched more than once — a claim a failed snapshot never
+#: supports (Redmine #15425: the rc3 live regression reported exactly that misnomer).
+SELF_LOOKUP_REASON_SNAPSHOT_INCOMPLETE = "snapshot_incomplete"
 
 #: The attestation write did not happen because no exact locator was resolved (Redmine
 #: #14231 coordinator interpretation j#84865). Distinct from a store write that RAISED:
@@ -175,7 +182,9 @@ def _match_own_identity(
     :data:`SELF_LOOKUP_REASON_ROW_AMBIGUOUS`, and an exactly-one match carrying an empty
     locator is ``row_absent`` too (a row without a locator identifies nothing). The
     unique row must also carry a canonical server-owned terminal id; absence and
-    malformed evidence are separate value-free failures.
+    malformed evidence are separate value-free failures. When the global slot join
+    fails because the snapshot itself never canonicalised, that is
+    :data:`SELF_LOOKUP_REASON_SNAPSHOT_INCOMPLETE`, never ``row_ambiguous`` (#15425).
     """
     if rows is None:
         return "", "", SELF_LOOKUP_REASON_LIST_UNREADABLE
@@ -204,6 +213,10 @@ def _match_own_identity(
     if type(terminal_id) is not str or terminal_id.strip() != terminal_id:
         return "", "", SELF_LOOKUP_REASON_TERMINAL_ID_MALFORMED
     if terminal_identity_of_live_slot(assigned_name, locator, rows) is None:
+        # Name the observation that actually failed: a snapshot that never
+        # canonicalised supports no per-row ambiguity claim (Redmine #15425).
+        if not terminal_identity_snapshot_complete(rows):
+            return "", "", SELF_LOOKUP_REASON_SNAPSHOT_INCOMPLETE
         return "", "", SELF_LOOKUP_REASON_ROW_AMBIGUOUS
     return locator, terminal_id, ""
 
@@ -628,6 +641,7 @@ __all__ = (
     "SELF_LOOKUP_REASON_LIST_UNREADABLE",
     "SELF_LOOKUP_REASON_ROW_ABSENT",
     "SELF_LOOKUP_REASON_ROW_AMBIGUOUS",
+    "SELF_LOOKUP_REASON_SNAPSHOT_INCOMPLETE",
     "SELF_LOOKUP_TOTAL_BUDGET_SECONDS",
     "Lister",
     "bounded_self_lookup",

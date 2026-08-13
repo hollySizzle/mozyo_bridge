@@ -32,8 +32,17 @@ def _canonical_snapshot(agents) -> tuple[Mapping[str, object], ...] | None:
         if terminal_id is None:
             return None
         raw_name = row.get(AGENT_KEY_NAME)
-        if type(raw_name) is not str or not raw_name or raw_name.strip() != raw_name:
-            return None
+        # A ``name: None`` row is an unmanaged pane herdr surfaces alongside the
+        # managed agents (an operator-launched terminal, Redmine #15425). It can
+        # never be a managed join target, so it owes no name — but its
+        # server-owned locator / terminal axes stay in the duplicate detection
+        # below, so a collision with a managed row still fails the snapshot.
+        # Any other malformed name (non-str, empty, padded) is inventory
+        # corruption on a row that claims to be named, and stays fail-closed.
+        if raw_name is not None:
+            if type(raw_name) is not str or not raw_name or raw_name.strip() != raw_name:
+                return None
+            names.append(raw_name)
         supplied = [row.get(key) for key in _LOCATOR_KEYS if row.get(key) is not None]
         if not supplied or any(
             type(value) is not str or not value or value.strip() != value
@@ -43,7 +52,6 @@ def _canonical_snapshot(agents) -> tuple[Mapping[str, object], ...] | None:
         locator = _agent_locator(row)
         if not locator or any(value != locator for value in supplied):
             return None
-        names.append(raw_name)
         locators.append(locator)
         terminals.append(terminal_id)
     if (
@@ -64,7 +72,12 @@ def terminal_identity_of_row(agent: Mapping[str, object]) -> Optional[str]:
 
 
 def terminal_identity_snapshot_complete(agents) -> bool:
-    """Whether every row has globally unique canonical name/locator/terminal axes."""
+    """Whether every row has globally unique canonical locator/terminal axes.
+
+    Named rows must also carry a canonical, globally unique name. ``name: None``
+    rows are unmanaged panes (#15425): they owe no name, but their locator and
+    terminal still participate in the uniqueness checks.
+    """
     return _canonical_snapshot(agents) is not None
 
 
