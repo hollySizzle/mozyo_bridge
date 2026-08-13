@@ -34,6 +34,29 @@ paths exceeds their operational benefit. If a broader or independently managed
 user base needs rolling upgrades later, that migration contract must be designed
 and tested as a separate feature before support is claimed.
 
+#### Identity store migration between release candidates (rc2 → rc3)
+
+Upgrading the CLI does not migrate the home-scoped identity stores by itself.
+The rc2 → rc3 cutover established this contract (observed live on Z690,
+Redmine #15422): after installing the new version and stopping the old
+session, and **before the first managed launch** from the new runtime:
+
+1. `mozyo-bridge herdr attestation-store status` (read-only). If it reports a
+   recognized older shape, run
+   `mozyo-bridge herdr attestation-store migrate --write` — backup-first and
+   idempotent. The managed-launch preflight refuses older shapes fail-closed,
+   so every managed launch stays blocked until this migration runs.
+2. `mozyo-bridge herdr launch-generation-store status` (read-only). If the
+   pre-upgrade store is reported corrupt from the new runtime's point of view,
+   run `mozyo-bridge herdr launch-generation-store rebuild --write` after the
+   old pairs are closed — the rail refuses a healthy store and refuses while
+   any managed agent still holds a generation. The next managed launch
+   re-derives the store.
+
+Both rails are dry-run by default (`--write` performs the change) and rotate
+the previous store into `~/.mozyo_bridge/backups/` before touching anything; a
+failed backup aborts with the store byte-unchanged.
+
 1. **Install the CLI** and confirm `tmux` is on `PATH`:
 
    ```bash
