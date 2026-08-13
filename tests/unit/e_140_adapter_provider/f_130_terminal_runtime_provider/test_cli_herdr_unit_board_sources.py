@@ -25,6 +25,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
 
 from tests.unit.e_140_adapter_provider.f_130_terminal_runtime_provider.test_remote_unit_action import (
     delivery_record,
+    gateway_probe_help,
 )
 from tests.unit.e_140_adapter_provider.f_130_terminal_runtime_provider.test_herdr_multi_source_unit_board import (
     REMOTE_CONFIG,
@@ -37,6 +38,7 @@ from tests.unit.e_140_adapter_provider.f_130_terminal_runtime_provider.test_herd
 
 
 GATEWAY_ARGS = ("project-gateway", "handoff")
+GATEWAY_PROBE_ARGS = ("project-gateway", "handoff", "--help")
 
 
 def parse(argv):
@@ -55,6 +57,9 @@ def fresh_remote_board():
 
 def answers(overrides=None):
     base = {
+        # The probe key precedes GATEWAY_ARGS: a `--help` invocation matches
+        # both token sets and the runner answers with the first match (#15420).
+        GATEWAY_PROBE_ARGS: gateway_probe_help(),
         REMOTE_BOARD_ARGS: fresh_remote_board(),
         REMOTE_WORKSPACE_ARGS: WORKSPACE_PAYLOAD,
         GATEWAY_ARGS: delivery_record(),
@@ -277,7 +282,7 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("remote Unit action: preview", out)
         self.assertFalse(
-            [argv for argv in wiring.runner.argvs if "project-gateway" in argv[-1]]
+            [argv for argv in wiring.runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]]
         )
 
     def test_apply_delivers_once_through_the_source_gateway(self) -> None:
@@ -308,7 +313,7 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn("delivered", out)
         gateway = [
-            argv for argv in wiring.runner.argvs if "project-gateway" in argv[-1]
+            argv for argv in wiring.runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         ]
         self.assertEqual(len(gateway), 1)
 
@@ -339,7 +344,7 @@ class ActionTests(unittest.TestCase):
         self.assertEqual(code, 1)
         self.assertIn("refused", out)
         self.assertFalse(
-            [argv for argv in wiring.runner.argvs if "project-gateway" in argv[-1]]
+            [argv for argv in wiring.runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]]
         )
 
     def _apply(self, wiring, *extra):
@@ -373,7 +378,7 @@ class ActionTests(unittest.TestCase):
             self._apply(wiring)
 
         command = next(
-            argv[-1] for argv in wiring.runner.argvs if "project-gateway" in argv[-1]
+            argv[-1] for argv in wiring.runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         )
         self.assertIn("--mode queue-enter", command)
         self.assertNotIn("--mode standard", command)
@@ -389,7 +394,7 @@ class ActionTests(unittest.TestCase):
 
         self.assertEqual(code, 0)
         command = next(
-            argv[-1] for argv in wiring.runner.argvs if "project-gateway" in argv[-1]
+            argv[-1] for argv in wiring.runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         )
         self.assertIn("--mode standard", command)
 
@@ -410,7 +415,7 @@ class ActionTests(unittest.TestCase):
         self.assertIn("uncertain", out)
         self.assertIn("uncertain_partial", out)
         command = next(
-            argv[-1] for argv in wiring.runner.argvs if "project-gateway" in argv[-1]
+            argv[-1] for argv in wiring.runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]
         )
         self.assertIn("--mode pending", command)
 
@@ -426,7 +431,7 @@ class ActionTests(unittest.TestCase):
         self.assertIn("uncertain", out)
         self.assertIn("uncertain_partial", out)
         self.assertEqual(
-            len([argv for argv in wiring.runner.argvs if "project-gateway" in argv[-1]]),
+            len([argv for argv in wiring.runner.argvs if "project-gateway" in argv[-1] and "--help" not in argv[-1]]),
             1,
         )
 

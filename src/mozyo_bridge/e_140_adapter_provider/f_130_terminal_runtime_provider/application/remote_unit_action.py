@@ -4,10 +4,14 @@ A Unit observed on another Herdr server is not a pane this client may type
 into.  Crossing a host boundary is a governance boundary crossing, so the only
 sanctioned route is the target environment's **own** project gateway: the
 action is delivered by running that host's ``project-gateway handoff`` against
-its own registry, which resolves the project's Codex gateway semantically and
-refuses ``--to claude`` outright.  The client never names a remote pane, never
-sends to a remote worker, and never infers authority from where something is
-drawn on screen.
+its own registry, which resolves the project gateway semantically — the
+receiver is the provider that environment's ``provider_binding`` binds to the
+gateway (Redmine #15420; the client pins no brand and reads no remote
+configuration), and a direct worker send stays refused.  The client never
+names a remote pane, never sends to a remote worker, and never infers
+authority from where something is drawn on screen.  A remote CLI that predates
+the binding-resolved receiver contract is detected via its ``--help``
+capability advertisement and refused typed, with nothing sent.
 
 The rail is preview-first and re-verifies at apply time.  A preview is an
 explanation, not a permit: it records which source, workspace, and repository
@@ -69,6 +73,9 @@ from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.unit_board_sources import (
     UnitBoardSource,
 )
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.project_gateway_handoff_capability import (
+    supports_binding_receiver,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_multi_source_unit_board import (
     MultiSourceUnitBoardRuntime,
     UntrustedJsonError,
@@ -100,6 +107,14 @@ REASON_DELIVERY_FAILED = "delivery_failed"
 REASON_DELIVERY_UNCERTAIN = "delivery_uncertain"
 REASON_CONNECTION_VALUE_DISCLOSED = "connection_value_disclosed"
 REASON_PREVIEW_MISMATCH = "preview_mismatch"
+#: Redmine #15420.  The probed target CLI does not advertise the
+#: ``binding_receiver_v1`` capability (an old remote whose ``project-gateway
+#: handoff`` still requires an explicit ``--to``), or the probe itself could not
+#: be read.  Delivering anyway would either die in the remote argparse (an
+#: outcome this client could only classify as uncertain) or require a silent
+#: ``--to`` pin — the exact receiver fixing this rail is moving away from.  A
+#: typed zero-send refusal names the version skew instead.
+REASON_REMOTE_GATEWAY_CONTRACT_UNSUPPORTED = "remote_gateway_contract_unsupported"
 
 #: Durable-anchor intents this rail may carry.  Deliberately the canonical
 #: handoff vocabulary and nothing new: a remote Unit action is an ordinary
@@ -181,6 +196,14 @@ _DETAIL_BY_REASON = {
         "and the submission was not confirmed; read that environment's durable "
         "record to establish what arrived before re-issuing — a blind retry can "
         "deliver the same request twice"
+    ),
+    REASON_REMOTE_GATEWAY_CONTRACT_UNSUPPORTED: (
+        "the target environment's project-gateway CLI could not be confirmed "
+        "to advertise the binding-resolved receiver contract "
+        "(binding_receiver_v1): the read-only --help probe was unreachable, "
+        "unreadable, or carried no advertisement; nothing was sent — verify "
+        "the source is reachable, upgrade mozyo-bridge on that environment if "
+        "it is current, then re-issue the same anchor"
     ),
 }
 
@@ -351,10 +374,12 @@ class RemoteUnitActionPreview:
             "summary": safe_text(self.summary, fallback=""),
             "observed_at": safe_text(self.observed_at, fallback=""),
             "delivery_mode": safe_text(self.delivery_mode, fallback=""),
-            # Named, not spelled out: the route is fixed and the receiver is
-            # fixed, so the operator confirms a boundary rather than a string.
+            # Named, not spelled out: the route is fixed, and the receiver is
+            # whatever the TARGET scope's provider_binding binds to its gateway
+            # (Redmine #15420) — resolved there, never pinned here, so the
+            # operator confirms a boundary rather than a brand.
             "route": "target-source project gateway",
-            "receiver": "codex",
+            "receiver": "gateway_binding",
             "direct_worker_send": False,
         }
 
@@ -530,8 +555,12 @@ class RemoteUnitActionRail:
         return (
             "project-gateway",
             "handoff",
-            "--to",
-            "codex",
+            # No --to (Redmine #15420): the receiver is resolved by the TARGET
+            # environment's own provider_binding. Pinning a brand here is what
+            # made every claude-bound scope permanently unreachable once the
+            # gateway began verifying the receiver against its binding (#15414).
+            # The capability probe in `_deliver` proves the remote CLI accepts
+            # this shape before anything is sent.
             "--source",
             "redmine",
             "--issue",
@@ -641,7 +670,28 @@ class RemoteUnitActionRail:
         gateway once; any Enter-only retry belongs to the rail on the far side,
         under its own bounded policy, and re-running this command would re-type
         the body rather than re-press Enter (Redmine #15198).
+
+        Before that one invocation, the target CLI's receiver contract is
+        probed read-only (Redmine #15420): the delivered argv omits ``--to`` so
+        the target's own ``provider_binding`` resolves the receiver, and a
+        remote whose ``project-gateway handoff`` predates that contract would
+        die in argparse — an outcome this side could only report as uncertain.
+        The ``--help`` capability advertisement makes the skew provable while
+        nothing has been sent, so it is reported as the typed zero-send it is.
         """
+        probe = self._runtime.run_source_command(
+            source,
+            ("project-gateway", "handoff", "--help"),
+        )
+        if (
+            not probe.ok
+            or probe.completed is None
+            or probe.completed.returncode != 0
+            or not supports_binding_receiver(probe.completed.stdout)
+        ):
+            return self._refuse(
+                preview, REASON_REMOTE_GATEWAY_CONTRACT_UNSUPPORTED
+            )
         result = self._runtime.run_source_command(
             source,
             self._gateway_args(request, workspace),
@@ -871,7 +921,7 @@ def render_preview(preview: RemoteUnitActionPreview) -> Sequence[str]:
         f"  project: {payload['project_label']}",
         f"  scope:   {payload['target_project']}",
         f"  lane:    {payload['lane_id']}",
-        "  route:   target-source project gateway -> codex",
+        "  route:   target-source project gateway -> binding-resolved receiver",
         f"  anchor:  Redmine #{payload['issue']} j#{payload['journal']} "
         f"({payload['kind']})",
         f"  rail:    --mode {payload['delivery_mode']}",
@@ -900,6 +950,7 @@ __all__ = (
     "REASON_OK",
     "REASON_PREVIEW_MISMATCH",
     "REASON_PREVIEW_STALE",
+    "REASON_REMOTE_GATEWAY_CONTRACT_UNSUPPORTED",
     "REASON_UNIT_UNRESOLVED",
     "REASON_WORKSPACE_UNRESOLVED",
     "RemoteUnitActionPreview",
