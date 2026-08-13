@@ -198,10 +198,12 @@ _DETAIL_BY_REASON = {
         "deliver the same request twice"
     ),
     REASON_REMOTE_GATEWAY_CONTRACT_UNSUPPORTED: (
-        "the target environment's project-gateway CLI does not advertise the "
-        "binding-resolved receiver contract (binding_receiver_v1); nothing was "
-        "sent — upgrade mozyo-bridge on that environment, then re-issue the "
-        "same anchor"
+        "the target environment's project-gateway CLI could not be confirmed "
+        "to advertise the binding-resolved receiver contract "
+        "(binding_receiver_v1): the read-only --help probe was unreachable, "
+        "unreadable, or carried no advertisement; nothing was sent — verify "
+        "the source is reachable, upgrade mozyo-bridge on that environment if "
+        "it is current, then re-issue the same anchor"
     ),
 }
 
@@ -948,6 +950,7 @@ __all__ = (
     "REASON_OK",
     "REASON_PREVIEW_MISMATCH",
     "REASON_PREVIEW_STALE",
+    "REASON_REMOTE_GATEWAY_CONTRACT_UNSUPPORTED",
     "REASON_UNIT_UNRESOLVED",
     "REASON_WORKSPACE_UNRESOLVED",
     "RemoteUnitActionPreview",
