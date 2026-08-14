@@ -553,6 +553,18 @@ class RemoteUnitActionRail:
         become a second opinion about what that default is.
         """
         return (
+            # Root --repo (Redmine #15475): the delivered command runs in a
+            # non-interactive shell whose cwd is the remote $HOME, where no
+            # repo-local `terminal_transport` config exists. Without an explicit
+            # sender repo the transport wiring resolves the sender to the tmux
+            # default, refuses the sender/target cross-backend join in under a
+            # second with a plain-text die, and the client can only classify
+            # the unreadable outcome as uncertain_partial. For a cross-host
+            # Unit action the sender ON the target host IS the target
+            # environment, so the sender repo is the same checkout the
+            # delivery targets.
+            "--repo",
+            workspace.canonical_path,
             "project-gateway",
             "handoff",
             # No --to (Redmine #15420): the receiver is resolved by the TARGET
@@ -681,7 +693,12 @@ class RemoteUnitActionRail:
         """
         probe = self._runtime.run_source_command(
             source,
-            ("project-gateway", "handoff", "--help"),
+            # The probe carries the same root --repo the delivery will carry
+            # (Redmine #15475): a remote whose root parser predates the option
+            # dies in argparse HERE — a typed zero-send refusal — instead of
+            # mid-delivery. --help short-circuits before repo access, so the
+            # probe proves option acceptance, not path validity.
+            ("--repo", workspace.canonical_path, "project-gateway", "handoff", "--help"),
         )
         if (
             not probe.ok
