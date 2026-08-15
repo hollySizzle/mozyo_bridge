@@ -140,26 +140,42 @@ Preset selection summary:
 command -v python3
 python3 --version
 command -v pipx
+```
 
-# Terminal backend: check the one this project selects.
-# Default (no terminal_transport block) is tmux.
+Then check ONLY the terminal backend this project selects — probing the other
+one reports a failure that does not apply to this host:
+
+```bash
+# Which backend? No terminal_transport block means the tmux default.
 grep -A1 '^terminal_transport:' .mozyo-bridge/config.yaml 2>/dev/null
-command -v tmux     # default backend
-command -v herdr    # only when the project declares backend: herdr
-herdr --version     # same case: expect the supported version
+```
+
+```bash
+# tmux backend (the default):
+command -v tmux
+```
+
+```bash
+# herdr backend (terminal_transport.backend: herdr):
+# MOZYO_HERDR_BINARY wins over PATH, exactly as the runtime resolves it,
+# so probe whichever one is in effect rather than assuming PATH.
+herdr_cmd="${MOZYO_HERDR_BINARY:-herdr}"
+command -v "$herdr_cmd"
+"$herdr_cmd" --version
 ```
 
 Expected:
 
 - `python3 --version` reports `3.10` or newer (`mozyo-bridge` requires Python >= 3.10).
 - `pipx` resolves to an installed path.
-- The backend the project selects resolves:
-  - default (tmux): `tmux` resolves to an installed path.
-  - `terminal_transport.backend: herdr`: `herdr` resolves and `herdr --version`
-    reports the version README "Herdr support and breaking upgrades" declares
-    supported. `tmux` is NOT required on such a host — `mozyo-bridge doctor`
-    judges the selected backend and reports absent tmux as informational there
-    (Redmine #15508).
+- The backend the project selects resolves — and only that one:
+  - default (tmux): `tmux` resolves to an installed path. `herdr` is not
+    checked and its absence is not a finding.
+  - `terminal_transport.backend: herdr`: `$herdr_cmd` resolves and reports the
+    version README "Herdr support and breaking upgrades" declares supported.
+    `tmux` is NOT required on such a host, and is not part of the success
+    signal — `mozyo-bridge doctor` judges the selected backend the same way and
+    reports absent tmux as informational there (Redmine #15508).
 
 If a signal is missing:
 
@@ -169,7 +185,7 @@ If a signal is missing:
   manager (for example `brew install tmux`, `apt install tmux`).
   `mozyo-bridge --help` works without tmux; its pane / notification commands do
   not.
-- `herdr` missing **on a herdr-backend project** → install it (Homebrew carries
+- `$herdr_cmd` missing **on a herdr-backend project** → install it (Homebrew carries
   the supported version: `brew install herdr`; other platforms follow
   <https://herdr.dev>). The herdr backend refuses to fall back to tmux, so this
   blocks every managed launch and handoff until it resolves. Update it the way
