@@ -1617,7 +1617,8 @@ documents:
     purpose: "terminal / transport / state 検知層の移行先候補として herdr を評価した PoC の実測記録 (Redmine #13175)。kill criteria 4 点に対する各実験を目的 / 実行 / 結果 / 学びの固定形式で残し、失敗・誤読・観測方法の欠陥も削除せず保持する。herdr バージョン更新時など将来の再評価で判定を再現するための証拠であり、現行 herdr backend の設計判断 (fail-closed 方針、identity / generation の扱い) の出所でもある。#15518 まで catalog 未登録だった。"
     audit_role: herdr_poc_experiment_log
     related_document_refs:
-      - logic-tiered-ci-gate-policy
+      - spec-herdr-native-identity
+      - logic-herdr-scenario-test-foundation
 
 file_conventions:
   - id: fc-agent-routers

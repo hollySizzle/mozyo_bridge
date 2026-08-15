@@ -46,7 +46,7 @@ end-to-end で駆動し、各 hop で routing decision を assert する。live 
 ### 1.1 実 herdr 0.7.1 API surface (モデル化対象の正本)
 
 正本参照: `spec-herdr-native-identity` (§5 launch contract、§6 close-evidence)、
-`vibes/docs/logics/herdr-poc-13175-experiment-log.md` (E1〜E14 実測、非 catalog doc)。
+`vibes/docs/logics/herdr-poc-13175-experiment-log.md` (E1〜E14 実測、`logic-herdr-poc-experiment-log`)。
 fake が忠実に再現すべき面:
 
 | # | API surface | 実測仕様 (正本) | fake が保証すべき契約 |
