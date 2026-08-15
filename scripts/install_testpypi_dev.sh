@@ -1,36 +1,37 @@
 #!/usr/bin/env sh
 set -eu
 
-# Install or update the local pipx runtime from a TestPyPI dev artifact and
+# Install or update the local pipx runtime from a TestPyPI artifact and
 # verify the installed CLI surface. This aligns the normal-PATH runtime
-# (default pipx target: ~/.local/bin/mozyo-bridge) with the dev artifact that
-# the automated `.github/workflows/testpypi.yml` main-CI job publishes, so
-# #12709-style real smoke evidence does not depend on source-runtime,
+# (default pipx target: ~/.local/bin/mozyo-bridge) with the exact-candidate
+# artifact the manual `.github/workflows/testpypi.yml` dispatch publishes
+# (the automatic main-CI dev path was removed by Redmine #15487), so real
+# smoke evidence does not depend on source-runtime,
 # `PYTHONPATH=src`, or an ad-hoc current-checkout reinstall.
 #
 # It NEVER publishes anything; it only installs locally and reads CLI help.
 #
 # Usage:
-#   scripts/install_testpypi_dev.sh <version>   # pin the exact dev version
+#   scripts/install_testpypi_dev.sh <version>   # pin the exact version
 #
-# You MUST pass the exact dev version (e.g. 0.9.2.dev20260628090000123456789).
-# Read it, and the commit SHA it maps to, from the source CI run's job summary
-# in the "Publish to TestPyPI" workflow (see references/release.md).
+# You MUST pass the exact version (e.g. 1.0.0rc5). Read it, and the commit
+# SHA it maps to, from the "Publish to TestPyPI" run's job summary
+# (see references/release.md).
 #
 # Why exact-only (no `latest`): this install uses TestPyPI as --index-url and
 # PyPI as --extra-index-url so dependencies still resolve from PyPI. pip
-# considers candidates for the TARGET package from BOTH indexes, and a dev
-# release (0.9.2.devN) sorts BEFORE the PyPI final (0.9.2). An unpinned install
+# considers candidates for the TARGET package from BOTH indexes, and a
+# pre-release (rc / dev) sorts BEFORE a PyPI final. An unpinned install
 # could therefore resolve the PyPI production release instead of the intended
-# TestPyPI dev artifact and silently taint smoke evidence. Pinning the exact
-# dev version is safe because that version exists ONLY on TestPyPI (production
-# PyPI never hosts dev releases), so the target can only resolve from TestPyPI.
+# TestPyPI artifact and silently taint smoke evidence. Pinning the exact
+# candidate version keeps the target resolving to the intended TestPyPI
+# artifact (candidate versions are published to TestPyPI, never to PyPI).
 
 usage() {
   cat <<USAGE
 Usage: $0 <version>
 
-  <version>  Exact PEP 440 dev version to install, e.g.
+  <version>  Exact PEP 440 version to install, e.g. 1.0.0rc5 or
              0.9.2.dev20260628090000123456789
 
 Pass the exact version from the 'Publish to TestPyPI' run summary so smoke
@@ -58,9 +59,9 @@ if ! command -v pipx >/dev/null 2>&1; then
 fi
 
 if [ "$version" = "latest" ]; then
-  echo "error: 'latest' is not supported; pass the exact dev version." >&2
+  echo "error: 'latest' is not supported; pass the exact version." >&2
   echo "       An unpinned install can resolve the PyPI production release" >&2
-  echo "       instead of the intended TestPyPI dev artifact." >&2
+  echo "       instead of the intended TestPyPI artifact." >&2
   echo >&2
   usage >&2
   exit 64
@@ -77,14 +78,6 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "       TestPyPI Simple JSON response without substring matches." >&2
   exit 1
 fi
-
-case "$version" in
-  *.dev*) : ;;  # looks like a dev release; proceed
-  *)
-    echo "warning: '$version' has no '.dev' segment; this runbook targets" >&2
-    echo "         TestPyPI dev artifacts. Continuing with the exact pin." >&2
-    ;;
-esac
 
 # TestPyPI's project JSON can expose a newly uploaded release before the
 # Simple Index used by pip has propagated through Warehouse/CDN caches. A
@@ -156,11 +149,11 @@ raise SystemExit(1)
 done
 
 spec="mozyo-bridge==$version"
-echo "Installing TestPyPI dev artifact: $spec"
+echo "Installing TestPyPI artifact: $spec"
 
 # Force the pip backend so TestPyPI serves mozyo-bridge while PyPI still serves
-# its dependencies. The exact dev version exists ONLY on TestPyPI (PyPI never
-# hosts dev releases), so the target resolves from TestPyPI even though PyPI is
+# its dependencies. The exact candidate version is published only to TestPyPI,
+# so the pinned target resolves from TestPyPI even though PyPI is
 # an extra-index for dependencies. --pre lets pip accept the pre-release;
 # --no-cache-dir prevents a just-published exact version from being hidden by a
 # stale cached Simple Index response. --force reinstalls / updates the existing
@@ -182,19 +175,19 @@ if [ -z "$bin_path" ]; then
 fi
 
 # Required surface: the two console entry points must both report the EXACT
-# dev version we pinned. `--version` prints `<prog> <version>` (argparse
+# version we pinned. `--version` prints `<prog> <version>` (argparse
 # `%(prog)s {__version__}`), so the version token is the last whitespace field.
-# Both entry points share the runtime `__version__`, and the TestPyPI dev build
+# Both entry points share the runtime `__version__`, and the TestPyPI build
 # mirrors that literal to the pinned version (Redmine #13586); if either CLI
 # disagrees, the installed artifact is not the pinned build and smoke evidence
 # would be inaccurate, so fail non-zero rather than merely displaying it.
 assert_cli_version() {
   cli_name="$1"
-  raw="$("$cli_name" --version)"   # e.g. "mozyo-bridge 0.10.0.dev123"
+  raw="$("$cli_name" --version)"   # e.g. "mozyo-bridge 1.0.0rc5"
   got="${raw##* }"                 # last whitespace field == version token
   if [ "$got" != "$version" ]; then
     echo "error: '$cli_name --version' reported '$got' but the requested" >&2
-    echo "       TestPyPI dev version is '$version'. The installed artifact" >&2
+    echo "       TestPyPI version is '$version'. The installed artifact" >&2
     echo "       does not match the pinned version; refusing so smoke" >&2
     echo "       evidence cannot silently tie to the wrong build." >&2
     exit 1

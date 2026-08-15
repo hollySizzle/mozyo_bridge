@@ -89,7 +89,7 @@ production tier に寄せる。
 
 ## TestPyPI pre-publish 機械 gate (invariant #3)
 
-`testpypi.yml` の build job は、**manual / auto 両 event** で publish 直前に inline で
+`testpypi.yml` の build job は、publish 直前に inline で
 clean single-Python full + health/docs + artifact/install smoke を回す。prior な
 `Test` run を *信頼するだけ* にせず、**exact checked-out SHA で suite を自ら実行**する
 ことで、manual dispatch の gate 抜け (green だが partial な上流 signal が publish へ
@@ -192,17 +192,16 @@ build job 内で走り `id-token` を持たないため、#13601 の OIDC 境界
 - `test.yml`: `test-<workflow>-<event>-<ref>` group。PR 更新と issue-branch push は
   `cancel-in-progress` で superseded run を止める。integration (`main` / `int_*` /
   `integration_*`) / nightly / manual dispatch は **cancel しない** (各 integration
-  SHA / scheduled sweep / on-demand run が固有の verdict を保つ。自動 TestPyPI dev
-  path が COMPLETED main `Test` run の head_sha を key にするため、main run を
-  cancel すると gate が落ちる)。cancel 判定は `refs/heads/` prefix を要求するため、
+  SHA / scheduled sweep / on-demand run が固有の verdict を保つ。TestPyPI
+  exact-candidate gate が candidate SHA の COMPLETED `Test` success を要求するため、
+  main run を cancel すると publish gate が落ちる)。cancel 判定は `refs/heads/` prefix を要求するため、
   tag ref は (trigger filter で既に除外されているうえ) cancel 対象クラスにも入らない。
-- `testpypi.yml`: `expected_version` (manual) / triggering `head_sha` (dev) 別に
-  serialize、`cancel-in-progress: false`。
+- `testpypi.yml`: `expected_version` 別に serialize、`cancel-in-progress: false`。
 - `publish.yml`: `publish-pypi-<tag>` で release tag 別 serialize、
   `cancel-in-progress: false` (production publish は決して cancel しない)。
 - run summary provenance: quick / integration / production の各 lane は
   `$GITHUB_STEP_SUMMARY` に event / ref / exact SHA / Python / gate 内容を出す。
-  TestPyPI は #13601 由来の dev/exact summary を維持する。
+  TestPyPI は #13601 由来の exact-candidate summary を維持する。
 
 ## 現行 green 証跡の非無効化 (Acceptance)
 

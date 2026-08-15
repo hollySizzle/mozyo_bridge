@@ -266,8 +266,7 @@ jobs:
           python-version: "3.11"
 
       # --- Tiered pre-publish clean-runner gate (Redmine #13734) ---
-      # Runs for BOTH events at the exact checked-out candidate SHA, BEFORE any
-      # dev-version rewrite and BEFORE upload. This is the mechanical gate that
+      # Runs at the exact checked-out candidate SHA BEFORE upload. This is the mechanical gate that
       # closes the manual-dispatch bypass: the whole suite + health/docs run
       # here rather than only trusting a prior signal.
       - name: Install package (pre-publish gate)
@@ -372,7 +371,7 @@ jobs:
         # console entry points before the artifact can be uploaded/published.
         # Proves the exact artifact that will land on TestPyPI imports and
         # exposes `mozyo-bridge` / `mozyo` (Redmine #13734 artifact/install
-        # smoke). Runs for both events.
+        # smoke).
         run: |
           set -euo pipefail
           python -m venv /tmp/testpypi-smoke-venv
