@@ -23,6 +23,17 @@ rather than restating its contents here.
 In scope:
 
 - CLI install (primary: PyPI via `pipx`).
+- terminal backend prerequisite, per the backend the target project selects:
+  tmux for the default, or the herdr binary when the project declares
+  `terminal_transport.backend: herdr`. herdr is a separate product
+  (<https://herdr.dev>), not bundled with this package; Homebrew currently
+  carries the supported 0.8.0 (`brew install herdr`), and other platforms
+  follow that site. `mozyo-bridge` resolves it via `MOZYO_HERDR_BINARY` or the
+  trusted PATH and refuses to fall back to tmux when it is missing, so this is
+  a real prerequisite rather than an optimization. `herdr update` can move a
+  host off the verified version — re-check `herdr --version` after updating.
+  Details and the supported version live in README "Herdr support and breaking
+  upgrades" (Redmine #15517).
 - existing CLI / rules / scaffold update after a release ships.
 - user-global rules install (`mozyo-bridge rules install`).
 - agent skill install:

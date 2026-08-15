@@ -22,6 +22,25 @@ Older Herdr versions and newer versions that have not completed this project's
 tests and acceptance checks are unsupported; “latest” does not mean automatic
 forward compatibility.
 
+Herdr is a separate product (<https://herdr.dev>) and is **not bundled with
+this package**: it is redistributed by its own project, ships its own updater,
+and is a platform binary, so vendoring it would mean shipping someone else's
+release on our cadence. Install it yourself:
+
+```bash
+brew install herdr    # Homebrew currently carries the supported 0.8.0
+herdr --version       # expect: herdr 0.8.0
+```
+
+On platforms without Homebrew, follow the instructions at <https://herdr.dev>.
+`mozyo-bridge` finds the binary through `MOZYO_HERDR_BINARY` or the trusted
+`PATH`, and refuses to fall back to tmux when the herdr backend is selected but
+no binary resolves.
+
+`herdr update` upgrades to the latest release, which can move you off the
+version this project verified. Pin deliberately: check `herdr --version`
+against the supported version above after any update.
+
 When upgrading an existing Herdr-backed installation, checkpoint the work in
 progress, stop the old session, and start a fresh named session from the new
 environment. Pre-1.0 sessions, launch receipts, and terminal identities are not
@@ -57,12 +76,20 @@ Both rails are dry-run by default (`--write` performs the change) and rotate
 the previous store into `~/.mozyo_bridge/backups/` before touching anything; a
 failed backup aborts with the store byte-unchanged.
 
-1. **Install the CLI** and confirm `tmux` is on `PATH`:
+1. **Install the CLI**, then make sure the terminal backend your project
+   selects is present:
 
    ```bash
    pipx install mozyo-bridge
    mozyo-bridge --version
    ```
+
+   The default backend is tmux, so `tmux` must be on `PATH` unless the project
+   declares `terminal_transport.backend: herdr` in `.mozyo-bridge/config.yaml`
+   — in which case `herdr` is the prerequisite instead (see “Herdr support and
+   breaking upgrades” for how to install it). `mozyo-bridge doctor` judges the
+   backend the project actually selects, so it will not ask a herdr-only host
+   for tmux.
 
    Alternative install path:
 
