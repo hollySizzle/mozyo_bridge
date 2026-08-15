@@ -267,6 +267,20 @@ def _docs_context_from_args(args: argparse.Namespace):
     return CatalogContext.build(repo_raw, catalog_raw, overlay_raw)
 
 
+def _docs_unreadable_catalog(context, exc) -> None:
+    """Report an unreadable catalog identically wherever it is caught.
+
+    The reason text comes from the reader, which has already removed the
+    catalog's own content from it (Redmine #15514) — so this prints the path
+    and the fixed reason, and never the cause's raw rendering.
+    """
+    print(
+        f"cannot read docs catalog {_docs_relpath(context, context.catalog_path)}",
+        file=sys.stderr,
+    )
+    print(f"- {exc}", file=sys.stderr)
+
+
 def _docs_relpath(context, path) -> str:
     """Repo-relative path for human-facing notices (absolute when outside)."""
     try:
@@ -288,6 +302,7 @@ def _docs_include_local(args: argparse.Namespace) -> bool:
 
 def cmd_docs_validate(args: argparse.Namespace) -> int:
     from mozyo_bridge.docs_tools import (
+        CatalogUnreadableError,
         validate_catalog,
         validate_file_coverage,
         validate_overlay,
@@ -312,9 +327,19 @@ def cmd_docs_validate(args: argparse.Namespace) -> int:
             "`--catalog` at an existing catalog"
         )
         return 1
-    errors = validate_catalog(
-        context, strict_metadata=bool(getattr(args, "strict_metadata", False))
-    )
+    try:
+        errors = validate_catalog(
+            context, strict_metadata=bool(getattr(args, "strict_metadata", False))
+        )
+    except CatalogUnreadableError as exc:
+        # The reader already stripped the catalog's content out of the reason
+        # (Redmine #15514); `exc` carries a fixed phrase plus at most a position.
+        print(
+            "catalog validation failed: cannot read "
+            f"{_docs_relpath(context, context.catalog_path)}"
+        )
+        print(f"- {exc}")
+        return 1
     notices: list[str] = []
     if getattr(args, "check_file_coverage", False):
         coverage_errors, coverage_notices = validate_file_coverage(
@@ -345,6 +370,7 @@ def cmd_docs_validate(args: argparse.Namespace) -> int:
 
 def cmd_docs_resolve(args: argparse.Namespace) -> int:
     from mozyo_bridge.docs_tools import (
+        CatalogUnreadableError,
         OverlayError,
         render_resolution_json,
         render_resolution_markdown,
@@ -357,6 +383,9 @@ def cmd_docs_resolve(args: argparse.Namespace) -> int:
         results, overlay = resolve_paths_detailed(
             context, list(args.paths), include_local=_docs_include_local(args)
         )
+    except CatalogUnreadableError as exc:
+        _docs_unreadable_catalog(context, exc)
+        return 1
     except OverlayError as exc:
         print(f"local overlay error: {exc}", file=sys.stderr)
         return 1
@@ -381,18 +410,26 @@ def cmd_docs_resolve(args: argparse.Namespace) -> int:
 
 
 def cmd_docs_generate(args: argparse.Namespace) -> int:
-    from mozyo_bridge.docs_tools import generate_file_conventions, run_generate_check
+    from mozyo_bridge.docs_tools import (
+        CatalogUnreadableError,
+        generate_file_conventions,
+        run_generate_check,
+    )
 
     context = _docs_context_from_args(args)
     output = getattr(args, "output", None)
-    if getattr(args, "check", False):
-        ok, output_path, detail = run_generate_check(context, output)
-        if not ok:
-            print(detail, file=sys.stderr)
-            return 1
-        print(detail)
-        return 0
-    output_path = generate_file_conventions(context, output)
+    try:
+        if getattr(args, "check", False):
+            ok, output_path, detail = run_generate_check(context, output)
+            if not ok:
+                print(detail, file=sys.stderr)
+                return 1
+            print(detail)
+            return 0
+        output_path = generate_file_conventions(context, output)
+    except CatalogUnreadableError as exc:
+        _docs_unreadable_catalog(context, exc)
+        return 1
     print(output_path.as_posix())
     return 0
 
@@ -442,6 +479,7 @@ def cmd_scaffold_canonical(args: argparse.Namespace) -> int:
 
 def cmd_docs_audit_impact(args: argparse.Namespace) -> int:
     from mozyo_bridge.docs_tools import (
+        CatalogUnreadableError,
         OverlayError,
         audit_doc_impact_detailed,
         run_generate_check,
@@ -455,6 +493,9 @@ def cmd_docs_audit_impact(args: argparse.Namespace) -> int:
             all_changed=bool(getattr(args, "all_changed", False)),
             include_local=_docs_include_local(args),
         )
+    except CatalogUnreadableError as exc:
+        _docs_unreadable_catalog(context, exc)
+        return 1
     except OverlayError as exc:
         print(f"local overlay error: {exc}", file=sys.stderr)
         return 1

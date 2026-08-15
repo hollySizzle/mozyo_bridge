@@ -92,11 +92,58 @@ class CatalogContext:
         return self.repo_root / relative_path
 
 
+class CatalogUnreadableError(Exception):
+    """A catalog that cannot be read at all, described without its content.
+
+    Redmine #15514: PyYAML reports a parse failure by quoting the offending
+    source line, so letting its exception escape printed the catalog's own text
+    into the operator's terminal and command log — a leak regardless of whether
+    that particular catalog held anything sensitive. Every reader failure is
+    therefore rewritten into a fixed reason plus, at most, the position PyYAML
+    reported. ``str()`` of this error is safe to print; the input never is.
+    """
+
+    def __init__(self, reason: str, *, line: int | None = None, column: int | None = None):
+        self.reason = reason
+        self.line = line
+        self.column = column
+        where = ""
+        if line is not None:
+            where = f" (line {line}" + (f", column {column}" if column is not None else "") + ")"
+        super().__init__(f"{reason}{where}")
+
+
 def load_catalog(catalog_path: Path) -> dict[str, Any]:
-    """Read the catalog YAML; raise ``ValueError`` on non-mapping root."""
-    data = yaml.safe_load(catalog_path.read_text(encoding="utf-8"))
+    """Read the catalog YAML.
+
+    Raises :class:`CatalogUnreadableError` — never a raw reader exception — when
+    the file cannot be read, does not parse, or does not hold a mapping, so no
+    caller can print catalog content by rendering the cause (Redmine #15514).
+    """
+    try:
+        text = catalog_path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        raise CatalogUnreadableError("catalog file does not exist") from None
+    except OSError:
+        # The errno text can name the path but never the contents; still, keep
+        # one fixed reason so callers have a single shape to render.
+        raise CatalogUnreadableError("catalog file could not be read") from None
+    except UnicodeDecodeError:
+        raise CatalogUnreadableError("catalog file is not valid UTF-8") from None
+    try:
+        data = yaml.safe_load(text)
+    except yaml.MarkedYAMLError as exc:
+        mark = exc.problem_mark
+        raise CatalogUnreadableError(
+            "catalog is not valid YAML",
+            # 1-based, matching how editors count; the numbers carry no content.
+            line=None if mark is None else mark.line + 1,
+            column=None if mark is None else mark.column + 1,
+        ) from None
+    except yaml.YAMLError:
+        raise CatalogUnreadableError("catalog is not valid YAML") from None
     if not isinstance(data, dict):
-        raise ValueError("catalog root must be a mapping")
+        raise CatalogUnreadableError("catalog root must be a mapping")
     return data
 
 
