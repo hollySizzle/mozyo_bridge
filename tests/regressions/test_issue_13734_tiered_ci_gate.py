@@ -16,7 +16,8 @@ Covered invariants (j#77169):
      issue-branch push routes to a single-Python quick lane, never the matrix.
   #2 integration push -> single-Python full + health/docs + build + smoke, once.
   #3 TestPyPI build job runs an inline clean single-Python full + install smoke
-     for BOTH events before upload (closes the manual-dispatch bypass), while
+     unconditionally before upload (closes the manual-dispatch bypass; the
+     workflow is single-trigger since #15487), while
      the #13601 OIDC boundary + data gates survive.
   #4 nightly keeps the 3.10-3.13 matrix; production publish mechanically runs a
      3.10-3.13 full matrix + tag<->version-mirror + fresh-install before OIDC
@@ -464,9 +465,10 @@ class TestPyPIPrePublishGateTest(unittest.TestCase):
                 return s
         raise AssertionError(f"no build step named ~{fragment!r}")
 
-    def test_inline_clean_full_and_smoke_run_for_both_events(self) -> None:
+    def test_inline_clean_full_and_smoke_run_unconditionally(self) -> None:
         # The pre-publish gate steps must NOT be guarded by a workflow_dispatch
-        # `if`: they run for the automatic dev path too (closes the asymmetry).
+        # `if`: the workflow is single-trigger (#15487), so an event guard would
+        # be dead compat code — and a non-dispatch guard would skip the gate.
         for frag in (
             "Run full suite (clean single-Python, pre-publish)",
             "Fresh-install smoke (built artifact, pre-publish)",
@@ -475,9 +477,9 @@ class TestPyPIPrePublishGateTest(unittest.TestCase):
         ):
             step = self._step(frag)
             self.assertNotIn(
-                "workflow_dispatch",
-                str(step.get("if", "")),
-                msg=f"{frag} must run for BOTH events (no dispatch-only guard)",
+                "if",
+                step,
+                msg=f"{frag} must run unconditionally (any `if` guard can skip it)",
             )
 
     def test_full_suite_runs_before_upload(self) -> None:

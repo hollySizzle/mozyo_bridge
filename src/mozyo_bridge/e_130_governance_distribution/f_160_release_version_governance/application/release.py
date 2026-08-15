@@ -755,9 +755,8 @@ def cmd_release_workflow_wait(args: argparse.Namespace) -> int:
 
 # The mirror-set constants (contract path, anchor, per-extension version-field
 # handlers) and the PEP 440 version recognizer live in the stdlib-only
-# ``version_mirror`` module (this Feature package) so this installed helper and
-# the dependency-free TestPyPI dev-version script (``scripts/
-# compute_testpypi_dev_version.py``) build on one source of truth. The mirror
+# ``version_mirror`` module (this Feature package) so every mirror consumer
+# builds on one source of truth. The mirror
 # resolution / extract / rewrite functions below are thin wrappers that
 # translate ``version_mirror.MirrorError`` into ``die`` for the helper's
 # operator-facing exit contract.

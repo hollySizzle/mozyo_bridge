@@ -28,7 +28,7 @@ interface には依存しない (`## 非目標`)。
 | --- | --- | --- | --- |
 | quick | `pull_request` / issue-branch `push` (branch ref のみ) / manual `quick` dispatch | single Python 3.12 | health + docs + **affected** tests (fail-closed → whole suite) |
 | integration | `push` to `main` / `int_*` / `integration_*` | clean Linux single Python 3.12 | health + docs + **full** `unittest discover` + wheel/sdist build + fresh-install smoke、**exact SHA に 1 回** |
-| testpypi | `workflow_dispatch` (exact candidate) / `workflow_run` (main Test success) | single Python 3.11 | #13601 data gate 群 + **inline clean single-Python full + artifact/install smoke** (両 event) |
+| testpypi | `workflow_dispatch` (exact candidate。`workflow_run` 自動 dev path は #15487 で廃止) | single Python 3.11 | #13601 data gate 群 + **inline clean single-Python full + artifact/install smoke** |
 | nightly | `schedule` (07:00 JST) | 3.10–3.13 matrix | full `unittest discover` + wheel build |
 | production | `release: published` | 3.10–3.13 matrix (verify) + single (build) | exact release/tag SHA の **full matrix** + tag↔version mirror + wheel/sdist + **fresh-install smoke**、OIDC publish は別 job |
 
@@ -78,8 +78,8 @@ whole suite (single Python) を推奨する (silent な空集合 = fail-open を
 
 integration ref への push で **exact integration SHA に 1 回** だけ、clean Linux
 single-Python full + health/docs + wheel/sdist build + fresh-install smoke を回す。
-これが自動 TestPyPI dev path (`testpypi.yml` の `workflow_run`) が key にする `main` の
-`Test` success でもある。full matrix (4 環境) は integration tier では回さず、nightly /
+これが exact-candidate publish gate (`testpypi.yml`) が要求する `main` 系 `Test` success の
+生成元でもある (自動 TestPyPI dev path は #15487 で廃止)。full matrix (4 環境) は integration tier では回さず、nightly /
 production tier に寄せる。
 
 ### nightly (invariant #4)
@@ -89,7 +89,7 @@ production tier に寄せる。
 
 ## TestPyPI pre-publish 機械 gate (invariant #3)
 
-`testpypi.yml` の build job は、**manual / auto 両 event** で publish 直前に inline で
+`testpypi.yml` の build job は、publish 直前に inline で
 clean single-Python full + health/docs + artifact/install smoke を回す。prior な
 `Test` run を *信頼するだけ* にせず、**exact checked-out SHA で suite を自ら実行**する
 ことで、manual dispatch の gate 抜け (green だが partial な上流 signal が publish へ
@@ -192,17 +192,16 @@ build job 内で走り `id-token` を持たないため、#13601 の OIDC 境界
 - `test.yml`: `test-<workflow>-<event>-<ref>` group。PR 更新と issue-branch push は
   `cancel-in-progress` で superseded run を止める。integration (`main` / `int_*` /
   `integration_*`) / nightly / manual dispatch は **cancel しない** (各 integration
-  SHA / scheduled sweep / on-demand run が固有の verdict を保つ。自動 TestPyPI dev
-  path が COMPLETED main `Test` run の head_sha を key にするため、main run を
-  cancel すると gate が落ちる)。cancel 判定は `refs/heads/` prefix を要求するため、
+  SHA / scheduled sweep / on-demand run が固有の verdict を保つ。TestPyPI
+  exact-candidate gate が candidate SHA の COMPLETED `Test` success を要求するため、
+  main run を cancel すると publish gate が落ちる)。cancel 判定は `refs/heads/` prefix を要求するため、
   tag ref は (trigger filter で既に除外されているうえ) cancel 対象クラスにも入らない。
-- `testpypi.yml`: `expected_version` (manual) / triggering `head_sha` (dev) 別に
-  serialize、`cancel-in-progress: false`。
+- `testpypi.yml`: `expected_version` 別に serialize、`cancel-in-progress: false`。
 - `publish.yml`: `publish-pypi-<tag>` で release tag 別 serialize、
   `cancel-in-progress: false` (production publish は決して cancel しない)。
 - run summary provenance: quick / integration / production の各 lane は
   `$GITHUB_STEP_SUMMARY` に event / ref / exact SHA / Python / gate 内容を出す。
-  TestPyPI は #13601 由来の dev/exact summary を維持する。
+  TestPyPI は #13601 由来の exact-candidate summary を維持する。
 
 ## 現行 green 証跡の非無効化 (Acceptance)
 

@@ -14,16 +14,17 @@ name: Publish to TestPyPI
 #     ref can request OIDC.
 #   - The ARTIFACT authority is the exact `source_sha` build input, checked out
 #     only inside the trusted (main-defined) build job.
-#   - The RELEASE-APPROVAL authority stays with the Redmine gate + the external
-#     `testpypi` environment protection (owner required reviewer + main-only
-#     deployment branch policy), configured separately before dispatch.
+#   - The RELEASE-APPROVAL authority stays with the Redmine gate + the fail-closed
+#     verification gates below; the external `testpypi` environment keeps only the
+#     main-only deployment branch policy (the required reviewer was removed by
+#     owner decision, Redmine #15255 j#105330 / #15487).
 #   - The build job carries NO `id-token: write`. Only the publish job — which
 #     merely downloads the built artifact and uploads it — holds `id-token:
 #     write` + `environment: testpypi`, so Trusted Publishing credentials are
 #     never exposed to the checkout/build/verify steps.
 #
 # Tiered pre-publish gate (Redmine #13734):
-#   - BOTH events (manual exact-candidate AND automatic main-CI dev) run an
+#   - Every dispatch runs an
 #     inline clean single-Python FULL suite + health/docs gate + fresh-install
 #     smoke inside the trusted build job BEFORE the artifact is uploaded. The
 #     mechanical gate does not merely TRUST a prior `Test` run — it runs the
@@ -34,9 +35,7 @@ name: Publish to TestPyPI
 #     full + artifact/install smoke.
 
 run-name: >-
-  ${{ github.event_name == 'workflow_dispatch'
-      && format('TestPyPI exact {0} @ {1} (nonce {2})', inputs.expected_version, inputs.source_sha, inputs.dispatch_nonce)
-      || 'TestPyPI dev (auto main-CI)' }}
+  ${{ format('TestPyPI exact {0} @ {1} (nonce {2})', inputs.expected_version, inputs.source_sha, inputs.dispatch_nonce) }}
 
 on:
   # Manual exact-candidate publish (internal-beta release-candidate check).
@@ -60,23 +59,18 @@ on:
         description: "Unique token embedded in run-name for deterministic dispatch<->run correlation (no latest-one guessing)."
         required: true
         type: string
-  # Automatic dev publish: after the required `Test` checks pass on `main`,
-  # publish a unique PEP 440 `.devN` artifact so the normal-PATH pipx runtime
-  # can be aligned to `main` without source-runtime or ad-hoc reinstalls.
-  workflow_run:
-    workflows: ["Test"]
-    types: [completed]
-    branches: [main]
+  # The automatic main-CI dev publish path (workflow_run on `Test`, Redmine
+  # #12756) was REMOVED by owner decision (Redmine #15487): with no required
+  # reviewer on the environment it would publish unattended on every `main`
+  # push, and its use case (a pipx-installable artifact for smoke work) is
+  # served by this manual exact-candidate dispatch.
 
 # Serialize by target version: two manual dispatches for the SAME
-# expected_version cannot race the TestPyPI upload; the dev path serializes per
-# triggering head_sha. Duplicate publishes are ALSO rejected TestPyPI-side, so
-# this only removes the local race, it is not the sole uniqueness guard.
+# expected_version cannot race the TestPyPI upload. Duplicate publishes are
+# ALSO rejected TestPyPI-side, so this only removes the local race, it is not
+# the sole uniqueness guard.
 concurrency:
-  group: >-
-    testpypi-${{ github.event_name == 'workflow_dispatch'
-      && format('exact-{0}', inputs.expected_version)
-      || format('dev-{0}', github.event.workflow_run.head_sha) }}
+  group: testpypi-exact-${{ inputs.expected_version }}
   cancel-in-progress: false
 
 permissions:
@@ -88,46 +82,26 @@ jobs:
     # workflow, checks out the exact candidate SHA, and produces the artifact.
     # Carries NO id-token: the OIDC credential lives only in `publish`.
     runs-on: ubuntu-24.04
-    # Manual dispatch always runs; the automatic path runs only when the
-    # triggering `Test` run on `main` actually succeeded (never on failure).
-    if: >-
-      github.event_name == 'workflow_dispatch' ||
-      (github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success')
     permissions:
       contents: read
     outputs:
       resolved_version: ${{ steps.resolve_version.outputs.version }}
     steps:
-      - name: Resolve checkout SHA
-        id: checkout_sha
-        env:
-          EVENT_NAME: ${{ github.event_name }}
-          INPUT_SHA: ${{ inputs.source_sha }}
-          RUN_SHA: ${{ github.event.workflow_run.head_sha }}
-        run: |
-          set -euo pipefail
-          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
-            echo "sha=$INPUT_SHA" >> "$GITHUB_OUTPUT"
-          else
-            echo "sha=$RUN_SHA" >> "$GITHUB_OUTPUT"
-          fi
-
       - uses: actions/checkout@v6
         with:
           # ARTIFACT authority: build the exact candidate SHA. The workflow
           # DEFINITION is still `main` (this file), so untrusted candidate code
           # never becomes the workflow authority. fetch-depth 0 so the origin
           # ref-resolution gate below can consult remote refs.
-          ref: ${{ steps.checkout_sha.outputs.sha }}
+          ref: ${{ inputs.source_sha }}
           fetch-depth: 0
 
-      # --- Manual exact-candidate fail-closed gates (trusted, main-defined) ---
+      # --- Exact-candidate fail-closed gates (trusted, main-defined) ---
       # Each gate is inline in this main-defined YAML and reads candidate DATA
       # only (SHA, version literals) — it never executes candidate code to make
       # a gating decision, so a tampered candidate tree cannot fake a pass.
 
-      - name: Verify exact source SHA == HEAD (manual)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Verify exact source SHA == HEAD
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
         run: |
@@ -144,8 +118,7 @@ jobs:
           fi
           echo "HEAD == source_sha ($SOURCE_SHA)"
 
-      - name: Verify source_ref resolves to source SHA on origin (manual)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Verify source_ref resolves to source SHA on origin
         env:
           SOURCE_SHA: ${{ inputs.source_sha }}
           SOURCE_REF: ${{ inputs.source_ref }}
@@ -174,8 +147,7 @@ jobs:
           fi
           echo "source_ref '$SOURCE_REF' -> exactly one origin ref tip == source_sha"
 
-      - name: Verify version mirror == expected_version (manual)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Verify version mirror == expected_version
         env:
           EXPECTED_VERSION: ${{ inputs.expected_version }}
         run: |
@@ -205,8 +177,7 @@ jobs:
           print(f"version mirror == expected_version ({expected})")
           PY
 
-      - name: Verify candidate Test workflow matches trusted main (manual)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Verify candidate Test workflow matches trusted main
         run: |
           set -euo pipefail
           # F1 (Redmine #13601 j#76006): a candidate could weaken its OWN
@@ -225,8 +196,7 @@ jobs:
           fi
           echo "candidate Test workflow == trusted origin/main"
 
-      - name: Verify successful Test CI for source SHA (manual)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Verify successful Test CI for source SHA
         env:
           GH_TOKEN: ${{ github.token }}
           SOURCE_SHA: ${{ inputs.source_sha }}
@@ -245,8 +215,7 @@ jobs:
           fi
           echo "Test CI success runs for source_sha: $SUCCESSES"
 
-      - name: Verify expected_version is unused on TestPyPI (manual)
-        if: github.event_name == 'workflow_dispatch'
+      - name: Verify expected_version is unused on TestPyPI
         env:
           EXPECTED_VERSION: ${{ inputs.expected_version }}
         run: |
@@ -297,8 +266,7 @@ jobs:
           python-version: "3.11"
 
       # --- Tiered pre-publish clean-runner gate (Redmine #13734) ---
-      # Runs for BOTH events at the exact checked-out candidate SHA, BEFORE any
-      # dev-version rewrite and BEFORE upload. This is the mechanical gate that
+      # Runs at the exact checked-out candidate SHA BEFORE upload. This is the mechanical gate that
       # closes the manual-dispatch bypass: the whole suite + health/docs run
       # here rather than only trusting a prior signal.
       - name: Install package (pre-publish gate)
@@ -337,10 +305,9 @@ jobs:
 
       - name: Check the OS write boundary refuses every known bypass
         # NOTE: the name deliberately avoids the word "Verify". #13601 collects
-        # every testpypi.yml step whose name contains "Verify" as a release gate
-        # and requires it to be workflow_dispatch-guarded; this boundary check is
-        # not a release gate and must run on every event. Renaming it back would
-        # break test_issue_13601_testpypi_exact_sha.
+        # every testpypi.yml step whose name contains "Verify" as a release
+        # gate; this boundary check is not a release gate. Renaming it would
+        # widen what test_issue_13601_testpypi_exact_sha treats as gates.
         # Run in EVERY job that runs the suite (Redmine #14757 j#100430), not just
         # the quick lane: a boundary that is installed but not enforcing would let
         # the suite's green silently mean less than it claims. These are the exact
@@ -375,48 +342,26 @@ jobs:
 
       - name: Resolve build version
         id: resolve_version
+        # The committed release version, already fail-closed verified to equal
+        # expected_version above. (The former automatic dev path's `.devN`
+        # mirror rewrite left with the path itself, Redmine #15487.)
         env:
-          EVENT_NAME: ${{ github.event_name }}
           EXPECTED_VERSION: ${{ inputs.expected_version }}
           SOURCE_SHA: ${{ inputs.source_sha }}
           SOURCE_REF: ${{ inputs.source_ref }}
-          DEV_RUN_ID: ${{ github.event.workflow_run.id }}
-          DEV_HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
-          DEV_RUN_URL: ${{ github.event.workflow_run.html_url }}
         run: |
           set -euo pipefail
-          if [ "$EVENT_NAME" = "workflow_run" ]; then
-            # Automatic dev path: rewrite EVERY release-version mirror file to
-            # the same exact dev version so the wheel METADATA and runtime
-            # __version__ / CLI --version agree (Redmine #13586). Manual dispatch
-            # keeps the committed release version (already fail-closed verified
-            # to equal expected_version above).
-            TS="$(date -u +%Y%m%d%H%M%S)"
-            DEV_NUMBER="${TS}${DEV_RUN_ID}"
-            DEV_VERSION="$(python scripts/compute_testpypi_dev_version.py --dev-number "$DEV_NUMBER" --write)"
-            echo "version=$DEV_VERSION" >> "$GITHUB_OUTPUT"
-            {
-              echo "### TestPyPI dev publish"
-              echo ""
-              echo "- version: \`$DEV_VERSION\`"
-              echo "- commit: \`$DEV_HEAD_SHA\`"
-              echo "- source CI run: $DEV_RUN_URL"
-              echo ""
-              echo "Record this version <-> commit mapping with the smoke evidence."
-            } >> "$GITHUB_STEP_SUMMARY"
-          else
-            echo "version=$EXPECTED_VERSION" >> "$GITHUB_OUTPUT"
-            {
-              echo "### TestPyPI exact-candidate publish"
-              echo ""
-              echo "- version: \`$EXPECTED_VERSION\`"
-              echo "- source_sha: \`$SOURCE_SHA\`"
-              echo "- source_ref: \`$SOURCE_REF\`"
-              echo ""
-              echo "Fail-closed gates passed: HEAD==source_sha, source_ref->source_sha,"
-              echo "version mirror==expected_version, Test CI success, version unused."
-            } >> "$GITHUB_STEP_SUMMARY"
-          fi
+          echo "version=$EXPECTED_VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "### TestPyPI exact-candidate publish"
+            echo ""
+            echo "- version: \`$EXPECTED_VERSION\`"
+            echo "- source_sha: \`$SOURCE_SHA\`"
+            echo "- source_ref: \`$SOURCE_REF\`"
+            echo ""
+            echo "Fail-closed gates passed: HEAD==source_sha, source_ref->source_sha,"
+            echo "version mirror==expected_version, Test CI success, version unused."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Build package
         run: python -m build
@@ -426,7 +371,7 @@ jobs:
         # console entry points before the artifact can be uploaded/published.
         # Proves the exact artifact that will land on TestPyPI imports and
         # exposes `mozyo-bridge` / `mozyo` (Redmine #13734 artifact/install
-        # smoke). Runs for both events.
+        # smoke).
         run: |
           set -euo pipefail
           python -m venv /tmp/testpypi-smoke-venv

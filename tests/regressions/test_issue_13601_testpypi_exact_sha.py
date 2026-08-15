@@ -13,10 +13,14 @@ weakens the OIDC boundary fails here:
   2. Build and publish are SEPARATE jobs; only the publish job carries
      ``id-token: write`` + ``environment: testpypi`` and it only downloads +
      publishes the artifact (no checkout / build / verify on the OIDC surface).
-  3. The manual path runs fail-closed verification gates (exact SHA, source_ref
+  3. The dispatch runs fail-closed verification gates (exact SHA, source_ref
      lineage, version mirror == expected_version, successful Test CI, unused
-     version), each guarded by the ``workflow_dispatch`` event.
-  4. The automatic main-CI dev publish path is preserved.
+     version).
+  4. ``workflow_dispatch`` is the ONLY trigger: the automatic main-CI dev
+     publish path (``workflow_run`` on ``Test``) was removed by owner decision
+     (Redmine #15487) — with no required reviewer on the environment it would
+     publish unattended on every ``main`` push. Its absence is pinned so it
+     cannot silently return.
   5. ``run-name`` carries the nonce and ``concurrency`` serializes per
      ``expected_version`` so dispatch<->run correlation is deterministic and
      duplicate exact-version publishes are serialized.
@@ -59,10 +63,11 @@ class TestPyPIExactShaWorkflowTest(unittest.TestCase):
                 msg=f"workflow_dispatch input {name} must be required",
             )
 
-    def test_automatic_dev_path_preserved(self) -> None:
-        workflow_run = self.on["workflow_run"]
-        self.assertEqual(["Test"], workflow_run["workflows"])
-        self.assertEqual(["main"], workflow_run["branches"])
+    def test_manual_dispatch_is_the_only_trigger(self) -> None:
+        # Redmine #15487: the automatic main-CI dev publish path must not
+        # return — an unattended publish on every `main` push contradicts the
+        # reviewer-less environment configuration.
+        self.assertEqual({"workflow_dispatch"}, set(self.on))
 
     def test_build_and_publish_are_separate_jobs(self) -> None:
         self.assertEqual({"build", "publish"}, set(self.jobs))
@@ -90,7 +95,7 @@ class TestPyPIExactShaWorkflowTest(unittest.TestCase):
         self.assertTrue(any("download-artifact" in u for u in uses))
         self.assertTrue(any("gh-action-pypi-publish" in u for u in uses))
 
-    def test_manual_fail_closed_gates_present_and_guarded(self) -> None:
+    def test_fail_closed_gates_present(self) -> None:
         steps = self.jobs["build"]["steps"]
         gates = {
             step["name"]: step
@@ -110,13 +115,14 @@ class TestPyPIExactShaWorkflowTest(unittest.TestCase):
         joined = " | ".join(gates)
         for marker in required_markers:
             self.assertIn(marker, joined, msg=f"missing gate for: {marker}")
-        # Every gate is guarded by the manual (workflow_dispatch) event so the
-        # automatic dev path is not blocked by exact-candidate requirements.
+        # With workflow_dispatch as the only trigger (#15487), every gate runs
+        # unconditionally; an event guard would be dead compat code, and a
+        # non-dispatch guard would skip a release gate.
         for name, step in gates.items():
-            self.assertIn(
-                "workflow_dispatch",
-                str(step.get("if", "")),
-                msg=f"gate {name!r} must be guarded by github.event_name == workflow_dispatch",
+            self.assertNotIn(
+                "if",
+                step,
+                msg=f"gate {name!r} must run unconditionally (single-trigger workflow)",
             )
 
     def test_f1_gate_compares_candidate_test_yml_to_trusted_main(self) -> None:
