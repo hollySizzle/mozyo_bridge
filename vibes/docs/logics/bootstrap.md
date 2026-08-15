@@ -23,6 +23,19 @@ rather than restating its contents here.
 In scope:
 
 - CLI install (primary: PyPI via `pipx`).
+- terminal backend prerequisite, per the backend the target project selects:
+  tmux for the default, or the herdr binary when the project declares
+  `terminal_transport.backend: herdr`. herdr is a separate product
+  (<https://herdr.dev>), not bundled with this package; Homebrew currently
+  carries the supported 0.8.0 (`brew install herdr`), and other platforms
+  follow that site. `mozyo-bridge` resolves it via `MOZYO_HERDR_BINARY` or the
+  trusted PATH and refuses to fall back to tmux when it is missing, so this is
+  a real prerequisite rather than an optimization. Update it through whatever
+  installed it (`herdr update` is disabled for package-manager installs); any
+  update can move a host off the verified version, so re-check
+  `herdr --version` afterwards.
+  Details and the supported version live in README "Herdr support and breaking
+  upgrades" (Redmine #15517).
 - existing CLI / rules / scaffold update after a release ships.
 - user-global rules install (`mozyo-bridge rules install`).
 - agent skill install:
@@ -124,23 +137,55 @@ Preset selection summary:
 ## Stage 0 — Prerequisites
 
 ```bash
-command -v tmux
 command -v python3
 python3 --version
 command -v pipx
 ```
 
+The terminal backend is a prerequisite too, but WHICH one depends on the
+project's `terminal_transport` setting, and reading that setting reliably needs
+the CLI this stage has not installed yet. So treat it as follows here, and let
+Stage 5's `doctor` — which judges the backend the project actually selects
+(Redmine #15508) — be the authority:
+
+- Default projects use **tmux**. Install it from the OS package manager
+  (`brew install tmux`, `apt install tmux`) if `command -v tmux` finds nothing.
+- Projects that declare `terminal_transport.backend: herdr` need the **herdr**
+  binary instead, and do NOT need tmux. Homebrew carries the supported version
+  (`brew install herdr`); other platforms follow <https://herdr.dev>. See
+  README "Herdr support and breaking upgrades" for the supported version and
+  for how to update each install method.
+- If you do not know yet which one this project declares, install neither now:
+  Stage 5 names the backend and the missing binary, if any.
+
+Stage 0 deliberately runs no backend probe. Which backend applies is a property
+of the project's config, and the tools that read it correctly do not exist
+until Stage 1 — a probe here could only guess, and a guess that checks the
+wrong backend reports a failure the host does not have (Redmine #15517).
+
 Expected:
 
-- `tmux` resolves to an installed path.
 - `python3 --version` reports `3.10` or newer (`mozyo-bridge` requires Python >= 3.10).
 - `pipx` resolves to an installed path.
+- The backend this project needs resolves — and only that one. A host that
+  runs herdr-backend projects does not need tmux, and vice versa; neither
+  absence is a finding on its own. Stage 5 settles it against the project's
+  actual setting.
 
 If a signal is missing:
 
-- `tmux` missing → install via the OS package manager (for example `brew install tmux`, `apt install tmux`). `mozyo-bridge --help` works without tmux; every pane / notification command requires it.
 - `python3` < 3.10 → install a newer Python before continuing.
 - `pipx` missing → see Stage 1 fallback.
+- `tmux` missing **on a tmux-backend project** → install via the OS package
+  manager (for example `brew install tmux`, `apt install tmux`).
+  `mozyo-bridge --help` works without tmux; its pane / notification commands do
+  not.
+- `herdr` missing **on a herdr-backend project** → install it (Homebrew carries
+  the supported version: `brew install herdr`; other platforms follow
+  <https://herdr.dev>). The herdr backend refuses to fall back to tmux, so this
+  blocks every managed launch and handoff until it resolves. Update it the way
+  you installed it — see the table in README "Herdr support and breaking
+  upgrades"; `herdr update` is disabled for package-manager installs.
 
 For agent skill install, also check:
 
@@ -523,6 +568,35 @@ Expected:
 - 6 sections checked: `cli`, `rules`, `codex_skill`, `claude_skill`, `scaffold`, `tmux`.
 - all `ok` when both primary skill paths and a scaffolded target are in place.
 
+This is also where the terminal backend deferred from Stage 0 is settled —
+`doctor` judges the backend the project actually selects (Redmine #15508), so
+neither the config file nor its key order has to be read by hand:
+
+```bash
+project=/path/to/project
+
+# A malformed config — an unrecognised backend value included — resolves to the
+# tmux default inside the runtime, so the backend reading alone would print
+# `tmux` and look exactly like a healthy default project. So parse first and
+# let the shell stop there: the reading runs ONLY if the config parses, and a
+# missing config file short-circuits as the genuine tmux default. Chained with
+# `&&` rather than sequenced, because a bare `if` would let a failed parse fall
+# through into the reading.
+{ [ ! -f "$project/.mozyo-bridge/config.yaml" ] \
+    || mozyo-bridge config check-parse --file "$project/.mozyo-bridge/config.yaml"; } \
+  && mozyo-bridge doctor --json --target "$project" \
+     | python3 -c 'import json,sys; raw=sys.stdin.read().strip(); sys.exit("doctor produced no JSON") if not raw else print((json.loads(raw)["sections"].get("herdr") or {}).get("backend", "tmux"))'
+```
+
+- the command exits 2 and prints no backend → the config is malformed. Fix it;
+  the backend reading is not meaningful until it parses, and the chain
+  deliberately never reached it.
+- prints `tmux` → `tmux` must be installed; absent tmux shows as
+  `tmux: missing` above.
+- prints `herdr` → the herdr binary must resolve (`MOZYO_HERDR_BINARY` wins
+  over `PATH`); the `herdr` section reports it, and `tmux: skipped` there means
+  tmux is simply not needed on this host, not a finding.
+
 Expected state when the Claude primary path (plugin marketplace) is used:
 
 - `mozyo-bridge doctor` scans the plugin cache as well as legacy
@@ -632,7 +706,11 @@ The symptoms below are the ones an LLM is most likely to observe while executing
 - `mozyo-bridge scaffold apply <preset>` refused to overwrite existing routers:
   - protection is intentional. Inspect with `--dry-run`, then replace via `--backup` (keep originals) or `--force` (no backup).
 - `doctor` reports `tmux: missing`:
-  - `tmux` is not on `PATH`. Install via the OS package manager.
+  - the project selects the tmux backend and `tmux` is not on `PATH`. Install
+    via the OS package manager. On a project that declares
+    `terminal_transport.backend: herdr`, doctor reports `tmux: skipped` instead
+    and absent tmux is not a finding (Redmine #15508) — check the `herdr`
+    section there.
 - every section reports `ok` but agents still do not see the rules / skill:
   - restart Claude Code / Codex. Same-session skill index is cached.
 - pane / notification commands fail with "no agent windows":
