@@ -23,6 +23,7 @@ Branches from the Start Gate acceptance (j#75722), Redmine #14978, Redmine
   (m) a PyPI 200 listing without the version proceeds
   (n) the PyPI response file is mktemp-created (no predictable PID path) and
       left behind by neither the success nor the failure branch
+  (o) `--backend pip` is passed only to a pipx that advertises the flag
 """
 
 import os
@@ -41,6 +42,14 @@ _SCRIPT = ROOT / "scripts" / "install_testpypi_dev.sh"
 # policy without touching the network or the real pipx environment.
 _FAKE_PIPX = (
     "#!/bin/sh\n"
+    'if [ "$2" = "--help" ] || [ "$1" = "--help" ]; then\n'
+    '  if [ "${FAKE_PIPX_HAS_BACKEND:-1}" = "1" ]; then\n'
+    '    echo "  --backend {pip,uv}  Which backend to use"\n'
+    "  else\n"
+    '    echo "  --force  Reinstall"\n'
+    "  fi\n"
+    "  exit 0\n"
+    "fi\n"
     "for arg in \"$@\"; do\n"
     "  printf 'FAKE_PIPX_ARG=%s\\n' \"$arg\"\n"
     "done\n"
@@ -128,6 +137,7 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
         pypi_status: str = "404",
         pypi_body: str | None = None,
         pypi_exit: str = "0",
+        pipx_has_backend: str = "1",
     ):
         with tempfile.TemporaryDirectory() as tmp:
             fakebin = Path(tmp) / "bin"
@@ -149,6 +159,7 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
                 "FAKE_CURL_COUNT_FILE": str(Path(tmp) / "curl-count"),
                 "FAKE_PYPI_STATUS": pypi_status,
                 "FAKE_PYPI_EXIT": pypi_exit,
+                "FAKE_PIPX_HAS_BACKEND": pipx_has_backend,
                 # Point the script's temp-file root at the per-test dir so the
                 # leftover check below sees exactly this run's artifacts.
                 "TMPDIR": tmp,
@@ -339,6 +350,24 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
         )
         self.assertEqual(75, failure.returncode, failure.stderr)
         self.assertEqual([], failure.tmp_leftovers)
+
+    def test_backend_flag_matches_what_this_pipx_advertises(self) -> None:
+        # (o) #15507: `--backend` exists only on pipx versions that can pick a
+        # non-pip backend. Passing it to an older pipx is an argparse ERROR that
+        # aborts the install, not a no-op — observed live on pipx 1.8.0 during
+        # the 1.0.0 QA. Such a pipx already uses pip, so omitting the flag keeps
+        # the intended resolution.
+        version = "1.0.0"
+        with_backend = self._run(version, mb_version=version, mz_version=version)
+        self.assertEqual(0, with_backend.returncode, with_backend.stderr)
+        self.assertIn("FAKE_PIPX_ARG=--backend", with_backend.stdout)
+
+        without = self._run(
+            version, mb_version=version, mz_version=version, pipx_has_backend="0"
+        )
+        self.assertEqual(0, without.returncode, without.stderr)
+        self.assertNotIn("FAKE_PIPX_ARG=--backend", without.stdout)
+        self.assertIn("FAKE_PIPX_ARG=install", without.stdout)
 
     def test_latest_is_rejected(self) -> None:
         # Guardrail unrelated to the version assertion but part of the runbook
