@@ -477,9 +477,9 @@ class TestPyPIPrePublishGateTest(unittest.TestCase):
         ):
             step = self._step(frag)
             self.assertNotIn(
-                "workflow_dispatch",
-                str(step.get("if", "")),
-                msg=f"{frag} must run unconditionally (no dispatch-only guard)",
+                "if",
+                step,
+                msg=f"{frag} must run unconditionally (any `if` guard can skip it)",
             )
 
     def test_full_suite_runs_before_upload(self) -> None:

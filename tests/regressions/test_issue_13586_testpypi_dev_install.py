@@ -6,8 +6,8 @@ disagrees, instead of merely displaying `--version`. These tests exercise the
 script against a fake ``pipx`` and fake ``mozyo-bridge`` / ``mozyo`` CLIs on a
 shadowed PATH so no network, no real install, and no real package are needed.
 
-Nine branches from the Start Gate acceptance (j#75722), Redmine #14978, and
-Redmine #14980 are pinned:
+Branches from the Start Gate acceptance (j#75722), Redmine #14978, Redmine
+#14980, and the #15487 R2 source-provenance gate are pinned:
   (a) both CLIs report the requested version -> exit 0
   (b) `mozyo-bridge --version` mismatches      -> non-zero
   (c) `mozyo --version` mismatches             -> non-zero
@@ -17,6 +17,10 @@ Redmine #14980 are pinned:
   (g) stable versions do not substring-match alpha filenames
   (h) readiness polls the same canonical Simple URL that pip resolves
   (i) unpinned `latest` is rejected before any install
+  (j) an exact rc candidate absent from PyPI (404) installs cleanly
+  (k) the version present on production PyPI refuses before any install
+  (l) a failed / unexpected-status / unreadable PyPI lookup fails closed
+  (m) a PyPI 200 listing without the version proceeds
 """
 
 import os
@@ -47,9 +51,23 @@ _FAKE_PIPX = (
 # asserted without a network call.
 _FAKE_CURL = (
     "#!/bin/sh\n"
+    "is_pypi=0\n"
+    "out_file=\"\"\n"
+    "prev=\"\"\n"
     "for arg in \"$@\"; do\n"
     "  printf 'FAKE_CURL_ARG=%s\\n' \"$arg\" >&2\n"
+    "  if [ \"$prev\" = \"--output\" ]; then out_file=\"$arg\"; fi\n"
+    "  case \"$arg\" in *://pypi.org/*) is_pypi=1 ;; esac\n"
+    "  prev=\"$arg\"\n"
     "done\n"
+    "if [ \"$is_pypi\" -eq 1 ]; then\n"
+    "  if [ \"${FAKE_PYPI_EXIT:-0}\" -ne 0 ]; then exit \"$FAKE_PYPI_EXIT\"; fi\n"
+    "  body=\"${FAKE_PYPI_BODY:-}\"\n"
+    "  if [ -z \"$body\" ]; then body='{\"files\":[]}'; fi\n"
+    "  if [ -n \"$out_file\" ]; then printf '%s\\n' \"$body\" > \"$out_file\"; fi\n"
+    "  printf '%s' \"${FAKE_PYPI_STATUS:-404}\"\n"
+    "  exit 0\n"
+    "fi\n"
     'count_file="$FAKE_CURL_COUNT_FILE"\n'
     "count=0\n"
     'if [ -f "$count_file" ]; then count="$(cat "$count_file")"; fi\n'
@@ -105,6 +123,9 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
         *,
         simple_version: str | None = None,
         simple_ready_after: int = 1,
+        pypi_status: str = "404",
+        pypi_body: str | None = None,
+        pypi_exit: str = "0",
     ):
         with tempfile.TemporaryDirectory() as tmp:
             fakebin = Path(tmp) / "bin"
@@ -124,7 +145,11 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
                 "FAKE_SIMPLE_VERSION": simple_version or requested,
                 "FAKE_SIMPLE_READY_AFTER": str(simple_ready_after),
                 "FAKE_CURL_COUNT_FILE": str(Path(tmp) / "curl-count"),
+                "FAKE_PYPI_STATUS": pypi_status,
+                "FAKE_PYPI_EXIT": pypi_exit,
             }
+            if pypi_body is not None:
+                env["FAKE_PYPI_BODY"] = pypi_body
             return subprocess.run(
                 ["sh", str(_SCRIPT), requested],
                 env=env,
@@ -231,6 +256,62 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
         self.assertIn("mozyo", result.stderr)
         # The matching first CLI still reported OK before the mismatch aborted.
         self.assertIn("OK: mozyo-bridge --version == 0.10.0.dev123456", result.stdout)
+
+    def test_exact_candidate_absent_from_pypi_installs(self) -> None:
+        # (j) #15487 R2 finding_1: an exact release candidate (no `.dev`)
+        # installs cleanly when production PyPI 404s, with no dev-only warning.
+        version = "1.0.0rc5"
+        result = self._run(version, mb_version=version, mz_version=version)
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("FAKE_PIPX_ARG=install", result.stdout)
+        self.assertIn("cannot resolve from PyPI", result.stdout)
+        self.assertNotIn("warning", result.stdout + result.stderr)
+
+    def test_version_present_on_pypi_refuses_before_install(self) -> None:
+        # (k) pip gives the extra index no lower priority, so a same-version
+        # PyPI artifact makes the TestPyPI source unprovable: refuse pre-mutation.
+        version = "1.0.0rc5"
+        result = self._run(
+            version,
+            mb_version=version,
+            mz_version=version,
+            pypi_status="200",
+            pypi_body='{"files":[{"filename":"mozyo_bridge-1.0.0rc5-py3-none-any.whl"}]}',
+        )
+        self.assertEqual(75, result.returncode, result.stderr)
+        self.assertNotIn("FAKE_PIPX_ARG=", result.stdout)
+        self.assertIn("EXISTS on production PyPI", result.stderr)
+
+    def test_failed_pypi_lookup_fails_closed(self) -> None:
+        # (l) an unprovable absence is a refusal, never a proceed.
+        version = "1.0.0rc5"
+        for kwargs in (
+            {"pypi_exit": "6"},
+            {"pypi_status": "503"},
+            {"pypi_status": "200", "pypi_body": "not json"},
+        ):
+            with self.subTest(**kwargs):
+                result = self._run(
+                    version, mb_version=version, mz_version=version, **kwargs
+                )
+                self.assertEqual(75, result.returncode, result.stderr)
+                self.assertNotIn("FAKE_PIPX_ARG=", result.stdout)
+                self.assertIn("fail-closed", result.stderr)
+
+    def test_pypi_200_without_the_version_proceeds(self) -> None:
+        # (m) a readable PyPI listing that does not carry the pinned version
+        # proves absence just as a 404 does.
+        version = "1.0.0rc5"
+        result = self._run(
+            version,
+            mb_version=version,
+            mz_version=version,
+            pypi_status="200",
+            pypi_body='{"files":[{"filename":"mozyo_bridge-0.9.0-py3-none-any.whl"}]}',
+        )
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertIn("FAKE_PIPX_ARG=install", result.stdout)
+        self.assertIn("does not list 1.0.0rc5", result.stdout)
 
     def test_latest_is_rejected(self) -> None:
         # Guardrail unrelated to the version assertion but part of the runbook

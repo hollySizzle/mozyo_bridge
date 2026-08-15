@@ -20,12 +20,15 @@ set -eu
 #
 # Why exact-only (no `latest`): this install uses TestPyPI as --index-url and
 # PyPI as --extra-index-url so dependencies still resolve from PyPI. pip
-# considers candidates for the TARGET package from BOTH indexes, and a
-# pre-release (rc / dev) sorts BEFORE a PyPI final. An unpinned install
-# could therefore resolve the PyPI production release instead of the intended
-# TestPyPI artifact and silently taint smoke evidence. Pinning the exact
-# candidate version keeps the target resolving to the intended TestPyPI
-# artifact (candidate versions are published to TestPyPI, never to PyPI).
+# considers candidates for the TARGET package from BOTH indexes with NO
+# priority between them (pip `install` "Finding Packages"), so an unpinned
+# install could resolve the PyPI production release and silently taint smoke
+# evidence. The exact pin alone does NOT prove the TestPyPI source either: if
+# the SAME version ever existed on PyPI, pip may serve either artifact and the
+# post-install `--version` check cannot tell them apart. Source provenance is
+# therefore proven mechanically below (Redmine #15487 R2 finding_1): right
+# before the pipx mutation the script requires the pinned version to be ABSENT
+# from production PyPI, failing closed on any unprovable lookup.
 
 usage() {
   cat <<USAGE
@@ -147,6 +150,91 @@ raise SystemExit(1)
   sleep "$simple_interval_seconds"
   simple_attempt=$((simple_attempt + 1))
 done
+
+# --- PyPI absence gate (source provenance, Redmine #15487 R2 finding_1) ---
+# pip gives --index-url no priority over --extra-index-url, so the pinned
+# version must be proven ABSENT from production PyPI immediately before the
+# mutation — otherwise pip may serve the PyPI artifact under the same version
+# and the smoke evidence cannot prove its TestPyPI origin. A 404 proves the
+# project (and thus the version) is absent; a 200 listing without the
+# version's files proves the version is absent; anything else — the version
+# present, an unreadable payload, an unexpected status, or a failed lookup —
+# refuses fail-closed with the pipx environment untouched.
+pypi_url="https://pypi.org/simple/mozyo-bridge/"
+pypi_body="${TMPDIR:-/tmp}/mozyo-pypi-absence-$$.json"
+pypi_code=""
+if ! pypi_code="$(curl \
+  --silent \
+  --show-error \
+  --location \
+  --header "Cache-Control: no-cache" \
+  --header "Accept: application/vnd.pypi.simple.v1+json" \
+  --output "$pypi_body" \
+  --write-out '%{http_code}' \
+  "$pypi_url")"; then
+  rm -f "$pypi_body"
+  echo "error: PyPI lookup failed; cannot prove '$version' is absent from" >&2
+  echo "       production PyPI (fail-closed). Environment unchanged." >&2
+  exit 75
+fi
+case "$pypi_code" in
+  404)
+    echo "OK: PyPI does not host mozyo-bridge; '$version' cannot resolve from PyPI"
+    ;;
+  200)
+    if MOZYO_PYPI_EXPECTED_VERSION="$version" python3 -c '
+import json
+import os
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeError):
+    raise SystemExit(2)
+
+files = payload.get("files")
+if not isinstance(files, list):
+    raise SystemExit(2)
+
+version = os.environ["MOZYO_PYPI_EXPECTED_VERSION"]
+wheel_prefix = f"mozyo_bridge-{version}-"
+sdist_names = {
+    f"mozyo_bridge-{version}.tar.gz",
+    f"mozyo_bridge-{version}.zip",
+}
+for item in files:
+    filename = item.get("filename") if isinstance(item, dict) else None
+    if isinstance(filename, str) and (
+        filename.startswith(wheel_prefix) or filename in sdist_names
+    ):
+        raise SystemExit(1)
+raise SystemExit(0)
+' < "$pypi_body"; then
+      echo "OK: PyPI Simple Index does not list $version"
+    else
+      pypi_check_status=$?
+      rm -f "$pypi_body"
+      if [ "$pypi_check_status" -eq 1 ]; then
+        echo "error: version '$version' EXISTS on production PyPI; the pinned" >&2
+        echo "       install cannot prove a TestPyPI source (pip treats both" >&2
+        echo "       indexes as acceptable for the same version). Refusing;" >&2
+        echo "       environment unchanged. Publish a distinct candidate" >&2
+        echo "       version instead." >&2
+      else
+        echo "error: PyPI Simple response is unreadable; cannot prove" >&2
+        echo "       '$version' is absent (fail-closed). Environment unchanged." >&2
+      fi
+      exit 75
+    fi
+    ;;
+  *)
+    rm -f "$pypi_body"
+    echo "error: unexpected PyPI Simple status '$pypi_code'; cannot prove" >&2
+    echo "       '$version' is absent (fail-closed). Environment unchanged." >&2
+    exit 75
+    ;;
+esac
+rm -f "$pypi_body"
 
 spec="mozyo-bridge==$version"
 echo "Installing TestPyPI artifact: $spec"
