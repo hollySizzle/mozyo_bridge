@@ -1,0 +1,124 @@
+"""Redmine #15513 — `docs validate` refuses a missing catalog in words, not a traceback.
+
+The scaffold ships `.mozyo-bridge/docs/catalog.yaml.example` and a project
+promotes it when it adopts the governed docs catalog, so a target without
+`catalog.yaml` is an EXPECTED state. `cmd_docs_validate` nevertheless walked
+straight into the reader and let `FileNotFoundError` escape, printing a
+traceback that reads as "the tool is broken" — hit while running the release
+acceptance smoke against a freshly scaffolded target during the 1.0.0
+production install QA (#15507 j#105418).
+
+The same investigation found the sibling escapes: a non-mapping root and
+unparseable YAML raised through the command too, so "cannot read the catalog"
+is handled as one class. A valid catalog must still pass, and a catalog that
+reads fine but fails structural rules must keep its own per-rule diagnostics
+rather than being flattened into the new branch.
+"""
+
+from __future__ import annotations
+
+import argparse
+import contextlib
+import io
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT / "src"))
+
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application.commands_docs_scaffold import (  # noqa: E402,E501
+    cmd_docs_validate,
+)
+
+
+class DocsValidateMissingCatalogTest(unittest.TestCase):
+    def _repo(self, catalog_text: str | None) -> Path:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        if catalog_text is not None:
+            docs_dir = repo / ".mozyo-bridge" / "docs"
+            docs_dir.mkdir(parents=True)
+            (docs_dir / "catalog.yaml").write_text(catalog_text, encoding="utf-8")
+        return repo
+
+    def _run(self, repo: Path) -> tuple[int, str]:
+        out = io.StringIO()
+        args = argparse.Namespace(repo=str(repo))
+        with contextlib.redirect_stdout(out):
+            code = cmd_docs_validate(args)
+        return code, out.getvalue()
+
+    def test_absent_catalog_refuses_in_words(self) -> None:
+        code, output = self._run(self._repo(None))
+
+        self.assertEqual(1, code)
+        self.assertIn("no docs catalog at", output)
+        # The repo-relative path, so the message reads the same from any cwd.
+        self.assertIn(".mozyo-bridge/docs/catalog.yaml", output)
+        # And it says what to do about it.
+        self.assertIn("catalog.yaml.example", output)
+        # Never the failure mode this fixes.
+        self.assertNotIn("Traceback", output)
+        self.assertNotIn("FileNotFoundError", output)
+
+    def test_absent_catalog_raises_nothing(self) -> None:
+        # The traceback came from an escaping exception, so pin the absence of
+        # the exception itself, not only the absence of its rendering.
+        repo = self._repo(None)
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                cmd_docs_validate(argparse.Namespace(repo=str(repo)))
+        except Exception as exc:  # noqa: BLE001 - any escape is the regression
+            self.fail(f"missing catalog must not raise, got {exc!r}")
+
+    #: The smallest catalog the validator accepts: schema version plus the
+    #: exact managed-type set it requires.
+    MINIMAL_CATALOG = (
+        "schema_version: 1\n"
+        "managed_types:\n"
+        "  - rule\n"
+        "  - spec\n"
+        "  - logic\n"
+        "  - manual_spec\n"
+        "  - task\n"
+        "documents: []\n"
+    )
+
+    def test_a_valid_catalog_still_passes(self) -> None:
+        code, output = self._run(self._repo(self.MINIMAL_CATALOG))
+
+        self.assertEqual(0, code)
+        self.assertIn("catalog validation passed", output)
+
+    def test_an_unreadable_catalog_refuses_in_words(self) -> None:
+        # Present but not readable as a catalog: a non-mapping root and broken
+        # YAML both raised through the command before this fix.
+        for label, text in (
+            ("non-mapping root", "- not\n- a mapping\n"),
+            ("broken yaml", "documents: [unclosed\n"),
+        ):
+            with self.subTest(label=label):
+                code, output = self._run(self._repo(text))
+                self.assertEqual(1, code)
+                self.assertIn("cannot read", output)
+                self.assertNotIn("Traceback", output)
+
+    def test_a_structurally_invalid_catalog_keeps_per_rule_errors(self) -> None:
+        # Reads fine, breaks the rules: the new branches must not swallow the
+        # validator's own findings.
+        code, output = self._run(
+            self._repo("schema_version: 2\nmanaged_types: []\ndocuments: []\n")
+        )
+
+        self.assertEqual(1, code)
+        self.assertIn("catalog validation failed", output)
+        self.assertIn("schema_version must be 1", output)
+        self.assertNotIn("cannot read", output)
+        self.assertNotIn("no docs catalog at", output)
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()
