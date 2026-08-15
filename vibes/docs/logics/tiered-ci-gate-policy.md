@@ -28,7 +28,7 @@ interface には依存しない (`## 非目標`)。
 | --- | --- | --- | --- |
 | quick | `pull_request` / issue-branch `push` (branch ref のみ) / manual `quick` dispatch | single Python 3.12 | health + docs + **affected** tests (fail-closed → whole suite) |
 | integration | `push` to `main` / `int_*` / `integration_*` | clean Linux single Python 3.12 | health + docs + **full** `unittest discover` + wheel/sdist build + fresh-install smoke、**exact SHA に 1 回** |
-| testpypi | `workflow_dispatch` (exact candidate) / `workflow_run` (main Test success) | single Python 3.11 | #13601 data gate 群 + **inline clean single-Python full + artifact/install smoke** (両 event) |
+| testpypi | `workflow_dispatch` (exact candidate。`workflow_run` 自動 dev path は #15487 で廃止) | single Python 3.11 | #13601 data gate 群 + **inline clean single-Python full + artifact/install smoke** |
 | nightly | `schedule` (07:00 JST) | 3.10–3.13 matrix | full `unittest discover` + wheel build |
 | production | `release: published` | 3.10–3.13 matrix (verify) + single (build) | exact release/tag SHA の **full matrix** + tag↔version mirror + wheel/sdist + **fresh-install smoke**、OIDC publish は別 job |
 
@@ -78,8 +78,8 @@ whole suite (single Python) を推奨する (silent な空集合 = fail-open を
 
 integration ref への push で **exact integration SHA に 1 回** だけ、clean Linux
 single-Python full + health/docs + wheel/sdist build + fresh-install smoke を回す。
-これが自動 TestPyPI dev path (`testpypi.yml` の `workflow_run`) が key にする `main` の
-`Test` success でもある。full matrix (4 環境) は integration tier では回さず、nightly /
+これが exact-candidate publish gate (`testpypi.yml`) が要求する `main` 系 `Test` success の
+生成元でもある (自動 TestPyPI dev path は #15487 で廃止)。full matrix (4 環境) は integration tier では回さず、nightly /
 production tier に寄せる。
 
 ### nightly (invariant #4)
