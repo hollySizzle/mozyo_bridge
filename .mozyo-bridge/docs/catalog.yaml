@@ -1599,6 +1599,27 @@ documents:
       - logic-release-flow
       - logic-release-helper-contract
 
+  - id: logic-ci-quick-full-lane-policy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/ci-quick-full-lane-policy.md
+    purpose: "issue-branch push の quick/affected lane と full unittest lane の分割契約 (Redmine #12753 / 親 US #12510)。どの push がどちらの lane を発火させるか、affected 判定の入力、full lane へ昇格する条件を定める。tiered-ci-gate-policy が quick/full lane split の正本として本 doc を名指しで参照しており (同 doc の関連文書節)、pre-commit-focused-verification と test-runtime-profiling-policy も参照する。#15518 まで catalog 未登録で path resolution から到達できなかったため、参照側だけが権威として扱う片側依存になっていた。"
+    audit_role: ci_quick_full_lane_policy_logic
+    related_document_refs:
+      - logic-tiered-ci-gate-policy
+      - logic-pre-commit-focused-verification
+      - logic-test-runtime-profiling-policy
+
+  - id: logic-herdr-poc-experiment-log
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/herdr-poc-13175-experiment-log.md
+    purpose: "terminal / transport / state 検知層の移行先候補として herdr を評価した PoC の実測記録 (Redmine #13175)。kill criteria 4 点に対する各実験を目的 / 実行 / 結果 / 学びの固定形式で残し、失敗・誤読・観測方法の欠陥も削除せず保持する。herdr バージョン更新時など将来の再評価で判定を再現するための証拠であり、現行 herdr backend の設計判断 (fail-closed 方針、identity / generation の扱い) の出所でもある。#15518 まで catalog 未登録だった。"
+    audit_role: herdr_poc_experiment_log
+    related_document_refs:
+      - spec-herdr-native-identity
+      - logic-herdr-scenario-test-foundation
+
 file_conventions:
   - id: fc-agent-routers
     name: agent entrypoint routers
