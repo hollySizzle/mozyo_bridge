@@ -46,11 +46,8 @@ Use the artifact under test, not local source. The point of this acceptance test
 # Production PyPI:
 pipx install --force mozyo-bridge==<X.Y.Z>
 
-# Or TestPyPI (per release-flow.md):
-pipx install --force --backend pip \
-  --index-url https://test.pypi.org/simple/ \
-  --pip-args "--extra-index-url https://pypi.org/simple/" \
-  mozyo-bridge==<X.Y.Z[aN]>
+# Or TestPyPI (canonical: the script detects whether this pipx takes --backend):
+scripts/install_testpypi_dev.sh <X.Y.Z[aN]>
 ```
 
 `mozyo-bridge --version` alone cannot tell PyPI from GitHub `main` (same `pyproject.toml` string). The acceptance test does not depend on the version string; it depends on the installed CLI surface, which the doctor will check.
