@@ -142,64 +142,36 @@ python3 --version
 command -v pipx
 ```
 
-Then check ONLY the terminal backend this project selects — probing the other
-one reports a failure that does not apply to this host. Determine which one is
-selected first:
+The terminal backend is a prerequisite too, but WHICH one depends on the
+project's `terminal_transport` setting, and reading that setting reliably needs
+the CLI this stage has not installed yet. So treat it as follows here, and let
+Stage 5's `doctor` — which judges the backend the project actually selects
+(Redmine #15508) — be the authority:
+
+- Default projects use **tmux**. Install it from the OS package manager
+  (`brew install tmux`, `apt install tmux`) if `command -v tmux` finds nothing.
+- Projects that declare `terminal_transport.backend: herdr` need the **herdr**
+  binary instead, and do NOT need tmux. Homebrew carries the supported version
+  (`brew install herdr`); other platforms follow <https://herdr.dev>. See
+  README "Herdr support and breaking upgrades" for the supported version and
+  for how to update each install method.
+- If you do not know yet which one this project declares, install neither now:
+  Stage 5 names the backend and the missing binary, if any.
 
 ```bash
-# Which backend? Ask the tools that resolve it — do not read the YAML by eye.
-# A key order like `version:` before `backend:`, or no config file at all, are
-# both normal, and neither is something a line-oriented grep can judge.
-
-# 1. If a repo-local config exists, prove THIS build parses it. Having no
-#    config at all is the normal tmux default, not a failure, so the absence
-#    branch says so instead of exiting non-zero.
-if [ -f .mozyo-bridge/config.yaml ]; then
-  mozyo-bridge config check-parse --file .mozyo-bridge/config.yaml
-else
-  echo "no repo-local config: tmux default"
-fi
-
-# 2. ONLY after step 1 is clean (exit 2 means malformed — including an
-#    unrecognised backend value — so stop and fix it rather than guessing):
-#    read the backend the runtime actually resolved. The herdr section is
-#    present only when the herdr backend is selected (Redmine #13355), so its
-#    absence IS the tmux default.
-mozyo-bridge doctor --json --repo . \
-  | python3 -c 'import json,sys; print((json.load(sys.stdin)["sections"].get("herdr") or {}).get("backend", "tmux"))'
-```
-
-```bash
-# tmux backend (the default):
-command -v tmux
-```
-
-```bash
-# herdr backend (terminal_transport.backend: herdr):
-# MOZYO_HERDR_BINARY wins over PATH, exactly as the runtime resolves it,
-# so probe whichever one is in effect rather than assuming PATH.
-herdr_cmd="${MOZYO_HERDR_BINARY:-herdr}"
-command -v "$herdr_cmd"
-"$herdr_cmd" --version
+# CLI-free: whichever backend you already know you need.
+command -v tmux      # default-backend projects
+command -v herdr     # herdr-backend projects (or set MOZYO_HERDR_BINARY)
 ```
 
 Expected:
 
 - `python3 --version` reports `3.10` or newer (`mozyo-bridge` requires Python >= 3.10).
 - `pipx` resolves to an installed path.
-- Step 1 prints either `parsed (schema version N)` or, with no config file,
-  `no repo-local config: tmux default`. Exit 2 is a malformed config —
-  including an unrecognised backend value — and stops Stage 0 here; step 2's
-  answer is not meaningful until it parses.
-- Step 2 prints exactly `tmux` or `herdr`. That is the backend to check below.
-- The backend the project selects resolves — and only that one:
-  - default (tmux): `tmux` resolves to an installed path. `herdr` is not
-    checked and its absence is not a finding.
-  - `terminal_transport.backend: herdr`: `$herdr_cmd` resolves and reports the
-    version README "Herdr support and breaking upgrades" declares supported.
-    `tmux` is NOT required on such a host, and is not part of the success
-    signal — `mozyo-bridge doctor` judges the selected backend the same way and
-    reports absent tmux as informational there (Redmine #15508).
+- The backend this project needs resolves — and only that one. A host that
+  runs herdr-backend projects does not need tmux, and vice versa; neither
+  absence is a finding on its own. Stage 5 settles it against the project's
+  actual setting.
 
 If a signal is missing:
 
@@ -209,7 +181,7 @@ If a signal is missing:
   manager (for example `brew install tmux`, `apt install tmux`).
   `mozyo-bridge --help` works without tmux; its pane / notification commands do
   not.
-- `$herdr_cmd` missing **on a herdr-backend project** → install it (Homebrew carries
+- `herdr` missing **on a herdr-backend project** → install it (Homebrew carries
   the supported version: `brew install herdr`; other platforms follow
   <https://herdr.dev>). The herdr backend refuses to fall back to tmux, so this
   blocks every managed launch and handoff until it resolves. Update it the way
@@ -596,6 +568,27 @@ Expected:
 - exit code `0`.
 - 6 sections checked: `cli`, `rules`, `codex_skill`, `claude_skill`, `scaffold`, `tmux`.
 - all `ok` when both primary skill paths and a scaffolded target are in place.
+
+This is also where the terminal backend deferred from Stage 0 is settled —
+`doctor` judges the backend the project actually selects (Redmine #15508), so
+neither the config file nor its key order has to be read by hand:
+
+```bash
+# Which backend did the runtime resolve? The `herdr` section is present only
+# under the herdr backend (Redmine #13355), so its absence is the tmux default.
+mozyo-bridge doctor --json --target /path/to/project \
+  | python3 -c 'import json,sys; print((json.load(sys.stdin)["sections"].get("herdr") or {}).get("backend", "tmux"))'
+```
+
+- prints `tmux` → `tmux` must be installed; absent tmux shows as
+  `tmux: missing` above.
+- prints `herdr` → the herdr binary must resolve (`MOZYO_HERDR_BINARY` wins
+  over `PATH`); the `herdr` section reports it, and `tmux: skipped` there means
+  tmux is simply not needed on this host, not a finding.
+- If the repo-local config is malformed the resolution is not meaningful; run
+  `mozyo-bridge config check-parse --file <project>/.mozyo-bridge/config.yaml`
+  (exit 2 = malformed, including an unrecognised backend value) and fix it
+  first.
 
 Expected state when the Claude primary path (plugin marketplace) is used:
 
