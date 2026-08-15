@@ -225,11 +225,17 @@ TestPyPI / PyPI の release acceptance では、local checkout / local wheel / e
 TestPyPI:
 
 ```bash
-pipx install --force --backend pip \
+# canonical path (backend flag は script が pipx の対応を検出して付与する):
+scripts/install_testpypi_dev.sh X.Y.Z
+
+# 手動で組む場合 (`--backend pip` は pipx が advertise するときだけ付ける):
+pipx install --force \
   --index-url https://test.pypi.org/simple/ \
   --pip-args "--extra-index-url https://pypi.org/simple/" \
   mozyo-bridge==X.Y.Z
 ```
+
+`--backend pip` は **flag を advertise する pipx にのみ**渡す (古い pipx では argparse error になり install が中断する。Redmine #15507 実測: pipx 1.8.0)。古い pipx は元から pip backend なので省略しても解決経路は変わらない。canonical path は条件判定済みの `scripts/install_testpypi_dev.sh <exact version>` を使うこと。
 
 PyPI:
 
@@ -387,8 +393,8 @@ GA / patch 手順:
 - pre-release は production publish を起こしてはならないので、GitHub Release を作らない。
 - bump → push → `Publish to TestPyPI` workflow を `workflow_dispatch` で起動する流れだけで完了する。
   - Helper: `mozyo-bridge release publish --testpypi --source-sha <40-hex> --expected-version 0.1.0a1 --source-ref refs/heads/<branch>` は exact-candidate dispatch を行う (Redmine #13601)。`--source-ref` は **origin 上の ref literal** で綴る (`refs/heads/<branch>` が canonical、短縮 `<branch>` も可)。local remote-tracking 表記 (`origin/<branch>` / `refs/remotes/origin/<branch>`) は **曖昧なため** helper が dispatch 前に exact な訂正付きで reject する (remote が同名 branch を持ちうるので推測しない。「origin 上に存在しないから」ではない)。exactly-one は構造保証ではなく動的検査であり、`ls-remote` の tail 一致は full path にも作用する (Redmine #13883、policy 正本: `release-helper-contract.md` の `### source_ref Spelling Policy` / `### exactly-one は構造保証ではなく動的検査`)。dispatch 前 client preflight が origin 上で non-peel ちょうど 1 件 + tip == source_sha を確認し、zero / multi / mismatch では dispatch を 0 回にする。workflow の event ref は `main` 固定で、exact `source_sha` / `expected_version` / `source_ref` / `dispatch_nonce` を input として渡す。trusted な build job が HEAD == source_sha / source_ref lineage / version mirror == expected_version / 同 SHA の `Test` success / version 未使用を fail-closed 照合し、build job と OIDC publish job を分離する。helper は run-name 中の nonce で run を決定的に相関し (exact 1 件以外は fail-closed)、run-id を active release ticket に貼れる shape で stdout に出す。polling は `mozyo-bridge release workflow wait --run-id <id> --timeout <seconds>` に明示的に委ねる。
-- 検証は `pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args "--extra-index-url https://pypi.org/simple/" mozyo-bridge==0.1.0a1` で行い、続けて `README.md` の `Beta Tester Install (GitHub main)` 節の acceptance smoke (rules install → skill install → `mozyo-bridge doctor` → isolated target に対する Asana / Redmine scaffold + doctor) を TestPyPI install に対して実行する。
-- `pipx` が default backend に `uv` を使う環境では、TestPyPI の `--index-url` と dependency 用 `--extra-index-url` の組み合わせが期待通り解決されないことがあるため、TestPyPI 検証では `--backend pip` を明示する。
+- 検証は `scripts/install_testpypi_dev.sh 0.1.0a1` (canonical) で行い、続けて `README.md` の `Beta Tester Install (GitHub main)` 節の acceptance smoke (rules install → skill install → `mozyo-bridge doctor` → isolated target に対する Asana / Redmine scaffold + doctor) を TestPyPI install に対して実行する。
+- `pipx` が default backend に `uv` を使う環境では、TestPyPI の `--index-url` と dependency 用 `--extra-index-url` の組み合わせが期待通り解決されないことがあるため、TestPyPI 検証では `--backend pip` を明示する。ただし `--backend pip` は **flag を advertise する pipx にのみ**渡す (古い pipx では argparse error になり install が中断する。Redmine #15507 実測: pipx 1.8.0)。古い pipx は元から pip backend なので省略しても解決経路は変わらない。canonical path は条件判定済みの `scripts/install_testpypi_dev.sh <exact version>` を使うこと。
 - 必要なら `git tag -a v0.1.0a1 -m "Pre-release v0.1.0a1"` で tag を打って push する。GitHub Release は作らない。
 
 `mozyo-bridge release publish --plan` は現在の git ref / pyproject version / 最新 `Test` workflow conclusion / TestPyPI 既存 version の有無を at-a-glance で集約する。release を進めるか / pre-release に留めるかの判定は引き続き operator が行う (helper は GA / beta / patch を判定しない)。

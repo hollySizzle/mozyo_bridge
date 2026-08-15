@@ -120,11 +120,13 @@ false positive とその根拠は、active な release ticket に記録する (r
 - remote tag が意図した release commit を指すことを `git ls-remote origin refs/tags/vX.Y.Z` で確認する。
 - release acceptance を主張する際に、TestPyPI / PyPI package と floating な `main` 由来の install script を混在させない。
 
-TestPyPI 検証では pip backend を強制し、`mozyo-bridge` には TestPyPI を使い、依存関係には PyPI を利用可能なままにする:
+TestPyPI 検証では `mozyo-bridge` に TestPyPI を使い、依存関係には PyPI を利用可能なままにする:
 
 ```bash
-pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args "--extra-index-url https://pypi.org/simple/" mozyo-bridge==X.Y.Z
+scripts/install_testpypi_dev.sh X.Y.Z
 ```
+
+`--backend pip` は **flag を advertise する pipx にのみ**渡す (古い pipx では argparse error になり install が中断する。Redmine #15507 実測: pipx 1.8.0)。古い pipx は元から pip backend なので省略しても解決経路は変わらない。canonical path は条件判定済みの `scripts/install_testpypi_dev.sh <exact version>` を使うこと。
 
 内部 beta distribution のために GitHub Release を作成しない。production の publish workflow は `release: published` で走るため、GitHub Release は production trigger である。
 

@@ -27,8 +27,16 @@ _TESTS = ROOT / "tests"
 #: `unittest` APIs newer than the minimum supported Python, mapped to the
 #: version that introduced them. A test using one of these runs green on the
 #: single-Python lanes and errors on the minimum, so it is banned outright.
+#:
+#: Everything unittest added between the floor and the lane Python belongs
+#: here, not just the one that bit us: `enterContext` was found by a release
+#: matrix, and its 3.11 siblings would have been found the same expensive way
+#: (Redmine #15507 review j#105422 finding_pyguard).
 _TOO_NEW_TESTCASE_APIS = {
+    # TestCase / IsolatedAsyncioTestCase context helpers, all new in 3.11.
     "enterContext": "3.11",
+    "enterClassContext": "3.11",
+    "enterAsyncContext": "3.11",
 }
 
 
@@ -78,8 +86,11 @@ class MinimumPythonTestApiTest(unittest.TestCase):
                 func = node.func
                 if not isinstance(func, ast.Attribute):
                     continue
-                if not isinstance(func.value, ast.Name):
-                    continue
+                # Match the attribute name wherever the receiver comes from:
+                # `self.x()`, `cls.x()`, `type(self).x()`, `self.case.x()`.
+                # Keying on the receiver shape would let a nested or computed
+                # receiver walk past a ban that is about the API, not the call
+                # site (review j#105422 finding_pyguard).
                 introduced = _TOO_NEW_TESTCASE_APIS.get(func.attr)
                 if introduced is None:
                     continue
@@ -96,6 +107,43 @@ class MinimumPythonTestApiTest(unittest.TestCase):
                 + "\n".join(offenders)
             ),
         )
+
+
+class GuardActuallyRedensTest(unittest.TestCase):
+    """Every banned API must really fail the scan, in each call shape.
+
+    A ban list is only as good as the matcher behind it: an entry that the AST
+    walk never matches is a comment, not a guard. This drives the same scan
+    logic over synthetic sources so a silently-ineffective entry is a failure
+    here rather than a green suite on the minimum Python.
+    """
+
+    RECEIVERS = ("self", "cls", "type(self)", "self.case")
+
+    def _offenders_in(self, source: str) -> list[str]:
+        tree = ast.parse(source)
+        found = []
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not isinstance(func, ast.Attribute):
+                continue
+            if func.attr in _TOO_NEW_TESTCASE_APIS:
+                found.append(func.attr)
+        return found
+
+    def test_every_banned_api_is_caught_in_every_receiver_shape(self) -> None:
+        for api in _TOO_NEW_TESTCASE_APIS:
+            for receiver in self.RECEIVERS:
+                with self.subTest(api=api, receiver=receiver):
+                    source = f"def t():\n    {receiver}.{api}(ctx)\n"
+                    self.assertEqual([api], self._offenders_in(source))
+
+    def test_an_allowed_api_is_not_caught(self) -> None:
+        # The 3.10-compatible replacement must stay usable.
+        source = "def t():\n    self.addCleanup(p.stop)\n"
+        self.assertEqual([], self._offenders_in(source))
 
 
 if __name__ == "__main__":  # pragma: no cover

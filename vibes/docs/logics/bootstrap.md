@@ -244,11 +244,15 @@ Important update rules:
   not scaffold drift.
 
 If `pipx upgrade mozyo-bridge` fails because the local pipx backend cannot
-install the package, retry with pipx's pip backend using a forced install of the
-desired release:
+install the package, retry with a forced install of the desired release. Pass
+`--backend pip` only if your pipx advertises it (`pipx install --help`): older
+pipx versions reject the unknown flag and abort the install, and they already
+use pip, so omitting it changes nothing about resolution (Redmine #15507,
+observed on pipx 1.8.0):
 
 ```bash
-pipx install --force --backend pip mozyo-bridge==<X.Y.Z>
+pipx install --force mozyo-bridge==<X.Y.Z>              # any pipx
+pipx install --force --backend pip mozyo-bridge==<X.Y.Z>  # pipx that has --backend
 ```
 
 Use the exact version only when pinning to a known release. For routine updates,
