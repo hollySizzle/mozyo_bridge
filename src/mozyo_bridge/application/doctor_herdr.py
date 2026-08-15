@@ -32,6 +32,8 @@ repairs, or asserts workflow truth.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Callable, Mapping, Optional, Protocol, runtime_checkable
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (
@@ -97,6 +99,106 @@ _ATTESTATION_NEXT_ACTION = (
     "close/relaunch action exists yet. Do not substitute raw `herdr pane close` "
     "or `herdr session-start`"
 )
+
+
+_STORE_ADMISSION_NEXT_ACTION = (
+    "this home's stores do not admit a managed launch, so `mozyo` / `mozyo-bridge herdr "
+    "session-start` will be refused here until they are repaired (Redmine #15520). Run "
+    "the read-only `mozyo-bridge herdr attestation-store status` and `mozyo-bridge herdr "
+    "launch-generation-store status` to see the shapes, then the rail the status names: "
+    "`mozyo-bridge herdr attestation-store migrate --write` for a recognized older "
+    "attestation store, `mozyo-bridge herdr launch-generation-store rebuild --write` for "
+    "an unreadable launch-generation store. Both are offline maintenance: they refuse "
+    "while managed agents still hold records in the store, so retire those pairs first"
+)
+_GENERATION_STORE_DETAIL = (
+    "the launch-generation store is not readable by this runtime, so a managed launch "
+    "cannot reserve the generation its startup attestation finalizes against"
+)
+
+
+@dataclass(frozen=True)
+class HerdrStoreAdmission:
+    """Whether this home's stores admit a managed launch at all (Redmine #15520).
+
+    A **home-level** fact, deliberately independent of the doctor target's repo: the
+    attestation and launch-generation stores are shared per ``MOZYO_BRIDGE_HOME``, and an
+    inadmissible shape refuses every managed launch on the host regardless of which repo
+    is being examined or whether that repo's workspace currently has live panes.
+
+    ``ok`` false carries the launch preflight's own ``reason`` / ``detail``, because both
+    come from the same functions the preflight calls — see
+    :class:`LiveHerdrStoreAdmissionReads`.
+    """
+
+    ok: bool
+    reason: Optional[str] = None
+    detail: Optional[str] = None
+
+    def to_record(self) -> dict[str, Any]:
+        return {"ok": self.ok, "reason": self.reason, "detail": self.detail}
+
+
+@runtime_checkable
+class HerdrStoreAdmissionReads(Protocol):
+    """Port: read whether the home's stores admit a managed launch."""
+
+    def describe(self) -> HerdrStoreAdmission:
+        ...
+
+
+class LiveHerdrStoreAdmissionReads:
+    """Live adapter: ask the launch preflight's own store gates, on the real home.
+
+    Both probes here are the ones ``preflight_*`` calls in ``herdr_pane_lifecycle``:
+    :func:`decide_store_admission` (the store-side half of the attestation join, shared
+    since Redmine #15520) and :func:`probe_launch_generation_store` against the same
+    ``ABSENT``/``HEALTHY`` admissible set. Reusing them rather than restating the rule is
+    the whole point of the fix — doctor previously reported ``ok`` on a host where every
+    launch was already being refused, and a re-implementation would drift back into that.
+
+    Read-only: probes never create, migrate, or repair a store (an absent store is a
+    legitimate fresh home and stays absent).
+    """
+
+    def __init__(self, home: Optional[Path] = None) -> None:
+        self._home = home
+
+    def describe(self) -> HerdrStoreAdmission:
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            herdr_identity_attestation_path,
+        )
+        from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+            HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+            probe_store_schema,
+        )
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            GENERATION_STORE_ABSENT,
+            GENERATION_STORE_HEALTHY,
+            herdr_launch_generation_path,
+            probe_launch_generation_store,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_store_admission import (  # noqa: E501
+            decide_store_admission,
+        )
+
+        verdict = decide_store_admission(
+            probe_store_schema(herdr_identity_attestation_path(self._home)),
+            required_schema_version=HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+        )
+        if verdict is not None and not verdict.ok:
+            return HerdrStoreAdmission(False, verdict.reason, verdict.detail)
+        generation_state, _detail = probe_launch_generation_store(
+            herdr_launch_generation_path(self._home)
+        )
+        if generation_state not in (GENERATION_STORE_ABSENT, GENERATION_STORE_HEALTHY):
+            # The preflight's own reason token, so the section names the same failure
+            # the launch would. `_detail` is dropped deliberately: it can quote store
+            # content, and this section is rendered to the terminal and command log.
+            return HerdrStoreAdmission(
+                False, "launch_generation_store_unsupported", _GENERATION_STORE_DETAIL
+            )
+        return HerdrStoreAdmission(True)
 
 
 def build_attestation_joins(
@@ -196,6 +298,7 @@ def evaluate_herdr_section(
     view: HerdrInventoryView,
     *,
     attestations: Optional[Mapping[str, AttestationJoin]] = None,
+    store_admission: Optional[HerdrStoreAdmission] = None,
 ) -> Optional[dict[str, Any]]:
     """Pure policy: derive the doctor ``herdr`` section from the inventory view.
 
@@ -220,6 +323,14 @@ def evaluate_herdr_section(
     :func:`build_attestation_joins`) is optional so the tmux / server-down / no-segment
     paths and callers that do not join stay byte-invariant; when omitted no
     attestation verdict is applied.
+
+    ``store_admission`` (Redmine #15520) is likewise optional. When supplied and not
+    ``ok`` the section is ``error``: the home's stores refuse every managed launch, which
+    doctor previously did not report at all — a v3 attestation store produced a green
+    ``herdr`` section on a host where `mozyo` was already failing. It is judged BEFORE the
+    attestation join and before the no-live-agent branch, because it is the *cause* of the
+    states those report (an unmigrated store reads the whole home unattested) and because
+    it holds whether or not this repo's workspace has any live pane.
     """
     if not view.backend_selected:
         return None
@@ -259,6 +370,20 @@ def evaluate_herdr_section(
         section["status"] = "warning"
         section["notes"].append(_WORKSPACE_SEGMENT_WARNING)
         section["next_action"].append(_WORKSPACE_SEGMENT_NEXT_ACTION)
+        return section
+
+    # Store admissibility (Redmine #15520). A home whose stores refuse managed launch is
+    # not healthy no matter how well the server answers, so this precedes every remaining
+    # branch — including the no-live-agent `ok`, which is exactly how a v3 store passed as
+    # green on the Mac that could not launch at all.
+    if store_admission is not None and not store_admission.ok:
+        section["status"] = "error"
+        section["store_admission"] = store_admission.to_record()
+        section["notes"].append(
+            f"managed launch is refused by this home's stores "
+            f"({store_admission.reason}): {store_admission.detail}"
+        )
+        section["next_action"].append(_STORE_ADMISSION_NEXT_ACTION)
         return section
 
     inventory_identity_incomplete = (
@@ -329,10 +454,14 @@ class HerdrSectionUseCase:
         attestation_reader: Optional[
             Callable[[str], Optional[IdentityAttestationRecord]]
         ] = None,
+        store_admission_reads: Optional[HerdrStoreAdmissionReads] = None,
     ) -> None:
         self._reads = reads
         self._attestation_reader = (
             attestation_reader or HerdrIdentityAttestationStore().read
+        )
+        self._store_admission_reads = (
+            store_admission_reads or LiveHerdrStoreAdmissionReads()
         )
 
     def execute(self) -> Optional[dict[str, Any]]:
@@ -341,13 +470,26 @@ class HerdrSectionUseCase:
         # with its startup self-attestation (Redmine #13637); the tmux / server-down /
         # no-segment sections need no join and stay byte-invariant.
         joins = build_attestation_joins(view, self._attestation_reader)
-        return evaluate_herdr_section(view, attestations=joins)
+        # The store probes are skipped entirely for a non-herdr target and for an
+        # unreadable inventory: the section is already absent / error there, and the
+        # probes would be pointless disk reads on a host doctor is not judging.
+        store_admission = (
+            self._store_admission_reads.describe()
+            if view.backend_selected and view.ok
+            else None
+        )
+        return evaluate_herdr_section(
+            view, attestations=joins, store_admission=store_admission
+        )
 
 
 __all__ = (
     "HerdrDoctorReads",
     "HerdrSectionUseCase",
+    "HerdrStoreAdmission",
+    "HerdrStoreAdmissionReads",
     "LiveHerdrDoctorReads",
+    "LiveHerdrStoreAdmissionReads",
     "build_attestation_joins",
     "evaluate_herdr_section",
 )
