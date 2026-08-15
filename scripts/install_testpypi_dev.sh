@@ -257,9 +257,20 @@ echo "Installing TestPyPI artifact: $spec"
 # --no-cache-dir prevents a just-published exact version from being hidden by a
 # stale cached Simple Index response. --force reinstalls / updates the existing
 # pipx app in place on the normal PATH.
+#
+# `--backend` only exists on the pipx versions that can choose a non-pip
+# backend; passing it to an older pipx is an argparse error, not a no-op, so it
+# is applied ONLY when this pipx advertises it. A pipx without the flag has no
+# alternative backend to select — pip is already what it uses — so omitting it
+# preserves the intended resolution rather than weakening it.
+backend_args=""
+if pipx install --help 2>&1 | grep -q -- "--backend"; then
+  backend_args="--backend pip"
+fi
+# shellcheck disable=SC2086 # backend_args is a controlled, word-split-by-design pair
 pipx install \
   --force \
-  --backend pip \
+  $backend_args \
   --index-url https://test.pypi.org/simple/ \
   --pip-args "--extra-index-url https://pypi.org/simple/ --pre --no-cache-dir" \
   "$spec"
