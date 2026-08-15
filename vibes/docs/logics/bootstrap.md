@@ -143,11 +143,30 @@ command -v pipx
 ```
 
 Then check ONLY the terminal backend this project selects — probing the other
-one reports a failure that does not apply to this host:
+one reports a failure that does not apply to this host. Determine which one is
+selected first:
 
 ```bash
-# Which backend? No terminal_transport block means the tmux default.
-grep -A1 '^terminal_transport:' .mozyo-bridge/config.yaml 2>/dev/null
+# Which backend? Ask the tools that resolve it — do not read the YAML by eye.
+# A key order like `version:` before `backend:`, or no config file at all, are
+# both normal, and neither is something a line-oriented grep can judge.
+
+# 1. If a repo-local config exists, prove THIS build parses it. Having no
+#    config at all is the normal tmux default, not a failure, so the absence
+#    branch says so instead of exiting non-zero.
+if [ -f .mozyo-bridge/config.yaml ]; then
+  mozyo-bridge config check-parse --file .mozyo-bridge/config.yaml
+else
+  echo "no repo-local config: tmux default"
+fi
+
+# 2. ONLY after step 1 is clean (exit 2 means malformed — including an
+#    unrecognised backend value — so stop and fix it rather than guessing):
+#    read the backend the runtime actually resolved. The herdr section is
+#    present only when the herdr backend is selected (Redmine #13355), so its
+#    absence IS the tmux default.
+mozyo-bridge doctor --json --repo . \
+  | python3 -c 'import json,sys; print((json.load(sys.stdin)["sections"].get("herdr") or {}).get("backend", "tmux"))'
 ```
 
 ```bash
@@ -168,6 +187,11 @@ Expected:
 
 - `python3 --version` reports `3.10` or newer (`mozyo-bridge` requires Python >= 3.10).
 - `pipx` resolves to an installed path.
+- Step 1 prints either `parsed (schema version N)` or, with no config file,
+  `no repo-local config: tmux default`. Exit 2 is a malformed config —
+  including an unrecognised backend value — and stops Stage 0 here; step 2's
+  answer is not meaningful until it parses.
+- Step 2 prints exactly `tmux` or `herdr`. That is the backend to check below.
 - The backend the project selects resolves — and only that one:
   - default (tmux): `tmux` resolves to an installed path. `herdr` is not
     checked and its absence is not a finding.
