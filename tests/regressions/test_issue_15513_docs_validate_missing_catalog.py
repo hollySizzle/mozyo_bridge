@@ -8,11 +8,13 @@ traceback that reads as "the tool is broken" — hit while running the release
 acceptance smoke against a freshly scaffolded target during the 1.0.0
 production install QA (#15507 j#105418).
 
-The same investigation found the sibling escapes: a non-mapping root and
-unparseable YAML raised through the command too, so "cannot read the catalog"
-is handled as one class. A valid catalog must still pass, and a catalog that
-reads fine but fails structural rules must keep its own per-rule diagnostics
-rather than being flattened into the new branch.
+The same investigation found sibling escapes — a non-mapping root and
+unparseable YAML raise through the command too — but this issue's scope
+declares invalid-catalog behaviour unchanged, so they stay out of here and are
+tracked separately (review j#105791 finding_1). What this file must still
+prove is that the missing-catalog branch does not swallow the cases around it:
+a valid catalog passes, and a catalog that reads fine but breaks the rules
+keeps its own per-rule diagnostics.
 """
 
 from __future__ import annotations
@@ -93,22 +95,9 @@ class DocsValidateMissingCatalogTest(unittest.TestCase):
         self.assertEqual(0, code)
         self.assertIn("catalog validation passed", output)
 
-    def test_an_unreadable_catalog_refuses_in_words(self) -> None:
-        # Present but not readable as a catalog: a non-mapping root and broken
-        # YAML both raised through the command before this fix.
-        for label, text in (
-            ("non-mapping root", "- not\n- a mapping\n"),
-            ("broken yaml", "documents: [unclosed\n"),
-        ):
-            with self.subTest(label=label):
-                code, output = self._run(self._repo(text))
-                self.assertEqual(1, code)
-                self.assertIn("cannot read", output)
-                self.assertNotIn("Traceback", output)
-
     def test_a_structurally_invalid_catalog_keeps_per_rule_errors(self) -> None:
-        # Reads fine, breaks the rules: the new branches must not swallow the
-        # validator's own findings.
+        # Reads fine, breaks the rules: the missing-catalog branch must not
+        # swallow the validator's own findings.
         code, output = self._run(
             self._repo("schema_version: 2\nmanaged_types: []\ndocuments: []\n")
         )
@@ -116,7 +105,6 @@ class DocsValidateMissingCatalogTest(unittest.TestCase):
         self.assertEqual(1, code)
         self.assertIn("catalog validation failed", output)
         self.assertIn("schema_version must be 1", output)
-        self.assertNotIn("cannot read", output)
         self.assertNotIn("no docs catalog at", output)
 
 

@@ -312,23 +312,9 @@ def cmd_docs_validate(args: argparse.Namespace) -> int:
             "`--catalog` at an existing catalog"
         )
         return 1
-    import yaml
-
-    try:
-        errors = validate_catalog(
-            context, strict_metadata=bool(getattr(args, "strict_metadata", False))
-        )
-    except (OSError, ValueError, yaml.YAMLError) as exc:
-        # A catalog that cannot be READ AT ALL — unparseable YAML, a non-mapping
-        # root, an unreadable file — is a validation result, not a crash. The
-        # reader raises for each of those, and every one of them used to reach
-        # the operator as a traceback (Redmine #15513).
-        print(
-            "catalog validation failed: cannot read "
-            f"{_docs_relpath(context, context.catalog_path)}"
-        )
-        print(f"- {exc}")
-        return 1
+    errors = validate_catalog(
+        context, strict_metadata=bool(getattr(args, "strict_metadata", False))
+    )
     notices: list[str] = []
     if getattr(args, "check_file_coverage", False):
         coverage_errors, coverage_notices = validate_file_coverage(
