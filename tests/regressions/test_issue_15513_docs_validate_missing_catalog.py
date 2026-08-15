@@ -13,11 +13,11 @@ unparseable YAML raise through the command too — but this issue's scope
 declares invalid-catalog behaviour unchanged, so fixing them is tracked
 separately as #15514 (review j#105791 finding_1).
 
-"Unchanged" is a claim, so it is pinned rather than asserted: the
-characterization below records what those paths do TODAY. It is deliberately
-not an endorsement — #15514 will replace that raising behaviour with a
-value-free typed refusal, and is expected to update this class in the same
-change. The rest of the file proves the missing-catalog branch does not
+#15514 has since replaced that raising behaviour with a value-free typed
+refusal, and updated the class below in the same change, as its docstring
+required. What it pins now is that the replacement still distinguishes the
+same shapes — and, per that issue, without echoing catalog content. The rest
+of the file proves the missing-catalog branch does not
 swallow the cases around it: a valid catalog passes, and a catalog that reads
 fine but breaks the rules keeps its own per-rule diagnostics.
 """
@@ -113,41 +113,46 @@ class DocsValidateMissingCatalogTest(unittest.TestCase):
         self.assertNotIn("no docs catalog at", output)
 
 
-class LegacyInvalidCatalogCharacterizationTest(unittest.TestCase):
-    """What an unreadable catalog does today — pinned, not endorsed.
+class UnreadableCatalogBehaviourTest(unittest.TestCase):
+    """What an unreadable catalog does, kept verifiable across #15513/#15514.
 
-    The scope of #15513 is the ABSENT catalog. These cases exist so that the
-    "invalid behaviour is unchanged" half of that scope is verifiable rather
-    than merely stated: without them, the legacy exception could drift before
-    #15514 deliberately replaces it and this suite would stay green.
+    The scope of #15513 was the ABSENT catalog, and it pinned the then-current
+    raising behaviour so "invalid behaviour is unchanged" was checkable rather
+    than merely stated. #15514 then replaced that behaviour deliberately, and
+    updated these cases with it — the handoff the previous docstring called for.
 
-    Fixtures carry no sensitive-looking value, and the YAML case pins only the
-    exception CLASS: PyYAML embeds the offending source line in its message, so
-    asserting that message would pull catalog input into the expectation — the
-    same echo that review j#105791 finding_2 flagged.
+    Fixtures still carry no sensitive-looking value, and expectations still
+    avoid asserting any text that could come from the catalog itself: the
+    leak that motivated #15514 was exactly such an echo (review j#105791
+    finding_2). Reason phrases below are fixed strings chosen by the reader.
     """
 
-    def _validate(self, catalog_text: str):
+    def _validate_capturing(self, catalog_text: str) -> tuple[int, str]:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         repo = Path(tmp.name)
         docs_dir = repo / ".mozyo-bridge" / "docs"
         docs_dir.mkdir(parents=True)
         (docs_dir / "catalog.yaml").write_text(catalog_text, encoding="utf-8")
-        with contextlib.redirect_stdout(io.StringIO()):
-            return cmd_docs_validate(argparse.Namespace(repo=str(repo)))
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            code = cmd_docs_validate(argparse.Namespace(repo=str(repo)))
+        return code, out.getvalue()
 
-    def test_a_non_mapping_root_still_raises_its_legacy_error(self) -> None:
-        with self.assertRaises(ValueError) as caught:
-            self._validate("- not\n- a mapping\n")
-        # Input-independent text, so pinning it echoes nothing.
-        self.assertEqual("catalog root must be a mapping", str(caught.exception))
+    def test_a_non_mapping_root_is_reported_not_raised(self) -> None:
+        code, output = self._validate_capturing("- not\n- a mapping\n")
 
-    def test_unparseable_yaml_still_raises_its_legacy_exception_class(self) -> None:
-        import yaml
+        self.assertEqual(1, code)
+        self.assertIn("cannot read", output)
+        # Fixed phrase from the reader, not text taken from the catalog.
+        self.assertIn("catalog root must be a mapping", output)
 
-        with self.assertRaises(yaml.YAMLError):
-            self._validate("documents: [unclosed\n")
+    def test_unparseable_yaml_is_reported_not_raised(self) -> None:
+        code, output = self._validate_capturing("documents: [unclosed\n")
+
+        self.assertEqual(1, code)
+        self.assertIn("cannot read", output)
+        self.assertIn("not valid YAML", output)
 
 
 if __name__ == "__main__":  # pragma: no cover
