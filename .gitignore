@@ -29,6 +29,14 @@ venv/
 .mozyo-bridge/workspace.json
 .mozyo-bridge/workspace-anchor.json
 
+# Sublane git worktrees (Redmine #15507). Each entry is a separate checkout
+# with its own `.git` file — per-operator process state, never repository or
+# release content. Left untracked-but-not-ignored they surface in
+# `git ls-files --others --exclude-standard`, which is the release source
+# snapshot's input, and the artifact gate then fails closed on a directory it
+# cannot copy.
+.worktrees/
+
 # Local secrets and release credentials
 .env
 .env.*
