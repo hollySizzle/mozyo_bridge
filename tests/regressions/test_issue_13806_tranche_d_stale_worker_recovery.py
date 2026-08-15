@@ -249,20 +249,25 @@ class _RecoveryCase(unittest.TestCase):
         # so the pre-#14741 receipt-capability path is seeded explicitly with the current
         # terminal-bound v4 attestation + completed generation-v2 authority.
         self._seed_current_authority()
-        self.enterContext(
-            patch(
-                "mozyo_bridge.e_110_execution_platform."
-                "f_140_delegated_coordinator_nested_handoff.application."
-                "sublane_herdr_projection.list_herdr_agent_rows",
-                return_value=[
-                    {
-                        "name": WORKER["assigned_name"],
-                        "pane_id": WORKER["old_locator"],
-                        "terminal_id": WORKER_TERMINAL,
-                    }
-                ],
-            )
+        # `TestCase.enterContext` is Python 3.11+, and the supported matrix
+        # (`requires-python = ">=3.10"`) still includes 3.10, where it raises
+        # AttributeError in setUp — every test in this class errors, and the
+        # #14741 site-wiring test that drives this fixture fails with it. The
+        # start()/addCleanup(stop) form is the 3.10-compatible equivalent.
+        rows_patcher = patch(
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "sublane_herdr_projection.list_herdr_agent_rows",
+            return_value=[
+                {
+                    "name": WORKER["assigned_name"],
+                    "pane_id": WORKER["old_locator"],
+                    "terminal_id": WORKER_TERMINAL,
+                }
+            ],
         )
+        rows_patcher.start()
+        self.addCleanup(rows_patcher.stop)
 
     def _seed_current_authority(self, **overrides):
         base = dict(
