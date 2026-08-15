@@ -573,31 +573,29 @@ This is also where the terminal backend deferred from Stage 0 is settled —
 neither the config file nor its key order has to be read by hand:
 
 ```bash
-# 1. FIRST, if the project has a repo-local config, prove this build parses it.
-#    A malformed config — an unrecognised backend value included — resolves to
-#    the tmux default inside the runtime, so the selector below would print
-#    `tmux` and look exactly like a healthy default project. check-parse is
-#    what tells those two apart, which is why it runs first and stops here on
-#    exit 2. No config file at all is the genuine tmux default and needs none
-#    of this.
-if [ -f /path/to/project/.mozyo-bridge/config.yaml ]; then
-  mozyo-bridge config check-parse --file /path/to/project/.mozyo-bridge/config.yaml
-fi
+project=/path/to/project
 
-# 2. Only once step 1 is clean: which backend did the runtime resolve? The
-#    `herdr` section is present only under the herdr backend (Redmine #13355),
-#    so its absence is the tmux default.
-mozyo-bridge doctor --json --target /path/to/project \
-  | python3 -c 'import json,sys; print((json.load(sys.stdin)["sections"].get("herdr") or {}).get("backend", "tmux"))'
+# A malformed config — an unrecognised backend value included — resolves to the
+# tmux default inside the runtime, so the backend reading alone would print
+# `tmux` and look exactly like a healthy default project. So parse first and
+# let the shell stop there: the reading runs ONLY if the config parses, and a
+# missing config file short-circuits as the genuine tmux default. Chained with
+# `&&` rather than sequenced, because a bare `if` would let a failed parse fall
+# through into the reading.
+{ [ ! -f "$project/.mozyo-bridge/config.yaml" ] \
+    || mozyo-bridge config check-parse --file "$project/.mozyo-bridge/config.yaml"; } \
+  && mozyo-bridge doctor --json --target "$project" \
+     | python3 -c 'import json,sys; raw=sys.stdin.read().strip(); sys.exit("doctor produced no JSON") if not raw else print((json.loads(raw)["sections"].get("herdr") or {}).get("backend", "tmux"))'
 ```
 
-- step 1 exits 2 → the config is malformed. Stop and fix it; the backend
-  reading is not meaningful until it parses.
-- step 2 prints `tmux` → `tmux` must be installed; absent tmux shows as
+- the command exits 2 and prints no backend → the config is malformed. Fix it;
+  the backend reading is not meaningful until it parses, and the chain
+  deliberately never reached it.
+- prints `tmux` → `tmux` must be installed; absent tmux shows as
   `tmux: missing` above.
-- step 2 prints `herdr` → the herdr binary must resolve (`MOZYO_HERDR_BINARY`
-  wins over `PATH`); the `herdr` section reports it, and `tmux: skipped` there
-  means tmux is simply not needed on this host, not a finding.
+- prints `herdr` → the herdr binary must resolve (`MOZYO_HERDR_BINARY` wins
+  over `PATH`); the `herdr` section reports it, and `tmux: skipped` there means
+  tmux is simply not needed on this host, not a finding.
 
 Expected state when the Claude primary path (plugin marketplace) is used:
 

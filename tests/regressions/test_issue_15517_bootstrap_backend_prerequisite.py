@@ -9,11 +9,14 @@ so they are pinned mechanically rather than re-read:
   `mozyo-bridge` nor a backend probe — the config that says which backend
   applies cannot be read correctly yet, and probing the wrong one reports a
   failure the host does not have (review j#105829, j#105833 finding_1).
-- Stage 5 must run `config check-parse` BEFORE reading the resolved backend. A
-  malformed config folds to the tmux default inside the runtime, so the
-  selector prints `tmux` and is indistinguishable from a healthy default
-  project; check-parse is the only thing that separates them (review j#105833
-  finding_2).
+- Stage 5 must not read the backend when the config does not parse. A malformed
+  config folds to the tmux default inside the runtime, so the reading prints
+  `tmux` and is indistinguishable from a healthy default project (review
+  j#105833 finding_2). Ordering alone does not achieve this: a bare `if` lets a
+  failed parse fall through into the reading, which is how the fail-open path
+  survived a round while a position-only assertion passed (review j#105839).
+  So the block is EXECUTED here, against a stubbed CLI, and judged on whether
+  the reading actually ran.
 - The backend reading must stay derived from the runtime's own answer rather
   than from re-parsing the YAML, whose key order is not the backend contract
   (review j#105825).
@@ -21,7 +24,11 @@ so they are pinned mechanically rather than re-read:
 
 from __future__ import annotations
 
+import os
 import re
+import subprocess
+import tempfile
+import textwrap
 import unittest
 from pathlib import Path
 
@@ -84,8 +91,89 @@ class StageZeroNeedsNothingItDoesNotHaveTest(unittest.TestCase):
         )
 
 
+def _stage5_backend_block() -> str:
+    """The Stage 5 bash block that reads the backend."""
+    for block in re.findall(r"```bash\n(.*?)```", _stage("5"), re.S):
+        if "check-parse" in block:
+            return block
+    raise AssertionError("Stage 5 has no backend-reading block")
+
+
+class StageFiveStopsWhenTheConfigDoesNotParseTest(unittest.TestCase):
+    """Run the documented block with a stubbed CLI and watch what it does.
+
+    The previous version of this file asserted only that `check-parse` appeared
+    before the reading. That is true of a fail-OPEN block too, so it passed the
+    exact defect it was meant to catch. These cases execute the block instead.
+    """
+
+    def _run_block(self, *, check_parse_exit: int, with_config: bool):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        root = Path(tmp.name)
+        project = root / "project"
+        (project / ".mozyo-bridge").mkdir(parents=True)
+        if with_config:
+            (project / ".mozyo-bridge" / "config.yaml").write_text("version: 2\n")
+
+        # A mozyo-bridge that records whether the backend reading was reached.
+        bindir = root / "bin"
+        bindir.mkdir()
+        doctor_marker = root / "doctor-ran"
+        stub = bindir / "mozyo-bridge"
+        stub.write_text(
+            textwrap.dedent(
+                f"""            #!/bin/sh
+            case "$1 $2" in
+              "config check-parse") exit {check_parse_exit} ;;
+              "doctor --json")
+                : > "{doctor_marker}"
+                echo '{{"sections": {{}}}}'
+                ;;
+            esac
+            """
+            )
+        )
+        stub.chmod(0o755)
+
+        script = _stage5_backend_block().replace("/path/to/project", str(project))
+        result = subprocess.run(
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env={**os.environ, "PATH": f"{bindir}{os.pathsep}{os.environ['PATH']}"},
+        )
+        return result, doctor_marker.exists()
+
+    def test_a_failed_parse_never_reaches_the_backend_reading(self) -> None:
+        result, doctor_ran = self._run_block(check_parse_exit=2, with_config=True)
+
+        self.assertFalse(
+            doctor_ran, "the backend reading ran despite the config not parsing"
+        )
+        self.assertNotEqual(0, result.returncode, "a failed parse must fail the block")
+        self.assertNotIn("tmux", result.stdout)
+        self.assertNotIn("herdr", result.stdout)
+
+    def test_a_clean_parse_reaches_the_backend_reading(self) -> None:
+        result, doctor_ran = self._run_block(check_parse_exit=0, with_config=True)
+
+        self.assertTrue(doctor_ran, "the backend reading did not run")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("tmux", result.stdout.strip())
+
+    def test_no_config_file_is_the_ordinary_default(self) -> None:
+        # Absence must short-circuit as healthy, not as a parse failure.
+        result, doctor_ran = self._run_block(check_parse_exit=2, with_config=False)
+
+        self.assertTrue(doctor_ran, "a project with no config must still be read")
+        self.assertEqual(0, result.returncode, result.stderr)
+        self.assertEqual("tmux", result.stdout.strip())
+
+
 class StageFiveChecksTheConfigBeforeTrustingItTest(unittest.TestCase):
     def test_check_parse_precedes_the_backend_reading(self) -> None:
+        # Secondary to the executed cases above: necessary, never sufficient.
         section = _stage("5")
         parse_at = section.find("config check-parse")
         selector_at = section.find('sections"].get("herdr")')
