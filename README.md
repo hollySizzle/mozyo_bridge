@@ -37,9 +37,17 @@ On platforms without Homebrew, follow the instructions at <https://herdr.dev>.
 `PATH`, and refuses to fall back to tmux when the herdr backend is selected but
 no binary resolves.
 
-`herdr update` upgrades to the latest release, which can move you off the
-version this project verified. Pin deliberately: check `herdr --version`
-against the supported version above after any update.
+Update Herdr the way you installed it — its own updater is only for its own
+installer, and is disabled for package-manager installs:
+
+| installed with | update with |
+| --- | --- |
+| Homebrew | `brew upgrade herdr` |
+| Herdr's own installer | `herdr update` |
+| mise / Nix | that tool's own upgrade path |
+
+Any of them can move you off the version this project verified, so check
+`herdr --version` against the supported version above after updating.
 
 When upgrading an existing Herdr-backed installation, checkpoint the work in
 progress, stop the old session, and start a fresh named session from the new

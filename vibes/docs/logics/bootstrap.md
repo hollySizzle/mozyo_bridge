@@ -30,8 +30,10 @@ In scope:
   carries the supported 0.8.0 (`brew install herdr`), and other platforms
   follow that site. `mozyo-bridge` resolves it via `MOZYO_HERDR_BINARY` or the
   trusted PATH and refuses to fall back to tmux when it is missing, so this is
-  a real prerequisite rather than an optimization. `herdr update` can move a
-  host off the verified version — re-check `herdr --version` after updating.
+  a real prerequisite rather than an optimization. Update it through whatever
+  installed it (`herdr update` is disabled for package-manager installs); any
+  update can move a host off the verified version, so re-check
+  `herdr --version` afterwards.
   Details and the supported version live in README "Herdr support and breaking
   upgrades" (Redmine #15517).
 - existing CLI / rules / scaffold update after a release ships.
@@ -135,23 +137,44 @@ Preset selection summary:
 ## Stage 0 — Prerequisites
 
 ```bash
-command -v tmux
 command -v python3
 python3 --version
 command -v pipx
+
+# Terminal backend: check the one this project selects.
+# Default (no terminal_transport block) is tmux.
+grep -A1 '^terminal_transport:' .mozyo-bridge/config.yaml 2>/dev/null
+command -v tmux     # default backend
+command -v herdr    # only when the project declares backend: herdr
+herdr --version     # same case: expect the supported version
 ```
 
 Expected:
 
-- `tmux` resolves to an installed path.
 - `python3 --version` reports `3.10` or newer (`mozyo-bridge` requires Python >= 3.10).
 - `pipx` resolves to an installed path.
+- The backend the project selects resolves:
+  - default (tmux): `tmux` resolves to an installed path.
+  - `terminal_transport.backend: herdr`: `herdr` resolves and `herdr --version`
+    reports the version README "Herdr support and breaking upgrades" declares
+    supported. `tmux` is NOT required on such a host — `mozyo-bridge doctor`
+    judges the selected backend and reports absent tmux as informational there
+    (Redmine #15508).
 
 If a signal is missing:
 
-- `tmux` missing → install via the OS package manager (for example `brew install tmux`, `apt install tmux`). `mozyo-bridge --help` works without tmux; every pane / notification command requires it.
 - `python3` < 3.10 → install a newer Python before continuing.
 - `pipx` missing → see Stage 1 fallback.
+- `tmux` missing **on a tmux-backend project** → install via the OS package
+  manager (for example `brew install tmux`, `apt install tmux`).
+  `mozyo-bridge --help` works without tmux; its pane / notification commands do
+  not.
+- `herdr` missing **on a herdr-backend project** → install it (Homebrew carries
+  the supported version: `brew install herdr`; other platforms follow
+  <https://herdr.dev>). The herdr backend refuses to fall back to tmux, so this
+  blocks every managed launch and handoff until it resolves. Update it the way
+  you installed it — see the table in README "Herdr support and breaking
+  upgrades"; `herdr update` is disabled for package-manager installs.
 
 For agent skill install, also check:
 
@@ -643,7 +666,11 @@ The symptoms below are the ones an LLM is most likely to observe while executing
 - `mozyo-bridge scaffold apply <preset>` refused to overwrite existing routers:
   - protection is intentional. Inspect with `--dry-run`, then replace via `--backup` (keep originals) or `--force` (no backup).
 - `doctor` reports `tmux: missing`:
-  - `tmux` is not on `PATH`. Install via the OS package manager.
+  - the project selects the tmux backend and `tmux` is not on `PATH`. Install
+    via the OS package manager. On a project that declares
+    `terminal_transport.backend: herdr`, doctor reports `tmux: skipped` instead
+    and absent tmux is not a finding (Redmine #15508) — check the `herdr`
+    section there.
 - every section reports `ok` but agents still do not see the rules / skill:
   - restart Claude Code / Codex. Same-session skill index is cached.
 - pane / notification commands fail with "no agent windows":
