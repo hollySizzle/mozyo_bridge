@@ -267,12 +267,17 @@ def _docs_context_from_args(args: argparse.Namespace):
     return CatalogContext.build(repo_raw, catalog_raw, overlay_raw)
 
 
+def _docs_relpath(context, path) -> str:
+    """Repo-relative path for human-facing notices (absolute when outside)."""
+    try:
+        return path.relative_to(context.repo_root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 def _docs_overlay_relpath(context, overlay_path) -> str:
     """Repo-relative overlay path for human-facing notices."""
-    try:
-        return overlay_path.relative_to(context.repo_root).as_posix()
-    except ValueError:
-        return overlay_path.as_posix()
+    return _docs_relpath(context, overlay_path)
 
 
 def _docs_include_local(args: argparse.Namespace) -> bool:
@@ -289,6 +294,24 @@ def cmd_docs_validate(args: argparse.Namespace) -> int:
     )
 
     context = _docs_context_from_args(args)
+    # An absent catalog is an EXPECTED state, not a crash: the scaffold ships
+    # `catalog.yaml.example` and the target promotes it when the project adopts
+    # the governed docs catalog. Letting the reader's FileNotFoundError escape
+    # printed a traceback that reads as "the tool is broken" to an operator who
+    # simply has not adopted the catalog yet (Redmine #15513, seen during the
+    # 1.0.0 install QA). Report it the way every other refusal here reports.
+    if not context.catalog_path.exists():
+        print(
+            "catalog validation failed: no docs catalog at "
+            f"{_docs_relpath(context, context.catalog_path)}"
+        )
+        print(
+            "- adopt the governed docs catalog by copying "
+            "`.mozyo-bridge/docs/catalog.yaml.example` to "
+            "`.mozyo-bridge/docs/catalog.yaml` and filling it in, or point "
+            "`--catalog` at an existing catalog"
+        )
+        return 1
     errors = validate_catalog(
         context, strict_metadata=bool(getattr(args, "strict_metadata", False))
     )
