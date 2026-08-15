@@ -95,9 +95,30 @@ def evaluate_tmux_section(view: dict[str, Any]) -> dict[str, Any]:
         "tmux_pane": view["tmux_pane"],
     }
     if not view["tmux_installed"]:
+        # Absent tmux is a health problem only for a target that routes through
+        # tmux (Redmine #15508). A herdr-selected target does not touch tmux at
+        # all, so reporting it unhealthy made every herdr-only host read
+        # `needs attention` forever. The verdict follows the SELECTED backend —
+        # never "some multiplexer is installed", which would pass a
+        # tmux-selected target on a host that cannot run tmux.
+        if view.get("selected_backend") == "herdr":
+            info["status"] = "skipped"
+            info["detail"] = (
+                "tmux not installed; this target selects the herdr terminal "
+                "backend, so tmux is optional here"
+            )
+            return info
         info["status"] = "missing"
         info["detail"] = "tmux not installed"
         info["next_action"] = ["install tmux to use mozyo-bridge pane notifications"]
+        if view.get("herdr_available"):
+            # The host has herdr but this target still routes through tmux.
+            # Point at the declaration rather than relaxing the verdict: the
+            # tmux paths really are unavailable until one of the two changes.
+            info["next_action"].append(
+                "or, to use the herdr backend that is already installed, declare "
+                "`terminal_transport.backend: herdr` in .mozyo-bridge/config.yaml"
+            )
         return info
     if not view["tmux_server_connected"]:
         # Not running under a tmux server. Doctor stays usable outside tmux.
@@ -215,6 +236,41 @@ def evaluate_tmux_section(view: dict[str, Any]) -> dict[str, Any]:
     return info
 
 
+def _selected_backend(args: argparse.Namespace) -> str:
+    """The terminal backend this target selects: ``"herdr"`` or ``"tmux"``.
+
+    Resolved through the same predicate the send path uses
+    (:func:`herdr_backend_selected`), so doctor cannot disagree with the rail
+    about which backend a target routes through. A missing or malformed config
+    resolves to the tmux default there, and therefore here too.
+    """
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E501
+        herdr_backend_selected,
+    )
+
+    try:
+        return "herdr" if herdr_backend_selected(args) else "tmux"
+    except Exception:  # noqa: BLE001 - an unreadable config is the tmux default
+        return "tmux"
+
+
+def _herdr_available() -> bool:
+    """Whether a herdr binary resolves for this host (diagnostic hint only).
+
+    Used to point a tmux-selected target at the backend it probably meant, and
+    never to relax the verdict: a host that has herdr but routes through tmux
+    still cannot run tmux.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_170_conversational_onboarding.application.herdr_binary import (  # noqa: E501
+        resolve_herdr_binary,
+    )
+
+    try:
+        return bool(getattr(resolve_herdr_binary(), "path", None))
+    except Exception:  # noqa: BLE001 - a probe failure is simply "no hint"
+        return False
+
+
 @runtime_checkable
 class TmuxPaneHealthReads(Protocol):
     """Port: read the tmux pane-health view for the doctor section.
@@ -252,6 +308,12 @@ class LiveTmuxPaneHealthReads:
 
         view: dict[str, Any] = {
             "tmux_pane": os.environ.get("TMUX_PANE", ""),
+            # Which backend this target actually selects, and whether the other
+            # one is even installed (Redmine #15508). Absent tmux is a health
+            # problem only for a target that routes through tmux; on a
+            # herdr-selected target it is just a fact about the host.
+            "selected_backend": _selected_backend(self._args),
+            "herdr_available": _herdr_available(),
         }
         if _doctor.subprocess.run(
             ["sh", "-c", "command -v tmux >/dev/null 2>&1"]
