@@ -161,7 +161,21 @@ done
 # present, an unreadable payload, an unexpected status, or a failed lookup —
 # refuses fail-closed with the pipx environment untouched.
 pypi_url="https://pypi.org/simple/mozyo-bridge/"
-pypi_body="${TMPDIR:-/tmp}/mozyo-pypi-absence-$$.json"
+# The response file is created EXCLUSIVELY by mktemp: a predictable path in a
+# shared tmp would let another process pre-plant a symlink there, and
+# `curl --output` would then truncate/overwrite whatever the symlink points at
+# (Redmine #15487 R3 finding_1). mktemp failure refuses before the mutation,
+# and the trap removes the file on normal exit and on signals alike.
+if ! pypi_body="$(mktemp "${TMPDIR:-/tmp}/mozyo-pypi-absence.XXXXXX")"; then
+  echo "error: could not create a private temp file for the PyPI response;" >&2
+  echo "       refusing (fail-closed). Environment unchanged." >&2
+  exit 75
+fi
+cleanup_pypi_body() { rm -f "$pypi_body"; }
+trap cleanup_pypi_body EXIT
+trap 'cleanup_pypi_body; trap - EXIT; exit 129' HUP
+trap 'cleanup_pypi_body; trap - EXIT; exit 130' INT
+trap 'cleanup_pypi_body; trap - EXIT; exit 143' TERM
 pypi_code=""
 if ! pypi_code="$(curl \
   --silent \
@@ -172,7 +186,6 @@ if ! pypi_code="$(curl \
   --output "$pypi_body" \
   --write-out '%{http_code}' \
   "$pypi_url")"; then
-  rm -f "$pypi_body"
   echo "error: PyPI lookup failed; cannot prove '$version' is absent from" >&2
   echo "       production PyPI (fail-closed). Environment unchanged." >&2
   exit 75
@@ -213,7 +226,6 @@ raise SystemExit(0)
       echo "OK: PyPI Simple Index does not list $version"
     else
       pypi_check_status=$?
-      rm -f "$pypi_body"
       if [ "$pypi_check_status" -eq 1 ]; then
         echo "error: version '$version' EXISTS on production PyPI; the pinned" >&2
         echo "       install cannot prove a TestPyPI source (pip treats both" >&2
@@ -228,13 +240,12 @@ raise SystemExit(0)
     fi
     ;;
   *)
-    rm -f "$pypi_body"
     echo "error: unexpected PyPI Simple status '$pypi_code'; cannot prove" >&2
     echo "       '$version' is absent (fail-closed). Environment unchanged." >&2
     exit 75
     ;;
 esac
-rm -f "$pypi_body"
+cleanup_pypi_body
 
 spec="mozyo-bridge==$version"
 echo "Installing TestPyPI artifact: $spec"

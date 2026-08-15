@@ -21,6 +21,8 @@ Branches from the Start Gate acceptance (j#75722), Redmine #14978, Redmine
   (k) the version present on production PyPI refuses before any install
   (l) a failed / unexpected-status / unreadable PyPI lookup fails closed
   (m) a PyPI 200 listing without the version proceeds
+  (n) the PyPI response file is mktemp-created (no predictable PID path) and
+      left behind by neither the success nor the failure branch
 """
 
 import os
@@ -147,15 +149,22 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
                 "FAKE_CURL_COUNT_FILE": str(Path(tmp) / "curl-count"),
                 "FAKE_PYPI_STATUS": pypi_status,
                 "FAKE_PYPI_EXIT": pypi_exit,
+                # Point the script's temp-file root at the per-test dir so the
+                # leftover check below sees exactly this run's artifacts.
+                "TMPDIR": tmp,
             }
             if pypi_body is not None:
                 env["FAKE_PYPI_BODY"] = pypi_body
-            return subprocess.run(
+            result = subprocess.run(
                 ["sh", str(_SCRIPT), requested],
                 env=env,
                 capture_output=True,
                 text=True,
             )
+            result.tmp_leftovers = sorted(  # type: ignore[attr-defined]
+                p.name for p in Path(tmp).glob("mozyo-pypi-absence*")
+            )
+            return result
 
     def test_matching_versions_succeed(self) -> None:
         version = "0.10.0.dev123456"
@@ -312,6 +321,24 @@ class InstallTestPyPIDevScriptTest(unittest.TestCase):
         self.assertEqual(0, result.returncode, result.stderr)
         self.assertIn("FAKE_PIPX_ARG=install", result.stdout)
         self.assertIn("does not list 1.0.0rc5", result.stdout)
+
+    def test_pypi_response_file_is_mktemp_created_and_cleaned_up(self) -> None:
+        # (n) #15487 R3 finding_1: a predictable PID-derived path in a shared
+        # tmp lets another process pre-plant a symlink that `curl --output`
+        # would then follow and truncate. The response file must be created
+        # exclusively via mktemp and removed by every branch.
+        script = _SCRIPT.read_text(encoding="utf-8")
+        self.assertIn("mktemp", script)
+        self.assertNotIn("mozyo-pypi-absence-$$", script)
+        version = "1.0.0rc5"
+        success = self._run(version, mb_version=version, mz_version=version)
+        self.assertEqual(0, success.returncode, success.stderr)
+        self.assertEqual([], success.tmp_leftovers)
+        failure = self._run(
+            version, mb_version=version, mz_version=version, pypi_status="503"
+        )
+        self.assertEqual(75, failure.returncode, failure.stderr)
+        self.assertEqual([], failure.tmp_leftovers)
 
     def test_latest_is_rejected(self) -> None:
         # Guardrail unrelated to the version assertion but part of the runbook
