@@ -1761,6 +1761,176 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
             + "\n".join(offenders),
         )
 
+    #: AST-scoped layer (review j#106523): file-wide literal presence can be satisfied
+    #: by bait in an unrelated comment. These contracts extract the EXACT argparse help
+    #: block / docstring and require the two-series tokens inside that block itself.
+    HELP_BLOCK_CONTRACTS = (
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "application/cli_handoff.py",
+            "--mode",
+            ("busy", "15537", "idle"),
+        ),
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "application/cli_handoff.py",
+            "--queue-enter-retry-window",
+            ("busy", "15537", "idle"),
+        ),
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "application/cli_handoff.py",
+            "--queue-enter-retry-interval",
+            ("15537", "idle"),
+        ),
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "application/cli_handoff_ticketless.py",
+            "--mode",
+            ("busy", "15537", "idle"),
+        ),
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "application/cli_handoff_ticketless.py",
+            "--queue-enter-retry-window",
+            ("busy", "15537", "idle"),
+        ),
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "application/cli_handoff_ticketless.py",
+            "--queue-enter-retry-interval",
+            ("15537", "idle"),
+        ),
+    )
+
+    #: (file, function name or None for the module docstring, required tokens).
+    DOCSTRING_CONTRACTS = (
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "application/delivery_outcome_gate.py",
+            None,
+            ("busy", "15537", "queue_enter"),
+        ),
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "application/delivery_outcome_gate.py",
+            "delivery_was_positive",
+            ("busy", "15537", "queue_enter"),
+        ),
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "domain/injection_stage.py",
+            None,
+            ("busy", "15537"),
+        ),
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "domain/injection_stage.py",
+            "injection_stage_for",
+            ("busy", "15537", "queue_enter"),
+        ),
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "domain/injection_stage.py",
+            "busy_queued_submission_delivery",
+            ("busy", "15537"),
+        ),
+        (
+            "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+            "application/handoff_herdr_queue_enter_rail.py",
+            None,
+            ("busy", "15537", "queue_enter"),
+        ),
+    )
+
+    @staticmethod
+    def _argparse_help_text(source: str, option: str):
+        import ast
+
+        tree = ast.parse(source)
+        for node in ast.walk(tree):
+            if not (
+                isinstance(node, ast.Call)
+                and getattr(node.func, "attr", "") == "add_argument"
+            ):
+                continue
+            if not any(
+                isinstance(arg, ast.Constant) and arg.value == option
+                for arg in node.args
+            ):
+                continue
+            for kw in node.keywords:
+                if kw.arg == "help":
+                    parts = [
+                        sub.value
+                        for sub in ast.walk(kw.value)
+                        if isinstance(sub, ast.Constant)
+                        and isinstance(sub.value, str)
+                    ]
+                    return "".join(parts)
+        return None
+
+    @staticmethod
+    def _docstring_text(source: str, function):
+        import ast
+
+        tree = ast.parse(source)
+        if function is None:
+            return ast.get_docstring(tree, clean=False)
+        for node in ast.walk(tree):
+            if (
+                isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == function
+            ):
+                return ast.get_docstring(node, clean=False)
+        return None
+
+    def test_cli_help_blocks_state_the_two_series_contract(self) -> None:
+        root = self._root()
+        problems = []
+        for rel, option, tokens in self.HELP_BLOCK_CONTRACTS:
+            block = self._argparse_help_text(
+                (root / rel).read_text(encoding="utf-8"), option
+            )
+            if block is None:
+                problems.append(f"{rel} [{option}]: help block not found")
+                continue
+            lowered = block.lower()
+            for token in tokens:
+                if token.lower() not in lowered:
+                    problems.append(f"{rel} [{option}]: missing {token!r} in help block")
+        self.assertEqual(
+            [],
+            problems,
+            "a queue-enter CLI help block dropped the busy exception "
+            "(#15537 / ADR-0002) — bait outside the block does not count:\n"
+            + "\n".join(problems),
+        )
+
+    def test_delivery_axis_docstrings_state_the_two_series_contract(self) -> None:
+        root = self._root()
+        problems = []
+        for rel, function, tokens in self.DOCSTRING_CONTRACTS:
+            block = self._docstring_text(
+                (root / rel).read_text(encoding="utf-8"), function
+            )
+            if block is None:
+                problems.append(f"{rel} [{function or 'module'}]: docstring not found")
+                continue
+            lowered = block.lower()
+            for token in tokens:
+                if token.lower() not in lowered:
+                    problems.append(
+                        f"{rel} [{function or 'module'}]: missing {token!r} in docstring"
+                    )
+        self.assertEqual(
+            [],
+            problems,
+            "a delivery-axis docstring dropped the busy exception "
+            "(#15537 / ADR-0002) — bait outside the docstring does not count:\n"
+            + "\n".join(problems),
+        )
+
     def test_no_surface_reintroduces_the_unconditional_causal_only_claims(self) -> None:
         root = self._root()
         surfaces = [root / "README.md"]
