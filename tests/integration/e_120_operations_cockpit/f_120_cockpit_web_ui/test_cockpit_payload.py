@@ -336,6 +336,11 @@ class GroupedUnitsPayloadTest(unittest.TestCase):
         self.repo = Path(self._tmp.name) / "repo"
         (self.repo / ".mozyo-bridge").mkdir(parents=True)
         (self.repo / ".git").mkdir()
+        # These tests exercise the TMUX inventory grouping (take_inventory is
+        # patched); since the 2.0 flip (#15531) an undeclared backend resolves
+        # to herdr and the payload would try a LIVE herdr column read, so the
+        # tmux rail under test is declared explicitly.
+        self._write_config("terminal_transport:\n  backend: tmux\n")
 
     def _write_config(self, text: str) -> None:
         (self.repo / ".mozyo-bridge" / "config.yaml").write_text(
@@ -358,6 +363,8 @@ class GroupedUnitsPayloadTest(unittest.TestCase):
 
     def test_config_groups_and_placement_drive_the_served_view(self) -> None:
         self._write_config(
+            "terminal_transport:\n"
+            "  backend: tmux\n"
             "presentation:\n"
             "  project_group_presentation: project_group_tmux_window\n"
             "  project_groups:\n"
@@ -480,6 +487,11 @@ class SameWorkspaceMultiLaneTest(unittest.TestCase):
         repo = Path(tmp.name) / "repo"
         (repo / ".mozyo-bridge").mkdir(parents=True)
         (repo / ".git").mkdir()
+        # tmux inventory rail under test; herdr is the undeclared default since
+        # the 2.0 flip (#15531) and would live-read.
+        (repo / ".mozyo-bridge" / "config.yaml").write_text(
+            "terminal_transport:\n  backend: tmux\n", encoding="utf-8"
+        )
         with patch(
             f"{COCKPIT_PAYLOAD}.take_inventory",
             lambda **_: self._multi_lane_snapshot(),
@@ -549,6 +561,11 @@ class LaneIdentitySplitTest(unittest.TestCase):
         repo = Path(tmp.name) / "repo"
         (repo / ".mozyo-bridge").mkdir(parents=True)
         (repo / ".git").mkdir()
+        # tmux inventory rail under test; herdr is the undeclared default since
+        # the 2.0 flip (#15531) and would live-read.
+        (repo / ".mozyo-bridge" / "config.yaml").write_text(
+            "terminal_transport:\n  backend: tmux\n", encoding="utf-8"
+        )
         # The served path derives freshness from the snapshot's collected_at, so
         # give the runtime snapshot a fresh collection time relative to ``now`` to
         # exercise the healthy (observed) path end to end.

@@ -58,6 +58,15 @@ LIVE_LANE_ENV_KEYS = (
     "MOZYO_AGENT_ROLE",
 )
 
+#: Filename (inside the fenced home) the herdr-binary pin points at. The file is
+#: never created: an ABSOLUTE ``MOZYO_HERDR_BINARY`` that does not resolve fails
+#: closed with no trusted-PATH fallback (#13496 step 1), so pinning it masks the
+#: operator's live herdr from every fenced test — a test that wants a working
+#: herdr must inject its own env/runner, exactly what CI (no herdr installed)
+#: already forces. Before this pin, tests that reached the ambient binary passed
+#: locally and failed in CI (#15531 flip fallout, 6 tests).
+HERDR_BINARY_FENCE_NAME = "herdr-fenced-absent"
+
 #: Subdirectories of the task-specific root, by role. Separate directories keep
 #: an isolation failure legible: a file's location says which resolver produced
 #: it.
@@ -138,6 +147,11 @@ def isolation_env(
     """
     return {
         "MOZYO_BRIDGE_HOME": str(layout.home),
+        # Mask the operator's live herdr (env pin wins over trusted-PATH search,
+        # and an absolute non-resolving value never falls back to PATH), so a
+        # fenced test can only use herdr it explicitly injects — the same world
+        # CI runs in. See HERDR_BINARY_FENCE_NAME.
+        "MOZYO_HERDR_BINARY": str(layout.home / HERDR_BINARY_FENCE_NAME),
         "TMPDIR": str(layout.tmp),
         "TMP": str(layout.tmp),
         "TEMP": str(layout.tmp),

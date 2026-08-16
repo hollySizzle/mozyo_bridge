@@ -99,6 +99,27 @@ class IsolationEnvTest(unittest.TestCase):
         self.assertEqual(pins["FENCE"], pins["MOZYO_BRIDGE_HOME"])
         self.assertEqual(pins["FENCE"], str(layout.home))
 
+    def test_the_herdr_binary_is_pinned_absent_inside_the_fence(self) -> None:
+        """#15531 flip fallout: tests that reached the operator's ambient herdr
+        binary passed locally and failed on hosts without one (CI). The pin is
+        an ABSOLUTE path inside the fenced home that is never created, so the
+        resolver fails closed with no trusted-PATH fallback — a fenced test can
+        only use herdr it explicitly injects."""
+        layout = IsolationLayout(root=Path("/task"))
+        pins = isolation_env(
+            layout,
+            denied_homes=(),
+            deny_separator=":",
+            fence_root_key="FENCE",
+            fence_deny_key="DENY",
+        )
+        pinned = Path(pins["MOZYO_HERDR_BINARY"])
+        self.assertTrue(pinned.is_absolute())
+        # Inside the fenced home (never the operator's), and never created by
+        # the layout's directory list.
+        self.assertEqual(pinned.parent, layout.home)
+        self.assertNotIn(pinned, layout.directories)
+
     def test_applying_isolation_keeps_the_base_env_and_drops_the_lane_pins(
         self,
     ) -> None:
