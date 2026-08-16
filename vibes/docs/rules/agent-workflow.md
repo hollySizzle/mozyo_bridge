@@ -337,6 +337,7 @@ adversarial_convergence:
       key: "threat_model: "          # 行頭 literal。この行の残り全体が宣言テキスト (自由文 1-2 行相当)
       placement: claim_schema block と同じ journal 本文 (位置は任意、行頭一致で同定する)
       cardinality: 1 request につき最大 1 行
+      value: trim 後 non-empty であること。空・whitespace-only は invalid = missing と同じ扱い
       missing: 宣言なし → 当該 request が主張する guard への指摘は全て material (fail 側は深い方)
       duplicate: 2 行以上 → 宣言なしとして扱う (fail 側は深い方)
     example: |
@@ -387,35 +388,45 @@ adversarial_convergence:
       conflict であり close blocked (どの anchor も authoritative にならない)。
       (c) resumption の選択は**二段階** (Review Generation Marker Contract v2 の「newer
       malformed generation を旧 valid generation で置換しない」fail-closed 原則に従う):
-      第一段階 (latest attempt の選択) — challenge C の owner-anchor chain (`challenge_ref: j#C`
-      を持つ全 anchor、**superseded を含む**) のいずれかを `challenge_resolution` 行で参照する
-      canonical review_request 全体を母集団とし、その**最大 id の 1 個**を latest attempt とする
-      (duplicate・malformed な行を持つ request も、C の chain を参照する行を 1 行でも持てば
-      母集団に含める)。
-      第二段階 (validation) — latest attempt が `challenge_resolution` 行を**ちょうど 1 行**持ち、
-      それが現行 authoritative (terminal) anchor を指す場合のみ authoritative resumption request
-      となる。superseded anchor の再参照・duplicate・malformed は **旧 chain へ fallback せず
-      blocked** — より新しい well-formed attempt だけが解消できる。
+      第一段階 (latest attempt の選択) — `challenge_attempt: j#C` 行で C を参照する canonical
+      review_request 全体を母集団とする (`challenge_resolution` 行の有無・正否は問わない —
+      target が malformed でも identity key により C へ帰属する)。加えて、challenge_attempt を
+      欠くが C の owner-anchor chain (`challenge_ref: j#C` を持つ全 anchor、**superseded を
+      含む**) を `challenge_resolution` 行で参照する request も母集団に含める。その**最大 id の
+      1 個**を latest attempt とする。
+      第二段階 (validation) — latest attempt が `challenge_attempt` 行をちょうど 1 行 (=C) と、
+      `challenge_resolution` 行を**ちょうど 1 行**持ち、後者が現行 authoritative (terminal)
+      anchor を指す場合のみ authoritative resumption request となる。superseded anchor の
+      再参照・key 欠落・duplicate・malformed は **旧 chain へ fallback せず blocked** — より
+      新しい well-formed attempt だけが解消できる。
       (d) challenged request = authoritative result が C である canonical review_request
       (意味検証の基準)
       resumption_request: |
-        再開する canonical review_request は `challenge_resolution: j#<owner anchor journal id>`
-        を claim と同じ journal に持つ。challenge_verdict=update_model の場合は threat_model 行を
-        更新して宣言し直す
+        再開する canonical review_request は `challenge_attempt: j#<challenge result id>`
+        (identity、最大 1 行) と `challenge_resolution: j#<owner anchor journal id>` (target、
+        最大 1 行) の**両方**を claim と同じ journal に持つ。challenge_verdict=update_model の
+        場合は valid (non-empty) な threat_model 行を更新して宣言し直す
       resolution_entry: |
         challenge_verdict が defer / wontfix_by_policy の場合、再開 request の authoritative
         result の `### Deferred (out-of-model)` 節に、item_grammar の entry として記録し、
         `resolution_anchor: j#<owner anchor journal id>` key を必須で付す
     close_predicate: |
-      challenge 節を含む各 result journal C について、authoritative_chain の全要素が存在し、
-      かつ意味的に整合すること:
+      **issue-level 前提**: いずれかの challenge key (`challenge_attempt` / `challenge_resolution`)
+      を持つ canonical review_request のうち**最大 id** のものが well-formed (該当 key が各
+      ちょうど 1 行) かつ既存の challenge result へ一意に帰属可能であること。latest bearer が
+      帰属不能 (typo・dangling・既存 challenge を指さない) または malformed なら、個別 chain の
+      状態にかかわらず issue close blocked — 回復はより新しい well-formed attempt のみ
+      (per-challenge の後勝ち規則の issue-level への拡張)。
+      その上で、challenge 節を含む各 result journal C について、authoritative_chain の全要素が
+      存在し、かつ意味的に整合すること:
       (i) pending record が存在する。
       (ii) authoritative anchor が一意に定まる (conflict は blocked)。
       (iii) **authoritative resumption request (最大 id の 1 個)** の authoritative result が
       存在する。先行 resumption 候補とその result は判定に使わない。
       (iv) 意味的一致 — **(iii) の result のみ**で判定する。challenge_verdict=update_model は
-      authoritative resumption request が `threat_model:` 行をちょうど 1 行持ち、その値が
-      challenged request の `threat_model:` 行と byte 一致しないこと。challenge_verdict=defer は
+      authoritative resumption request が **valid (trim 後 non-empty) な** `threat_model:` 行を
+      ちょうど 1 行持ち、その値が challenged request の `threat_model:` 行と byte 一致しない
+      こと (空・whitespace-only は invalid = 宣言なしであり、この条件を満たさない)。challenge_verdict=defer は
       同 result の `resolution_anchor` 付き Deferred entry が `disposition: deferred` を持つこと。
       challenge_verdict=wontfix_by_policy は同 entry が `disposition: wontfix_by_policy` を
       持つこと。
@@ -532,9 +543,11 @@ else (no)
     :owner 裁定 anchor を対象 issue journal に記録;
     |implementer|
     :authoritative anchor (supersession 連鎖の末端) を確認し、
-それを指す challenge_resolution key 付きの新 canonical request を発行
-(update_model なら threat_model 行を challenged request から更新。
-この request が最大 id の authoritative resumption になる — 先行候補は自動失効);
+challenge_attempt (=C) + challenge_resolution (=anchor) の
+両 key 付きの新 canonical request を発行
+(update_model なら valid な threat_model 行を challenged request から更新。
+この request が最大 id の latest attempt になる — 先行候補は自動失効、
+malformed でも帰属して blocked を発動する);
     |reviewer|
     :authoritative result を発行 — verdict が defer /
 wontfix_by_policy なら Deferred 節に resolution_anchor 付き entry を
