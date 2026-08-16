@@ -603,3 +603,37 @@ class BusyQueuedSubmissionRecordTest(unittest.TestCase):
         self.assertIn("idle/turn-ended series", record)
         self.assertIn("working-transition wait armed first", record)
         self.assertNotIn("busy queue path", record)
+
+    def test_malformed_busy_proof_shapes_fail_closed_to_non_busy_wording(
+        self,
+    ) -> None:
+        """Review j#106486: only the producer's exact ``True`` mints busy proof.
+
+        The queue rail writes exact bools. A truthiness reader would promote
+        wire-shaped values it never writes (the string ``"false"``, ints,
+        lists) into a fabricated "sender verified the composer cleared" record.
+        Every non-canonical shape must fall back to the rail-appropriate
+        non-busy wording on both the success and the uncertain path.
+        """
+        shapes = (
+            {"busy_queue_path": "false", "queued_submission_confirmed": "false"},
+            {"busy_queue_path": 1, "queued_submission_confirmed": 1},
+            {"busy_queue_path": [True], "queued_submission_confirmed": [True]},
+            {"busy_queue_path": True, "queued_submission_confirmed": "true"},
+            {"busy_queue_path": "true", "queued_submission_confirmed": True},
+            {"busy_queue_path": True, "queued_submission_confirmed": False},
+            {"busy_queue_path": False, "queued_submission_confirmed": True},
+            {},
+        )
+        for shape in shapes:
+            with self.subTest(shape=shape, path="sent"):
+                record = self._record("sent", "queue_enter", **shape)
+                self.assertNotIn("composer cleared", record)
+                self.assertNotIn("sender verified", record)
+                self.assertIn("marker unobserved", record)
+            with self.subTest(shape=shape, path="uncertain"):
+                record = self._record("blocked", "turn_start_unconfirmed", **shape)
+                if shape.get("busy_queue_path") is True:
+                    continue
+                self.assertNotIn("busy queue path", record)
+                self.assertIn("working-transition wait armed first", record)

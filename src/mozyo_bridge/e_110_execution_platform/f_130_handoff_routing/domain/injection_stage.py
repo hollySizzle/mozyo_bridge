@@ -346,13 +346,17 @@ def busy_queue_path_observed(
 ) -> bool:
     """True when the queue-enter rail took the busy queue path (ADR-0002 / #15537).
 
-    The rail sets ``busy_queue_path`` on the v2 observation only when the
-    baseline runtime state was ``busy`` and the pending working-transition
-    observer was waived; Enters then pass the wait-free full effect fence.
+    The queue rail writes ``busy_queue_path=True`` (exact bool, independent of
+    generation coherence) only when the baseline runtime state was ``busy`` and
+    the pending working-transition observer was waived; Enters then pass the
+    wait-free full effect fence. Like ``canonical_v2_generation_binding``, this
+    reader accepts only the producer's exact ``True`` — truthiness would promote
+    wire-shaped values the producer never writes (``"false"``, ``1``, a list)
+    into effect-fence evidence.
     """
     if not isinstance(queue_enter_turn_start_observation, dict):
         return False
-    return bool(queue_enter_turn_start_observation.get("busy_queue_path"))
+    return queue_enter_turn_start_observation.get("busy_queue_path") is True
 
 
 def busy_queued_submission_observed(
@@ -365,12 +369,18 @@ def busy_queued_submission_observed(
     body cleared the receiver composer — a **noncausal** queued submission
     reported as ``sent`` / ``queue_enter``. This predicate never implies a causal
     turn start; ``turn_start_positively_observed`` stays False on this path.
+
+    Both fields must be the producer's exact ``True`` (the rail writes exact
+    bools): a positive "sender verified the composer cleared" claim in the
+    durable record must never be minted from a malformed, stale, or
+    future-wire-shaped value such as the string ``"false"``.
     """
     if not isinstance(queue_enter_turn_start_observation, dict):
         return False
     observation = queue_enter_turn_start_observation
-    return bool(observation.get("busy_queue_path")) and bool(
-        observation.get("queued_submission_confirmed")
+    return (
+        observation.get("busy_queue_path") is True
+        and observation.get("queued_submission_confirmed") is True
     )
 
 
