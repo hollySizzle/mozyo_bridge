@@ -151,6 +151,50 @@ Redmine の表示上、Epic / Feature が `未着手` のまま配下 UserStory 
 - 本 repo 固有の宣言: US close 前の mandatory audit は `mozyo_bridge` repository の project-local policy として維持する (US-level audit model 自体は `redmine-governed` / `redmine-rails-governed` preset 経由で配布される)。doc-only / rule-only scope の US でも省略しない。
 - `mozyo-bridge scaffold apply <preset>` ではユーザーが ticket system preset を明示選択する。選択された preset の workflow だけを適用し、他 preset やこの repo 固有の audit policy を混ぜない。
 
+## ADR (Owner Decision Records) — Redmine #15536
+
+owner の意思決定の正本は `vibes/docs/adr/` の ADR (書式・索引は `vibes/docs/adr/README.md`、判断
+正本は ADR-0001)。本節はその**実行契約**であり、repo-local 宣言 (中央 preset 不変)。
+
+```yaml
+adr_conflict_gate:
+  # static schema。owner 判断の収集順序は本節が所有せず、central preset
+  # `### Claude Owner-Question Bypass Prohibition` の既存 flow (durable record →
+  # coordinator role へ handoff → coordinator が owner 回答を収集・記録) へ委譲する。
+  actors:
+    reviewer: 監査 role (resolved auditor binding)
+    implementer: 実装 role (resolved implementer binding)
+    coordinator: owner 判断の唯一の収集窓口 (`### Claude Owner-Question Bypass Prohibition`)
+    owner: ADR を変更できる唯一の authority
+  trigger: review finding または実装変更が、active な ADR の「決定 (規約行)」と矛盾する、
+    または矛盾の疑いがある場合
+  scope: 本 gate が拘束するのは「矛盾指摘の採用」と「矛盾変更の実装」のみ。
+    指摘の起票自体・矛盾しない通常の review / 実装は対象外
+  required_fields:
+    - adr_id                # 例: ADR-0002
+    - conflict_statement    # どの規約行とどう衝突するか
+    - evidence              # 根拠 (evidence_source 分類つき)
+    - owner_approval_anchor # owner 裁定の Redmine journal 参照。未取得なら空
+  reviewer:
+    - 指摘の起票は常に自由 (独立性を維持)。ただし ADR 矛盾指摘は required_fields を伴う
+      「ADR 変更の提案」として書く
+    - owner_approval_anchor が空の間、その指摘を required_correction として採用しない (zero_adopt)
+  implementer:
+    - owner_approval_anchor の無い ADR 矛盾変更は実装しない (zero_implementation)。レビュー指摘
+      への対応であっても同じ
+    - owner 判断が必要な場合: 対象 issue の journal に required_fields を記録した上で、
+      owner への確認は自分で行わず coordinator role へ canonical handoff で委ねる
+      (正本: central preset `### Claude Owner-Question Bypass Prohibition`)
+  invalid:
+    - 関連 ADR の特定に失敗した場合、または ADR index (`vibes/docs/adr/README.md`) が読めない
+      場合は「矛盾なし」とみなさず、implementer の owner 判断 route と同じ経路で停止する (fail_closed)
+  record:
+    - 判断・裁定・その anchor は対象 issue の journal に記録する。通知は canonical handoff のみ
+    - ADR file の新規作成・supersede・status 変更は owner 裁定の journal anchor がある場合のみ。
+      エージェント起草の提案は ADR file を作らず journal 上の draft として出し、
+      anchor 成立後に file 化する (README の status enum に draft は存在しない)
+```
+
 ## Workflow Change Verification
 
 正本は skill `references/workflow.md` `## Workflow 変更の反映確認 (Workflow Change Verification)` (guardrail / skill / gate 変更後の新セッション反映確認、検証対象を直接変更しない通常開発 task の選定、Claude 実装 / Codex 選定・audit、結果記録と follow-up 起票)。本 doc は再掲しない (#13028 で pointer 化)。本 repo での適用: 反映確認は `mozyo_bridge` 本体の通常開発 task で行う。

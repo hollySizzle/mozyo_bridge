@@ -48,6 +48,44 @@ documents:
     related_document_refs:
       - spec-project-map
       - skill-workflow-reference
+      - rule-adr-index
+
+  - id: rule-adr-index
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/README.md
+    purpose: owner 決定を記録する ADR の書式・運用規則・索引の正本 (#15536)。
+    audit_role: adr_index_rule
+    related_document_refs:
+      - rule-project-agent-workflow
+      - rule-adr-0001-adr-practice
+
+  - id: rule-adr-0001-adr-practice
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0001-adr-practice.md
+    purpose: "ADR-0001: owner 決定は ADR として記録し、レビューは owner 承認なしに上書きできない。"
+    audit_role: adr_0001_rule
+    related_document_refs:
+      - rule-adr-index
+
+  - id: rule-adr-0002-enter-resend-priority
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0002-enter-resend-priority.md
+    purpose: "ADR-0002: 受信側が busy でも Enter を押す (停止は二重送信より害が大きい)。実装は #15537。"
+    audit_role: adr_0002_rule
+    related_document_refs:
+      - rule-adr-index
+
+  - id: rule-adr-0003-three-tier-granularity
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0003-three-tier-granularity.md
+    purpose: "ADR-0003: 3 階層粒度 (release/version/US)、レビュー単位は US。"
+    audit_role: adr_0003_rule
+    related_document_refs:
+      - rule-adr-index
 
   - id: rule-release-distribution
     type: rule
