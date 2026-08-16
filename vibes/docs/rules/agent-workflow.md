@@ -333,10 +333,14 @@ review / close authority は変更しない — 本節は mode 継続中の審�
 adversarial_convergence:
   # 判断正本は ADR-0005。本節は実行契約 (repo-local 宣言、中央 preset・wire format 不変)。
   threat_model_declaration:
-    - guard / 検証機構 (tests/** の contract guard・mutation proof 等) を成果物として主張する
-      review request は、その脅威モデルを claim_schema と同じ journal に 1-2 行で宣言する
-      (例: 「偶発的な契約巻き戻しの検出が対象。故意の回避工作 (bait 工作等) は対象外」)
-    - 宣言を欠く request への guard 指摘は全て material として扱う (fail 側は常に深い方)
+    request_grammar:                 # review_request journal 本文の literal grammar
+      key: "threat_model: "          # 行頭 literal。この行の残り全体が宣言テキスト (自由文 1-2 行相当)
+      placement: claim_schema block と同じ journal 本文 (位置は任意、行頭一致で同定する)
+      cardinality: 1 request につき最大 1 行
+      missing: 宣言なし → 当該 request が主張する guard への指摘は全て material (fail 側は深い方)
+      duplicate: 2 行以上 → 宣言なしとして扱う (fail 側は深い方)
+    example: |
+      threat_model: 将来の保守者による偶発的な契約巻き戻しの検出が対象。故意の回避工作 (bait 工作等) は対象外。
   material_boundary:
     in_model: |
       宣言脅威モデル内の反証 (宣言した検出能力が実際には成立しない実証) は material —
@@ -346,28 +350,71 @@ adversarial_convergence:
       review result journal に記録する (下記 deferred_finding_record)
     model_challenge: |
       「宣言脅威モデル自体が甘い」という主張は policy 論点であり、implementer / reviewer の
-      往復で裁定しない。owner-question bypass 禁止の正規導線 (implementer が対象 issue journal に
-      判断待ち記録 → coordinator へ canonical handoff → coordinator が owner 裁定 anchor を記録)
-      で owner へ回す (ADR-0001 の延長: モデルの甘さの裁定者は往復の当事者ではない)
+      往復で裁定しない。reviewer は challenge を material finding にせず、review result journal
+      本文の `### Threat-model challenge (owner decision pending)` 見出し配下に記録し
+      (対象 model の引用 + 甘いと考える理由。machine marker prefix 不使用)、canonical
+      review_result の結論は**残余の material findings のみ**から既存規則で出す (material 0 件
+      なら approved も正当)。その後 implementer が対象 issue journal に判断待ちを記録 →
+      coordinator へ canonical handoff → coordinator が owner 裁定 anchor を記録する
+      (owner-question bypass 禁止の正規導線。ADR-0001 の延長: モデルの甘さの裁定者は往復の
+      当事者ではない)。**停止点は Close Gate**: owner 裁定 anchor が記録されるまで当該 US は
+      close できず、当該 guard 面に触れる light 主張は invalid。裁定後は (a) 宣言を更新した新
+      review_request、または (b) challenge の deferred / wontfix_by_policy 化、のいずれかを記録して
+      再開する
   mandatory_de_escalation:
-    trigger: |
-      テスト基盤 (tests/** の guard・検証 tooling) のみを対象とする severity Medium 以下の
-      finding が 2 round 連続した時点 (round の単位は ADR-0004 depth_round_derivation の
-      canonical review_request journal)
+    severity_vocabulary:
+      values: low | medium | high    # closed。canonical finding manifest v1 は変更しない
+      recording_authority: |
+        reviewer が review result journal 本文の各 finding 見出しに `[High]` / `[Medium]` /
+        `[Low]` (または `severity: <値>` 行) で記す。structured manifest には severity field を
+        追加しない (payload contract 不変)。本文から severity を同定できない finding は
+        high とみなす (fail 側は深い方)
+    round_pairing:                   # round の単位は ADR-0004 depth_round_derivation の canonical request
+      authoritative_result: |
+        request R の authoritative result は、R より後かつ次の canonical review_request より前に
+        あり、`req=<R>` と head 一致を満たす canonical review_result journal (最初の 1 件)。
+        これを満たす result が無い round (orphan request)、または相関不能 result しか無い round は
+        「導出不能 round」
+    qualifying_round:                # counter が数える round の述語
+      predicate: |
+        authoritative result の全 finding が (a) 対象 location が tests/** の guard・検証 tooling
+        のみ、かつ (b) severity が medium 以下、を満たす changes_requested round
+      reset: |
+        material finding に (a)(b) を満たさないものが 1 件でも含まれる round、および
+        conclusion=approved の round は counter を 0 に戻す
+      unreadable: |
+        導出不能 round・severity 同定不能は count も reset もせず、その時点で下記 action と同じ
+        owner 判断ルートへ止める (fail-closed の倒し先は owner)
+    trigger: 直近の連続 qualifying round 数が 2 に達した時点
     action: |
       implementer は次の correction round へ進まず、対象 issue journal に判断待ちを記録して
       coordinator 経由で owner 判断を仰ぐ。chat での懸念表明は本 action の代替にならない
       (#15537 R10 の実例: 懸念表明のみで 2 round 追加続行した)
     outcome: owner 裁定 anchor (続行 / deferred 化 / mode 解除) を記録してから再開する
   deferred_finding_record:
-    place: review result journal (finding 単位の個別 issue は乱発しない)
-    fields:
-      - finding 名と severity (reviewer の記載のまま)
-      - disposition: deferred | wontfix_by_policy
-      - reason: 費用対効果の判断 1 行 (owner 方針: 「効用が低いものは今はやらない。残しておく
+    placement: |
+      review result journal 本文の `### Deferred (out-of-model)` 見出し配下 (finding 単位の
+      個別 issue は乱発しない)。material findings の `## Findings` 系見出しとは別見出しであり、
+      deferred entry に machine marker prefix (`[mozyo:` 等) を使わない — strict parser の
+      material finding / gate marker と衝突しない
+    item_grammar:                    # 1 finding = 1 list item。closed keys、順不同、他 key は invalid
+      name: <finding 名>             # 同一 result 内で一意。identity は (result journal id, name)
+      severity: low | medium | high  # severity_vocabulary と同じ closed enum
+      disposition: deferred | wontfix_by_policy
+      reason: 費用対効果の判断 1 行 (owner 方針: 「効用が低いものは今はやらない。残しておく
         ことに価値はある」)
-      - reevaluate_on: 事象条件のみ (当該 surface の次回変更時 / 脅威モデルへの再挑戦時)。
-        時間条件 (「いつか」「N ヶ月後」) は書かない
+      reevaluate_on: surface_change | model_challenge   # closed enum。事象条件のみ。
+        # 時間条件 (「いつか」「N ヶ月後」) は書かない
+    invalid_handling: |
+      closed key の欠落・enum 外の値・同一 result 内の name 重複は、その entry を deferred として
+      無効化し、当該 finding を material として扱う (fail 側は深い方)
+    example: |
+      ### Deferred (out-of-model)
+      - name: guard_dead_branch_bait
+        severity: medium
+        disposition: deferred
+        reason: 故意の bait 工作は宣言脅威モデル外。committer が自組織のみの repo では費用対効果が薄い
+        reevaluate_on: model_challenge
     invariants:
       - 記録は判断の追跡可能性のためであり、TODO の約束ではない。後日の再評価で
         wontfix_by_policy と結論することは正当な出口
@@ -393,20 +440,29 @@ if (finding は宣言脅威モデル内の反証?) then (yes)
 (既存 flow のまま);
 else (no)
   if (脅威モデル自体への挑戦?) then (yes)
+    :Threat-model challenge 節に記録し、
+結論は残余 material findings のみから発行
+(material 0 件なら approved も正当);
     |implementer|
-    :対象 issue journal に「owner 判断待ち」を記録;
+    :対象 issue journal に「owner 判断待ち」を記録
+(以後 owner anchor まで US close 不可・
+当該 guard 面の light 主張 invalid);
     :coordinator へ canonical handoff;
     |coordinator|
     :owner 裁定 anchor を対象 issue journal に記録;
+    |implementer|
+    :裁定に従い (a) 宣言更新付き新 request
+または (b) deferred / wontfix_by_policy 化を記録して再開;
   else (no — 圏外指摘)
     |reviewer|
-    :deferred finding として review journal に記録
-(disposition / reason / reevaluate_on);
+    :Deferred (out-of-model) 節に item_grammar で記録
+(name / severity / disposition / reason / reevaluate_on);
   endif
 endif
 |implementer|
-if (テスト基盤のみ・Medium 以下の finding が
-2 round 連続した?) then (yes)
+if (qualifying round (test-infra のみ・medium 以下の
+changes_requested) が 2 連続した?
+(導出不能 round はその場で owner ルートへ)) then (yes)
   :correction へ進まず判断待ちを記録;
   :coordinator へ canonical handoff;
   |coordinator|
