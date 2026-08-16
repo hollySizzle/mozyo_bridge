@@ -151,6 +151,19 @@ Redmine の表示上、Epic / Feature が `未着手` のまま配下 UserStory 
 - 本 repo 固有の宣言: US close 前の mandatory audit は `mozyo_bridge` repository の project-local policy として維持する (US-level audit model 自体は `redmine-governed` / `redmine-rails-governed` preset 経由で配布される)。doc-only / rule-only scope の US でも省略しない。
 - `mozyo-bridge scaffold apply <preset>` ではユーザーが ticket system preset を明示選択する。選択された preset の workflow だけを適用し、他 preset やこの repo 固有の audit policy を混ぜない。
 
+## ADR (Owner Decision Records) — Redmine #15536
+
+- owner の意思決定の正本は `vibes/docs/adr/` の ADR。書式と運用規則の正本は `vibes/docs/adr/README.md`、
+  運用規則そのものの決定は ADR-0001。
+- **reviewer の義務**: review finding を出す前に対象領域の active ADR を確認する。active な ADR と
+  矛盾する指摘は、その ADR を名指しした「ADR 変更の提案」としてのみ出せる。owner の明示承認
+  なしに required_correction として採用しない。黙った上書きは禁止。
+- **implementer の義務**: ADR と矛盾する変更を、レビュー指摘への対応であっても行わない。矛盾に
+  気づいたら owner へ escalate する。
+- ADR の作成・supersede は owner 決定があったときのみ。エージェント起草の draft は owner 承認の
+  記録が入るまで active にしない。
+- 本節は repo-local 宣言であり、中央 preset を変更しない。
+
 ## Workflow Change Verification
 
 正本は skill `references/workflow.md` `## Workflow 変更の反映確認 (Workflow Change Verification)` (guardrail / skill / gate 変更後の新セッション反映確認、検証対象を直接変更しない通常開発 task の選定、Claude 実装 / Codex 選定・audit、結果記録と follow-up 起票)。本 doc は再掲しない (#13028 で pointer 化)。本 repo での適用: 反映確認は `mozyo_bridge` 本体の通常開発 task で行う。
