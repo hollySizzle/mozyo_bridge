@@ -1487,8 +1487,38 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         "f_140_delegated_coordinator_nested_handoff/domain/callback_delivery.py",
         "src/mozyo_bridge/application/turn_start_observation.py",
         "src/mozyo_bridge/application/handoff_delivery_command.py",
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "application/cli_handoff_ticketless.py",
         "vibes/docs/logics/release-flow.md",
     )
+
+    #: Per-surface positive literals (review j#106519): pin the busy clause inside each
+    #: help block / module behavior paragraph, so deleting the exception (or reverting the
+    #: paragraph to its causal-only form) reds even while file-wide tokens survive.
+    SURFACE_EXTRA_LITERALS = {
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "application/cli_handoff_ticketless.py": (
+            "a busy baseline takes the #15537 ",
+            "(idle/turn-ended; busy takes the ",
+            "wait (idle/turn-ended series only, #15537) and re-runs the live ",
+        ),
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "application/cli_handoff.py": (
+            "causal wait (idle/turn-ended; a busy baseline takes the #15537 ",
+            "wait (idle/turn-ended series only, #15537) and re-runs the strict ",
+        ),
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "application/delivery_outcome_gate.py": (
+            "which IS a positive delivery here even though",
+            "or the exact herdr busy queued submission",
+        ),
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "domain/injection_stage.py": (
+            "while the independent positive-delivery axis,",
+            "is also positive while staying ``uncertain_partial`` on THIS",
+            "reports the noncausal ``sent`` / ``queue_enter`` queued submission",
+        ),
+    }
 
     #: Required on every surface: the noncausal outcome, the busy trigger, and
     #: the decision anchor. Token presence, not phrasing, so paraphrases of the
@@ -1519,6 +1549,11 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         "causal wait, all minimum-",
         "wait and re-runs the strict live gate before every extra Enter",
         "positive delivery (`sent`/`ok`, marker observed)",
+        "Herdr instead withholds success until its causal rail confirms",
+        "Identical to the #13583 ``delivery_was_positive`` predicate by",
+        "Herdr causal wait before each ",
+        "now requires causal turn-start evidence and otherwise fails closed",
+        "reached the receiver and submission is not confirmed.",
     )
 
     def _root(self):
@@ -1539,6 +1574,9 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
             for token in self.REQUIRED_TOKENS:
                 if token.lower() not in text:
                     missing.append(f"{rel}: missing {token!r}")
+            for literal in self.SURFACE_EXTRA_LITERALS.get(rel, ()):
+                if literal.lower() not in text:
+                    missing.append(f"{rel}: missing literal {literal!r}")
         self.assertEqual(
             [],
             missing,
@@ -1570,6 +1608,7 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         ("vibes/docs/logics/tmux-send-safety-contract.md", "用語の対応"),
         ("skills/mozyo-bridge-agent/references/workflow.md", "完了チェックリスト"),
         ("skills/mozyo-bridge-agent/references/workflow.md", "Callback outcome journal テンプレート"),
+        ("vibes/docs/logics/ack-completion-receiver-state.md", "運用への帰結"),
     )
 
     #: Per-section additional literals (review j#106482): pin surfaces where the
@@ -1582,6 +1621,10 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         ("vibes/docs/logics/tmux-send-safety-contract.md", "herdr queue-enter (causal"): (
             "`sent` / `queue_enter` / exit 0",
             "arm を要求せず retry effect boundary 内で同じ gate を再証明する",
+        ),
+        ("vibes/docs/logics/ack-completion-receiver-state.md", "運用への帰結"): (
+            "positive delivery である",
+            "full effect fence → Enter の順で進む",
         ),
     }
 

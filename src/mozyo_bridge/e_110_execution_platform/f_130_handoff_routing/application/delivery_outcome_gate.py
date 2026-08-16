@@ -8,8 +8,11 @@ confirmed receiver turn**:
   checked too);
 - the tmux-compatibility ``queue-enter`` rail can return ``0`` without observing its landing
   marker (``status="sent"``, ``reason="queue_enter"``).  That is a practical queued submission,
-  not causal turn-start evidence.  Herdr instead withholds success until its causal rail confirms
-  the turn.
+  not causal turn-start evidence.  Herdr withholds success until its causal rail confirms the
+  turn on an idle / turn-ended baseline, or — on a busy baseline (ADR-0002 / #15537) — until
+  the injected body clears the composer behind the wait-free full effect fence (the noncausal
+  ``sent`` / ``queue_enter`` queued submission, which IS a positive delivery here even though
+  its injection stage stays ``uncertain_partial``).
 
 Any caller that may only act on a *delivered* message must therefore read the transport's structured
 outcome, not the rc. The #13583 forward-generation completion hook is exactly such a caller:
@@ -57,9 +60,13 @@ def publish_delivery_outcome(args: argparse.Namespace, outcome) -> None:
 def delivery_was_positive(args: argparse.Namespace) -> bool:
     """True only when the last ``orchestrate_handoff`` on ``args`` **positively delivered**.
 
-    Positive delivery requires a structured outcome classified as submitted and confirmed.
-    ``pending_input`` (body typed, Enter never pressed), a tmux marker-unobserved
-    ``queue_enter``, a blocked outcome, and an **absent** outcome are all ``False``.
+    Two proofs qualify (review j#106497): a structured outcome classified as submitted and
+    confirmed (causal, idle / turn-ended), or the exact herdr busy queued submission —
+    ``sent`` / ``queue_enter`` with producer-exact ``busy_queue_path`` /
+    ``queued_submission_confirmed`` bools (composer cleared, ADR-0002 / #15537) — whose
+    stage stays ``uncertain_partial``. ``pending_input`` (body typed, Enter never pressed),
+    a tmux marker-unobserved ``queue_enter``, malformed observation shapes, a blocked
+    outcome, and an **absent** outcome are all ``False``.
     """
     outcome = getattr(args, DELIVERY_OUTCOME_ATTR, None)
     if outcome is None:

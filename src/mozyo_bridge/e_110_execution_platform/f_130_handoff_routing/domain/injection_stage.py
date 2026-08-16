@@ -22,7 +22,11 @@ one question: **may a blind retry duplicate the payload?**
   Enter, no ACK, nothing for the receiver to have half-received. A retry cannot duplicate, so
   a bounded retry is safe.
 - :data:`STAGE_UNCERTAIN_PARTIAL` — the **no-blind-retry** class: text and/or Enter may have
-  reached the receiver and submission is not confirmed. This deliberately covers both a
+  reached the receiver and no CAUSAL submission proof exists. (The herdr busy queued
+  submission, ADR-0002 / #15537, deliberately stays in this class — re-issuing could still
+  duplicate — while the independent positive-delivery axis,
+  :func:`delivery_positively_confirmed`, reports it delivered on the exact composer-clear
+  proof.) This deliberately covers both a
   *known* partial (``pending_input`` parks the body in the composer on purpose; a
   ``marker_timeout`` typed the body and could not verify the rollback cleared it) and an
   *unknown* partial (a transport primitive timed out mid-injection, an event wait expired
@@ -30,8 +34,10 @@ one question: **may a blind retry duplicate the payload?**
   the additive telemetry; this axis answers only the retry question, and for every member the
   answer is the same: **do not blind-retry**.
 - :data:`STAGE_SUBMITTED_CONFIRMED` — the payload was submitted and the submission was
-  positively confirmed. Identical to the #13583 ``delivery_was_positive`` predicate by
-  construction (``sent`` + ``ok``), which is why that gate now reads this module.
+  positively confirmed by causal evidence. The #13583 ``delivery_was_positive`` predicate
+  reads this module but is wider by exactly one case (review j#106497): the exact herdr
+  busy queued submission is also positive while staying ``uncertain_partial`` on THIS
+  axis.
 
 Fail-closed and exhaustive by construction
 ------------------------------------------
@@ -534,8 +540,11 @@ def injection_stage_for(
       confirmed submission;
     - on the tmux ``queue-enter`` rail ``ok`` only means **the landing marker was observed and
       Enter was pressed**; tmux has no causal turn-start gate. The Herdr ``queue-enter`` rail
-      now requires causal turn-start evidence and otherwise fails closed. Older or synthetic
-      outcomes without that evidence remain unconfirmed.
+      requires causal turn-start evidence on an idle / turn-ended baseline; a busy baseline
+      (ADR-0002 / #15537) reports the noncausal ``sent`` / ``queue_enter`` queued submission
+      instead (stage stays ``uncertain_partial``; positive delivery is answered by
+      :func:`delivery_positively_confirmed`). Without either proof it fails closed. Older or
+      synthetic outcomes without evidence remain unconfirmed.
 
     Reading ``ok`` as confirmed on queue-enter was therefore the same optimistic
     delivered-ization the issue's Non-goals prohibit, in a second place: it claimed a
