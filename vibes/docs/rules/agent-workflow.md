@@ -374,10 +374,12 @@ adversarial_convergence:
       pending_record: |
         implementer の判断待ち journal は `challenge_pending: j#<challenge result id>` を持つ
       owner_anchor: |
-        **anchor candidate** = `challenge_ref` 行を 1 行以上含む journal (validity 判定前の
-        母集合)。challenge_ref がちょうど 1 行で実在の challenge result C を指す candidate は
-        「C へ帰属する candidate」。重複行・dangling target の candidate は**帰属不能 candidate**
-        として outstanding blocker 集合へ入る (repairs_attempt で修復可能)。
+        **anchor attempt** = `challenge_ref` / `challenge_verdict` / `supersedes_anchor` の
+        **いずれか**を 1 行以上含む journal (validity 判定前の母集合 — identity key を欠く
+        owner correction もここに入る)。challenge_ref がちょうど 1 行で実在の challenge
+        result C を指す attempt は「C へ帰属する candidate」。challenge_ref の欠落・重複行・
+        dangling target の attempt は**帰属不能 attempt** として outstanding blocker 集合へ
+        入る (repairs_attempt で修復可能。明示修復まで旧 anchor へ fallback しない)。
         C へ帰属する candidate が **valid** であるのは、`challenge_verdict: update_model |
         defer | wontfix_by_policy` をちょうど 1 行持ち、`supersedes_anchor: j#<先行 anchor
         candidate id>` が最大 1 行・後方参照・同一 C の candidate を指す場合。裁定の訂正は
@@ -437,18 +439,24 @@ adversarial_convergence:
         result の `### Deferred (out-of-model)` 節に、item_grammar の entry として記録し、
         `resolution_anchor: j#<owner anchor journal id>` key を必須で付す
     close_predicate: |
-      **issue-level 前提 (outstanding blocker 集合)**: journal id 昇順の**単一 pass** で
-      決定的に構成する。各 canonical review_request は次の**優先順位付き分岐**でちょうど
-      1 分岐に落ちる:
-      (1) **repair candidate** (`repairs_attempt` 行を 1 行以上含む — repair_record の母集合
-      定義。ordinary 帰属判定より優先): valid repair record なら出現時に target U を集合から
-      除去、invalid repair なら出現時に自身を集合へ追加 (effect 0)。
-      (2) **ordinary challenge-key record** (repair candidate でなく `challenge_attempt` /
-      `challenge_resolution` を持つ): 既存の challenge result へ一意に帰属できない (typo・
-      dangling・前方参照・duplicate 等) 場合、出現時に集合へ追加。
-      (3) **帰属不能 anchor candidate** (`challenge_ref` 行を持つが owner_anchor の帰属規則で
-      C へ一意帰属できない journal — 重複行・dangling): 出現時に集合へ追加。
-      (4) 上記いずれの key も持たない journal は集合に関与しない。
+      **issue-level 前提 (outstanding blocker 集合)**: 走査 domain は**当該 issue の全 journal**
+      (canonical review_request に限らない)。journal id 昇順の**単一 pass** で決定的に構成し、
+      各 journal は次の**優先順位付き完全分割**でちょうど 1 分岐に落ちる (fall-through も
+      到達不能分岐も存在しない):
+      (1) **repair candidate** (`repairs_attempt` 行を 1 行以上含む journal): valid repair
+      record (canonical review_request であることを validity に含む) なら出現時に target U を
+      集合から除去、それ以外 (非 request・混在・重複行・malformed 等) は invalid repair として
+      出現時に自身を集合へ追加 (effect 0)。
+      (2) **ordinary challenge-key record** ((1) 以外で `challenge_attempt` /
+      `challenge_resolution` 行を持つ journal): canonical review_request であり、anchor 系 key
+      (challenge_ref / challenge_verdict / supersedes_anchor) と混在せず、既存の challenge
+      result へ一意に帰属できる場合のみ blocker にならない。非 request・anchor 系 key との
+      混在・帰属不能 (typo・dangling・前方参照・duplicate 等) は出現時に集合へ追加。
+      (3) **anchor attempt** ((1)(2) 以外で anchor 系 key を 1 行以上持つ journal): owner_anchor
+      の帰属規則で C へ一意帰属できない (challenge_ref 欠落・重複行・dangling) 場合は出現時に
+      集合へ追加。帰属可能な candidate は authoritative_chain の規則 (latest 検証 → 線形
+      supersession) で評価する。
+      (4) いずれの key も持たない journal は集合に関与しない。
       この pass の最終結果のみを判定に使う (評価順依存の非決定性を排除。fall-through する
       record は存在しない)。無関係な challenge の well-formed attempt が最大 id を更新しても
       集合は変化しない。集合が空でない間は、個別 chain の状態にかかわらず issue close blocked。
@@ -597,8 +605,8 @@ verdict と同名の disposition で記録;
 pending record + 一意な authoritative anchor +
 latest attempt の二段階検証 + 時系列 + 意味的一致
 (canonical value / entry の exact binding)) を確認してから
-(帰属不能 record は valid repair record (repair candidate 分類が
-ordinary 帰属判定に優先、単一 pass 評価) での個別修復のみ解消。
+(帰属不能 record は valid repair record (全 journal を domain とする
+優先順位付き完全分割の単一 pass 評価) での個別修復のみ解消。
 conflict・stale/malformed・forward reference・意味不一致は blocked);
   else (no — 圏外指摘)
     |reviewer|
