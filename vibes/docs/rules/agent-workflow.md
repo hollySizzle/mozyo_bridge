@@ -357,18 +357,22 @@ adversarial_convergence:
       なら approved も正当)。その後 implementer が対象 issue journal に判断待ちを記録 →
       coordinator へ canonical handoff → coordinator が owner 裁定 anchor を記録する
       (owner-question bypass 禁止の正規導線。ADR-0001 の延長: モデルの甘さの裁定者は往復の
-      当事者ではない)。**停止点は Close Gate**: owner 裁定 anchor が記録されるまで当該 US は
-      close できず、当該 guard 面に触れる light 主張は invalid。裁定後は (a) 宣言を更新した新
-      review_request、または (b) challenge の deferred / wontfix_by_policy 化、のいずれかを記録して
-      再開する
+      当事者ではない)。**停止点は Close Gate**: challenge に対応する disposition 付き owner
+      裁定 anchor journal が記録されるまで当該 US は close できず、当該 guard 面に触れる light
+      主張は invalid。裁定後の再開は 2 経路 — (a) 宣言を更新した新 review_request (deferred
+      への反映は reviewer の新 atomic result 経由)、または (b) coordinator が owner 裁定 anchor
+      journal 自体に deferred_finding_record.item_grammar と同形の entry + challenge 元 result
+      journal への参照を含めて記録する (元 result は immutable なため、この anchor journal が
+      challenge 経由 disposition の第二の sanctioned placement。actor は coordinator)
   mandatory_de_escalation:
     severity_vocabulary:
       values: low | medium | high    # closed。canonical finding manifest v1 は変更しない
       recording_authority: |
         reviewer が review result journal 本文の各 finding 見出しに `[High]` / `[Medium]` /
         `[Low]` (または `severity: <値>` 行) で記す。structured manifest には severity field を
-        追加しない (payload contract 不変)。本文から severity を同定できない finding は
-        high とみなす (fail 側は深い方)
+        追加しない (payload contract 不変)。本文から severity を同定できない finding を含む
+        round は「導出不能 round」であり、disposition は qualifying_round.unreadable の
+        一経路のみ (high とみなす等の代替解釈をしない)
     round_pairing:                   # round の単位は ADR-0004 depth_round_derivation の canonical request
       authoritative_result: |
         request R の authoritative result は、R より後かつ次の canonical review_request より前に
@@ -383,8 +387,16 @@ adversarial_convergence:
         material finding に (a)(b) を満たさないものが 1 件でも含まれる round、および
         conclusion=approved の round は counter を 0 に戻す
       unreadable: |
-        導出不能 round・severity 同定不能は count も reset もせず、その時点で下記 action と同じ
-        owner 判断ルートへ止める (fail-closed の倒し先は owner)
+        導出不能 round (authoritative result の pairing 不能・orphan、または severity を同定
+        できない finding を含む) は count も reset もせず、その時点で下記 action と同じ
+        owner 判断ルートへ止める (fail-closed の倒し先は owner)。これが severity 欠落・
+        malformed に対する**唯一の** disposition である
+    worked_sequence: |
+      例: R1 = changes_requested (全 finding が tests/** guard・medium 以下) → counter 1。
+      R2 = changes_requested だが 1 finding に severity 記載なし → 導出不能 round。counter は
+      1 のまま増減せず、この時点で owner 判断ルートへ停止 (correction round へ進まない)。
+      owner 裁定 anchor (続行) の後、R3 = qualifying → counter 2 → trigger 発火。
+      R3 が approved なら counter 0 に reset
     trigger: 直近の連続 qualifying round 数が 2 に達した時点
     action: |
       implementer は次の correction round へ進まず、対象 issue journal に判断待ちを記録して
@@ -393,10 +405,15 @@ adversarial_convergence:
     outcome: owner 裁定 anchor (続行 / deferred 化 / mode 解除) を記録してから再開する
   deferred_finding_record:
     placement: |
-      review result journal 本文の `### Deferred (out-of-model)` 見出し配下 (finding 単位の
-      個別 issue は乱発しない)。material findings の `## Findings` 系見出しとは別見出しであり、
-      deferred entry に machine marker prefix (`[mozyo:` 等) を使わない — strict parser の
-      material finding / gate marker と衝突しない
+      次の 2 箇所のみ (finding 単位の個別 issue は乱発しない):
+      (1) review result journal 本文の `### Deferred (out-of-model)` 見出し配下 (actor:
+      reviewer、result の atomic append の一部)。
+      (2) threat-model challenge の owner 裁定 anchor journal (actor: coordinator。
+      material_boundary.model_challenge の branch (b) 専用 — challenge 元 result journal への
+      参照を必須とする)。
+      いずれも material findings の `## Findings` 系見出しとは別見出しであり、deferred entry に
+      machine marker prefix (`[mozyo:` 等) を使わない — strict parser の material finding /
+      gate marker と衝突しない
     item_grammar:                    # 1 finding = 1 list item。closed keys、順不同、他 key は invalid
       name: <finding 名>             # 同一 result 内で一意。identity は (result journal id, name)
       severity: low | medium | high  # severity_vocabulary と同じ closed enum
@@ -450,9 +467,14 @@ else (no)
     :coordinator へ canonical handoff;
     |coordinator|
     :owner 裁定 anchor を対象 issue journal に記録;
+    |coordinator|
+    :branch (b) (deferred / wontfix_by_policy 化) の場合は
+owner 裁定 anchor journal 自体に item_grammar 同形 entry +
+challenge 元 result 参照を記録;
     |implementer|
-    :裁定に従い (a) 宣言更新付き新 request
-または (b) deferred / wontfix_by_policy 化を記録して再開;
+    :branch (a) の場合は宣言更新付き新 request を発行
+(deferred 反映は reviewer の新 atomic result 経由)。
+close は disposition 付き anchor journal の存在を確認してから;
   else (no — 圏外指摘)
     |reviewer|
     :Deferred (out-of-model) 節に item_grammar で記録
