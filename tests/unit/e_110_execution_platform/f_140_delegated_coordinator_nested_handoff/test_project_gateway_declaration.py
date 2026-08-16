@@ -412,6 +412,37 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
             self.assertEqual(o.status, PG_DECL_ROUTE_MISMATCH)
             self.assertIsNone(self._row_at(tmp))
 
+    def test_route_by_assigned_name_declares(self) -> None:
+        # The herdr backend inventory stamps the durable ASSIGNED NAME as the candidate
+        # ``pane_id`` (its stable target form), so the route arrives with the gateway's
+        # assigned name where a tmux candidate carries the pane id. Joining on the pin
+        # locator alone made a healthy attested pair zero-write as
+        # ``route_identity_mismatch`` on every herdr-only host (#15146 j#106290); the
+        # join accepts either identity form of the SAME pin.
+        with tempfile.TemporaryDirectory() as tmp:
+            o = _declare(tmp, dry_run=True, observed_route=_route(locator=GW_NAME))
+            self.assertEqual(o.status, PG_DECL_DRY_RUN)
+            self.assertTrue(o.would_declare)
+            self.assertIsNone(self._row_at(tmp))
+
+            o = _declare(tmp, dry_run=False, observed_route=_route(locator=GW_NAME))
+            self.assertEqual(o.status, ADOPT_DECL_DECLARED)
+            self.assertIsNotNone(self._row_at(tmp))
+
+    def test_route_foreign_assigned_name_fails_closed(self) -> None:
+        # The widened join accepts the SAME pin's other identity form, never an unrelated
+        # name: a foreign lane's assigned name still mismatches, zero-write.
+        with tempfile.TemporaryDirectory() as tmp:
+            o = _declare(
+                tmp,
+                dry_run=False,
+                observed_route=_route(
+                    locator=encode_assigned_name(WS, "codex", "pgwv1_other-lane")
+                ),
+            )
+            self.assertEqual(o.status, PG_DECL_ROUTE_MISMATCH)
+            self.assertIsNone(self._row_at(tmp))
+
     def test_scope_lane_mismatch_foreign_lane_rows_fail_closed(self) -> None:
         # Redmine #13811 T2 R2 F2: the caller cannot write a scope/lane-mismatched row — the
         # lane is derived from the scope inside the boundary. Live rows that belong to a
