@@ -1183,8 +1183,12 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_herdr_queue_enter_rail.py
-    lines: 1110
+    lines: 1114
     reason: >-
+      Raised 1110 -> 1114 for #15537 review j#106497: the module docstring's safety
+      invariants now state the busy-series wait waiver / full effect fence and the
+      composer-clear queued-submission proof instead of the causal-only universal
+      claim (guarded by BusyContractSurfaceGuardTest).
       Herdr queue-enter causal session (generation pinning, wait/Enter ordering,
       strict resend gates, deadline accounting). Raised past 1000 by the #15537
       ADR-0002 busy-receiver queued-submission path (busy_queue_path flag, the

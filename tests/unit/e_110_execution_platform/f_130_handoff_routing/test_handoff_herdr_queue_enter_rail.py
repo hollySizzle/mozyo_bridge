@@ -1473,6 +1473,21 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         "application/handoff_tmux_transport_rail.py",
         "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
         "application/cli_handoff.py",
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "application/handoff_herdr_queue_enter_rail.py",
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "application/cli_handoff_q_enter.py",
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "application/delivery_outcome_gate.py",
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "domain/injection_stage.py",
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "domain/q_enter.py",
+        "src/mozyo_bridge/e_110_execution_platform/"
+        "f_140_delegated_coordinator_nested_handoff/domain/callback_delivery.py",
+        "src/mozyo_bridge/application/turn_start_observation.py",
+        "src/mozyo_bridge/application/handoff_delivery_command.py",
+        "vibes/docs/logics/release-flow.md",
     )
 
     #: Required on every surface: the noncausal outcome, the busy trigger, and
@@ -1496,6 +1511,14 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         "Herdr は causal confirmation が無ければ成功にせず",
         "Herdr reports success only after causal",
         "every actual Enter had a working-transition wait armed first",
+        "only that causal evidence controls whether",
+        "Herdr queue-enter confirms a turn\n        # before success",
+        "(3) causal confirmation時だけexit 0",
+        "Herdr は causal confirmation 時だけ",
+        "- each Enter is preceded by an armed working-transition wait;",
+        "causal wait, all minimum-",
+        "wait and re-runs the strict live gate before every extra Enter",
+        "positive delivery (`sent`/`ok`, marker observed)",
     )
 
     def _root(self):

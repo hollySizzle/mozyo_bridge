@@ -384,6 +384,55 @@ def busy_queued_submission_observed(
     )
 
 
+def busy_queued_submission_delivery(
+    status: object,
+    reason: object,
+    queue_enter_turn_start_observation: object = None,
+) -> bool:
+    """True for the herdr busy queued-submission delivery (ADR-0002 / #15537, pure).
+
+    Review j#106497 (finding_busyprojection): this is the SHARED positive-delivery
+    answer for the busy path, so the delivery gate, the q-enter front door, the
+    composer-residue read, and the callback / outbox disposition cannot answer
+    "was it delivered?" differently again. It is deliberately independent of the
+    injection stage: the stage stays ``uncertain_partial`` (the blind-retry axis
+    is unchanged — re-issuing could still duplicate), while THIS predicate is the
+    positive-delivery axis, proven by the exact producer facts
+    (``busy_queue_path is True`` and ``queued_submission_confirmed is True``).
+    A tmux / legacy / synthetic ``sent`` / ``queue_enter`` carries no such
+    observation and a malformed shape fails the exact-``True`` reader, so
+    neither is promoted.
+    """
+    return (
+        str(status or "").strip() == "sent"
+        and str(reason or "").strip() == "queue_enter"
+        and busy_queued_submission_observed(queue_enter_turn_start_observation)
+    )
+
+
+def delivery_positively_confirmed(outcome: object) -> bool:
+    """True when a whole DeliveryOutcome **positively delivered** (pure, fail-closed).
+
+    Two proofs exist, and only these two (review j#106497):
+
+    - the causal proof: the carried / derived injection stage is
+      :data:`STAGE_SUBMITTED_CONFIRMED` (idle / turn-ended series);
+    - the busy queued-submission proof: :func:`busy_queued_submission_delivery`
+      over the outcome's own status / reason / observation.
+
+    ``None`` (no outcome at all) is ``False``.
+    """
+    if outcome is None:
+        return False
+    if injection_stage_for_outcome(outcome) == STAGE_SUBMITTED_CONFIRMED:
+        return True
+    return busy_queued_submission_delivery(
+        getattr(outcome, "status", None),
+        getattr(outcome, "reason", None),
+        getattr(outcome, "queue_enter_turn_start_observation", None),
+    )
+
+
 def turn_start_positively_observed(
     queue_enter_turn_start_observation: object = None,
     turn_start_outcome: object = None,
@@ -582,6 +631,37 @@ def stage_guidance(stage: object) -> str:
     return _STAGE_GUIDANCE.get(str(stage or "").strip(), "")
 
 
+#: Truthful guidance for the busy queued submission (review j#106497): the generic
+#: ``uncertain_partial`` text says "submission is NOT confirmed", which is false on this
+#: path — submission WAS proven, by the composer clearing, without a causal turn-start claim.
+BUSY_QUEUED_SUBMISSION_GUIDANCE = (
+    "queued submission proven: the injected body cleared the busy receiver's composer "
+    "behind the wait-free full effect fence (ADR-0002 / #15537), so the receiver CLI "
+    "queued it for its next turn. No causal turn start is claimed and blind retry stays "
+    "prohibited — re-issuing would duplicate. Delivery is an ACK, not task completion; "
+    "the receiver reads the durable anchor and decides."
+)
+
+
+def contextual_stage_guidance(
+    stage: object,
+    *,
+    status: object = None,
+    reason: object = None,
+    queue_enter_turn_start_observation: object = None,
+) -> str:
+    """Stage guidance that tells the truth on the busy queued submission (pure).
+
+    Falls back to :func:`stage_guidance` everywhere else; only the exact busy
+    proof (:func:`busy_queued_submission_delivery`) swaps in the busy text.
+    """
+    if busy_queued_submission_delivery(
+        status, reason, queue_enter_turn_start_observation
+    ):
+        return BUSY_QUEUED_SUBMISSION_GUIDANCE
+    return stage_guidance(stage)
+
+
 def injection_stage_telemetry(
     status: object,
     reason: object,
@@ -613,7 +693,12 @@ def injection_stage_telemetry(
     return {
         "stage": stage,
         "blind_retry_prohibited": blind_retry_prohibited(stage),
-        "next_action": stage_guidance(stage),
+        "next_action": contextual_stage_guidance(
+            stage,
+            status=status,
+            reason=reason,
+            queue_enter_turn_start_observation=queue_enter_turn_start_observation,
+        ),
     }
 
 

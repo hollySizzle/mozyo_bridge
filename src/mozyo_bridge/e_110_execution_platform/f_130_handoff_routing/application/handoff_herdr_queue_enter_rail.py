@@ -8,13 +8,17 @@ holds, bounded Enter-only retries.  It deliberately does not reuse the standard 
 Safety invariants:
 
 - the body is never in reach of a send-text primitive here;
-- each Enter is preceded by an armed working-transition wait;
+- on the idle / turn-ended series each Enter is preceded by an armed
+  working-transition wait; the busy series (ADR-0002 / #15537) waives only that
+  pending observer and passes each Enter through the wait-free full effect fence;
 - every additional Enter repeats launch-generation, current-composer,
   startup-screen, and runtime-state checks;
 - the public retry window is one absolute deadline across all waits and intervals;
 - timeout retries use the public policy cap; an observer error stops the
   sequence immediately without authorising another Enter;
-- a busy receiver can be nudged, but busy-only evidence never confirms this delivery;
+- a busy receiver can be nudged, but busy-only evidence never confirms this
+  delivery — the busy series proves its noncausal queued submission (``sent`` /
+  ``queue_enter``) only by the injected body clearing the current composer;
 - telemetry remains on ``queue_enter_turn_start_observation`` so the delivery ledger
   continues to classify the outcome as the queue-enter rail.
 """

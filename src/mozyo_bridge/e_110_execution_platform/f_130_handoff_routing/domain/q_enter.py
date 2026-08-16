@@ -54,6 +54,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injectio
     POST_INJECTION_BLOCKED_REASONS,
     STAGE_SUBMITTED_CONFIRMED,
     blind_retry_prohibited,
+    busy_queued_submission_delivery,
+    contextual_stage_guidance,
+    delivery_positively_confirmed,
     injection_stage_for_outcome,
     stage_guidance,
     turn_start_positively_observed,
@@ -340,6 +343,13 @@ def classify_composer_residue(
     reason_token = reason if isinstance(reason, str) else ""
     if status_token == "sent":
         if reason_token != "ok":
+            # Review j#106497: the busy queued submission's PROOF is the composer clearing
+            # (ADR-0002 / #15537), so its residue is `cleared` by construction. Only the
+            # exact producer bools qualify; a tmux / malformed `queue_enter` stays pending.
+            if busy_queued_submission_delivery(
+                status_token, reason_token, queue_enter_turn_start_observation
+            ):
+                return RESIDUE_CLEARED
             return RESIDUE_TYPED_BUT_PENDING
         # Review j#95333 F1, same misreading on the residue axis: a marker-observed
         # `queue-enter` send also reports `ok`, but that rail never verified a submit. If the
@@ -510,7 +520,11 @@ class SubmitOutcome:
           parked ``pending_input`` still prohibits a blind resend: its body IS in the composer.
         """
         stage = injection_stage_for_outcome(outcome)
-        delivered = stage == STAGE_SUBMITTED_CONFIRMED
+        # Review j#106497 (finding_busyprojection): the busy queued submission is the second
+        # positive-delivery proof (ADR-0002 / #15537). The stage stays `uncertain_partial`
+        # (blind-retry axis unchanged) but the front door must not report a proven queued
+        # submission as blocked.
+        delivered = delivery_positively_confirmed(outcome)
         reason = getattr(outcome, "reason", None)
         parked = str(getattr(outcome, "status", None) or "").strip() == STATUS_PENDING_INPUT
         return cls(
@@ -525,7 +539,14 @@ class SubmitOutcome:
             blocked_reason=(
                 None if (delivered or parked) else (str(reason) if reason else None)
             ),
-            guidance=stage_guidance(stage),
+            guidance=contextual_stage_guidance(
+                stage,
+                status=getattr(outcome, "status", None),
+                reason=reason,
+                queue_enter_turn_start_observation=getattr(
+                    outcome, "queue_enter_turn_start_observation", None
+                ),
+            ),
             injection_stage=stage,
             blind_retry_prohibited=blind_retry_prohibited(stage),
         )

@@ -63,6 +63,12 @@ class HandoffDeliveryResult:
     #: marker-observed ``queue-enter`` send that never started a turn. "" when the payload
     #: carried none (a legacy sender), which falls back to the two-token classification.
     injection_stage: str = ""
+    #: The producer's full queue observation dict when the structured JSON carried one
+    #: (review j#106497): it is what proves the herdr busy queued submission (exact
+    #: ``busy_queue_path`` / ``queued_submission_confirmed`` bools) as a positive delivery.
+    #: ``None`` for legacy payloads and every other rail — the disposition then derives from
+    #: the stage alone, fail-closed.
+    queue_enter_turn_start_observation: "dict | None" = None
 
 
 class HandoffCallbackSender:
@@ -88,7 +94,10 @@ class HandoffCallbackSender:
         except Exception:  # noqa: BLE001 - a mid-send failure is fail-safe uncertain, never a retry
             return CallbackSendResult(SEND_UNCERTAIN)
         outcome = send_outcome_for_delivery(
-            result.status, result.reason, injection_stage=result.injection_stage
+            result.status,
+            result.reason,
+            injection_stage=result.injection_stage,
+            queue_enter_turn_start_observation=result.queue_enter_turn_start_observation,
         )
         # Redmine #14248 review j#85410 F1: the send edge's own reason used to be consumed by
         # `send_outcome_for_delivery` and then DROPPED, so a downstream reader could see

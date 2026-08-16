@@ -28,6 +28,7 @@ from typing import Any, Callable
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (
     STAGE_SUBMITTED_CONFIRMED,
+    delivery_positively_confirmed,
     injection_stage_for_outcome,
 )
 
@@ -63,15 +64,16 @@ def delivery_was_positive(args: argparse.Namespace) -> bool:
     outcome = getattr(args, DELIVERY_OUTCOME_ATTR, None)
     if outcome is None:
         return False
-    # Redmine #14232: evaluate the SHARED injection-stage authority rather than re-testing the
-    # two tokens locally, so this gate and the callback / outbox retry authority can no longer
+    # Redmine #14232: evaluate the SHARED positive-delivery authority rather than re-testing
+    # tokens locally, so this gate and the callback / outbox retry authority can no longer
     # answer "was it delivered?" differently.
     #
-    # Review j#95333 F1: read the WHOLE outcome, not the two tokens. A tmux, legacy, or
-    # synthetic ``queue-enter`` outcome can report ``sent`` / ``ok`` without causal
-    # turn-start evidence. The Herdr rail now supplies that evidence and fails closed when
-    # it cannot. The shared classifier keeps both cases safe.
-    return injection_stage_for_outcome(outcome) == STAGE_SUBMITTED_CONFIRMED
+    # Review j#95333 F1: read the WHOLE outcome, not the two tokens. Review j#106497
+    # (finding_busyprojection): the herdr busy queued submission (ADR-0002 / #15537) is the
+    # second positive proof — exact ``busy_queue_path`` / ``queued_submission_confirmed``
+    # bools over ``sent`` / ``queue_enter`` — while a tmux, legacy, or synthetic
+    # ``queue_enter`` (no such observation) and malformed shapes stay non-positive.
+    return delivery_positively_confirmed(outcome)
 
 
 def make_publishing_emitter(publish: Callable[[Any], None], emit):

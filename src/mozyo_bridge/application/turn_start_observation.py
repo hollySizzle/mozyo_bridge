@@ -263,8 +263,11 @@ def project_herdr_turn_start(result: TurnStartResult) -> Tuple[str, str]:
 # ``read_agent_state``). The snapshot fields remain advisory: a read failure, an
 # ``unknown`` state, or an ``awaiting_input`` state cannot confirm or reject this
 # send. Redmine #15242 merges separate armed-wait + coherent-generation evidence
-# into the queue observation envelope; only that causal evidence controls whether
-# the handoff is confirmed or ``blocked / turn_start_unconfirmed``.
+# into the queue observation envelope; on the idle / turn-ended series only that
+# causal evidence controls whether the handoff is confirmed or ``blocked /
+# turn_start_unconfirmed``. The busy series (ADR-0002 / #15537) instead proves a
+# noncausal queued submission (``sent`` / ``queue_enter``) by the injected body
+# clearing the composer behind the wait-free full effect fence.
 #
 # It is kept structurally distinct from the event rail's ``turn_start_outcome``
 # telemetry on purpose (j#72759 answer 3): a post-hoc snapshot does not prove

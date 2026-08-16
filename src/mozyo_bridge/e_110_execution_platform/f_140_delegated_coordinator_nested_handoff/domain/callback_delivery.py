@@ -51,6 +51,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injectio
     STAGE_NOT_SENT,
     STAGE_SUBMITTED_CONFIRMED,
     STAGE_UNCERTAIN_PARTIAL,
+    busy_queued_submission_delivery,
     injection_stage_for,
 )
 
@@ -224,7 +225,11 @@ _SEND_OUTCOME_BY_STAGE: dict = {
 
 
 def send_outcome_for_delivery(
-    status: str, reason: str, *, injection_stage: str = ""
+    status: str,
+    reason: str,
+    *,
+    injection_stage: str = "",
+    queue_enter_turn_start_observation: object = None,
 ) -> str:
     """Map a handoff ``DeliveryOutcome`` (status, reason) onto a closed send outcome (pure).
 
@@ -243,10 +248,13 @@ def send_outcome_for_delivery(
 
     **Two deliberate behaviour changes** (both fail-closed or strictly more accurate):
 
-    1. ``sent`` + ``queue_enter`` is no longer :data:`SEND_DELIVERED`. That reason means the
-       landing marker was **never observed** — the relaxed rail pressed Enter without
-       pre-confirming submission — so reporting it delivered closed an outbox row on an
-       unconfirmed delivery. This module and
+    1. ``sent`` + ``queue_enter`` is no longer :data:`SEND_DELIVERED` **by itself**. On tmux
+       that reason means the landing marker was **never observed** — the relaxed rail pressed
+       Enter without pre-confirming submission — so reporting it delivered closed an outbox
+       row on an unconfirmed delivery. The one exception (review j#106497, ADR-0002 /
+       #15537) is the herdr busy queued submission, proven by the exact
+       ``busy_queue_path`` / ``queued_submission_confirmed`` bools on the full
+       queue observation passed via ``queue_enter_turn_start_observation``. This module and
        ``...f_130_handoff_routing.application.delivery_outcome_gate.delivery_was_positive``
        (which has always refused ``queue_enter``) were precisely the two divergent answers
        #14232 j#84877 recorded, and the issue's Non-goals prohibit reading a timed-out landing
@@ -267,6 +275,15 @@ def send_outcome_for_delivery(
     When it is supplied and recognised it wins; otherwise this falls back to the two-token
     classification, which keeps a legacy / unparseable payload working and still fails closed.
     """
+    # Review j#106497 (finding_busyprojection): the herdr busy queued submission (ADR-0002 /
+    # #15537) is a positive delivery even though its stage stays `uncertain_partial`. Only the
+    # exact producer proof on the FULL observation qualifies — never an optimistic read of
+    # status / reason / stage alone — so a tmux / legacy / synthetic `queue_enter` (no such
+    # observation) and malformed shapes keep the fail-closed `uncertain` disposition.
+    if busy_queued_submission_delivery(
+        status, reason, queue_enter_turn_start_observation
+    ):
+        return SEND_DELIVERED
     carried = str(injection_stage or "").strip()
     if carried in _SEND_OUTCOME_BY_STAGE:
         return _SEND_OUTCOME_BY_STAGE[carried]

@@ -414,7 +414,8 @@ def configure_handoff_parser(
             "Absolute queue-enter retry budget in seconds (default "
             f"{QUEUE_ENTER_RETRY_WINDOW_SECONDS:g}); after admission the body is typed "
             "at most once. Herdr first Enter is zero-or-one and includes its pre-armed "
-            "causal wait, all minimum-"
+            "causal wait (idle/turn-ended; a busy baseline takes the #15537 "
+            "wait-free full effect fence instead), all minimum-"
             "interval delays, and every re-armed wait in this one budget. A "
             "timeout may repeat an Enter-only retry after a fresh strict gate "
             "until the deadline; a wait error stops the sequence immediately "
@@ -433,7 +434,8 @@ def configure_handoff_parser(
         help=(
             "Minimum seconds between queue-enter Enter presses (default "
             f"{QUEUE_ENTER_RETRY_INTERVAL_SECONDS:g}). Herdr re-arms the causal "
-            "wait and re-runs the strict live gate before every extra Enter; "
+            "wait (idle/turn-ended series only, #15537) and re-runs the strict "
+            "live gate before every extra Enter; "
             "Herdr accepts only finite values up to 3600 seconds. tmux keeps "
             "the legacy marker probe loop. `0` disables extra Enter."
         ),
