@@ -1300,3 +1300,138 @@ class LiveQueueEnterBindingTest(unittest.TestCase):
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
+
+
+def _drive_busy(session: HerdrQueueEnterSession, ops: _FakeOps) -> _DriveResult:
+    """Model the common rail's ADR-0002 busy branch (#15537) around the session."""
+    if not session.capture_before_body():
+        return _DriveResult(False, ())
+    ops.events.append("body:external")
+    if not session.arm_before_first_enter():
+        return _DriveResult(False, ())
+    ops.events.append("enter:first")
+    session.note_first_enter_sent()
+    extra_enter_times: list[float] = []
+
+    def _press_extra_enter() -> None:
+        ops.events.append("enter:retry")
+        extra_enter_times.append(ops.clock())
+
+    assert session.busy_queue_path, "busy drive requires the busy path flag"
+    session.complete_after_busy_enter(press_extra_enter=_press_extra_enter)
+    return _DriveResult(True, tuple(extra_enter_times))
+
+
+class BusyReceiverQueuedSubmissionTest(unittest.TestCase):
+    """ADR-0002 (#15537): a busy receiver gets the Enter, and submission is proven
+    by the composer clearing — never by a causal turn start. Measured live before
+    the fix: baseline busy => enter_attempts=0 / wait_unarmed (#15537 j#106467)."""
+
+    def test_busy_baseline_sets_the_busy_path_and_authorises_first_enter(self) -> None:
+        clock = _ManualClock()
+        ops = _FakeOps(
+            clock,
+            states=["busy"],
+            gates=[QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT)],
+        )
+        session = _session(ops, clock)
+
+        result = _drive_busy(session, ops)
+
+        self.assertTrue(result.first_enter_sent)
+        self.assertTrue(session.busy_queue_path)
+        self.assertEqual(session.enter_attempts, 1)
+
+    def test_composer_cleared_after_first_enter_confirms_queued_submission(self) -> None:
+        clock = _ManualClock()
+        ops = _FakeOps(
+            clock,
+            states=["busy"],
+            gates=[QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT)],
+        )
+        session = _session(ops, clock)
+
+        _drive_busy(session, ops)
+
+        self.assertTrue(session.queued_submission_confirmed)
+        self.assertEqual(session.resend_skipped_reason, RESEND_SKIP_NONE)
+        self.assertFalse(session.causal_start_confirmed)
+
+    def test_retained_body_gets_a_bounded_extra_enter_then_confirms(self) -> None:
+        clock = _ManualClock()
+        ops = _FakeOps(
+            clock,
+            states=["busy"],
+            gates=[
+                QueueEnterResendGate(RESEND_SKIP_NONE, "busy"),   # first poll: retained
+                QueueEnterResendGate(RESEND_SKIP_NONE, "busy"),   # effect-boundary re-proof
+                QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT),    # after retry: cleared
+            ],
+        )
+        session = _session(ops, clock)
+
+        result = _drive_busy(session, ops)
+
+        self.assertEqual(len(result.extra_enter_times), 1)
+        self.assertEqual(session.enter_attempts, 2)
+        self.assertTrue(session.queued_submission_confirmed)
+        self.assertTrue(session.retry_engaged)
+
+    def test_body_retained_to_the_cap_stays_unconfirmed(self) -> None:
+        clock = _ManualClock()
+        retained = QueueEnterResendGate(RESEND_SKIP_NONE, "busy")
+        ops = _FakeOps(clock, states=["busy"], gates=[retained] * 40)
+        session = _session(ops, clock)
+
+        _drive_busy(session, ops)
+
+        self.assertFalse(session.queued_submission_confirmed)
+        self.assertEqual(
+            session.resend_skipped_reason, RESEND_SKIP_BUDGET_EXHAUSTED
+        )
+        self.assertEqual(session.failure_reason, "turn_start_unconfirmed")
+
+    def test_receiver_blocked_mid_poll_refuses_further_enters(self) -> None:
+        clock = _ManualClock()
+        ops = _FakeOps(
+            clock,
+            states=["busy"],
+            gates=[QueueEnterResendGate(RESEND_SKIP_RECEIVER_BLOCKED, "blocked")],
+        )
+        session = _session(ops, clock)
+
+        result = _drive_busy(session, ops)
+
+        self.assertEqual(result.extra_enter_times, ())
+        self.assertFalse(session.queued_submission_confirmed)
+        self.assertEqual(
+            session.resend_skipped_reason, RESEND_SKIP_RECEIVER_BLOCKED
+        )
+        self.assertEqual(session.failure_reason, "receiver_blocked")
+
+    def test_idle_baseline_never_takes_the_busy_path(self) -> None:
+        clock = _ManualClock()
+        ops = _FakeOps(clock, states=["turn_ended"], wait_kinds=[WAIT_CHANGED])
+        session = _session(ops, clock)
+
+        result = _drive(session, ops)
+
+        self.assertTrue(result.first_enter_sent)
+        self.assertFalse(session.busy_queue_path)
+        self.assertTrue(session.causal_start_confirmed)
+
+    def test_busy_observation_carries_additive_facts_without_causal_claim(self) -> None:
+        clock = _ManualClock()
+        ops = _FakeOps(
+            clock,
+            states=["busy"],
+            gates=[QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT)],
+        )
+        session = _session(ops, clock)
+
+        _drive_busy(session, ops)
+        observation = session.observation(_Snapshot(runtime_state="busy"))
+
+        self.assertTrue(observation.get("busy_queue_path"))
+        self.assertTrue(observation.get("queued_submission_confirmed"))
+        self.assertNotIn("event_wait_kind", observation)

@@ -285,6 +285,14 @@ class HerdrQueueEnterSession:
     resend_skipped_reason: str = RESEND_SKIP_NONE
     enter_attempts: int = 0
     retry_engaged: bool = False
+    #: ADR-0002 (#15537): the receiver was BUSY at arm time. A working-transition wait
+    #: can never attribute a turn to this send (the receiver is already working), so the
+    #: session presses Enter without requiring a live pending observer and proves
+    #: submission by the composer clearing instead of by a causal turn start.
+    busy_queue_path: bool = False
+    #: The busy path's submission evidence: the injected body left the current composer
+    #: after an Enter (the receiver CLI accepted it into its input queue).
+    queued_submission_confirmed: bool = False
 
     @property
     def retry_enabled(self) -> bool:
@@ -412,9 +420,18 @@ class HerdrQueueEnterSession:
         return RESEND_SKIP_NONE
 
     def _ready_for_immediate_enter(self, armed: Optional[object]) -> bool:
-        """Make observer, deadline, and stable generation the final live checks."""
+        """Make observer, deadline, and stable generation the final live checks.
+
+        On the busy path (ADR-0002, #15537) the pending-observer requirement is
+        waived: a ``working``-transition wait against an already-working receiver
+        completes (or refuses) immediately, so demanding a live observer made the
+        first Enter structurally impossible exactly when the receiver was busy —
+        measured live as ``enter_attempts=0`` / ``wait_unarmed`` (#15537 j#106467).
+        No causal claim is ever made from this path; deadline and generation
+        checks stay mandatory.
+        """
         reason = RESEND_SKIP_NONE
-        if not self._pending(armed):
+        if not self.busy_queue_path and not self._pending(armed):
             reason = RESEND_SKIP_WAIT_UNARMED
         elif self.retry_deadline is not None and self.retry_deadline - self.monotonic() < 0.001:
             reason = RESEND_SKIP_BUDGET_EXHAUSTED
@@ -422,6 +439,7 @@ class HerdrQueueEnterSession:
             reason = self._binding_refusal()
             if (
                 reason == RESEND_SKIP_NONE
+                and not self.busy_queue_path
                 and not self._pending(armed)
             ):
                 reason = RESEND_SKIP_WAIT_UNARMED
@@ -502,6 +520,14 @@ class HerdrQueueEnterSession:
         # arming must not be mistaken for a consequence of the later Enter.
         self.baseline_state = self._observe_state()
         self.causal_state = self.baseline_state
+        if self.baseline_state == RUNTIME_BUSY:
+            # ADR-0002 (#15537): the receiver is already producing a turn, so the armed
+            # working-transition wait is useless for attribution (it satisfies or dies
+            # immediately) and MUST not gate the Enter. Take the queued-submission
+            # path: the Enter below is still fenced by deadline + generation, and the
+            # completion proves submission by the composer clearing — never by a
+            # causal turn start.
+            self.busy_queue_path = True
         if (
             self.retry_deadline is not None
             and self.retry_deadline - self.monotonic() < 0.001
@@ -578,6 +604,72 @@ class HerdrQueueEnterSession:
         if not isinstance(gate, QueueEnterResendGate):
             return QueueEnterResendGate(RESEND_SKIP_STATE_UNREADABLE)
         return gate
+
+    def complete_after_busy_enter(
+        self, *, press_extra_enter: Callable[[], None]
+    ) -> None:
+        """Busy-path completion (ADR-0002, #15537): prove submission, not turn start.
+
+        The receiver was busy when the body was typed, so a causal turn start for
+        THIS message cannot exist inside the window — the receiver CLI queues the
+        submitted input and processes it when its current turn ends. Submission is
+        therefore proven by the injected body LEAVING the current composer after an
+        Enter (``queued_submission_confirmed``). While the body is still retained,
+        bounded Enter-only fallbacks re-press through the full resend gate (identity,
+        screen, composer, state — ``blocked`` still refuses). The body is never
+        re-typed. A body still retained at the deadline stays an uncertain partial
+        delivery, exactly as before.
+        """
+        # The armed wait (if any) is useless here — reap it so no observer leaks.
+        self._cancel(self.armed_wait)
+        self.armed_wait = None
+        resends = 0
+        while True:
+            gate = self._evaluate_resend_gate()
+            if gate.skip_reason == RESEND_SKIP_BODY_ABSENT:
+                # The composer no longer holds the body: the Enter was accepted and
+                # the message sits in the receiver's input queue.
+                self.queued_submission_confirmed = True
+                self.resend_skipped_reason = RESEND_SKIP_NONE
+                return
+            if not gate.allowed:
+                self.resend_skipped_reason = gate.skip_reason
+                return
+            self.causal_state = gate.runtime_state
+            if not self.retry_enabled:
+                self.resend_skipped_reason = RESEND_SKIP_DISABLED
+                return
+            if (
+                self.retry_deadline is None
+                or self.retry_deadline - self.monotonic() < 0.001
+            ):
+                self.resend_skipped_reason = RESEND_SKIP_BUDGET_EXHAUSTED
+                return
+            if resends >= self.retry_policy.max_retries:
+                self.resend_skipped_reason = RESEND_SKIP_BUDGET_EXHAUSTED
+                return
+            self.ops.sleep(self.retry_policy.interval_seconds)
+            if (
+                self.retry_deadline is not None
+                and self.retry_deadline - self.monotonic() < 0.001
+            ):
+                self.resend_skipped_reason = RESEND_SKIP_BUDGET_EXHAUSTED
+                return
+            # Re-prove at the effect boundary, then press Enter and only Enter.
+            gate = self._evaluate_resend_gate()
+            if gate.skip_reason == RESEND_SKIP_BODY_ABSENT:
+                self.queued_submission_confirmed = True
+                self.resend_skipped_reason = RESEND_SKIP_NONE
+                return
+            if not gate.allowed:
+                self.resend_skipped_reason = gate.skip_reason
+                return
+            self.causal_state = gate.runtime_state
+            press_extra_enter()
+            resends += 1
+            self.enter_attempts += 1
+            self.last_enter_at = self.monotonic()
+            self.retry_engaged = True
 
     def complete_after_first_enter(
         self, *, press_extra_enter: Callable[[], None]
@@ -725,6 +817,11 @@ class HerdrQueueEnterSession:
             "final_event_wait_kind": self.final_wait_kind,
             "resend_skipped_reason": self.resend_skipped_reason,
         }
+        if self.busy_queue_path:
+            # ADR-0002 (#15537): additive, value-free busy-path facts. Submission was
+            # proven (or not) by the composer clearing; no causal claim is implied.
+            extra["busy_queue_path"] = True
+            extra["queued_submission_confirmed"] = self.queued_submission_confirmed
         causal_baseline = (
             self.causal_baseline_state
             if self.causal_start_confirmed
