@@ -407,6 +407,14 @@ Expected files written:
 - `CLAUDE.md`
 - `.mozyo-bridge/scaffold.json`
 
+To select the herdr terminal backend at adoption time, pass `--backend herdr`
+(Redmine #15527). That writes one additional file, `.mozyo-bridge/config.yaml`
+with `terminal_transport.backend: herdr`, which the Stage 5 backend reading below
+then reports as `herdr`. The config is operator-owned and not manifest-tracked
+(`scaffold status` ignores it); an existing `config.yaml` fails the apply closed
+rather than being overwritten. Without `--backend` no config is written and the
+tmux default applies as before.
+
 Project-Local Additions:
 
 - The marker block in generated `AGENTS.md` / `CLAUDE.md` is where target-owned

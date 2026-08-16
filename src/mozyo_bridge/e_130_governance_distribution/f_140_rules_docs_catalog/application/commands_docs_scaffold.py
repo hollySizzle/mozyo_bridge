@@ -120,6 +120,27 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     warning = nested_target_warning(target, infer_git_worktree_root(target))
     if warning is not None:
         print(warning)
+    # Backend declaration (Redmine #15527). Decided BEFORE the scaffold write so an
+    # operator-owned config refuses the whole apply with zero files written, rather
+    # than leaving a scaffolded target whose backend request was silently dropped.
+    declaration = None
+    backend = getattr(args, "backend", None)
+    if backend is not None:
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.scaffold_backend_declaration import (  # noqa: E501
+            backend_declaration,
+        )
+        from mozyo_bridge.shared.errors import die
+
+        # `lexists`, not `exists` (review j#106056 finding_1): a DANGLING symlink at
+        # the config path answers False to `exists()`, and following it on write
+        # would create a file OUTSIDE the target — reproduced before this fix. Any
+        # directory entry at the path, symlink included, is an existing declaration.
+        config_path = target / ".mozyo-bridge" / "config.yaml"
+        declaration = backend_declaration(
+            target, backend, config_exists=os.path.lexists(config_path)
+        )
+        if not declaration.ok:
+            die(declaration.refusal)
     paths = write_scaffold(
         args.preset,
         target,
@@ -134,6 +155,28 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     action = "would write" if args.dry_run else "wrote"
     for path in paths:
         print(f"{action}: {path}")
+    if declaration is not None:
+        # After the manifest-tracked files, deliberately outside the manifest: the
+        # config is operator-owned from its first byte, so `scaffold status` must
+        # stay clean when it is edited later (Redmine #15527).
+        if not args.dry_run:
+            declaration.path.parent.mkdir(parents=True, exist_ok=True)
+            # Exclusive create (review j#106056 finding_1): O_EXCL refuses when the
+            # final component exists — INCLUDING a symlink, dangling or not — so a
+            # link planted between the lexists check and this write cannot redirect
+            # the config outside the target. FileExistsError here is that race.
+            try:
+                fd = os.open(
+                    declaration.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
+                )
+            except FileExistsError:
+                die(
+                    f"refusing --backend {backend}: {declaration.path} appeared "
+                    "between the preflight check and the write; not overwriting it"
+                )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(declaration.content)
+        print(f"{action}: {declaration.path} (backend declaration; not in manifest)")
     return 0
 
 
