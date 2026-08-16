@@ -213,22 +213,34 @@ review_depth_tiers:
       - comments_only                # コメント・docstring のみ (契約記述を変えない)
       - generated_regen              # generator 出力の再生成のみ
     target_head: <commit sha>        # 主張が指す exact head
-    round: <n>                       # 参考値。authority は reviewer の導出 (下記) であり自己申告ではない
+    depth_round: <n>                 # 参考値。authority は reviewer の導出 (下記) であり自己申告ではない
     reason_or_anchor:                # 再分類時のみ: 格上げ理由 1 行、または格下げ承認 anchor
-  round_derivation:                  # reviewer が実行する exact な導出
-    - 対象 issue の canonical marker 連鎖 (`gate=review_request:head=` と、それを `req=` で指す
-      `gate=review_result`) を journal 順に読む
-    - 現在の review generation (最新 request の head 系列に属する request/result の連鎖) に含まれる
-      有効な review_result の数 + 1 が今回の round
-    - implementer 申告の round と導出値が食い違う場合は導出値を採用し、差異を review journal に記す
+  depth_round_derivation:            # reviewer が実行する exact な導出
+    # depth_round は review-depth 専用の往復数であり、Review Generation Marker Contract v2 の
+    # current review generation とは別概念 (generation は最新 request が開き直すが、depth_round は
+    # issue の審査史全体を数える)。
+    - 開始境界: 当該 issue の最初の canonical review_request journal
+      (`gate=review_request:head=` marker を持つもの)
+    - journal 昇順に、(a) canonical request を `req=` で指し head が一致する有効な
+      `gate=review_result` pair のうち conclusion=changes_requested のもの、(b) canonical request
+      と相関できないが changes_requested を主張する review_result、をそれぞれ数える
+    - depth_round = (a) + (b) + 1。欠損・相関不能・marker 不正は常に**深い側** (round に算入) へ倒す
+    - 導出例 (2026-08-16 の #15547 実データ): canonical request は 1 件 (j#106443)、有効 pair 0、
+      相関不能な changes_requested result 2 件 (j#106427 / j#106438 — request 側 marker が
+      非 canonical で pair 不成立) → depth_round = 0 + 2 + 1 = 3
+    - implementer 申告と導出値が食い違う場合は導出値を採用し、差異を review journal に記す
   actors:
     implementer: class を主張し、格上げを随時宣言し、light 承認後の Notes を follow-up issue 化する
+    coordinator: owner 裁定の唯一の収集窓口 (owner 承認が要る格下げで登場)
     reviewer: diff を主張と照合して最終 class を確定し、review journal に記録する
-    owner_or_reviewer: 格下げ (standard -> light) の承認 anchor を発行できる唯一の authority
+    owner_or_reviewer: 格下げ (standard -> light) の承認 anchor を発行できる唯一の authority。
+      reviewer 承認は直接発行できるが、owner 承認は owner-question bypass 禁止 (central preset
+      `### Claude Owner-Question Bypass Prohibition`) に従い、implementer の判断待ち記録 →
+      coordinator への canonical handoff → coordinator による owner 裁定 anchor 記録、の順でのみ成立する
   always_standard:
     - us_level_audit.task_level例外 の高リスク種別 (主張にかかわらず reviewer が standard へ確定)
     - light 主張の diff が src の動作コード・高リスクパスに触れている場合 (自動格上げ)
-    - light 案件の round >= 2 (自動格上げ。2 周目が要ること自体が light でなかった証拠)
+    - light 案件の導出 depth_round >= 2 (自動格上げ。2 周目が要ること自体が light でなかった証拠)
   light_contract:
     - changes_requested にできるのは、ADR-0004 の観測可能 3 条件
       「壊れる / 契約と矛盾する / 安全境界に触れる」のいずれかを満たす finding のみ
@@ -261,15 +273,23 @@ if (作業中に別成果物 (別の欠陥・別機能) が生えた?) then (yes
 else (no)
 endif
 if (standard を light へ下げたい?) then (yes)
-  |owner_or_reviewer|
-  :格下げ承認 anchor を対象 issue journal に発行;
+  if (reviewer 承認で足りる?) then (yes)
+    |owner_or_reviewer|
+    :reviewer が格下げ承認 anchor を\n対象 issue journal に直接発行;
+  else (owner 承認が必要)
+    |implementer|
+    :対象 issue journal に「owner 判断待ち」を記録;
+    :coordinator role へ canonical handoff;
+    |coordinator|
+    :owner 裁定を収集し anchor を\n対象 issue journal に記録\n(owner-question bypass 禁止の正規導線);
+  endif
   |implementer|
   :claim_schema.reason_or_anchor に anchor を記載;
 else (no)
 endif
 :canonical review_request journal を発行\n(claim_schema 付き、marker は gate=review_request:head=<full SHA>);
 |reviewer|
-:round を round_derivation で導出\n(申告値は参考。導出値が authority);
+:depth_round を depth_round_derivation で導出\n(申告値は参考。導出値が authority);
 if (claim に格下げ anchor あり?) then (yes)
   if (anchor が journal 上で検証できる?) then (yes)
     :light として審査continue;
@@ -278,7 +298,7 @@ if (claim に格下げ anchor あり?) then (yes)
   endif
 else (no)
 endif
-if (always_standard に該当?\n(task_level例外種別 / light 主張の動作コード・高リスクパス接触 / 導出 round >= 2)) then (yes)
+if (always_standard に該当?\n(task_level例外種別 / light 主張の動作コード・高リスクパス接触 / 導出 depth_round >= 2)) then (yes)
   :standard へ確定し、理由を review journal に記録;
 else (no)
 endif
