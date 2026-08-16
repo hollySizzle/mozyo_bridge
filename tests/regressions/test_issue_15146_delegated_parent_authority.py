@@ -65,7 +65,7 @@ class DecisionTest(unittest.TestCase):
     def test_a_coordinator_only_declaration_refuses_undeclared(self) -> None:
         # The filed reproduction: only `coordinator` is bound, no gateway exists.
         verdict = decide_delegated_parent_authority(
-            _bindings(COORDINATOR_ENTRY), owner_row_active=lambda lane: True
+            _bindings(COORDINATOR_ENTRY), owner_row_active=lambda lane, scope: True
         )
 
         self.assertFalse(verdict.ok)
@@ -73,7 +73,7 @@ class DecisionTest(unittest.TestCase):
 
     def test_an_empty_declaration_refuses_undeclared(self) -> None:
         verdict = decide_delegated_parent_authority(
-            ParsedRoleBindings.empty(), owner_row_active=lambda lane: True
+            ParsedRoleBindings.empty(), owner_row_active=lambda lane, scope: True
         )
 
         self.assertFalse(verdict.ok)
@@ -82,7 +82,7 @@ class DecisionTest(unittest.TestCase):
     def test_an_invalid_declaration_refuses_outright(self) -> None:
         verdict = decide_delegated_parent_authority(
             ParsedRoleBindings.invalid("broken"),
-            owner_row_active=lambda lane: True,
+            owner_row_active=lambda lane, scope: True,
         )
 
         self.assertFalse(verdict.ok)
@@ -92,7 +92,7 @@ class DecisionTest(unittest.TestCase):
         # Declaration is intent; the owner row is the existing parent. Without an
         # active row the geometry is still a claim about a tier that is not there.
         verdict = decide_delegated_parent_authority(
-            _bindings(GATEWAY_ENTRY), owner_row_active=lambda lane: False
+            _bindings(GATEWAY_ENTRY), owner_row_active=lambda lane, scope: False
         )
 
         self.assertFalse(verdict.ok)
@@ -102,8 +102,8 @@ class DecisionTest(unittest.TestCase):
         expected_lane = project_gateway_lane_id("proj-a")
         seen = []
 
-        def owner_row_active(lane_id: str) -> bool:
-            seen.append(lane_id)
+        def owner_row_active(lane_id: str, project_scope: str) -> bool:
+            seen.append((lane_id, project_scope))
             return True
 
         verdict = decide_delegated_parent_authority(
@@ -112,12 +112,14 @@ class DecisionTest(unittest.TestCase):
 
         self.assertTrue(verdict.ok)
         self.assertEqual((expected_lane,), verdict.verified_gateway_lanes)
-        # The predicate was asked about the DERIVED gateway lane, not a guess.
-        self.assertEqual([expected_lane], seen)
+        # The predicate was asked about the DERIVED gateway lane AND the
+        # binding's own canonical scope — the pair the canonical owner row
+        # must match (j#106254), not a guess.
+        self.assertEqual([(expected_lane, "proj-a")], seen)
 
     def test_the_refusal_names_both_routes(self) -> None:
         verdict = decide_delegated_parent_authority(
-            _bindings(COORDINATOR_ENTRY), owner_row_active=lambda lane: True
+            _bindings(COORDINATOR_ENTRY), owner_row_active=lambda lane, scope: True
         )
         text = parent_authority_refusal_text(verdict)
 
@@ -273,6 +275,107 @@ class BothEntryPointsRefuseIdenticallyTest(_TempRepo):
         self.assertIsNotNone(refusal)
         self.assertIn(PARENT_SCOPE_UNRESOLVED, refusal)
 
+    def test_an_active_foreign_row_at_the_derived_key_verifies_nothing(self) -> None:
+        # j#106254 finding_parentownerrowtype: an ACTIVE row occupying the
+        # derived gateway key that is NOT the canonical owner — issue-kind,
+        # foreign scope — must not stand in for the parent. Both entry points
+        # refuse with the typed UNVERIFIED reason, before any side effect.
+        repo = self._repo(bindings=[dict(GATEWAY_ENTRY)])
+
+        class _ForeignRecord:
+            lane_disposition = "active"
+            binding_kind = "issue"
+            project_scope = "proj-other"
+
+        class _Store:
+            def get(self, key):
+                return _ForeignRecord()
+
+        with patch(
+            "mozyo_bridge.core.state.lane_lifecycle.LaneLifecycleStore",
+            return_value=_Store(),
+        ):
+            plan_code, plan_text = self._plan_only(repo, "delegated_coordinator")
+            act_code, act_text = self._actuator(repo, "delegated_coordinator")
+
+        self.assertEqual(1, plan_code)
+        self.assertIn(PARENT_GATEWAY_UNVERIFIED, plan_text)
+        self.assertEqual(1, act_code)
+        self.assertIn(PARENT_GATEWAY_UNVERIFIED, act_text)
+        # Zero side effect: no worktree appeared under the repo.
+        self.assertFalse((repo / ".worktrees").exists())
+
+    def test_a_gateway_row_with_a_foreign_scope_verifies_nothing(self) -> None:
+        # The scope match must hold on its own: a genuine project_gateway row
+        # whose canonical scope belongs to a DIFFERENT project is some other
+        # gateway's owner row, not this binding's parent.
+        repo = self._repo(bindings=[dict(GATEWAY_ENTRY)])
+
+        class _OtherGatewayRecord:
+            lane_disposition = "active"
+            binding_kind = "project_gateway"
+            project_scope = "proj-other"
+
+        class _Store:
+            def get(self, key):
+                return _OtherGatewayRecord()
+
+        with patch(
+            "mozyo_bridge.core.state.lane_lifecycle.LaneLifecycleStore",
+            return_value=_Store(),
+        ):
+            code, text = self._plan_only(repo, "delegated_coordinator")
+
+        self.assertEqual(1, code)
+        self.assertIn(PARENT_GATEWAY_UNVERIFIED, text)
+
+    def test_an_issue_row_with_a_matching_scope_verifies_nothing(self) -> None:
+        # The kind check must hold on its own: an issue-kind row can carry the
+        # right scope string and still not be what `declare-project-gateway`
+        # writes — kind alone disqualifies it.
+        repo = self._repo(bindings=[dict(GATEWAY_ENTRY)])
+
+        class _IssueRecord:
+            lane_disposition = "active"
+            binding_kind = "issue"
+            project_scope = "proj-a"
+
+        class _Store:
+            def get(self, key):
+                return _IssueRecord()
+
+        with patch(
+            "mozyo_bridge.core.state.lane_lifecycle.LaneLifecycleStore",
+            return_value=_Store(),
+        ):
+            code, text = self._plan_only(repo, "delegated_coordinator")
+
+        self.assertEqual(1, code)
+        self.assertIn(PARENT_GATEWAY_UNVERIFIED, text)
+
+    def test_an_inactive_canonical_row_verifies_nothing(self) -> None:
+        # And the disposition check: a superseded/retired canonical owner row
+        # is a parent that WAS, not a parent that is.
+        repo = self._repo(bindings=[dict(GATEWAY_ENTRY)])
+
+        class _RetiredRecord:
+            lane_disposition = "superseded"
+            binding_kind = "project_gateway"
+            project_scope = "proj-a"
+
+        class _Store:
+            def get(self, key):
+                return _RetiredRecord()
+
+        with patch(
+            "mozyo_bridge.core.state.lane_lifecycle.LaneLifecycleStore",
+            return_value=_Store(),
+        ):
+            code, text = self._plan_only(repo, "delegated_coordinator")
+
+        self.assertEqual(1, code)
+        self.assertIn(PARENT_GATEWAY_UNVERIFIED, text)
+
     def test_a_verified_gateway_admits_through_the_live_gate(self) -> None:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.delegated_parent_authority_gate import (  # noqa: E501
             delegated_parent_authority_refusal,
@@ -283,6 +386,8 @@ class BothEntryPointsRefuseIdenticallyTest(_TempRepo):
 
         class _Record:
             lane_disposition = "active"
+            binding_kind = "project_gateway"
+            project_scope = "proj-a"
 
         class _Store:
             def get(self, key):

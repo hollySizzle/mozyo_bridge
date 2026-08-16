@@ -149,6 +149,8 @@ class SublaneCreateLaneKindCommandRouteTest(unittest.TestCase):
 
         class _ActiveRow:
             lane_disposition = "active"
+            binding_kind = "project_gateway"
+            project_scope = "scenario-project"
 
         class _ActiveStore:
             def get(self, key):

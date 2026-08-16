@@ -71,14 +71,30 @@ def _decide(repo_root: Path) -> ParentAuthorityVerdict:
             ),
         )
 
-    def owner_row_active(lane_id: str) -> bool:
+    def owner_row_active(lane_id: str, project_scope: str) -> bool:
         try:
             from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
-            from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
+            from mozyo_bridge.core.state.lane_lifecycle_model import (
+                BINDING_KIND_PROJECT_GATEWAY,
+                LaneLifecycleKey,
+                stored_binding_kind_is,
+            )
 
             record = LaneLifecycleStore().get(LaneLifecycleKey(scope, lane_id))
         except Exception:  # noqa: BLE001 - an unreadable authority verifies nothing
             return False
-        return record is not None and record.lane_disposition == "active"
+        if record is None or record.lane_disposition != "active":
+            return False
+        # The CANONICAL owner row, not merely an active occupant of the derived
+        # key (review j#106254 finding_parentownerrowtype): only what
+        # `sublane declare-project-gateway` writes — binding_kind
+        # project_gateway, byte-exact via the model's own comparator, carrying
+        # this binding's canonical scope — verifies the parent. A stale or
+        # foreign issue-kind row at the same key verifies nothing.
+        if not stored_binding_kind_is(
+            getattr(record, "binding_kind", None), BINDING_KIND_PROJECT_GATEWAY
+        ):
+            return False
+        return str(getattr(record, "project_scope", "") or "") == project_scope
 
     return decide_delegated_parent_authority(parsed, owner_row_active=owner_row_active)

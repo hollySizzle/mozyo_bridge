@@ -65,7 +65,7 @@ class ParentAuthorityVerdict:
 def decide_delegated_parent_authority(
     parsed: ParsedRoleBindings,
     *,
-    owner_row_active: Callable[[str], bool],
+    owner_row_active: Callable[[str, str], bool],
 ) -> ParentAuthorityVerdict:
     """Decide the admission from the parsed declaration and an owner-row predicate.
 
@@ -80,10 +80,14 @@ def decide_delegated_parent_authority(
        owner row is what ``sublane declare-project-gateway`` writes from a live,
        attested pair, and it is the fact the child geometry hangs from.
 
-    ``owner_row_active(lane_id)`` answers whether the gateway lane's canonical
-    lifecycle owner row exists AND is active; the application layer resolves the
-    store and the workspace scope, and folds its own read failures to ``False``
-    (an unreadable authority verifies nothing).
+    ``owner_row_active(lane_id, project_scope)`` answers whether the gateway
+    lane's CANONICAL lifecycle owner row exists — a row that is not merely
+    active, but carries ``binding_kind=project_gateway`` and this binding's own
+    canonical project scope (review j#106254 finding_parentownerrowtype: a
+    stale or foreign issue-kind row occupying the derived key must never stand
+    in for the parent). The application layer resolves the store and the
+    workspace scope, and folds its own read failures to ``False`` (an
+    unreadable authority verifies nothing).
     """
     if not parsed.ok:
         return ParentAuthorityVerdict(
@@ -101,14 +105,18 @@ def decide_delegated_parent_authority(
                 "workspace"
             ),
         )
-    verified = tuple(b.lane_id for b in gateways if owner_row_active(b.lane_id))
+    verified = tuple(
+        b.lane_id for b in gateways if owner_row_active(b.lane_id, b.project_scope)
+    )
     if not verified:
         return ParentAuthorityVerdict(
             False,
             reason=PARENT_GATEWAY_UNVERIFIED,
             detail=(
                 f"{len(gateways)} project_gateway binding(s) are declared, but no "
-                "declared gateway lane owns an active lifecycle owner row"
+                "declared gateway lane owns an ACTIVE canonical owner row "
+                "(binding_kind=project_gateway with the binding's own project "
+                "scope)"
             ),
         )
     return ParentAuthorityVerdict(True, verified_gateway_lanes=verified)
