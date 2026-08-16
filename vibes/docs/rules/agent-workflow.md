@@ -357,13 +357,37 @@ adversarial_convergence:
       なら approved も正当)。その後 implementer が対象 issue journal に判断待ちを記録 →
       coordinator へ canonical handoff → coordinator が owner 裁定 anchor を記録する
       (owner-question bypass 禁止の正規導線。ADR-0001 の延長: モデルの甘さの裁定者は往復の
-      当事者ではない)。**停止点は Close Gate**: challenge に対応する disposition 付き owner
-      裁定 anchor journal が記録されるまで当該 US は close できず、当該 guard 面に触れる light
-      主張は invalid。裁定後の再開は 2 経路 — (a) 宣言を更新した新 review_request (deferred
-      への反映は reviewer の新 atomic result 経由)、または (b) coordinator が owner 裁定 anchor
-      journal 自体に deferred_finding_record.item_grammar と同形の entry + challenge 元 result
-      journal への参照を含めて記録する (元 result は immutable なため、この anchor journal が
-      challenge 経由 disposition の第二の sanctioned placement。actor は coordinator)
+      当事者ではない)。challenge の相関と再開は下記 challenge_grammar の literal key で行い、
+      deferred / wontfix_by_policy の記録先は ADR-0005 のとおり **review result journal のみ**
+      (owner 裁定後も reviewer の新 atomic result を経由する — challenge は稀な事象であり、
+      追加 1 往復は placement 一貫性の価値を下回らない)。**停止点は Close Gate**: 下記
+      close_predicate を満たすまで当該 US は close できず、当該 guard 面に触れる light 主張は
+      invalid
+    challenge_grammar:               # 相関はすべて行頭 literal key。各 journal で該当 key は最大 1 行
+      challenge_section: |
+        reviewer は challenge を review result journal 本文の
+        `### Threat-model challenge (owner decision pending)` 見出し配下に記録する
+        (1 result につき最大 1 個。identity = その result journal id)
+      pending_record: |
+        implementer の判断待ち journal は `challenge_pending: j#<challenge result id>` を持つ
+      owner_anchor: |
+        coordinator の owner 裁定 anchor journal は `challenge_ref: j#<challenge result id>` と
+        `challenge_verdict: update_model | defer | wontfix_by_policy` を持つ。どちらかの欠落・
+        重複・enum 外は anchor 不成立 (close blocked のまま)
+      resumption_request: |
+        再開する canonical review_request は `challenge_resolution: j#<owner anchor journal id>`
+        を claim と同じ journal に持つ。challenge_verdict=update_model の場合は threat_model 行を
+        更新して宣言し直す
+      resolution_entry: |
+        challenge_verdict が defer / wontfix_by_policy の場合、再開 request の authoritative
+        result の `### Deferred (out-of-model)` 節に、item_grammar の entry として記録し、
+        `resolution_anchor: j#<owner anchor journal id>` key を必須で付す
+    close_predicate: |
+      challenge 節を含む各 result journal について、(i) `challenge_ref` がそれを指す owner
+      裁定 anchor journal が存在し、かつ (ii) `challenge_resolution` がその anchor を指す
+      canonical review_request の authoritative result が存在する (verdict が defer /
+      wontfix_by_policy の場合は加えて `resolution_anchor` 付き Deferred entry をその result が
+      含む) こと。いずれかを欠く間は close blocked (fail 側は blocked)
   mandatory_de_escalation:
     severity_vocabulary:
       values: low | medium | high    # closed。canonical finding manifest v1 は変更しない
@@ -405,15 +429,12 @@ adversarial_convergence:
     outcome: owner 裁定 anchor (続行 / deferred 化 / mode 解除) を記録してから再開する
   deferred_finding_record:
     placement: |
-      次の 2 箇所のみ (finding 単位の個別 issue は乱発しない):
-      (1) review result journal 本文の `### Deferred (out-of-model)` 見出し配下 (actor:
-      reviewer、result の atomic append の一部)。
-      (2) threat-model challenge の owner 裁定 anchor journal (actor: coordinator。
-      material_boundary.model_challenge の branch (b) 専用 — challenge 元 result journal への
-      参照を必須とする)。
-      いずれも material findings の `## Findings` 系見出しとは別見出しであり、deferred entry に
-      machine marker prefix (`[mozyo:` 等) を使わない — strict parser の material finding /
-      gate marker と衝突しない
+      review result journal 本文の `### Deferred (out-of-model)` 見出し配下のみ (actor:
+      reviewer、result の atomic append の一部。ADR-0005 が固定する唯一の置き場であり、
+      challenge 経由の disposition も再開 request の authoritative result を経由してここに置く)。
+      finding 単位の個別 issue は乱発しない。material findings の `## Findings` 系見出しとは
+      別見出しであり、deferred entry に machine marker prefix (`[mozyo:` 等) を使わない —
+      strict parser の material finding / gate marker と衝突しない
     item_grammar:                    # 1 finding = 1 list item。closed keys、順不同、他 key は invalid
       name: <finding 名>             # 同一 result 内で一意。identity は (result journal id, name)
       severity: low | medium | high  # severity_vocabulary と同じ closed enum
@@ -422,6 +443,8 @@ adversarial_convergence:
         ことに価値はある」)
       reevaluate_on: surface_change | model_challenge   # closed enum。事象条件のみ。
         # 時間条件 (「いつか」「N ヶ月後」) は書かない
+      resolution_anchor: "j#<owner anchor journal id>"  # challenge 由来 entry (challenge_grammar
+        # の resolution_entry) では必須、それ以外の entry では禁止 (存在すれば invalid)
     invalid_handling: |
       closed key の欠落・enum 外の値・同一 result 内の name 重複は、その entry を deferred として
       無効化し、当該 finding を material として扱う (fail 側は深い方)
@@ -467,14 +490,16 @@ else (no)
     :coordinator へ canonical handoff;
     |coordinator|
     :owner 裁定 anchor を対象 issue journal に記録;
-    |coordinator|
-    :branch (b) (deferred / wontfix_by_policy 化) の場合は
-owner 裁定 anchor journal 自体に item_grammar 同形 entry +
-challenge 元 result 参照を記録;
     |implementer|
-    :branch (a) の場合は宣言更新付き新 request を発行
-(deferred 反映は reviewer の新 atomic result 経由)。
-close は disposition 付き anchor journal の存在を確認してから;
+    :challenge_resolution key 付きの新 canonical request を発行
+(update_model なら threat_model 行を更新);
+    |reviewer|
+    :authoritative result を発行 — verdict が defer /
+wontfix_by_policy なら Deferred 節に resolution_anchor 付き
+entry を記録;
+    |implementer|
+    :close は close_predicate (anchor + 解決 result) を
+確認してから;
   else (no — 圏外指摘)
     |reviewer|
     :Deferred (out-of-model) 節に item_grammar で記録
