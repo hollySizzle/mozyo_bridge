@@ -14,9 +14,12 @@ remaining tmux choreography injects the body once and drives it to a terminal di
   recovery guidance, and ``die``\\ s WITHOUT pressing Enter — the one place a C-u rollback is
   allowed;
 - press Enter once. tmux ``--mode queue-enter`` retains its marker-miss retry; Herdr instead
-  arms a working-transition wait and may issue deadline-bounded additional Enters after freshly
-  re-proving launch generation, current composer, clear screen, readable state, and a re-armed
-  wait before each one. Neither path re-types marker+body;
+  arms a working-transition wait for an idle/turn-ended baseline, while a BUSY baseline takes
+  the ADR-0002 queued-submission path (#15537): no observer is required, the Enter passes a
+  wait-free full effect fence, and the composer releasing the body reports ``sent`` /
+  ``queue_enter``. Either flavour may issue deadline-bounded additional Enters after freshly
+  re-proving launch generation, current composer, clear screen, and readable state (plus a
+  re-armed wait on the causal flavour). Neither path re-types marker+body;
 - under ``--mode standard`` observe the receiver pane for post-Enter turn-start activity; an
   unconfirmed turn start emits a ``blocked`` / ``turn_start_unconfirmed`` outcome and ``die``\\ s
   with **no C-u rollback and no re-send** (the uncertain-delivery no-blind-retry boundary);

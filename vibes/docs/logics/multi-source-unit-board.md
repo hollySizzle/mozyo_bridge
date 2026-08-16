@@ -394,13 +394,16 @@ read-only observation + 1 本の routed な preview-first action に限る。
 - Herdr 0.8 の wait argv が `agent wait TARGET --until STATUS --timeout MS` であり、旧
   `wait agent-status ... --status ...` を production fake が受理しないこと。body 後に tmux 由来の
   landing-marker wait を行わず generation recheck → wait arm → Enter の順であること
-- Herdr queue-enter が body / gateway command を再入力せず、first Enter zero-or-one、各実発行 Enter 前の arm、
+- Herdr queue-enter が body / gateway command を再入力せず、first Enter zero-or-one、idle / turn-ended
+  系列での各実発行 Enter 前の arm (busy 系列は ADR-0002 / #15537 の wait 非依存 full effect fence)、
   各 extra Enter 前の fresh strict recheck を行うこと。timeout-only 系列は policy/deadline まで反復でき、
   wait error は次の Enter を許可せず即時停止すること。identity / collision-free launch generation drift、historical transcript
   だけの body、startup/modal、blocked / unknown / state read failure、wait unarmed がその回の extra Enter を
   zero-actuation にすること
-- busy receiver は queue 配送候補として維持されるが busy-only evidence で `submitted_confirmed` にならず、
-  `awaiting_input` / `turn_ended` の armed event + coherent generation だけが confirmation になること
+- busy receiver は queue 配送候補として維持され、composer clear を証拠に `sent` / `queue_enter`
+  (queued submission、`injection_stage=uncertain_partial` のまま) になり得るが、busy-only evidence で
+  `submitted_confirmed` にはならず、`awaiting_input` / `turn_ended` の armed event + coherent generation
+  だけが causal confirmation になること (ADR-0002 / #15537)
 - public retry window が initial wait + 全 interval + 全 re-wait の absolute budget で、再 arm しても延長されないこと。
   interval は隣接 Enter の最小間隔で、window / interval `0` または正の sub-millisecond 値が extra
   Enter を無効にすること

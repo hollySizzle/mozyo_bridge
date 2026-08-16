@@ -1183,20 +1183,22 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_herdr_queue_enter_rail.py
-    lines: 1076
+    lines: 1110
     reason: >-
       Herdr queue-enter causal session (generation pinning, wait/Enter ordering,
       strict resend gates, deadline accounting). Raised past 1000 by the #15537
       ADR-0002 busy-receiver queued-submission path (busy_queue_path flag, the
       pending-observer waiver, complete_after_busy_enter, additive observation
-      facts). Cohesive rail state machine; candidate split is the resend-gate
+      facts; raised 1076 -> 1110 for the j#106470 busy effect fence — the
+      busy-specific first-Enter verifier and the retry-boundary-wrapped extra
+      Enter). Cohesive rail state machine; candidate split is the resend-gate
       evaluation half vs the session choreography half.
     owner_issue: "#15537"
     resolution_version: "v2.0.0 (Version #327)"
     expires: "2026-10-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_tmux_transport_rail.py
-    lines: 1020
+    lines: 1023
     reason: >-
       Common transport-rail use case (both tmux and herdr terminals of the
       queue-enter/standard/pending rails). Crossed 1000 by the #15537 busy-path

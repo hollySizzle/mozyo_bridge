@@ -1435,3 +1435,58 @@ class BusyReceiverQueuedSubmissionTest(unittest.TestCase):
         self.assertTrue(observation.get("busy_queue_path"))
         self.assertTrue(observation.get("queued_submission_confirmed"))
         self.assertNotIn("event_wait_kind", observation)
+
+
+class StaleCausalOnlyClaimGuardTest(unittest.TestCase):
+    """No contract surface may reintroduce the pre-ADR-0002 unconditional claims
+    (review j#106470 finding_busycontractsync).
+
+    Before #15537, the distributed contracts said every actually-issued Enter must
+    have a wait armed first and only a causal turn start could yield exit 0 —
+    claims the busy queued-submission path now contradicts. This guard scans the
+    current contract surfaces for the exact unconditional phrasings so they cannot
+    quietly return; the conditional (idle/turn-ended-scoped) forms remain legal.
+    """
+
+    FORBIDDEN = (
+        # unconditional "arm before every issued Enter"
+        "実際に発行する first / extra Enter はすべて先に wait を arm する。",
+        "各 Enter の前に working-transition wait を arm する。",
+        "- first Enter と各 extra Enter より先に working-transition wait を arm する",
+        "実際に発行する各 Enter より先に wait を arm する。",
+        "arms a causal wait before every Enter",
+        # unconditional "only causal start exits 0 / confirms"
+        "causal turn-start を確認した場合だけ `submitted_confirmed` / exit 0 を返す。",
+        "busy自体を成功証拠にはしない。",
+    )
+
+    def test_no_surface_reintroduces_the_unconditional_causal_only_claims(self) -> None:
+        import pathlib
+
+        root = pathlib.Path(__file__).resolve().parents[4]
+        surfaces = [root / "README.md"]
+        surfaces += sorted((root / "vibes" / "docs").rglob("*.md"))
+        surfaces += sorted((root / "skills").rglob("*.md"))
+        surfaces += sorted((root / "plugins").rglob("*.md"))
+        surfaces += sorted(
+            (root / "src" / "mozyo_bridge" / "scaffold" / "presets").rglob("*.md")
+        )
+        surfaces += sorted(
+            (root / "src" / "mozyo_bridge" / "e_110_execution_platform").rglob("*.py")
+        )
+        offenders = []
+        for path in surfaces:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for phrase in self.FORBIDDEN:
+                if phrase in text:
+                    offenders.append(f"{path.relative_to(root)}: {phrase[:60]!r}")
+        self.assertEqual(
+            [],
+            offenders,
+            "pre-ADR-0002 unconditional causal-only claim(s) found — the busy "
+            "queued-submission exception (#15537) must stay stated:\n"
+            + "\n".join(offenders),
+        )

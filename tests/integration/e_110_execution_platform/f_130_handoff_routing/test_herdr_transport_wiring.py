@@ -127,6 +127,7 @@ class _FakeHerdr:
         get_states=None,
         wait_results=None,
         read_returns_body=False,
+        enter_clears_composer=False,
         fail_send_text=False,
         fail_send_keys=False,
         pane_content=None,
@@ -143,6 +144,10 @@ class _FakeHerdr:
         self._wait_calls = 0
         self.wait_processes: list[_FakeWaitProc] = []
         self._read_returns_body = read_returns_body
+        # #15537 busy path modeling: a real TUI submits (queues) the composer on
+        # Enter, so the retained body disappears. Opt-in so the stuck-Enter tests
+        # (body retained across Enters) keep their scenario.
+        self._enter_clears_composer = enter_clears_composer
         self._fail_send_text = fail_send_text
         self._fail_send_keys = fail_send_keys
         # Redmine #13760: what the receiver's pane is rendering. Defaults to a live,
@@ -193,6 +198,8 @@ class _FakeHerdr:
         if rest[:2] == ["pane", "send-keys"]:
             keys = rest[3] if len(rest) > 3 else ""
             self.sends.append(("send_keys", rest[2], keys))
+            if self._enter_clears_composer and not self._fail_send_keys:
+                self._last_body_by_target.pop(rest[2], None)
             rc = 1 if self._fail_send_keys else 0
             return subprocess.CompletedProcess(
                 argv, rc, stdout="", stderr="send-keys failed" if rc else ""
@@ -1387,7 +1394,12 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         # (`event_wait_kind` stays absent); the promise is the tmux rail's
         # practical queued submission, reported with the existing
         # ``sent / queue_enter`` vocabulary.
-        herdr = _FakeHerdr([], get_states=["working"])
+        herdr = _FakeHerdr(
+            [],
+            get_states=["working"],
+            read_returns_body=True,
+            enter_clears_composer=True,
+        )
         result, herdr, ws, out, err = self._run(
             agent_rows_fn=_same_lane_rows(),
             herdr=herdr,
@@ -1564,7 +1576,12 @@ class HerdrLedgerSendSiteWiringTest(unittest.TestCase):
         # ADR-0002 (#15537): busy + composer-cleared is a queued submission; the
         # ledger records the sent / queue_enter outcome with the additive
         # post-choreography observation carried through unchanged.
-        herdr = _FakeHerdr([], get_states=["working"])
+        herdr = _FakeHerdr(
+            [],
+            get_states=["working"],
+            read_returns_body=True,
+            enter_clears_composer=True,
+        )
         result, outcome, records, out = self._run_and_ledger(
             herdr=herdr, mode="queue-enter"
         )
