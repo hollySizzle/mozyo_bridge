@@ -120,6 +120,22 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     warning = nested_target_warning(target, infer_git_worktree_root(target))
     if warning is not None:
         print(warning)
+    # Backend declaration (Redmine #15527). Decided BEFORE the scaffold write so an
+    # operator-owned config refuses the whole apply with zero files written, rather
+    # than leaving a scaffolded target whose backend request was silently dropped.
+    declaration = None
+    backend = getattr(args, "backend", None)
+    if backend is not None:
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.scaffold_backend_declaration import (  # noqa: E501
+            backend_declaration,
+        )
+        from mozyo_bridge.shared.errors import die
+
+        declaration = backend_declaration(
+            target, backend, config_exists=(target / ".mozyo-bridge/config.yaml").exists()
+        )
+        if not declaration.ok:
+            die(declaration.refusal)
     paths = write_scaffold(
         args.preset,
         target,
@@ -134,6 +150,14 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     action = "would write" if args.dry_run else "wrote"
     for path in paths:
         print(f"{action}: {path}")
+    if declaration is not None:
+        # After the manifest-tracked files, deliberately outside the manifest: the
+        # config is operator-owned from its first byte, so `scaffold status` must
+        # stay clean when it is edited later (Redmine #15527).
+        if not args.dry_run:
+            declaration.path.parent.mkdir(parents=True, exist_ok=True)
+            declaration.path.write_text(declaration.content, encoding="utf-8")
+        print(f"{action}: {declaration.path} (backend declaration; not in manifest)")
     return 0
 
 
