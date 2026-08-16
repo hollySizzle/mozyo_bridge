@@ -18,7 +18,7 @@ owner が繰り返し指示した送信リトライ方針 (#12580 で承認) が
 ```markdown
 # ADR-NNNN: <題名>
 
-- status: active | superseded (by ADR-MMMM)
+- status: active | superseded (by ADR-MMMM)   # この 2 状態のみ。承認前の ADR file は作らない
 - date: YYYY-MM-DD
 - related: <Redmine issue/journal 参照>
 
@@ -32,8 +32,11 @@ owner が繰り返し指示した送信リトライ方針 (#12580 で承認) が
 
 ## 根拠 (逐語引用)
 
-<owner 発言・承認記録を、出所 (issue/journal または日付+chat) 付きで逐語引用する。
- 要約で置き換えない — 引用が改変検知と藁人形防止の実体>
+<owner 発言・承認記録を逐語引用する。要約で置き換えない — 引用が改変検知と
+ 藁人形防止の実体。出所は exact な Redmine anchor (`#<issue> j#<journal>`、
+ または issue description) を必須とする。chat が初出の決定は、先に exact text と
+ 前後文脈を durable journal へ記録し、ADR はその journal を引用元にする。
+ 「日付+chat」単独の出所は invalid であり、その引用を持つ ADR は active にできない>
 
 ## 影響
 

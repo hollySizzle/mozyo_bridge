@@ -158,13 +158,23 @@ owner の意思決定の正本は `vibes/docs/adr/` の ADR (書式・索引は 
 
 ```yaml
 adr_conflict_gate:
+  # static schema。owner 判断の収集順序は本節が所有せず、central preset
+  # `### Claude Owner-Question Bypass Prohibition` の既存 flow (durable record →
+  # coordinator role へ handoff → coordinator が owner 回答を収集・記録) へ委譲する。
+  actors:
+    reviewer: 監査 role (resolved auditor binding)
+    implementer: 実装 role (resolved implementer binding)
+    coordinator: owner 判断の唯一の収集窓口 (`### Claude Owner-Question Bypass Prohibition`)
+    owner: ADR を変更できる唯一の authority
   trigger: review finding または実装変更が、active な ADR の「決定 (規約行)」と矛盾する、
     または矛盾の疑いがある場合
+  scope: 本 gate が拘束するのは「矛盾指摘の採用」と「矛盾変更の実装」のみ。
+    指摘の起票自体・矛盾しない通常の review / 実装は対象外
   required_fields:
     - adr_id                # 例: ADR-0002
     - conflict_statement    # どの規約行とどう衝突するか
     - evidence              # 根拠 (evidence_source 分類つき)
-    - owner_approval_anchor # owner 承認の journal 参照。未取得なら空
+    - owner_approval_anchor # owner 裁定の Redmine journal 参照。未取得なら空
   reviewer:
     - 指摘の起票は常に自由 (独立性を維持)。ただし ADR 矛盾指摘は required_fields を伴う
       「ADR 変更の提案」として書く
@@ -172,14 +182,17 @@ adr_conflict_gate:
   implementer:
     - owner_approval_anchor の無い ADR 矛盾変更は実装しない (zero_implementation)。レビュー指摘
       への対応であっても同じ
-    - route: `design_consultation` (正本: rule-claude-design-consultation) で owner へ確認し、
-      判断を対象 issue の journal に記録する
+    - owner 判断が必要な場合: 対象 issue の journal に required_fields を記録した上で、
+      owner への確認は自分で行わず coordinator role へ canonical handoff で委ねる
+      (正本: central preset `### Claude Owner-Question Bypass Prohibition`)
   invalid:
     - 関連 ADR の特定に失敗した場合、または ADR index (`vibes/docs/adr/README.md`) が読めない
-      場合は「矛盾なし」とみなさず、design_consultation へ route する (fail_closed)
+      場合は「矛盾なし」とみなさず、implementer の owner 判断 route と同じ経路で停止する (fail_closed)
   record:
-    - ADR の新規作成・supersede・status 変更は owner 決定の journal anchor がある場合のみ。
-      エージェント起草 draft は owner 承認記録が入るまで status: active にしない
+    - 判断・裁定・その anchor は対象 issue の journal に記録する。通知は canonical handoff のみ
+    - ADR file の新規作成・supersede・status 変更は owner 裁定の journal anchor がある場合のみ。
+      エージェント起草の提案は ADR file を作らず journal 上の draft として出し、
+      anchor 成立後に file 化する (README の status enum に draft は存在しない)
 ```
 
 ## Workflow Change Verification
