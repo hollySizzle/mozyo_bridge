@@ -217,17 +217,23 @@ review_depth_tiers:
     reason_or_anchor:                # 再分類時のみ: 格上げ理由 1 行、または格下げ承認 anchor
   depth_round_derivation:            # reviewer が実行する exact な導出
     # depth_round は review-depth 専用の往復数であり、Review Generation Marker Contract v2 の
-    # current review generation とは別概念 (generation は最新 request が開き直すが、depth_round は
-    # issue の審査史全体を数える)。
-    - 開始境界: 当該 issue の最初の canonical review_request journal
-      (`gate=review_request:head=` marker を持つもの)
-    - journal 昇順に、(a) canonical request を `req=` で指し head が一致する有効な
-      `gate=review_result` pair のうち conclusion=changes_requested のもの、(b) canonical request
-      と相関できないが changes_requested を主張する review_result、をそれぞれ数える
-    - depth_round = (a) + (b) + 1。欠損・相関不能・marker 不正は常に**深い側** (round に算入) へ倒す
-    - 導出例 (2026-08-16 の #15547 実データ): canonical request は 1 件 (j#106443)、有効 pair 0、
-      相関不能な changes_requested result 2 件 (j#106427 / j#106438 — request 側 marker が
-      非 canonical で pair 不成立) → depth_round = 0 + 2 + 1 = 3
+    # current review generation とは別概念。対象 review_request journal R ごとに一意に定まる。
+    - count 対象は canonical な review_result marker
+      (`gate=review_result:conclusion=changes_requested:…` を strict parser が同定した journal)
+      のみ。marker を持たない journal は、本文が何を主張していても**数えない** (散文推定の禁止)
+    - 範囲: 当該 issue の journal のうち id が R より小さいもの (上限 = 対象 request journal。
+      これにより同じ R に対する導出値は後続 journal の追加で変わらない)。下限は issue 先頭
+      (canonical marker のみ数えるため、別の開始境界は置かない)
+    - 分類は exactly-once で 2 種:
+      (a) valid pair — result の `req=` が canonical `gate=review_request:head=` journal を指し、
+          head が一致するもの
+      (b) orphan — canonical grammar の changes_requested result だが (a) の相関が成立しないもの
+      (同一 result journal は (a) に該当すれば (a)、しなければ (b) の一方でのみ数える。
+       duplicate marker は journal 単位で 1 回)
+    - depth_round(R) = (a) + (b) + 1
+    - 導出例 (#15547 実 marker 列、R = j#106452): (a)=1 (j#106449 → req=106443、head 一致)、
+      (b)=1 (j#106427 → req=106418 が canonical request でなく orphan)、
+      j#106438 は marker 0 件のため対象外 → depth_round = 1 + 1 + 1 = **3**
     - implementer 申告と導出値が食い違う場合は導出値を採用し、差異を review journal に記す
   actors:
     implementer: class を主張し、格上げを随時宣言し、light 承認後の Notes を follow-up issue 化する
