@@ -317,6 +317,41 @@ def workspace_adoption_marker(root: str | Path) -> str | None:
     return None
 
 
+def nested_adoption_marker(
+    start: str | Path, root: str | Path
+) -> tuple[Path, str] | None:
+    """The nearest adoption marker STRICTLY BETWEEN ``start`` and ``root``.
+
+    Git-root-first resolution (Redmine #13641) deliberately walks past a marker in
+    a project subdirectory, because letting a subtree shadow the Git root's
+    ``config.yaml`` silently changes the selected terminal backend. Walking past it
+    is correct; staying silent about it is not — an operator who just scaffolded
+    that subdirectory was told the project was unadopted and to scaffold it, with
+    no mention of the marker the tool had already seen (Redmine #15526).
+
+    Returns ``(directory, marker)`` for the nearest such marker, or ``None``. Both
+    ends are excluded: ``root`` itself is :func:`workspace_adoption_marker`'s
+    question, and a ``start`` outside ``root`` is not a subtree of it at all.
+    """
+    base = Path(start).expanduser().resolve()
+    top = Path(root).expanduser().resolve()
+    if base == top:
+        return None
+    try:
+        base.relative_to(top)
+    except ValueError:
+        # `start` is not under `root` (an explicit --repo elsewhere); there is no
+        # "between" to report, and guessing one would name an unrelated tree.
+        return None
+    for path in (base, *base.parents):
+        if path == top:
+            break
+        marker = workspace_adoption_marker(path)
+        if marker is not None:
+            return (path, marker)
+    return None
+
+
 def resolve_repo_root(repo: str | Path | None = None, start: Path | None = None) -> Path:
     if repo:
         return Path(repo).expanduser().resolve()

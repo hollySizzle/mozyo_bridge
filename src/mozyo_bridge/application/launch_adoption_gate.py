@@ -29,13 +29,25 @@ __all__ = ("adoption_refusal",)
 
 
 def adoption_refusal(
-    repo_root: Path, marker: str | None, home: Path | None = None
+    repo_root: Path,
+    marker: str | None,
+    home: Path | None = None,
+    *,
+    nested: tuple[Path, str] | None = None,
 ) -> str | None:
     """The bare-``mozyo`` refusal for ``repo_root``, or ``None`` to proceed.
 
     ``marker`` is the adoption marker found at the resolved root (see
     :func:`mozyo_bridge.shared.paths.workspace_adoption_marker`); ``home`` is
     injectable for tests and defaults to the real home directory.
+
+    ``nested`` is the ``(directory, marker)`` this walk passed on the way up (see
+    :func:`mozyo_bridge.shared.paths.nested_adoption_marker`). When the resolved
+    root is unadopted but such a marker exists, the generic "adopt this project
+    first" text tells an operator to do the thing they just did — the loop
+    measured in Redmine #15526 — so the refusal names the marker instead and
+    gives both routes. Omitted / ``None`` keeps the original wording byte for
+    byte, which is what every pre-#15526 case still gets.
     """
     if repo_root == (home if home is not None else Path.home()):
         return (
@@ -44,6 +56,23 @@ def adoption_refusal(
             "unadopted directory resolves up to incidental home markers). "
             "cd into an adopted project root, or adopt the project first: "
             "`mozyo-bridge scaffold apply <preset> --target <project_root>`."
+        )
+    if marker is None and nested is not None:
+        nested_dir, nested_marker = nested
+        return (
+            f"bare `mozyo` resolved repo root {repo_root}, which is not an "
+            "adopted mozyo workspace (no .mozyo-bridge/config.yaml or "
+            f"scaffold/workspace marker); refusing to start agent sessions "
+            f"there. A marker DOES exist below it, at {nested_dir} "
+            f"({nested_marker}), but the Git worktree root is the workspace "
+            "identity, so that subtree marker is deliberately not adopted "
+            "(Redmine #13641: letting a subtree shadow the root would silently "
+            "change the selected terminal backend). Either adopt the resolved "
+            f"root — `mozyo-bridge scaffold apply <preset> --target "
+            f"{repo_root}` — or, to run that subtree as its own workspace, "
+            f"point the CLI at it explicitly (`--repo {nested_dir}` or "
+            "MOZYO_REPO) and declare how it relates to the parent with "
+            "`mozyo-bridge workspace alias`."
         )
     if marker is None:
         return (

@@ -109,6 +109,15 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
     repo_local = bool(getattr(args, "repo_local", False))
     target = scaffold_target_from_args(args)
+    # Say it BEFORE the write (Redmine #15526): a target the resolver will walk
+    # past is worth knowing while it can still be retargeted, not at the next
+    # `mozyo` launch. Advisory only — see `scaffold_target_gate`.
+    from mozyo_bridge.application.scaffold_target_gate import nested_target_warning
+    from mozyo_bridge.shared.paths import infer_git_worktree_root
+
+    warning = nested_target_warning(target, infer_git_worktree_root(target))
+    if warning is not None:
+        print(warning)
     paths = write_scaffold(
         args.preset,
         target,

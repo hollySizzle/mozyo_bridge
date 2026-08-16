@@ -106,6 +106,12 @@ class _FakeLaunchOps:
         self.calls.append(("adoption_marker", repo_root))
         return self._adoption_marker
 
+    def nested_adoption_marker(self, repo_root: Path) -> tuple[Path, str] | None:
+        # Redmine #15526. Defaults to "nothing below", which is what every case
+        # written before that issue assumed, so their refusal text is unchanged.
+        self.calls.append(("nested_adoption_marker", repo_root))
+        return getattr(self, "_nested_adoption_marker", None)
+
     def canonical_session_name(self, repo_root: Path) -> str:
         return self._canonical
 
