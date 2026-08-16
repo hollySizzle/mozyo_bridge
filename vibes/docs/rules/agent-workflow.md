@@ -198,35 +198,88 @@ adr_conflict_gate:
 ## Review Depth Tiers — Redmine #15547 (判断正本: ADR-0004)
 
 レビュー深度の段階化契約。単位は US のまま (ADR-0003)、深度だけを変更クラスで変える。
+review 結果の wire format は既存の canonical `review_result` 契約
+(`conclusion: approved|changes_requested`、approved は finding 0 件 / changes_requested は
+1 件以上) を変更しない — 本節はその**中で** light の運用を定める。
 
 ```yaml
 review_depth_tiers:
-  # 判断正本は ADR-0004。本節は実行契約のみ (repo-local 宣言、中央 preset 不変)。
-  classes:
-    light:
-      # 閉じたリスト。ここに無い変更は light を主張できない。
-      - docs_typo_or_wording      # 文書の誤記・清書 (契約内容を変えない)
-      - tests_only                # tests/** のみの変更
-      - comments_only             # コメント・docstring のみ (契約記述を変えない)
-      - generated_regen           # generator 出力の再生成のみ
-    standard:
-      - light に該当しないすべての変更
-      - us_level_audit.task_level例外 の高リスク種別は宣言にかかわらず常に standard
+  # 判断正本は ADR-0004。本節は実行契約 (repo-local 宣言、中央 preset・wire format 不変)。
+  claim_schema:            # review request journal に載せる class 主張
+    class: light | standard          # 欠落・不正値は standard として扱う (invalid -> standard)
+    light_subtype:                   # class=light のとき必須。閉じたリスト外は invalid -> standard
+      - docs_typo_or_wording         # 文書の誤記・清書 (契約内容を変えない)
+      - tests_only                   # tests/** のみの変更
+      - comments_only                # コメント・docstring のみ (契約記述を変えない)
+      - generated_regen              # generator 出力の再生成のみ
+    target_head: <commit sha>        # 主張が指す exact head
+    round: <n>                       # この request が何周目か (req marker 連鎖が正本)
+    reason_or_anchor:                # 再分類時のみ: 格上げ理由 1 行、または格下げ承認 anchor
+  actors:
+    implementer: class を主張し、格上げを随時宣言し、light 承認後の Notes を follow-up issue 化する
+    reviewer: diff を主張と照合して最終 class を確定し、review journal に記録する
+    owner_or_reviewer: 格下げ (standard -> light) の承認 anchor を発行できる唯一の authority
+  always_standard:
+    - us_level_audit.task_level例外 の高リスク種別 (主張にかかわらず reviewer が standard へ確定)
+    - light 主張の diff が src の動作コード・高リスクパスに触れている場合 (自動格上げ)
+    - light 案件の round >= 2 (自動格上げ。2 周目が要ること自体が light でなかった証拠)
   light_contract:
-    - 1 往復: reviewer が差し戻し (changes_requested) にできるのは High/blocker 級
-      (壊れる / 契約と矛盾 / 安全境界に触れる) のみ
-    - それ未満の指摘は approve_with_notes とし、メモは reviewer または implementer が
-      後続タスクとして起票する (黙殺しない)
-  claim_verification:
-    - class は review request の必須 field (省略時は standard)
-    - reviewer は diff を主張 class と照合する。light 主張が src の動作コード・
-      高リスクパスに触れていれば standard へ自動格上げし、その事実を review journal に記す
-  reclassification:
-    - escalate (light -> standard): implementer 単独・随時・journal 1 行で成立。承認不要
-    - de_escalate (standard -> light): reviewer または owner の承認 anchor 必須
-    - auto_escalate: light 案件が review 2 周目に入った時点で standard へ自動格上げ
-    - 膨張 (同一成果物の増大) は escalate で続行。派生 (別成果物の発生) は別 issue へ
-      切り出し、anchor を journal に残す
+    - changes_requested にできるのは、ADR-0004 の観測可能 3 条件
+      「壊れる / 契約と矛盾する / 安全境界に触れる」のいずれかを満たす finding のみ
+    - それ未満の指摘は conclusion=approved (finding manifest は空) とし、review journal の
+      本文に `### Notes (non-blocking)` 節として残す (structured finding にしない)
+    - follow-up 起票の単一責任は implementer: US close 前に Notes を follow-up issue 化し、
+      その issue anchor を close journal に記録する。anchor 未記録のまま close しない
+  record_and_notify:
+    - class の主張・確定・再分類・承認 anchor はすべて対象 issue の journal に記録する
+    - 通知は canonical handoff のみ。pane 観測から class を推測しない
+  invalid:
+    - claim_schema の欠落・不正、light_subtype の照合不能、格下げ anchor の検証失敗は、
+      いずれも standard として審査する (fail 側は常に「深い方」)
+```
+
+flow (最小 swimlane。既存の review request/result flow の上に class 判定を重ねるだけで、
+gate 語彙・順序は変更しない):
+
+```plantuml
+@startuml
+|implementer|
+start
+:review request に claim_schema を記録
+(class 欠落/不正は standard 扱い);
+|reviewer|
+:diff を主張と照合;
+if (always_standard に該当?) then (yes)
+  :standard へ確定 (review journal に理由を記録);
+else (no)
+  :主張 class で確定;
+endif
+if (確定 class = light?) then (yes)
+  if (壊れる / 契約矛盾 / 安全境界の finding あり?) then (yes)
+    :conclusion=changes_requested
+(structured finding 付き);
+  else (no)
+    :conclusion=approved (finding 0 件)
++ 本文に Notes (non-blocking) 節;
+    |implementer|
+    :close 前に Notes を follow-up issue 化し
+anchor を close journal に記録;
+  endif
+else (no)
+  :標準深度で審査 (既存 flow のまま);
+endif
+|implementer|
+:格上げ (light->standard) は随時:
+対象 issue journal 1 行 + 次 request の claim 更新;
+note right
+  格下げ (standard->light) は owner_or_reviewer の
+  承認 anchor を claim_schema.reason_or_anchor に載せ、
+  reviewer が照合してから light として扱う。
+  作業中に別成果物が生えたら本 US で続けず
+  別 issue へ切り出して anchor を journal に残す。
+end note
+stop
+@enduml
 ```
 
 ## Workflow Change Verification

@@ -6,9 +6,11 @@
 
 ## 決定 (規約行)
 
-レビューの深さは変更クラスに比例させる。動作を変えない**軽量クラス**の変更は 1 往復契約
-(壊れる級の欠陥のみ差し戻し可、中小指摘は承認+メモ) とする。分類は検証される主張であり、
-格上げは実装者単独でいつでも無コスト、格下げは承認必須。central preset の
+レビューの深さは変更クラスに比例させる。動作を変えない**軽量クラス**の変更は 1 往復契約とする
+— 差し戻し (changes_requested) にできるのは「壊れる / 契約と矛盾する / 安全境界に触れる」の
+3 条件のいずれかを満たす欠陥のみで、それ未満の指摘は approved (finding manifest 空) の review
+journal に非 blocking の Notes として残し、close 前に follow-up issue 化する。分類は検証される
+主張であり、格上げは実装者単独でいつでも無コスト、格下げは承認必須。central preset の
 `us_level_audit.task_level例外` の高リスク種別は軽量クラスに入れない。
 
 ## 背景
@@ -31,9 +33,10 @@
 ## 影響
 
 - **軽量クラス** (閉じたリスト、`vibes/docs/rules/agent-workflow.md` の `review_depth_tiers` が
-  正本): 文書の誤記・清書、テストのみの変更、コメント、生成物の再生成。reviewer は
-  High/blocker 級 (壊れる・契約と矛盾する・安全境界に触れる) のみを差し戻し理由にでき、
-  それ未満の指摘は「承認+メモ」で通し、メモは後続タスクとして起票する。
+  正本): 文書の誤記・清書、テストのみの変更、コメント、生成物の再生成。差し戻しの可否は
+  既存の review_result 契約 (`conclusion: approved|changes_requested`) の中で表現する —
+  新しい結論語・severity 語彙は作らない。非 blocking の指摘の扱いと follow-up 起票責任は
+  同 `review_depth_tiers` の light_contract を正本とする。
 - **標準クラス**: 上記以外すべて。従来どおりの深度。`us_level_audit.task_level例外` の
   高リスク種別 (guardrail / release・CI / credential・権限 / destructive・migration /
   architecture・互換性) は宣言にかかわらず常に標準クラス。
