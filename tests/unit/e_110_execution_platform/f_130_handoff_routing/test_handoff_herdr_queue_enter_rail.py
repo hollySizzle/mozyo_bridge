@@ -1492,6 +1492,8 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         "same-generation causal turn-start returns",
         "causal turn-start を確認した場合だけ `submitted_confirmed` / exit 0 を返す。",
         "busy自体を成功証拠にはしない。",
+        "成功判定は marker ではなく causal event + coherent generation なので",
+        "Herdr は causal confirmation が無ければ成功にせず",
     )
 
     def _root(self):
@@ -1538,9 +1540,13 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         ("vibes/docs/logics/tmux-send-safety-contract.md", "handoff send"),
         ("vibes/docs/logics/tmux-send-safety-contract.md", "herdr queue-enter (causal"),
         ("vibes/docs/logics/tmux-send-safety-contract.md", "短い結論"),
+        ("vibes/docs/logics/tmux-send-safety-contract.md", "Blind Enter を避ける条件"),
+        ("vibes/docs/logics/tmux-send-safety-contract.md", "Fail-Closed Conditions"),
     )
 
-    SECTION_TOKENS = ("15537", "busy")
+    #: Two-outcome mapping: each promise section must anchor the busy exception
+    #: AND carry the noncausal outcome token itself.
+    SECTION_TOKENS = ("15537", "busy", "queue_enter")
 
     @staticmethod
     def _extract_section(text: str, heading_substring: str) -> str | None:
@@ -1579,6 +1585,90 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
             problems,
             "a queue-enter promise section dropped the busy queued-submission "
             "exception (#15537 / ADR-0002):\n" + "\n".join(problems),
+        )
+
+    #: Sentence-level layer (review j#106478): token/section presence alone lets a
+    #: busy-exception sentence COEXIST with an exclusive causal-only claim in the
+    #: same section. Any sentence in a promise section that makes an exclusive or
+    #: universal claim about Enter actuation / success (JA or EN phrasing) must
+    #: scope itself — name the busy exception or restrict itself to the
+    #: idle/turn-ended series inside that same sentence. A causal-only rewrite
+    #: loses the scope tokens and goes red regardless of wording elsewhere.
+    EXCLUSIVITY_PATTERNS = (
+        "場合だけ",
+        "場合に限る",
+        "無ければ成功にせず",
+        "より先の causal wait",
+        "各 Enter より先",
+        "すべて事前に",
+        "Every Enter",
+        "every issued Enter",
+        "unarmed wait",
+        "wait unarmed",
+        "armed before",
+        "wait before",
+        "Otherwise the command fails closed",
+    )
+
+    #: Pair form: both substrings in one sentence make it an exclusivity claim
+    #: (e.g. "the first Enter requires ... an armed wait").
+    EXCLUSIVITY_PAIRS = (("require", "armed"),)
+
+    SCOPE_TOKENS = ("busy", "15537", "idle", "turn-ended", "turn_ended", "awaiting_input")
+
+    ACTUATION_TOKENS = ("enter", "sent", "ok", "exit", "成功", "actuation", "fail")
+
+    @staticmethod
+    def _sentences(section: str):
+        import re
+
+        unwrapped = re.sub(r"\n\s*", " ", section)
+        return [
+            frag.strip()
+            for frag in re.split(r"(?<=。)|(?<=\.)\s+(?=[A-Z`])", unwrapped)
+            if frag.strip()
+        ]
+
+    def test_promise_section_sentences_scope_exclusive_causal_claims(self) -> None:
+        root = self._root()
+        offenders = []
+        for rel, heading in self.SECTION_CONTRACTS:
+            text = (root / rel).read_text(encoding="utf-8")
+            section = self._extract_section(text, heading)
+            if section is None:
+                offenders.append(f"{rel}: section heading containing {heading!r} not found")
+                continue
+            for sentence in self._sentences(section):
+                lowered = sentence.lower().replace("not_sent", "")
+                exclusive = any(
+                    pat.lower() in lowered for pat in self.EXCLUSIVITY_PATTERNS
+                ) or any(
+                    all(part in lowered for part in pair)
+                    for pair in self.EXCLUSIVITY_PAIRS
+                )
+                if (
+                    exclusive
+                    and any(tok in lowered for tok in self.ACTUATION_TOKENS)
+                    and not any(tok in lowered for tok in self.SCOPE_TOKENS)
+                ):
+                    offenders.append(
+                        f"{rel} [{heading}]: unscoped exclusive claim: {sentence[:120]!r}"
+                    )
+                if (
+                    "exit 0" in lowered
+                    and ("maps to" in lowered or "写" in sentence)
+                    and "queue_enter" not in lowered
+                ):
+                    offenders.append(
+                        f"{rel} [{heading}]: success mapping without busy outcome: "
+                        f"{sentence[:120]!r}"
+                    )
+        self.assertEqual(
+            [],
+            offenders,
+            "an exclusive/universal Enter-actuation claim in a queue-enter promise "
+            "section does not scope the busy exception (#15537 / ADR-0002):\n"
+            + "\n".join(offenders),
         )
 
     def test_no_surface_reintroduces_the_unconditional_causal_only_claims(self) -> None:

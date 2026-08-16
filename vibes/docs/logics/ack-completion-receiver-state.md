@@ -161,9 +161,9 @@ layer 0 hardening である。ただし queue-enter は `busy` な receiver に�
 idle だけを許す standard `drive_turn_start` を流用しない。
 
 - marker + body は exactly once。Herdr queue-enter は body 注入後に tmux compatibility 由来の
-  landing-marker wait を行わない。pinned generation を再確認し、Herdr 0.8 の
+  landing-marker wait を行わない。pinned generation を再確認し、idle / turn-ended 系列では Herdr 0.8 の
   `agent wait TARGET --until working --timeout MS` を arm でき、absolute deadline 内にある場合だけ
-  first Enter を発行する。失敗時は
+  first Enter を発行する (busy 系列 (#15537) は arm を要求せず wait 非依存の full effect fence を通して発行する)。失敗時は
   `enter_attempts=0` のまま `blocked` / `turn_start_unconfirmed` に閉じる。idle / turn-ended 系列で実際に発行する first / extra Enter は
   すべて事前に wait を arm する。busy 系列 (#15537) は wait を attribution に使えないため arm を要求せず、
   wait 非依存の full effect fence を通した Enter と composer clear を証拠に非 causal な
@@ -185,14 +185,15 @@ idle だけを許す standard `drive_turn_start` を流用しない。
   再観測を含む単一 absolute budget で、wait を arm し直しても延長しない。interval は隣接する Enter 間の
   最小間隔で、観測待ちにより既に満たしていれば追加 sleep しない。window / interval の `0` または正の
   sub-millisecond 値は追加 Enter 無効である。これは initial admission 自体を抑止しないが、first Enter と
-  observation は post-body generation 再確認・wait arm・deadline check が成功した場合に限る。`0.001` 秒へ
+  observation は post-body generation 再確認と deadline check、および idle / turn-ended 系列では wait arm が
+  成功した場合に限る (busy 系列は #15537 の wait 非依存 full effect fence を通す)。`0.001` 秒へ
   切り上げず、非有限値は本文注入前に拒否する。
 
 確認結果は queue 専用 `queue_enter_turn_start_observation` と queue delivery-ledger rail に残し、standard
 `turn_start_outcome` へ射影しない。後者へ射影すると queue delivery が別 rail として分類され、recovery 判断が
-変わるためである。causal event と coherent generation が揃った場合だけ `sent` / `ok` / exit 0。wait absent は
+変わるためである。idle / turn-ended 系列は causal event と coherent generation が揃った場合だけ、busy 系列は full effect fence 後の composer clear を証拠とした場合だけ (#15537)、`sent` (`ok` / `queue_enter`) / exit 0。wait absent は
 `blocked` / `turn_start_absent`、fresh gate が runtime blocked を確認した場合は `blocked` /
-`receiver_blocked`、timeout / error / wait unarmed / drift / body-screen-state 再確認不成立は `blocked` /
+`receiver_blocked`、timeout / error / wait unarmed (idle / turn-ended 系列) / drift / body-screen-state 再確認不成立は `blocked` /
 `turn_start_unconfirmed`、送信 primitive の `TerminalTransportError` は `blocked` / `transport_error` へ写し、
 いずれも非0である。未確認を legacy の `sent` / telemetry-only success に倒さない。ただし本文が届いた可能性を
 含むので injection stage は `uncertain_partial`、blind retry 禁止となる。ここまで確認できても task completion ではない。

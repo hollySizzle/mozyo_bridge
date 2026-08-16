@@ -269,9 +269,9 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
 - **queue-enter の本文は 1 回だけ渡す。** client は結果に関わらず gateway command を **ちょうど 1 回**
   実行し、再実行しない（再実行は Enter の再送ではなく本文の再入力になる）。対象 host が Herdr の場合、
   host 側 rail は body exactly once / first Enter zero-or-one を維持し、tmux compatibility 用の
-  landing-marker wait は実行しない。post-body generation 再確認、Herdr 0.8 の
-  `agent wait TARGET --until working --timeout MS` の arm、deadline check が成功した場合だけ
-  first Enter を発行し、失敗時は `enter_attempts=0` の
+  landing-marker wait は実行しない。post-body generation 再確認と deadline check、および idle / turn-ended 系列では Herdr 0.8 の
+  `agent wait TARGET --until working --timeout MS` の arm が成功した場合だけ
+  first Enter を発行し (busy 系列 (#15537) は arm を要求せず wait 非依存の full effect fence を通す)、失敗時は `enter_attempts=0` の
   `blocked` / `turn_start_unconfirmed` に閉じる。causal turn start 未確認時だけ、同一
   target identity、collision-free launch generation、現在の composer tail にある full marker+body
   （hard-wrap whitespace のみ正規化）、startup / modal / trust / login / selection screen の非該当、runtime
@@ -289,7 +289,8 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   延長しない。`QUEUE_ENTER_RETRY_INTERVAL_SECONDS`（既定2秒）は隣接 Enter 間の最小間隔で、直前の wait が
   既に interval を消費した場合は追加 sleep しない。window / interval のどちらか `0`、または正値でも
   `0.001` 秒未満なら host 側の extra Enter は無効である。initial admission は試みるが、first Enter と
-  observation は generation 再確認・wait arm・deadline check が成功した場合に限る。
+  observation は generation 再確認と deadline check、および idle / turn-ended 系列では wait arm が
+  成功した場合に限る (busy 系列は #15537 の wait 非依存 full effect fence を通す)。
   これは client 側で retry を増やす処理ではなく、対象 host の bounded rail が完了する前に client が command
   を timeout にしないための待機 budget である。`standard` / `pending` を
   明示した action は基礎 deadline のままとする。

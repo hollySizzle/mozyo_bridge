@@ -1557,19 +1557,23 @@ The queue seam owns this sequence:
    intentionally strict at this pre-body boundary. The binding also carries stable
    provider / assigned-name / locator / terminal-id fields and a verified
    `pane_bound_v2` launch token. Arm a `working`-transition wait before the first
-   Enter and then read the runtime baseline.
+   Enter and then read the runtime baseline; a `busy` baseline switches to the
+   #15537 queue path, where that armed wait is unusable as attribution.
 2. Keep the common transport choreography: body exactly once, first Enter zero-or-one.
    Unlike the tmux compatibility rail, Herdr queue-enter performs **no landing-marker wait**
    between body injection and causal admission. The first Enter requires, in order, the
    post-body **stable terminal/v2 launch-token** recheck, an armed Herdr 0.8
-   `agent wait TARGET --until working --timeout MS`, and an unexpired absolute deadline;
+   `agent wait TARGET --until working --timeout MS` on an idle / turn-ended
+   baseline (a `busy` baseline waives only that pending observer and passes the
+   #15537 wait-free full effect fence instead), and an unexpired absolute deadline;
    revision-only drift on that same
    verified terminal is allowed because body rendering may advance the revision.
    The pending wait and absolute deadline are checked again at the final transport
    effect boundary, after project-gateway capability verification and immediately
    before the delegate send. Otherwise `enter_attempts` remains unchanged and the
    send fails closed. Never move body injection into the retry helper. Every Enter
-   actually pressed has a successfully armed wait.
+   actually pressed on the idle / turn-ended path has a successfully armed wait;
+   busy-path Enters pass the #15537 wait-free full effect fence instead.
 3. Treat an armed `changed` event as submission evidence only when the baseline was
    `awaiting_input` / `turn_ended` and the stable terminal/v2 launch generation stay
    coherent.
@@ -1581,9 +1585,11 @@ The queue seam owns this sequence:
    tail** contain the complete injected marker+body (whitespace is ignored only to
    survive terminal hard wraps); no declared startup / modal / trust / login /
    selection screen; successful runtime read in `busy` / `awaiting_input` /
-   `turn_ended`; and a new wait armed before that Enter. `blocked`, `unknown`, read
-   failure, generation drift, historical-transcript-only body matches, and unarmed
-   wait all stop actuation. A timeout-only sequence may repeat this strict iteration
+   `turn_ended`; and, on the idle / turn-ended path, a new wait armed before that
+   Enter (the busy path instead re-proves the same gate inside the #15537 retry
+   effect boundary). `blocked`, `unknown`, read
+   failure, generation drift, historical-transcript-only body matches, and — on
+   the idle / turn-ended path — unarmed wait all stop actuation. A timeout-only sequence may repeat this strict iteration
    within the public policy/deadline. A wait `error` authorises no next Enter and stops
    immediately; timeout-authorised retries already issued before a late error cannot be
    undone and remain explicit in telemetry.
@@ -1606,9 +1612,11 @@ screen gate passes; `busy` alone can never pass the **delivery confirmation** ga
 Telemetry remains in the queue-specific `queue_enter_turn_start_observation`; the
 seam does not emit standard `turn_start_outcome`. This preserves the queue delivery-
 ledger classification and its generation fence. A same-generation causal start (idle/turn-ended baseline) maps
-to `sent` / `ok` / exit 0. Otherwise the command fails closed and exits non-zero:
+to `sent` / `ok` / exit 0, and a busy-baseline composer clear behind the #15537
+full effect fence maps to the noncausal `sent` / `queue_enter` / exit 0.
+Otherwise the command fails closed and exits non-zero:
 wait `absent` maps to `blocked` / `turn_start_absent`; a fresh gate that observes
-runtime `blocked` maps to `blocked` / `receiver_blocked`; timeout, error, unarmed wait,
+runtime `blocked` maps to `blocked` / `receiver_blocked`; timeout, error, unarmed wait (idle / turn-ended path),
 identity/generation drift, or body/screen/state proof failure maps to `blocked` /
 `turn_start_unconfirmed`; a raised `TerminalTransportError` maps to `blocked` /
 `transport_error`. These post-injection failures retain an `uncertain_partial` injection
