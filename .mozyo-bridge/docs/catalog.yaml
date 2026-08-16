@@ -583,6 +583,22 @@ documents:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: logic-local-mcp-tool-surface
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/local-mcp-tool-surface.md
+    purpose: "installed packageから起動するlocal MCP serverと高レベルread/plan tool schema、およびUnit状態read modelの設計正本 (Redmine #15151 / 親Feature #15148)。#15149の共有application境界の上にMCP entryを置き、閉じた4 tool語彙 (docs_resolve / workflow_glance / workflow_step_plan / unit_state) をread/plan専用として固定する。MCP SDKを依存に追加しない判断と照合した一次仕様、stdio framing規律 (stdoutはMCP frame専用・改行埋め込み拒否・受理requestには必ず1応答)、protocol errorとtool execution errorの分離、任意command / shell argv / raw pane / tmux / mutating操作をschema上表現できないことの構造検査を含む。Unit状態はworkflow / runtime / delivery / healthの独立4軸で、全fieldがsource・observed_at・freshnessを持ち、journal無更新・pane本文・stdout silence・turn endedからblocked / idle / completedを導出しない。blockedは権威あるblocker source・reason・resume conditionが揃う場合だけ返す。"
+    audit_role: local_mcp_tool_surface_logic
+    related_document_refs:
+      - logic-cli-mcp-shared-application-api
+      - logic-unit-target-model
+      - logic-ack-completion-receiver-state
+      - logic-managed-state-model
+      - logic-runtime-observability-boundary
+      - logic-plugin-ready-adapter-boundary
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-plugin-ready-adapter-boundary
     type: logic
     status: active

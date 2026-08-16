@@ -4112,6 +4112,16 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
     #: The trade is stated in ``test_no_module_shape_can_hide_a_capability_from_a_wildcard_consumer``:
     #: over-detection costs a declaration line, a missed reader costs a silent gate.
     INHERITED = {
+        "src/mozyo_bridge/e_110_execution_platform/f_180_llm_mcp_operation_entry/domain/blocker_claim.py": (
+            ['handoff'],
+            "inherits via a used import of hibernate_park_record's `governed_field`; names no "
+            "marker token itself. It reads the governed parked-state fixed fields to decide "
+            "whether a durable blocker claim exists for the read-only Unit-state report "
+            "(Redmine #15162). It renders nothing. A field declared twice with differing "
+            "values is folded to ABSENT — `governed_field` returns its conflict sentinel and "
+            "this module treats any non-string as missing — so a record that says two things "
+            "yields no claim rather than an arbitrary one, and the caller reports `unknown`",
+        ),
         f"{_D}/application/retire_superseded_audit_failure.py": (
             ['*'],
             "inherits via a used import of superseded_audit_failure_terminal (Redmine #15166); "

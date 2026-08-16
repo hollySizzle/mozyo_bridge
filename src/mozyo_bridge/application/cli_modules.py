@@ -66,6 +66,9 @@ from mozyo_bridge.e_150_quality_architecture.f_130_module_health.domain.module_r
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application import (
     cli_test_impact,
 )
+from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application import (  # noqa: E501
+    cli_mcp,
+)
 
 # Each entry is (CliFamily description, registrar). The registrar takes the
 # top-level subparsers action and adds this family's subparsers. The order is
@@ -301,6 +304,20 @@ _FAMILY_BINDINGS: tuple[tuple[CliFamily, Callable[[object], None]], ...] = (
             ),
         ),
         cli_redmine_version.register,
+    ),
+    (
+        CliFamily(
+            name="mcp",
+            summary=(
+                "Local MCP server family (Redmine #15151): a non-interactive stdio "
+                "session publishing the typed read/plan tools (docs resolve, "
+                "workflow glance, workflow step plan, Unit state) to an LLM client, "
+                "plus the operator catalog view. Every published tool is read-only "
+                "— no routing, send, approval, or close authority, and no arbitrary "
+                "command / shell argv / raw pane surface."
+            ),
+        ),
+        cli_mcp.register,
     ),
 )
 

@@ -46,13 +46,19 @@ import json as _json
 from pathlib import Path
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.glance_snapshot_source import (
-    GlanceLiveRedmineSource,
-    MappingGlanceRedmineSource,
     MappingGlanceSnapshotSource,
     active_lane_snapshots,
     enumerate_active_lanes_for_repo,
     enumerate_detached_residue_for_repo,
     enumerate_lifecycle_diagnostic,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.glance_source_wiring import (
+    GlanceFixtureError,
+    build_authority_index,
+    build_delivery_ledger,
+    build_redmine_source,
+    build_reconcile_store,
+    build_workflow_runtime_store,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_glance import (
     fold_glance_rows,
@@ -74,16 +80,7 @@ def _snapshot_json_payload(args: argparse.Namespace):
 
 def _store_from_args(args: argparse.Namespace):
     """Build the workflow-runtime store from ``--store-path`` (test/debug) or the home default."""
-    # Lazy import so the glance CLI does not pull the store module in until an active-lane
-    # enumeration actually needs it (the --snapshot-json path stays store-free).
-    from mozyo_bridge.core.state.workflow_runtime_store import (
-        WorkflowRuntimeStore,
-        workflow_runtime_store_path,
-    )
-
-    raw = (getattr(args, "store_path", None) or "").strip()
-    path = Path(raw) if raw else workflow_runtime_store_path()
-    return WorkflowRuntimeStore(path=path)
+    return build_workflow_runtime_store(getattr(args, "store_path", None))
 
 
 def _reconcile_store_from_args(args: argparse.Namespace):
@@ -94,17 +91,7 @@ def _reconcile_store_from_args(args: argparse.Namespace):
     unavailable / unreadable store degrades to no reconcile projection (every lane's reconcile
     group stays the fail-closed empty facts), never a hard error on the read-only glance.
     """
-    from mozyo_bridge.core.state.reconcile_state import (
-        ReconcileStateStore,
-        reconcile_state_path,
-    )
-
-    raw = (getattr(args, "reconcile_store_path", None) or "").strip()
-    try:
-        path = Path(raw) if raw else reconcile_state_path()
-        return ReconcileStateStore(path=path)
-    except Exception:  # noqa: BLE001 - a missing/unreadable reconcile store degrades to no join
-        return None
+    return build_reconcile_store(getattr(args, "reconcile_store_path", None))
 
 
 def _authority_index(args: argparse.Namespace):
@@ -116,31 +103,15 @@ def _authority_index(args: argparse.Namespace):
     inspection. Fail-open: an unreadable lifecycle store degrades to no join (unknown facts).
     The live-pane dispatch states connect at #13492.
     """
-    try:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.glance_snapshot_source import (
-            authority_execution_index,
-        )
-
-        return authority_execution_index()
-    except Exception:  # noqa: BLE001 - a lifecycle read never breaks the read-only glance
-        return {}
+    return build_authority_index()
 
 
 def _ledger_from_args(args: argparse.Namespace):
     """Build the herdr delivery ledger, or None when disabled / unavailable (fail-open)."""
-    if getattr(args, "no_ledger", False):
-        return None
-    from mozyo_bridge.core.state.herdr_delivery_ledger import (
-        HerdrDeliveryLedger,
-        herdr_delivery_ledger_path,
+    return build_delivery_ledger(
+        getattr(args, "ledger_path", None),
+        enabled=not getattr(args, "no_ledger", False),
     )
-
-    raw = (getattr(args, "ledger_path", None) or "").strip()
-    try:
-        path = Path(raw) if raw else herdr_delivery_ledger_path()
-        return HerdrDeliveryLedger(path=path)
-    except Exception:  # noqa: BLE001 - a missing/unreadable ledger degrades to no join
-        return None
 
 
 def _redmine_source(args: argparse.Namespace):
@@ -152,19 +123,10 @@ def _redmine_source(args: argparse.Namespace):
     marks the lane unknown) — the glance never fails because Redmine is unreachable.
     """
     raw = (getattr(args, "redmine_json", None) or "").strip()
-    if raw:
-        try:
-            data = _json.loads(Path(raw).read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            raise SystemExit(f"--redmine-json {raw!r} could not be read as JSON: {exc}") from exc
-        payloads = data.get("issues", data) if isinstance(data, dict) else {}
-        return MappingGlanceRedmineSource(payloads if isinstance(payloads, dict) else {})
-    if getattr(args, "no_redmine", False):
-        return None
     try:
-        return GlanceLiveRedmineSource.from_environment()
-    except Exception:  # noqa: BLE001 - unconfigured / unreachable Redmine degrades, never breaks
-        return None
+        return build_redmine_source(raw, live=not getattr(args, "no_redmine", False))
+    except GlanceFixtureError as exc:
+        raise SystemExit(f"--redmine-json {exc}") from exc
 
 
 def _roster(args: argparse.Namespace):
@@ -173,6 +135,12 @@ def _roster(args: argparse.Namespace):
     Explicit ``--issue`` ids form the roster directly (no enumeration, ``error=None``);
     otherwise the live sublane read model is enumerated (``error`` set when the read failed, so
     a roster that could not be read is reported degraded, not silently empty).
+
+    Kept as a direct call rather than routed through ``glance_source_wiring.roster_for``
+    (Redmine #15151): the roster *authority* is already one shared function
+    (:func:`enumerate_active_lanes_for_repo`, which both this CLI and the MCP entry call),
+    and this module-level name is an established monkeypatch seam for the #14813
+    regression tests. Dedup'ing four lines is not worth removing a test seam.
     """
     issues = [i.strip() for i in (getattr(args, "issue", None) or []) if i.strip()]
     if issues:

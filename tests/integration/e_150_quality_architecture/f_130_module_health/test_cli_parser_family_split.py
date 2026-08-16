@@ -98,6 +98,9 @@ EXPECTED_TOP_LEVEL_ORDER = [
     "health",
     "tests",
     "redmine-version",
+    # Redmine #15151: the local MCP server family, appended last so every
+    # pre-existing subcommand keeps its position.
+    "mcp",
 ]
 
 
