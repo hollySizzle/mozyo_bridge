@@ -374,20 +374,28 @@ adversarial_convergence:
       pending_record: |
         implementer の判断待ち journal は `challenge_pending: j#<challenge result id>` を持つ
       owner_anchor: |
-        coordinator の owner 裁定 anchor journal は `challenge_ref: j#<challenge result id>` と
-        `challenge_verdict: update_model | defer | wontfix_by_policy` を持つ。どちらかの欠落・
-        重複・enum 外は anchor 不成立 (close blocked のまま)。裁定の訂正は新しい anchor journal に
-        `supersedes_anchor: j#<先行 anchor journal id>` (最大 1 行) を付して行う (旧 journal は
-        編集しない)
+        **anchor candidate** = `challenge_ref` 行を 1 行以上含む journal (validity 判定前の
+        母集合)。challenge_ref がちょうど 1 行で実在の challenge result C を指す candidate は
+        「C へ帰属する candidate」。重複行・dangling target の candidate は**帰属不能 candidate**
+        として outstanding blocker 集合へ入る (repairs_attempt で修復可能)。
+        C へ帰属する candidate が **valid** であるのは、`challenge_verdict: update_model |
+        defer | wontfix_by_policy` をちょうど 1 行持ち、`supersedes_anchor: j#<先行 anchor
+        candidate id>` が最大 1 行・後方参照・同一 C の candidate を指す場合。裁定の訂正は
+        新しい candidate journal の append で行う (旧 journal は編集しない)。
+        **latest-anchor-attempt 検証**: C へ帰属する candidate のうち最大 id のものが invalid
+        なら、C の chain は close blocked — 旧 valid terminal へ fallback しない。回復はより
+        新しい valid candidate の append のみ
     authoritative_chain: |
       challenge result C ごとに、history 全体から一意に選ぶ:
       (a) pending record = `challenge_pending: j#C` を持つ journal のうち **id > C の最小 id** の
       1 個 (chain の必須要素。C より前の journal は選択対象外)。
-      (b) owner anchor 集合 = `challenge_ref: j#C` を持つ有効 anchor 全部。authoritative anchor は
-      supersession 連鎖の末端 1 個 — 各 anchor は同じ challenge_ref を持つ先行 anchor のみを
-      supersede でき、連鎖は線形でなければならない。未 supersede の anchor が 2 個以上並立、
-      dangling な supersedes_anchor、別 challenge_ref の anchor への supersede、循環は、いずれも
-      conflict であり close blocked (どの anchor も authoritative にならない)。
+      (b) authoritative anchor の解決は二段階: まず C へ帰属する anchor candidate の**最大 id**
+      が valid であること (invalid なら C の chain は close blocked — 旧 valid terminal へ
+      fallback しない)。その上で、valid candidate 全部の supersession 連鎖の末端 1 個を
+      authoritative anchor とする — 各 anchor は同じ C の先行 candidate のみを supersede でき、
+      連鎖は線形でなければならない。未 supersede の valid anchor が 2 個以上並立、dangling な
+      supersedes_anchor、別 challenge の candidate への supersede、循環は、いずれも conflict で
+      あり close blocked (どの anchor も authoritative にならない)。
       (c) resumption の選択は**二段階** (Review Generation Marker Contract v2 の「newer
       malformed generation を旧 valid generation で置換しない」fail-closed 原則に従う):
       第一段階 (latest attempt の選択) — repair candidate (repair_record 参照) を除いた上で、
@@ -417,7 +425,8 @@ adversarial_convergence:
         attempt へ復帰しない)。
         **valid repair record** = repair candidate の closed subset — `repairs_attempt:
         j#<U の journal id>` がちょうど 1 行、他の challenge key (challenge_attempt /
-        challenge_resolution) を一切持たず、target U が実在し、U < 自 journal id (後方参照)、
+        challenge_resolution) を一切持たず、target U (帰属不能な canonical request または
+        帰属不能な anchor candidate journal) が実在し、U < 自 journal id (後方参照)、
         かつ評価時点で U が outstanding blocker 集合の要素であるもの。effect は「U を集合から
         除去する」ことだけで、per-challenge の chain 判定には一切影響しない。
         それ以外の repair candidate (重複行・値 malformed・dangling・前方参照・blocker でない
@@ -437,7 +446,9 @@ adversarial_convergence:
       (2) **ordinary challenge-key record** (repair candidate でなく `challenge_attempt` /
       `challenge_resolution` を持つ): 既存の challenge result へ一意に帰属できない (typo・
       dangling・前方参照・duplicate 等) 場合、出現時に集合へ追加。
-      (3) challenge key を持たない request は集合に関与しない。
+      (3) **帰属不能 anchor candidate** (`challenge_ref` 行を持つが owner_anchor の帰属規則で
+      C へ一意帰属できない journal — 重複行・dangling): 出現時に集合へ追加。
+      (4) 上記いずれの key も持たない journal は集合に関与しない。
       この pass の最終結果のみを判定に使う (評価順依存の非決定性を排除。fall-through する
       record は存在しない)。無関係な challenge の well-formed attempt が最大 id を更新しても
       集合は変化しない。集合が空でない間は、個別 chain の状態にかかわらず issue close blocked。
@@ -567,7 +578,9 @@ else (no)
 当該 guard 面の light 主張 invalid);
     :coordinator へ canonical handoff;
     |coordinator|
-    :owner 裁定 anchor を対象 issue journal に記録;
+    :owner 裁定 anchor candidate を対象 issue journal に append
+(challenge_ref=C + verdict。訂正は supersedes_anchor 付き新 candidate。
+最大 id の candidate が invalid なら C は blocked — 旧裁定へ fallback しない);
     |implementer|
     :authoritative anchor (supersession 連鎖の末端) を確認し、
 challenge_attempt (=C) + challenge_resolution (=anchor) の
