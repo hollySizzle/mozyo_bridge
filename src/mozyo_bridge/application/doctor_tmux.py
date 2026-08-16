@@ -241,8 +241,9 @@ def _selected_backend(args: argparse.Namespace) -> str:
 
     Resolved through the same predicate the send path uses
     (:func:`herdr_backend_selected`), so doctor cannot disagree with the rail
-    about which backend a target routes through. A missing or malformed config
-    resolves to the tmux default there, and therefore here too.
+    about which backend a target routes through. Since 2.0 (Redmine #15531) a
+    missing config resolves to the herdr default; a present-but-malformed config
+    stays on the legacy tmux rail there, and therefore here too.
     """
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E501
         herdr_backend_selected,
@@ -250,7 +251,7 @@ def _selected_backend(args: argparse.Namespace) -> str:
 
     try:
         return "herdr" if herdr_backend_selected(args) else "tmux"
-    except Exception:  # noqa: BLE001 - an unreadable config is the tmux default
+    except Exception:  # noqa: BLE001 - an unreadable config stays on the legacy tmux rail
         return "tmux"
 
 

@@ -63,7 +63,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional, Protocol, runtime_checkable
 
 # --- backend vocabulary (core-owned) -----------------------------------------
@@ -76,10 +76,14 @@ BACKEND_HERDR = "herdr"
 
 TERMINAL_TRANSPORT_BACKENDS: frozenset[str] = frozenset({BACKEND_TMUX, BACKEND_HERDR})
 
-#: The default backend. ``tmux`` means herdr transport is **off**: no herdr
-#: adapter is constructed and the existing tmux path is untouched. A repo must
-#: opt in explicitly (``terminal_transport.backend: herdr``) to select herdr.
-DEFAULT_TERMINAL_BACKEND = BACKEND_TMUX
+#: The default backend. Since 2.0 the default is ``herdr`` (Redmine #15531):
+#: an UNDECLARED ``terminal_transport.backend`` resolves to herdr, and staying
+#: on tmux requires the explicit declaration ``terminal_transport.backend:
+#: tmux``. The 1.x default was tmux; the flip is part of the single 1.x -> 2.0
+#: upgrade contract (#15529). Selecting herdr on a host without the herdr
+#: binary fails closed (``binary_unconfigured`` / ``binary_not_found``) — it
+#: never silently falls back to tmux.
+DEFAULT_TERMINAL_BACKEND = BACKEND_HERDR
 
 # --- pane read source vocabulary (core-owned) --------------------------------
 # The pane-content sources a read may request, mirroring the herdr ``agent
@@ -385,6 +389,13 @@ class TerminalTransportConfig:
     """
 
     backend: str = DEFAULT_TERMINAL_BACKEND
+    #: Whether the backend was EXPLICITLY declared in the source record, or fell
+    #: through to :data:`DEFAULT_TERMINAL_BACKEND` (Redmine #15531). Metadata
+    #: only — excluded from equality so declared and defaulted selections of the
+    #: same backend stay interchangeable everywhere routing is decided. Doctor
+    #: uses it to tell an operator whose UNDECLARED target now resolves to herdr
+    #: (the 2.0 flip) how to stay on tmux, without guessing.
+    backend_declared: bool = field(default=True, compare=False)
 
     def __post_init__(self) -> None:
         if (
@@ -398,8 +409,8 @@ class TerminalTransportConfig:
 
     @classmethod
     def default(cls) -> "TerminalTransportConfig":
-        """The behaviour-preserving default: tmux backend (herdr off)."""
-        return cls()
+        """The 2.0 default: herdr backend, marked as not explicitly declared."""
+        return cls(backend_declared=False)
 
     @property
     def herdr_enabled(self) -> bool:
@@ -441,13 +452,14 @@ class TerminalTransportConfig:
                 f"unsupported terminal transport config version {version!r}; this "
                 f"build understands version 1"
             )
+        declared = "backend" in record
         backend = record.get("backend", DEFAULT_TERMINAL_BACKEND)
         if not isinstance(backend, str):
             raise TerminalTransportError(
                 f"terminal transport config 'backend' must be a string naming a "
                 f"recognised backend, got {type(backend).__name__}"
             )
-        return cls(backend=backend)
+        return cls(backend=backend, backend_declared=declared)
 
 
 __all__ = (

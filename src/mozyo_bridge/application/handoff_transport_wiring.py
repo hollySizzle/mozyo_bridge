@@ -16,7 +16,7 @@ Two pieces:
 - :func:`bind_runtime_transport` decorates the handoff entry: for the herdr
   backend it swaps the ``commands`` module's ``run_tmux`` / ``capture_pane``
   globals for the tmux-shaped herdr shim for the duration of the send and restores
-  them in a ``finally``; for the tmux default it installs nothing, so the send is
+  them in a ``finally``; for a tmux selection it installs nothing, so the send is
   byte-for-byte the current behaviour and any test-patched ``commands.run_tmux``
   stays in force (the #12932 monkeypatch seam is untouched).
 
@@ -37,7 +37,8 @@ handle and resolves the receiver label against the inventory instead; the result
 assigned name is then re-bound against a fresh snapshot (existing translator path).
 
 Fail-closed (Redmine #13253 j#72318 / #13261): an absent / broken config is "no
-herdr selection" and resolves to the tmux default; a herdr selection whose trusted-
+herdr selection" and stays on the legacy tmux rail; a herdr selection — declared, or
+the 2.0 undeclared default (Redmine #15531) — whose trusted-
 environment binary is unconfigured / unresolvable, or whose sender identity is
 missing / mismatched against the repo anchor, or whose receiver does not resolve to a
 single live agent, surfaces as a clean ``die`` — never a silent downgrade to tmux and
@@ -388,7 +389,7 @@ def _require_project_gateway_herdr_transport_frame(
     Project-gateway inventory is selected from ``--target-repo`` while the legacy
     handoff decorator selects its rail from the sender repo.  Until those configs
     are proven to name the same Herdr backend, the capability must never fall
-    through to the sender's tmux default.  The send-effect verifier repeats this
+    through to the sender's tmux rail.  The send-effect verifier repeats this
     backend join immediately before every later mutation.
     """
 
@@ -421,7 +422,7 @@ def _require_project_gateway_herdr_transport_frame(
 def resolve_handoff_transport_binding(
     source: "argparse.Namespace | HandoffTransportContext",
 ) -> Optional[TransportBinding]:
-    """Resolve the transport binding for this send, or ``None`` for the tmux default.
+    """Resolve the transport binding for this send, or ``None`` for the tmux rail.
 
     Redmine #15149: takes either the parsed Namespace (every existing CLI caller)
     or the typed :class:`HandoffTransportContext` the shared application API
@@ -452,7 +453,9 @@ def resolve_handoff_transport_binding(
             )
             raise AssertionError("unreachable")
         # A present-but-broken / unreadable config is "no usable selection", not a
-        # herdr opt-in — resolve to the tmux default rather than failing the send.
+        # herdr selection — stay on the legacy tmux rail rather than failing the
+        # send (an ABSENT config, by contrast, loads as the default and selects
+        # herdr since 2.0, Redmine #15531).
         return None
     _require_project_gateway_herdr_transport_frame(ctx, config)
     if config.backend != BACKEND_HERDR:
@@ -487,7 +490,8 @@ def resolve_handoff_transport_runtime(
     subprocess/Popen in production, injected fakes in tests via patched
     ``subprocess.run`` / ``subprocess.Popen``).
 
-    Returns ``(None, None)`` for the tmux default / absent / broken config; returns
+    Returns ``(None, None)`` for a tmux selection (declared) or a broken config
+    (an absent config loads as the 2.0 herdr default, Redmine #15531); returns
     ``(binding, rail)`` for the herdr backend. The rail is resolved for every herdr
     send (it runs no subprocess at resolution time) but is only *used* by the
     herdr+standard branch in ``orchestrate_handoff`` — queue-enter / pending herdr
@@ -578,7 +582,7 @@ def runtime_transport_binding(
     the send, and (Redmine #13255) stashes the resolved event-driven turn-start
     rail on ``commands.active_herdr_turn_start_rail`` so the herdr+standard
     branch of the orchestration can drive it in place of the capture-based
-    observation; all three are restored in a ``finally``. For the tmux default it
+    observation; all three are restored in a ``finally``. For a tmux selection it
     installs nothing (and leaves the rail slot ``None``), so the send is
     byte-for-byte the current behaviour and any test-patched ``commands.run_tmux``
     stays in force (the #12932 monkeypatch seam is untouched).

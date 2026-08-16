@@ -529,9 +529,14 @@ class LiveProjectPathAuthorityTest(unittest.TestCase):
 
 
 @patch.object(cli_project_gateway_resolve, "require_tmux", lambda: None)
+@patch.object(cli_project_gateway_resolve, "_route_provider", lambda **_: "codex")
 class ResolveCliTest(unittest.TestCase):
     # Redmine #12751: the read-only resolve handler + the shared resolution core
     # moved to `cli_project_gateway_resolve`; patch/call that module directly.
+    # Redmine #15531 (v2.0.0): the undeclared-backend default is herdr, so the
+    # real `_route_provider` no longer short-circuits to codex for these
+    # fictional repo roots; the provider seam is pinned deterministically (its
+    # real resolution is covered by test_issue_15414_resolve_provider_binding).
     def _run(self, args, candidates):
         out = io.StringIO()
         with patch.object(cli_project_gateway_resolve, "_discover_candidates", return_value=candidates):
@@ -607,6 +612,7 @@ class ResolveCliTest(unittest.TestCase):
 
 
 @patch.object(cli_project_gateway, "require_tmux", lambda: None)
+@patch.object(cli_project_gateway, "_route_provider", lambda **_: "codex")
 class AdoptAndRoutePlanBackendTest(unittest.TestCase):
     """The three read-only reproductions use the shared backend inventory."""
 
@@ -691,6 +697,7 @@ class AdoptAndRoutePlanBackendTest(unittest.TestCase):
 
 
 @patch.object(cli_project_gateway, "require_tmux", lambda: None)
+@patch.object(cli_project_gateway, "_route_provider", lambda **_: "codex")
 class HandoffCliTest(unittest.TestCase):
     def _handoff_args(self, **overrides):
         base = dict(
@@ -818,6 +825,7 @@ class HandoffCliTest(unittest.TestCase):
 
 
 @patch.object(cli_project_gateway_consult, "require_tmux", lambda: None)
+@patch.object(cli_project_gateway_consult, "_route_provider", lambda **_: "codex")
 class ConsultCliTest(unittest.TestCase):
     """`project-gateway consult` — the forward no-anchor consultation (#12740).
 
@@ -1003,6 +1011,7 @@ class ConsultCliTest(unittest.TestCase):
 
 
 @patch.object(cli_project_gateway_child_intake, "require_tmux", lambda: None)
+@patch.object(cli_project_gateway_child_intake, "_route_provider", lambda **_: "codex")
 class ChildIntakeCliTest(unittest.TestCase):
     """`project-gateway child-intake` — the forward no-anchor work-intake (#12748)."""
 

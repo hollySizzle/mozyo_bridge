@@ -22,6 +22,7 @@ import json
 import tempfile
 import unittest
 import unittest.mock
+from pathlib import Path
 from types import SimpleNamespace
 
 from mozyo_bridge.application.cockpit_membership_command import (
@@ -989,11 +990,19 @@ class CollectHerdrMembershipTest(unittest.TestCase):
         self.assertEqual(default.as_dict(), off.as_dict())
 
     def test_live_herdr_ops_off_returns_none(self) -> None:
-        # A repo whose config selects no herdr backend (here: no config at all)
-        # keeps the live supply None (byte-invariant), not an empty list or a
-        # raise — pinned to a hermetic repo_root so this checkout's committed
-        # backend selection (#13307 herdr re-cutover) cannot leak in.
+        # A repo whose config selects no herdr backend keeps the live supply
+        # None (byte-invariant), not an empty list or a raise — pinned to a
+        # hermetic repo_root so this checkout's committed backend selection
+        # (#13307 herdr re-cutover) cannot leak in. Since 2.0 an undeclared
+        # backend defaults to herdr (Redmine #15531), so "off" is now the
+        # explicit tmux declaration.
         with tempfile.TemporaryDirectory() as tmp:
+            config_dir = Path(tmp) / ".mozyo-bridge"
+            config_dir.mkdir()
+            (config_dir / "config.yaml").write_text(
+                "version: 1\nterminal_transport:\n  version: 1\n  backend: tmux\n",
+                encoding="utf-8",
+            )
             self.assertIsNone(
                 LiveHerdrColumnOps(repo_root=tmp).read_herdr_agent_rows()
             )

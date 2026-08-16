@@ -122,10 +122,19 @@ class ValidRecordTest(unittest.TestCase):
         self.assertEqual(config.presentation.surface, SURFACE_TEXT)
         self.assertEqual(config.cli, CliCompositionConfig.default())
 
-    def test_terminal_transport_default_is_tmux_off(self) -> None:
-        # An absent terminal_transport block resolves to tmux (herdr off),
-        # behavior-preserving.
+    def test_terminal_transport_default_is_herdr(self) -> None:
+        # Since 2.0 (Redmine #15531) an absent terminal_transport block resolves
+        # to the herdr default; staying on tmux requires an explicit declaration.
         config = RepoLocalConfig.from_record({})
+        self.assertEqual(config.terminal_transport.backend, "herdr")
+        self.assertTrue(config.terminal_transport.herdr_enabled)
+
+    def test_terminal_transport_tmux_requires_explicit_declaration(self) -> None:
+        # The 2.0 opt-out: `terminal_transport: {version: 1, backend: tmux}`
+        # keeps the tmux backend (herdr off).
+        config = RepoLocalConfig.from_record(
+            {"terminal_transport": {"version": 1, "backend": "tmux"}}
+        )
         self.assertEqual(config.terminal_transport.backend, "tmux")
         self.assertFalse(config.terminal_transport.herdr_enabled)
 

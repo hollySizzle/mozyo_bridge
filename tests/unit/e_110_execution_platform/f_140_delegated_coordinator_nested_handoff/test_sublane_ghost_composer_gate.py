@@ -224,9 +224,15 @@ class RenderGhostFactsReaderTest(unittest.TestCase):
     """The default facts reader maps the e140 render view onto the domain facts."""
 
     def _repo(self, tmp, *, herdr):
+        # Since 2.0 an undeclared backend defaults to herdr (Redmine #15531),
+        # so the non-herdr repo must declare `backend: tmux` explicitly.
         repo = Path(tmp) / "repo"
         (repo / ".mozyo-bridge").mkdir(parents=True)
-        body = "version: 1\nterminal_transport:\n  backend: herdr\n" if herdr else "version: 1\n"
+        body = (
+            "version: 1\nterminal_transport:\n  backend: herdr\n"
+            if herdr
+            else "version: 1\nterminal_transport:\n  version: 1\n  backend: tmux\n"
+        )
         (repo / ".mozyo-bridge" / "config.yaml").write_text(body, encoding="utf-8")
         return repo
 

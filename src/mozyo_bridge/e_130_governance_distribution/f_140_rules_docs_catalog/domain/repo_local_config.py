@@ -717,7 +717,8 @@ class RepoLocalConfig:
         # own self-contained domain schema; its TerminalTransportError is
         # re-raised as a RepoLocalConfigError so the loader keeps a single
         # fail-closed boundary. An absent ``terminal_transport`` block resolves to
-        # the tmux default, so it stays behavior-preserving. The herdr *binary*
+        # the runtime default backend (herdr since 2.0, Redmine #15531),
+        # marked ``backend_declared=False``. The herdr *binary*
         # is deliberately not a config field — it comes only from the trusted
         # environment (see TerminalTransportConfig).
         try:

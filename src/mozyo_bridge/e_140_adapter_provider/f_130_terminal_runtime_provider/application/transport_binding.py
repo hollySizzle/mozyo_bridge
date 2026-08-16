@@ -484,7 +484,7 @@ def resolve_runtime_transport_binding(
     """Resolve the :class:`TransportBinding` for a ``terminal_transport`` selection.
 
     ``config`` is the repo-local :class:`TerminalTransportConfig` (``None`` ⇒ the
-    default / tmux). The tmux primitives are **injected** (``tmux_run_tmux`` /
+    default — herdr since 2.0, Redmine #15531). The tmux primitives are **injected** (``tmux_run_tmux`` /
     ``tmux_capture_pane``) so this module never imports the tmux infrastructure
     package: the caller — which already holds the rail's ``run_tmux`` /
     ``capture_pane`` — passes them in, and for the tmux backend they are returned
@@ -502,7 +502,7 @@ def resolve_runtime_transport_binding(
     the port; tests inject ``port`` + ``list_agents`` + ``resolve_assigned_name``.
 
     Fail-closed selection (no silent tmux fallback once herdr is selected): the
-    default / tmux backend returns a passthrough binding over the injected tmux
+    tmux backend returns a passthrough binding over the injected tmux
     callables; a herdr selection whose binary is unconfigured / unresolvable raises
     :class:`TerminalTransportError`.
     """

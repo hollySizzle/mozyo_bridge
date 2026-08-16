@@ -19,6 +19,7 @@ import contextlib
 import io
 import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -50,7 +51,7 @@ REPO = "/work/repo"
 PROJECT = "cloud-drive"
 
 
-def _cand(pane_id, *, role="codex", project_scope="", lane_kind=""):
+def _cand(pane_id, *, role="codex", project_scope="", lane_kind="", repo=REPO):
     return TargetCandidate(
         pane_id=pane_id,
         role=role,
@@ -67,8 +68,8 @@ def _cand(pane_id, *, role="codex", project_scope="", lane_kind=""):
         lane_id="lane",
         lane_label="lane",
         repo_short="repo",
-        repo_root=REPO,
-        cwd=REPO,
+        repo_root=repo,
+        cwd=repo,
         host="host",
         view_kind=VIEW_KIND_COCKPIT_PANE,
         branch=None,
@@ -165,10 +166,27 @@ class FailClosedTest(unittest.TestCase):
 
 
 class ExecuteForwardLegTest(unittest.TestCase):
-    """The grandparent forward leg dispatches `project-gateway consult` internally."""
+    """The grandparent forward leg dispatches `project-gateway consult` internally.
+
+    These legs exercise the tmux rail, so since 2.0 (Redmine #15531) the target
+    repo must be a real root that explicitly declares `terminal_transport.backend:
+    tmux` — an undeclared/unresolvable root now selects the herdr default and the
+    consult primitive routes through the herdr gateway inventory instead.
+    """
+
+    def _tmux_repo(self) -> str:
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        repo = Path(tmp.name)
+        (repo / ".mozyo-bridge").mkdir()
+        (repo / ".mozyo-bridge" / "config.yaml").write_text(
+            "version: 1\nterminal_transport:\n  backend: tmux\n", encoding="utf-8"
+        )
+        return str(repo)
 
     def test_consult_is_dispatched_and_reaches_orchestrate(self):
-        gateway = _cand("%gw", project_scope=PROJECT)
+        repo = self._tmux_repo()
+        gateway = _cand("%gw", project_scope=PROJECT, repo=repo)
         captured: dict[str, object] = {}
 
         def fake_orchestrate(args, **kwargs):
@@ -185,7 +203,9 @@ class ExecuteForwardLegTest(unittest.TestCase):
     ), patch.object(
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
-            cli_workflow, "_discover_candidates", return_value=[_cand("%self"), gateway]
+            cli_workflow,
+            "_discover_candidates",
+            return_value=[_cand("%self", repo=repo), gateway],
         ), patch.object(
             cli_workflow, "_load_store_action", return_value=_ABSENT_STORE
         ), patch.object(
@@ -197,23 +217,26 @@ class ExecuteForwardLegTest(unittest.TestCase):
         ), contextlib.redirect_stdout(out):
             rc = cli_workflow.cmd_workflow_step(_args())
 
-        self.assertEqual(rc, 0)
+        self.assertEqual(rc, 0, msg=out.getvalue())
         # The pane was resolved by the primitive, not typed by the caller.
         self.assertEqual(captured["target"], "%gw")
         self.assertEqual(captured["to"], "codex")
-        self.assertEqual(captured["target_repo"], REPO)
+        self.assertEqual(captured["target_repo"], repo)
         self.assertEqual(captured["target_project"], PROJECT)
         self.assertTrue(captured["ticketless_consultation"])
         self.assertIn("execution: executed", out.getvalue())
 
     def test_execute_json_is_single_envelope(self):
-        gateway = _cand("%gw", project_scope=PROJECT)
+        repo = self._tmux_repo()
+        gateway = _cand("%gw", project_scope=PROJECT, repo=repo)
         with patch.object(cli_workflow, "require_tmux", lambda: None), patch.object(
         cli_workflow, "_herdr_step_preflight", lambda _a: None
     ), patch.object(
             cli_workflow, "current_pane", lambda: "%self"
         ), patch.object(
-            cli_workflow, "_discover_candidates", return_value=[_cand("%self"), gateway]
+            cli_workflow,
+            "_discover_candidates",
+            return_value=[_cand("%self", repo=repo), gateway],
         ), patch.object(
             cli_workflow, "_load_store_action", return_value=_ABSENT_STORE
         ), patch.object(

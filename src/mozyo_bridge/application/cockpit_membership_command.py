@@ -445,7 +445,7 @@ class HerdrColumnOps(Protocol):
     """Port: the live herdr ``agent list`` inventory the cockpit tags herdr Units from.
 
     :meth:`read_herdr_agent_rows` returns the raw herdr ``agent list`` rows when the
-    herdr backend is selected, or ``None`` when it is off (the tmux default) — the
+    herdr backend is selected, or ``None`` when it is off (a tmux selection) — the
     ``None`` sentinel keeps the tmux projection byte-invariant, distinct from ``[]``
     (herdr on, zero agents). It may raise a fail-closed transport error on an
     unreadable snapshot; the use case catches it and degrades to a warning rather
@@ -472,7 +472,7 @@ class LiveHerdrColumnOps:
 
     Resolves the repo-local ``terminal_transport`` selection for ``repo_root`` and,
     **only when the herdr backend is explicitly selected**, runs the built-in herdr
-    agent lister (#13261). Default-off and fail-soft on selection: the tmux default
+    agent lister (#13261). Fail-soft on selection: a tmux selection
     backend — and a missing / unreadable / malformed repo-local config, exactly like
     :func:`herdr_backend_selected` — returns ``None`` (no herdr Units), so the cockpit
     projection is byte-invariant whenever herdr is not deliberately turned on. Once
@@ -503,12 +503,13 @@ class LiveHerdrColumnOps:
         try:
             config = load_repo_local_config(self._repo_root).terminal_transport
         except RepoLocalConfigError:
-            # A broken / unreadable config is not a herdr selection (it resolves to
-            # the tmux default), so it never diverts the cockpit onto the herdr path.
+            # A broken / unreadable config is not a herdr selection (it stays on
+            # the legacy tmux rail), so it never diverts the cockpit onto the
+            # herdr path.
             return None
         lister = resolve_agent_lister(config)
         if lister is None:
-            # tmux (default) backend: herdr is off -> no herdr Units.
+            # declared tmux backend: herdr is off -> no herdr Units.
             return None
         return lister.list_agent_rows()
 

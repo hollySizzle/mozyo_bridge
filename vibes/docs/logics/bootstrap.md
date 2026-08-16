@@ -24,8 +24,9 @@ In scope:
 
 - CLI install (primary: PyPI via `pipx`).
 - terminal backend prerequisite, per the backend the target project selects:
-  tmux for the default, or the herdr binary when the project declares
-  `terminal_transport.backend: herdr`. herdr is a separate product
+  the herdr binary for the default (herdr since 2.0, Redmine #15531), or tmux
+  when the project declares `terminal_transport.backend: tmux`. herdr is a
+  separate product
   (<https://herdr.dev>), not bundled with this package; Homebrew currently
   carries the supported 0.8.0 (`brew install herdr`), and other platforms
   follow that site. `mozyo-bridge` resolves it via `MOZYO_HERDR_BINARY` or the
@@ -148,13 +149,14 @@ the CLI this stage has not installed yet. So treat it as follows here, and let
 Stage 5's `doctor` — which judges the backend the project actually selects
 (Redmine #15508) — be the authority:
 
-- Default projects use **tmux**. Install it from the OS package manager
-  (`brew install tmux`, `apt install tmux`) if `command -v tmux` finds nothing.
-- Projects that declare `terminal_transport.backend: herdr` need the **herdr**
-  binary instead, and do NOT need tmux. Homebrew carries the supported version
+- Default projects (no `terminal_transport.backend` declaration) use **herdr**
+  since 2.0 (Redmine #15531). Homebrew carries the supported version
   (`brew install herdr`); other platforms follow <https://herdr.dev>. See
   README "Herdr support and breaking upgrades" for the supported version and
   for how to update each install method.
+- Projects that declare `terminal_transport.backend: tmux` need **tmux**
+  instead, and do NOT need herdr. Install it from the OS package manager
+  (`brew install tmux`, `apt install tmux`) if `command -v tmux` finds nothing.
 - If you do not know yet which one this project declares, install neither now:
   Stage 5 names the backend and the missing binary, if any.
 
@@ -407,13 +409,15 @@ Expected files written:
 - `CLAUDE.md`
 - `.mozyo-bridge/scaffold.json`
 
-To select the herdr terminal backend at adoption time, pass `--backend herdr`
-(Redmine #15527). That writes one additional file, `.mozyo-bridge/config.yaml`
-with `terminal_transport.backend: herdr`, which the Stage 5 backend reading below
-then reports as `herdr`. The config is operator-owned and not manifest-tracked
-(`scaffold status` ignores it); an existing `config.yaml` fails the apply closed
-rather than being overwritten. Without `--backend` no config is written and the
-tmux default applies as before.
+To declare the terminal backend at adoption time, pass `--backend herdr` or
+`--backend tmux` (Redmine #15527). That writes one additional file,
+`.mozyo-bridge/config.yaml` with `terminal_transport.backend: <value>`, which
+the Stage 5 backend reading below then reports. The config is operator-owned
+and not manifest-tracked (`scaffold status` ignores it); an existing
+`config.yaml` fails the apply closed rather than being overwritten. Without
+`--backend` no config is written and the runtime default applies — herdr since
+2.0 (Redmine #15531), so a target that should stay on tmux must declare
+`--backend tmux`.
 
 Project-Local Additions:
 
@@ -583,11 +587,12 @@ neither the config file nor its key order has to be read by hand:
 ```bash
 project=/path/to/project
 
-# A malformed config — an unrecognised backend value included — resolves to the
-# tmux default inside the runtime, so the backend reading alone would print
-# `tmux` and look exactly like a healthy default project. So parse first and
-# let the shell stop there: the reading runs ONLY if the config parses, and a
-# missing config file short-circuits as the genuine tmux default. Chained with
+# A malformed config — an unrecognised backend value included — stays on the
+# legacy tmux rail inside the runtime, so the backend reading alone would print
+# `tmux` and look exactly like an explicitly tmux-declared project. So parse
+# first and let the shell stop there: the reading runs ONLY if the config
+# parses, and a missing config file short-circuits as the genuine runtime
+# default (herdr since 2.0, Redmine #15531). Chained with
 # `&&` rather than sequenced, because a bare `if` would let a failed parse fall
 # through into the reading.
 { [ ! -f "$project/.mozyo-bridge/config.yaml" ] \
@@ -595,6 +600,11 @@ project=/path/to/project
   && mozyo-bridge doctor --json --target "$project" \
      | python3 -c 'import json,sys; raw=sys.stdin.read().strip(); sys.exit("doctor produced no JSON") if not raw else print((json.loads(raw)["sections"].get("herdr") or {}).get("backend", "tmux"))'
 ```
+
+Note the fallback string `"tmux"` in the reading is only correct for a target
+that declares `terminal_transport.backend: tmux` (the `herdr` doctor section is
+absent exactly then); on an undeclared target the section is present since 2.0
+and prints `herdr`.
 
 - the command exits 2 and prints no backend → the config is malformed. Fix it;
   the backend reading is not meaningful until it parses, and the chain
@@ -714,11 +724,14 @@ The symptoms below are the ones an LLM is most likely to observe while executing
 - `mozyo-bridge scaffold apply <preset>` refused to overwrite existing routers:
   - protection is intentional. Inspect with `--dry-run`, then replace via `--backup` (keep originals) or `--force` (no backup).
 - `doctor` reports `tmux: missing`:
-  - the project selects the tmux backend and `tmux` is not on `PATH`. Install
-    via the OS package manager. On a project that declares
-    `terminal_transport.backend: herdr`, doctor reports `tmux: skipped` instead
-    and absent tmux is not a finding (Redmine #15508) — check the `herdr`
-    section there.
+  - the project declares the tmux backend and `tmux` is not on `PATH`. Install
+    via the OS package manager. On a project that selects herdr — by
+    declaration or as the 2.0 undeclared default (Redmine #15531) — doctor
+    reports `tmux: skipped` instead and absent tmux is not a finding (Redmine
+    #15508) — check the `herdr` section there. An undeclared target on a host
+    without the herdr binary gets an `error` herdr section whose next_action
+    names both routes: install herdr, or declare
+    `terminal_transport.backend: tmux` to stay on tmux.
 - every section reports `ok` but agents still do not see the rules / skill:
   - restart Claude Code / Codex. Same-session skill index is cached.
 - pane / notification commands fail with "no agent windows":

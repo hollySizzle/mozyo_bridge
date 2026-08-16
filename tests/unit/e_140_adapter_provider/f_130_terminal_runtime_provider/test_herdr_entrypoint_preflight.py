@@ -92,10 +92,23 @@ class BackendActiveTest(unittest.TestCase):
         ):
             self.assertFalse(pre.herdr_backend_active(Path("/repo")))
 
-    def test_tmux_backend_repo_without_herdr_config_is_not_active(self):
+    def test_repo_without_herdr_config_defaults_to_active(self):
         with tempfile.TemporaryDirectory() as tmp:
-            # A bare directory with no `.mozyo-bridge/config.yaml` resolves to the tmux
-            # default through the real config reader (fail-open), never herdr.
+            # 2.0 contract (Redmine #15531): a bare directory with no
+            # `.mozyo-bridge/config.yaml` resolves to the herdr default through
+            # the real config reader.
+            self.assertTrue(pre.herdr_backend_active(Path(tmp)))
+
+    def test_explicit_tmux_backend_repo_is_not_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            # Staying on tmux requires the explicit declaration (Redmine
+            # #15531); the declared tmux repo is not herdr-active.
+            config_dir = Path(tmp) / ".mozyo-bridge"
+            config_dir.mkdir()
+            (config_dir / "config.yaml").write_text(
+                "version: 1\nterminal_transport:\n  version: 1\n  backend: tmux\n",
+                encoding="utf-8",
+            )
             self.assertFalse(pre.herdr_backend_active(Path(tmp)))
 
 

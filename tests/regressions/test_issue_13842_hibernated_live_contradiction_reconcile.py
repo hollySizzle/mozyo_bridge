@@ -1451,6 +1451,12 @@ class ReconcileOrchestrationTests(unittest.TestCase):
         plain = Path(self._tmp.name) / "plain"
         _git_init = plain / ".git"  # not a herdr repo
         plain.mkdir()
+        # Since 2.0 (Redmine #15531) an undeclared backend resolves to herdr,
+        # so "not a herdr repo" now means the explicit tmux declaration.
+        (plain / ".mozyo-bridge").mkdir()
+        (plain / ".mozyo-bridge" / "config.yaml").write_text(
+            "version: 1\nterminal_transport:\n  backend: tmux\n", encoding="utf-8"
+        )
         result = run_hibernated_live_reconcile(
             self._args(),
             plain,

@@ -151,7 +151,30 @@ class StatusCommandHandlerHerdrTest(unittest.TestCase):
         adapter = LiveStatusHerdrBackend(argparse.Namespace(repo="/repo"))
         self.assertIsInstance(adapter, StatusHerdrBackendPort)
 
-    def test_live_adapter_resolves_none_for_a_non_herdr_repo(self) -> None:
+    def test_live_adapter_resolves_none_for_a_declared_tmux_repo(self) -> None:
+        # Redmine #15531 (v2.0.0): staying on tmux now requires an explicit
+        # repo-local declaration; a declared-tmux repo still resolves to None
+        # (no herdr read, tmux byte-invariance).
+        import argparse
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            (repo / ".mozyo-bridge").mkdir(parents=True)
+            (repo / ".mozyo-bridge" / "config.yaml").write_text(
+                "terminal_transport:\n  version: 1\n  backend: tmux\n",
+                encoding="utf-8",
+            )
+            adapter = LiveStatusHerdrBackend(argparse.Namespace(repo=str(repo)))
+            self.assertIsNone(adapter.resolve())
+
+    def test_live_adapter_selects_herdr_for_an_undeclared_backend_repo(self) -> None:
+        # Redmine #15531 (v2.0.0): an UNDECLARED terminal_transport.backend
+        # resolves to herdr, so the adapter now returns a herdr view (marked
+        # backend_declared=False) where the pre-2.0 tmux default returned None.
+        # Only the selection is pinned: whether the live inventory read then
+        # succeeds or fails closed depends on the host's herdr transport.
         import argparse
         import tempfile
         from pathlib import Path
@@ -160,7 +183,10 @@ class StatusCommandHandlerHerdrTest(unittest.TestCase):
             repo = Path(tmp) / "repo"
             repo.mkdir()
             adapter = LiveStatusHerdrBackend(argparse.Namespace(repo=str(repo)))
-            self.assertIsNone(adapter.resolve())
+            view = adapter.resolve()
+            self.assertIsNotNone(view)
+            self.assertTrue(view.backend_selected)
+            self.assertFalse(view.backend_declared)
 
 
 if __name__ == "__main__":

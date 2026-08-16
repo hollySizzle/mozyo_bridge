@@ -126,8 +126,13 @@ class BackendReloadTest(unittest.TestCase):
         herdr.assert_called_once()
         tmux.assert_not_called()
 
-    def test_absent_config_takes_tmux_path(self):
-        # No config written (fresh/default) → the byte-invariant tmux path.
+    def test_written_tmux_config_takes_tmux_path(self):
+        # Since 2.0 (Redmine #15531) staying on tmux requires the explicit
+        # declaration; a written tmux config still routes the tmux path.
+        (self.root / ".mozyo-bridge").mkdir()
+        (self.root / ".mozyo-bridge" / "config.yaml").write_text(
+            "version: 1\nterminal_transport:\n  backend: tmux\n", encoding="utf-8"
+        )
         with mock.patch(
             "mozyo_bridge.application.herdr_launch_command.cmd_mozyo_herdr",
             return_value=7,
@@ -136,6 +141,18 @@ class BackendReloadTest(unittest.TestCase):
         self.assertEqual(rc, 3)
         tmux.assert_called_once()
         herdr.assert_not_called()
+
+    def test_absent_config_takes_herdr_path(self):
+        # No config written (fresh/undeclared) → the 2.0 herdr default path
+        # (Redmine #15531); the reload must not fall back to tmux silently.
+        with mock.patch(
+            "mozyo_bridge.application.herdr_launch_command.cmd_mozyo_herdr",
+            return_value=7,
+        ) as herdr, mock.patch.object(cli, "cmd_mozyo", return_value=3) as tmux:
+            rc = cli._backend_aware_launch(self.args, self.root)
+        self.assertEqual(rc, 7)
+        herdr.assert_called_once()
+        tmux.assert_not_called()
 
 
 if __name__ == "__main__":

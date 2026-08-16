@@ -270,7 +270,14 @@ class ProjectGatewayAdoptCliTest(unittest.TestCase):
         args = argparse.Namespace(
             repo=REPO, project=project, session=None, as_json=as_json
         )
+        # Redmine #15531 (v2.0.0): with the undeclared-backend default flipped to
+        # herdr, the real `_route_provider` no longer short-circuits to codex for
+        # this fictional repo root; pin the provider seam deterministically (its
+        # real resolution is covered by test_issue_15414_resolve_provider_binding).
         with patch.object(cli_project_gateway, "require_tmux"), \
+            patch.object(
+                cli_project_gateway, "_route_provider", return_value="codex"
+            ), \
             patch.object(
                 cli_project_gateway, "_discover_candidates", return_value=candidates
             ), \
@@ -384,7 +391,11 @@ class ProjectGatewayRoutePlanCliTest(unittest.TestCase):
         args = argparse.Namespace(
             from_role=from_role, repo=REPO, project=PROJECT, session=None, as_json=as_json
         )
+        # Redmine #15531 (v2.0.0): pin the provider seam (see AdoptCliTest._run).
         with patch.object(cli_project_gateway, "require_tmux"), \
+            patch.object(
+                cli_project_gateway, "_route_provider", return_value="codex"
+            ), \
             patch.object(
                 cli_project_gateway, "_discover_candidates", return_value=candidates
             ), \

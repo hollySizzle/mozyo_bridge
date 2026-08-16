@@ -217,10 +217,18 @@ class CollectClassificationTests(unittest.TestCase):
 
 
 class RailResolverTests(unittest.TestCase):
-    def test_tmux_default_is_off(self) -> None:
-        self.assertIsNone(resolve_turn_start_rail(None, env={}))
-        self.assertIsNone(
+    def test_default_is_herdr_and_fails_closed_unconfigured(self) -> None:
+        # 2.0 contract (Redmine #15531): the undeclared default resolves to
+        # herdr; with no trusted binary it fails closed, never tmux fallback.
+        with self.assertRaises(TerminalTransportError):
+            resolve_turn_start_rail(None, env={})
+        with self.assertRaises(TerminalTransportError):
             resolve_turn_start_rail(TerminalTransportConfig.default(), env={})
+
+    def test_explicit_tmux_is_off(self) -> None:
+        # Staying on tmux requires the explicit declaration (Redmine #15531).
+        self.assertIsNone(
+            resolve_turn_start_rail(TerminalTransportConfig(backend="tmux"), env={})
         )
 
     def test_herdr_without_binary_fails_closed(self) -> None:

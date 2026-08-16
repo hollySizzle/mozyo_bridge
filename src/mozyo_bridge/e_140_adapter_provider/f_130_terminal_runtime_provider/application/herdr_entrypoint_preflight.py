@@ -24,7 +24,7 @@ vocabulary:
 - *Is the herdr backend active for this repo?* (:func:`herdr_backend_active`) — the cheap
   selection-only check, delegating to the same
   :func:`~...application.herdr_observability.herdr_backend_selected_for` predicate the
-  observability surfaces use, so a broken / absent config resolves to the tmux default and
+  observability surfaces use, so a broken config stays on the legacy tmux rail and
   never diverts a surface onto the herdr guidance.
 - *Which herdr-native lane-identity env vars did the caller's shell actually carry?*
   (:func:`herdr_lane_env_snapshot`) — so a fail-closed diagnostic can report that it looked
@@ -92,7 +92,7 @@ def herdr_backend_active(repo_root: Path) -> bool:
 
     The cheap selection-only check (no binary resolution, no ``agent list``): delegates to
     the shared :func:`herdr_backend_selected_for` so a broken / absent / malformed config
-    resolves to the tmux default (``False``) and never diverts a standard entrypoint onto
+    stays on the legacy tmux rail (``False``) and never diverts a standard entrypoint onto
     the herdr guidance path.
     """
     try:
