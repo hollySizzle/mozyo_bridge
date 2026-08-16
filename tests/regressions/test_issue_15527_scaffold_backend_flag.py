@@ -202,6 +202,40 @@ class SymlinkEntryIsAnExistingConfigTest(_AppliedScaffoldCase):
         # to this suite instead of an equivalent mutant.
         self.assertIn("operator-owned", str(caught.exception))
 
+    def test_a_symlink_planted_after_preflight_hits_the_exclusive_create(self) -> None:
+        """Pin the O_EXCL backstop itself (review j#106070 finding_1).
+
+        Both cases above plant the link BEFORE the command runs, so the lexists
+        preflight refuses and the exclusive-create branch never executes — the
+        reviewer removed O_EXCL and this suite stayed green. Here the link is
+        planted deterministically through the `write_scaffold` seam, which runs
+        after the preflight and before the final create: exactly the race the
+        backstop exists for.
+        """
+        import mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application.commands_docs_scaffold as command_module  # noqa: E501
+
+        repo = self._repo()
+        outside_dir = self._repo()
+        outside = outside_dir / "evil.yaml"
+        real_write_scaffold = command_module.write_scaffold
+
+        def write_then_plant(*args, **kwargs):
+            paths = real_write_scaffold(*args, **kwargs)
+            (repo / ".mozyo-bridge" / "config.yaml").symlink_to(outside)
+            return paths
+
+        command_module.write_scaffold = write_then_plant
+        self.addCleanup(setattr, command_module, "write_scaffold", real_write_scaffold)
+
+        with self.assertRaises(CommandAbort) as caught:
+            self._apply(repo, self._home(), backend="herdr")
+
+        # The RACE refusal, not the preflight one: this is the branch under test.
+        self.assertIn("appeared between", str(caught.exception))
+        self.assertFalse(outside.exists(), "the exclusive create followed the symlink")
+        link = repo / ".mozyo-bridge" / "config.yaml"
+        self.assertTrue(link.is_symlink(), "the planted entry was replaced")
+
     def test_a_symlink_to_an_existing_file_refuses_without_touching_it(self) -> None:
         repo = self._repo()
         outside_dir = self._repo()
