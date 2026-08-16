@@ -647,6 +647,20 @@ def cmd_sublane_create(args: argparse.Namespace) -> int:
     except RepoLocalConfigError as exc:
         print(f"invalid repo-local config: {exc}", file=sys.stderr)
         return 1
+    # Parent-authority admission (Redmine #15146): the SAME decision the actuator
+    # runs, so the plan-only surface refuses exactly where --dry-run / --execute
+    # would — a plan that promises a lane execute then refuses is the
+    # plan/execute drift #14224 was filed over.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.delegated_parent_authority_gate import (  # noqa: E501
+        delegated_parent_authority_refusal,
+    )
+
+    parent_refusal = delegated_parent_authority_refusal(
+        repo_root, getattr(args, "lane_kind", "") or ""
+    )
+    if parent_refusal is not None:
+        print(parent_refusal, file=sys.stderr)
+        return 1
     request = _build_create_request(
         args, work_unit=work_unit, work_unit_decision_anchor=decision_anchor
     )
