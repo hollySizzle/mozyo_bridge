@@ -14,9 +14,12 @@ remaining tmux choreography injects the body once and drives it to a terminal di
   recovery guidance, and ``die``\\ s WITHOUT pressing Enter — the one place a C-u rollback is
   allowed;
 - press Enter once. tmux ``--mode queue-enter`` retains its marker-miss retry; Herdr instead
-  arms a working-transition wait and may issue deadline-bounded additional Enters after freshly
-  re-proving launch generation, current composer, clear screen, readable state, and a re-armed
-  wait before each one. Neither path re-types marker+body;
+  arms a working-transition wait for an idle/turn-ended baseline, while a BUSY baseline takes
+  the ADR-0002 queued-submission path (#15537): no observer is required, the Enter passes a
+  wait-free full effect fence, and the composer releasing the body reports ``sent`` /
+  ``queue_enter``. Either flavour may issue deadline-bounded additional Enters after freshly
+  re-proving launch generation, current composer, clear screen, and readable state (plus a
+  re-armed wait on the causal flavour). Neither path re-types marker+body;
 - under ``--mode standard`` observe the receiver pane for post-Enter turn-start activity; an
   unconfirmed turn start emits a ``blocked`` / ``turn_start_unconfirmed`` outcome and ``die``\\ s
   with **no C-u rollback and no re-send** (the uncertain-delivery no-blind-retry boundary);
@@ -664,9 +667,16 @@ class TmuxTransportRailUseCase:
                 self._current_step = STEP_SEND_KEYS_ENTER_RETRY
                 ops.press_enter(request.target)
             self._current_step = STEP_READ_PANE_RETRY_PROBE  # retry authorization reads
-            queue_session.complete_after_first_enter(
-                press_extra_enter=_press_extra_enter
-            )
+            if queue_session.busy_queue_path:
+                # ADR-0002 (#15537): a busy receiver cannot yield a causal turn start,
+                # so completion proves queued submission (composer cleared) instead.
+                queue_session.complete_after_busy_enter(
+                    press_extra_enter=_press_extra_enter
+                )
+            else:
+                queue_session.complete_after_first_enter(
+                    press_extra_enter=_press_extra_enter
+                )
             enter_attempts = queue_session.enter_attempts
             retry_engaged = queue_session.retry_engaged
 
@@ -734,8 +744,19 @@ class TmuxTransportRailUseCase:
         # is a successful submit. Missing evidence is an uncertain partial delivery,
         # never rc=0 / sent merely because Enter was issued (#15242 acceptance).
         relaxed_unobserved = request.mode == MODE_QUEUE_ENTER and not marker_observed
+        # ADR-0002 (#15537): a busy receiver whose composer verifiably released the
+        # injected body after an Enter is a QUEUED submission — the receiver CLI holds
+        # the message and processes it when its current turn ends. That is the same
+        # practical promise the tmux rail reports as ``sent / queue_enter``, so the
+        # existing vocabulary is reused; a causal turn start is still never claimed.
+        herdr_queued_submission = (
+            queue_session is not None
+            and queue_session.queued_submission_confirmed
+            and not turn_start_positively_observed(queue_enter_observation)
+        )
         herdr_queue_unconfirmed = queue_session is not None and not (
             turn_start_positively_observed(queue_enter_observation)
+            or queue_session.queued_submission_confirmed
         )
         outcome = self._outcome(
             request,
@@ -743,6 +764,8 @@ class TmuxTransportRailUseCase:
             reason=(
                 queue_session.failure_reason
                 if herdr_queue_unconfirmed
+                else "queue_enter"
+                if herdr_queued_submission
                 else "ok"
                 if queue_session is not None
                 else "queue_enter"

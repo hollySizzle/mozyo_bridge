@@ -43,7 +43,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_
 )
 # Redmine #14232: the ONE injection-stage authority + the transport-failure family's wording
 # (see that module's `## Reason wording owned here` note). It imports nothing from here.
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import ANCHOR_AUTHORITY_NARRATIVE, ANCHOR_AUTHORITY_NEXT_ACTION, INJECT_FAILED_NARRATIVE, INJECT_FAILED_NEXT_ACTION, TRANSPORT_ERROR_NARRATIVE, TRANSPORT_ERROR_NEXT_ACTION, TRANSPORT_ERROR_RECEIVER_CONTRACT, injection_stage_telemetry, turn_start_positively_observed  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import ANCHOR_AUTHORITY_NARRATIVE, ANCHOR_AUTHORITY_NEXT_ACTION, INJECT_FAILED_NARRATIVE, INJECT_FAILED_NEXT_ACTION, TRANSPORT_ERROR_NARRATIVE, TRANSPORT_ERROR_NEXT_ACTION, TRANSPORT_ERROR_RECEIVER_CONTRACT, busy_queue_path_observed, busy_queued_submission_observed, injection_stage_telemetry, turn_start_positively_observed  # noqa: E501
 
 if TYPE_CHECKING:
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import RoleProfileResolution
@@ -1461,6 +1461,8 @@ def _header_label(
 ) -> str:
     if status == "sent":
         if reason == "queue_enter":
+            if busy_queued_submission_observed(queue_observation):
+                return "sent (queue-enter, busy queued submission, composer cleared)"
             return "sent (queue-enter, marker unobserved)"
         if mode == MODE_QUEUE_ENTER:
             if turn_start_positively_observed(queue_observation):
@@ -1490,6 +1492,23 @@ def _outcome_narrative(
     """Render the outcome, disambiguating reused unconfirmed reasons by rail."""
     if status == "sent":
         if reason == "queue_enter":
+            if busy_queued_submission_observed(queue_observation):
+                # ADR-0002 / #15537: herdr busy queued submission. The sender DID
+                # verify submission — by the composer clearing, not by a causal
+                # turn start — so this narrative must not borrow the tmux
+                # marker-unobserved wording.
+                return (
+                    "Herdr queue-enter delivered to a busy receiver (ADR-0002 / "
+                    "#15537): the body was typed once, Enter passed the wait-free "
+                    "full effect fence (generation / deadline / composer / screen "
+                    "/ state; the pending working-transition observer was waived "
+                    "because the receiver was already producing a turn), and the "
+                    "sender verified that the injected body cleared the receiver "
+                    "composer — a noncausal queued submission. No turn start is "
+                    "claimed: the receiver CLI queued the input for its next "
+                    "turn. Blind retry stays prohibited; the durable record (the "
+                    "issue journal) remains the source of truth."
+                )
             # #13262 option (b): tmux marker-unobserved remains sent/queue_enter.
             return (
                 "Landing marker was not observed in the target pane before "
@@ -1529,10 +1548,27 @@ def _outcome_narrative(
             "cleared."
         )
     if mode == MODE_QUEUE_ENTER and reason in _QUEUE_ENTER_UNCERTAIN_REASONS:
+        if busy_queue_path_observed(queue_observation):
+            # ADR-0002 / #15537: no armed-wait claim is true on the busy path —
+            # the pending observer was waived; every actual Enter passed the
+            # wait-free full effect fence instead.
+            return (
+                f"Herdr queue-enter ended with `{reason}` after the send began "
+                "on the busy queue path (ADR-0002 / #15537). The marker+body was "
+                "typed at most once; depending on the failure point, Enter was "
+                "pressed zero or more times, each behind the wait-free full "
+                "effect fence — the pending working-transition observer was "
+                "waived because the receiver was already busy, so no armed-wait "
+                "claim applies. The body was not re-sent and no C-u rollback was "
+                "issued. Submission was not proven by a composer clear, so "
+                "partial delivery remains uncertain and blind retry is "
+                "prohibited."
+            )
         return (
             f"Herdr queue-enter ended with `{reason}` after the send began. The "
             "marker+body was typed at most once; depending on the failure point, "
-            "Enter was pressed zero or more times, and every actual Enter had a "
+            "Enter was pressed zero or more times, and every actual Enter on this "
+            "idle/turn-ended series had a "
             "working-transition wait armed first. The body was not re-sent and no "
             "C-u rollback was issued. No same-generation causal turn start was "
             "confirmed, so partial delivery remains uncertain and blind retry is "

@@ -158,9 +158,10 @@ def submit_lines_for(
         intent=intent,
         delivery_id=delivery_id,
         # Review j#95333 F1: the residue classification needs the rail and its causal
-        # telemetry, not just the two wire tokens.  Herdr queue-enter confirms a turn
-        # before success, while tmux queue-enter remains a compatibility-level queued
-        # submission; the mode-specific evidence distinguishes those meanings.
+        # telemetry, not just the two wire tokens.  Herdr queue-enter proves success by a
+        # causal turn start (idle/turn-ended) or by the busy composer-clear queued
+        # submission (ADR-0002 / #15537), while tmux queue-enter remains a
+        # compatibility-level queued submission; the evidence distinguishes those meanings.
         mode=outcome.mode,
         queue_enter_turn_start_observation=outcome.queue_enter_turn_start_observation,
         turn_start_outcome=outcome.turn_start_outcome,

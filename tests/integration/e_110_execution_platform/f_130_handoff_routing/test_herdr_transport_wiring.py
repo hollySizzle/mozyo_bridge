@@ -127,6 +127,7 @@ class _FakeHerdr:
         get_states=None,
         wait_results=None,
         read_returns_body=False,
+        enter_clears_composer=False,
         fail_send_text=False,
         fail_send_keys=False,
         pane_content=None,
@@ -143,6 +144,10 @@ class _FakeHerdr:
         self._wait_calls = 0
         self.wait_processes: list[_FakeWaitProc] = []
         self._read_returns_body = read_returns_body
+        # #15537 busy path modeling: a real TUI submits (queues) the composer on
+        # Enter, so the retained body disappears. Opt-in so the stuck-Enter tests
+        # (body retained across Enters) keep their scenario.
+        self._enter_clears_composer = enter_clears_composer
         self._fail_send_text = fail_send_text
         self._fail_send_keys = fail_send_keys
         # Redmine #13760: what the receiver's pane is rendering. Defaults to a live,
@@ -193,6 +198,8 @@ class _FakeHerdr:
         if rest[:2] == ["pane", "send-keys"]:
             keys = rest[3] if len(rest) > 3 else ""
             self.sends.append(("send_keys", rest[2], keys))
+            if self._enter_clears_composer and not self._fail_send_keys:
+                self._last_body_by_target.pop(rest[2], None)
             rc = 1 if self._fail_send_keys else 0
             return subprocess.CompletedProcess(
                 argv, rc, stdout="", stderr="send-keys failed" if rc else ""
@@ -1380,23 +1387,29 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         )
         self.assertIsNone(outcome.get("turn_start_outcome"), msg=out)
 
-    def test_busy_snapshot_without_causal_authority_is_non_success(self) -> None:
-        # Redmine #13292 (design j#72759): a herdr queue-enter send takes a read-only
-        # post-choreography `agent get` snapshot and records it as the additive,
-        # telemetry-only `queue_enter_turn_start_observation` field. A `working`
-        # snapshot is a settled state (single read), but it is not attributable
-        # to this send and therefore cannot produce a successful result.
-        herdr = _FakeHerdr([], get_states=["working"])
+    def test_busy_snapshot_yields_queued_submission_when_composer_clears(self) -> None:
+        # ADR-0002 (#15537): a busy receiver takes the queued-submission path — the
+        # Enter fires without a pending observer and the composer releasing the body
+        # is the submission evidence. No causal turn start is claimed
+        # (`event_wait_kind` stays absent); the promise is the tmux rail's
+        # practical queued submission, reported with the existing
+        # ``sent / queue_enter`` vocabulary.
+        herdr = _FakeHerdr(
+            [],
+            get_states=["working"],
+            read_returns_body=True,
+            enter_clears_composer=True,
+        )
         result, herdr, ws, out, err = self._run(
             agent_rows_fn=_same_lane_rows(),
             herdr=herdr,
             mode="queue-enter",
             queue_binding=_queue_binding,
         )
-        self.assertNotEqual(result, 0, msg=f"out={out}\nerr={err}")
+        self.assertEqual(result, 0, msg=f"out={out}\nerr={err}")
         outcome = _outcome_from(out)
-        self.assertEqual(outcome.get("status"), "blocked", msg=out)
-        self.assertEqual(outcome.get("reason"), "turn_start_unconfirmed", msg=out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(outcome.get("reason"), "queue_enter", msg=out)
         # The snapshot read hit `agent get` at least once.
         self.assertTrue([op for op in herdr.sends if op[0] == "get"], msg=herdr.sends)
         obs = outcome.get("queue_enter_turn_start_observation")
@@ -1559,21 +1572,29 @@ class HerdrLedgerSendSiteWiringTest(unittest.TestCase):
             (rec.turn_start_outcome or {}).get("outcome"), "delivered_not_started"
         )
 
-    def test_queue_enter_unconfirmed_appends_non_success_with_observation(self) -> None:
-        herdr = _FakeHerdr([], get_states=["working"])
+    def test_queue_enter_busy_queued_submission_appends_success_with_observation(self) -> None:
+        # ADR-0002 (#15537): busy + composer-cleared is a queued submission; the
+        # ledger records the sent / queue_enter outcome with the additive
+        # post-choreography observation carried through unchanged.
+        herdr = _FakeHerdr(
+            [],
+            get_states=["working"],
+            read_returns_body=True,
+            enter_clears_composer=True,
+        )
         result, outcome, records, out = self._run_and_ledger(
             herdr=herdr, mode="queue-enter"
         )
-        self.assertNotEqual(result, 0, msg=out)
-        self.assertEqual(outcome.get("status"), "blocked", msg=out)
-        self.assertEqual(outcome.get("reason"), "turn_start_unconfirmed", msg=out)
+        self.assertEqual(result, 0, msg=out)
+        self.assertEqual(outcome.get("status"), "sent", msg=out)
+        self.assertEqual(outcome.get("reason"), "queue_enter", msg=out)
         self.assertEqual(len(records), 1, msg=records)
         rec = records[0]
         self.assertEqual(rec.entry_kind, "delivery_outcome")
         self.assertEqual(rec.rail, "queue_enter_rail")
         self.assertEqual(rec.backend, "herdr")
-        self.assertEqual(rec.status, "blocked")
-        self.assertEqual(rec.reason, "turn_start_unconfirmed")
+        self.assertEqual(rec.status, "sent")
+        self.assertEqual(rec.reason, "queue_enter")
         # The queue-enter rail carries the additive post-choreography observation;
         # the event rail's `turn_start_outcome` stays absent.
         self.assertIsInstance(rec.queue_enter_observation, dict)

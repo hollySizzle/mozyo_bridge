@@ -161,11 +161,13 @@ layer 0 hardening である。ただし queue-enter は `busy` な receiver に�
 idle だけを許す standard `drive_turn_start` を流用しない。
 
 - marker + body は exactly once。Herdr queue-enter は body 注入後に tmux compatibility 由来の
-  landing-marker wait を行わない。pinned generation を再確認し、Herdr 0.8 の
+  landing-marker wait を行わない。pinned generation を再確認し、idle / turn-ended 系列では Herdr 0.8 の
   `agent wait TARGET --until working --timeout MS` を arm でき、absolute deadline 内にある場合だけ
-  first Enter を発行する。失敗時は
-  `enter_attempts=0` のまま `blocked` / `turn_start_unconfirmed` に閉じる。実際に発行する first / extra Enter は
-  すべて事前に wait を arm する。causal start が未確認なら、同一 target identity、collision-free launch
+  first Enter を発行する (busy 系列 (#15537) は arm を要求せず wait 非依存の full effect fence を通して発行する)。失敗時は
+  `enter_attempts=0` のまま `blocked` / `turn_start_unconfirmed` に閉じる。idle / turn-ended 系列で実際に発行する first / extra Enter は
+  すべて事前に wait を arm する。busy 系列 (#15537) は wait を attribution に使えないため arm を要求せず、
+  wait 非依存の full effect fence を通した Enter と composer clear を証拠に非 causal な
+  `sent` / `queue_enter` (queued submission、`uncertain_partial` のまま) を返せる。causal start が未確認なら、同一 target identity、collision-free launch
   generation、現在の composer tail にある full marker+body（hard-wrap whitespace のみ正規化）、startup /
   modal / trust / login / selection screen の非該当、runtime state の read 成功を **各回の送信直前に fresh に**
   再確認する。timeout-only 系列は policy 回数上限と absolute deadline まで Enter-only retry を反復できる。
@@ -183,14 +185,15 @@ idle だけを許す standard `drive_turn_start` を流用しない。
   再観測を含む単一 absolute budget で、wait を arm し直しても延長しない。interval は隣接する Enter 間の
   最小間隔で、観測待ちにより既に満たしていれば追加 sleep しない。window / interval の `0` または正の
   sub-millisecond 値は追加 Enter 無効である。これは initial admission 自体を抑止しないが、first Enter と
-  observation は post-body generation 再確認・wait arm・deadline check が成功した場合に限る。`0.001` 秒へ
+  observation は post-body generation 再確認と deadline check、および idle / turn-ended 系列では wait arm が
+  成功した場合に限る (busy 系列は #15537 の wait 非依存 full effect fence を通す)。`0.001` 秒へ
   切り上げず、非有限値は本文注入前に拒否する。
 
 確認結果は queue 専用 `queue_enter_turn_start_observation` と queue delivery-ledger rail に残し、standard
 `turn_start_outcome` へ射影しない。後者へ射影すると queue delivery が別 rail として分類され、recovery 判断が
-変わるためである。causal event と coherent generation が揃った場合だけ `sent` / `ok` / exit 0。wait absent は
+変わるためである。idle / turn-ended 系列は causal event と coherent generation が揃った場合だけ、busy 系列は full effect fence 後の composer clear を証拠とした場合だけ (#15537)、`sent` (`ok` / `queue_enter`) / exit 0。wait absent は
 `blocked` / `turn_start_absent`、fresh gate が runtime blocked を確認した場合は `blocked` /
-`receiver_blocked`、timeout / error / wait unarmed / drift / body-screen-state 再確認不成立は `blocked` /
+`receiver_blocked`、timeout / error / wait unarmed (idle / turn-ended 系列) / drift / body-screen-state 再確認不成立は `blocked` /
 `turn_start_unconfirmed`、送信 primitive の `TerminalTransportError` は `blocked` / `transport_error` へ写し、
 いずれも非0である。未確認を legacy の `sent` / telemetry-only success に倒さない。ただし本文が届いた可能性を
 含むので injection stage は `uncertain_partial`、blind retry 禁止となる。ここまで確認できても task completion ではない。
@@ -373,13 +376,18 @@ doctrine としての position:
 7. **owner approval / review / close を runtime signal で自動化しない**。`runtime.input.ack`、`runtime.output.eof`、`assistant_turn_finished`、ticket webhook のいずれも、Review Gate / owner close approval / Close Gate の代替ではない。
 8. **ticket-system signal は provider 境界に閉じる**。Redmine / Asana の status、journal、approval record を読む場合は ticket provider adapter / governed workflow の layer 3 record として扱い、terminal runtime adapter や sidecar の ACK state に混ぜない。
 9. **Herdr queue-enter の確認不能を外側の自動再送へ読み替えない**。本文が既に composer にある可能性が
-   あるため、causal event + coherent generation が欠ける結果は precise `blocked` reason / non-zero かつ
-   injection stage `uncertain_partial` とし、同じ gateway command や本文を再実行しない。rail 内だけは body を再入力せず、
-   各 Enter より先の wait と fresh strict gate、public absolute budget の下で Enter-only retry できる。
+   あるため、idle / turn-ended 系列の causal event + coherent generation と busy 系列 (#15537) の
+   composer clear のどちらの証拠も欠ける結果は precise `blocked` reason / non-zero かつ
+   injection stage `uncertain_partial` とし、同じ gateway command や本文を再実行しない。busy 系列の
+   queued submission は stage `uncertain_partial` のまま非 causal な `sent` / `queue_enter` / exit 0 の
+   positive delivery である。rail 内だけは body を再入力せず、
+   idle / turn-ended 系列では各 Enter より先の wait と fresh strict gate (busy 系列は wait 非依存の
+   full effect fence)、public absolute budget の下で Enter-only retry できる。
    timeout-only 系列は policy 上限まで反復できるが、wait error は次の Enter を許可せず即時停止する。
 10. **Herdr の wait command と tmux の marker wait を混同しない**。現行 Herdr 0.8 の event wait は
     `agent wait TARGET --until STATUS --timeout MS` である。Herdr queue-enter は body 後に landing-marker
-    wait を挟まず、generation 再確認 → event wait arm → Enter の順で進む。
+    wait を挟まず、idle / turn-ended 系列では generation 再確認 → event wait arm → Enter、busy 系列
+    (#15537) では generation 再確認 → full effect fence → Enter の順で進む。
 
 ## Receiver-side recovery admission と、その保証境界 (Redmine #13910)
 

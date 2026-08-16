@@ -1182,6 +1182,37 @@ allowlist:
     resolution_version: "v0.10.10 (Version #241)"
     expires: "2027-11-30"
 
+  - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_herdr_queue_enter_rail.py
+    lines: 1114
+    reason: >-
+      Raised 1110 -> 1114 for #15537 review j#106497: the module docstring's safety
+      invariants now state the busy-series wait waiver / full effect fence and the
+      composer-clear queued-submission proof instead of the causal-only universal
+      claim (guarded by BusyContractSurfaceGuardTest).
+      Herdr queue-enter causal session (generation pinning, wait/Enter ordering,
+      strict resend gates, deadline accounting). Raised past 1000 by the #15537
+      ADR-0002 busy-receiver queued-submission path (busy_queue_path flag, the
+      pending-observer waiver, complete_after_busy_enter, additive observation
+      facts; raised 1076 -> 1110 for the j#106470 busy effect fence — the
+      busy-specific first-Enter verifier and the retry-boundary-wrapped extra
+      Enter). Cohesive rail state machine; candidate split is the resend-gate
+      evaluation half vs the session choreography half.
+    owner_issue: "#15537"
+    resolution_version: "v2.0.0 (Version #327)"
+    expires: "2026-10-30"
+
+  - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_tmux_transport_rail.py
+    lines: 1023
+    reason: >-
+      Common transport-rail use case (both tmux and herdr terminals of the
+      queue-enter/standard/pending rails). Crossed 1000 by the #15537 busy-path
+      completion branch and the queued-submission outcome mapping. Candidate
+      split is the herdr queue-enter terminal block into its own module beside
+      handoff_herdr_queue_enter_rail.
+    owner_issue: "#15537"
+    resolution_version: "v2.0.0 (Version #327)"
+    expires: "2026-10-30"
+
   - path: src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
     lines: 2482
     reason: >-
@@ -1245,8 +1276,16 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 2211
+    lines: 2247
     reason: >-
+      Raised 2211 -> 2247 for #15537 review j#106482: the durable-record renderer
+      (`_header_label` / `_outcome_narrative`) must distinguish the herdr busy
+      queued submission (composer clear behind the wait-free full effect fence,
+      ADR-0002) from the tmux marker-unobserved `sent`/`queue_enter` wording and
+      from the idle/turn-ended armed-wait narrative; the two observation-gated
+      branches and their accurate narratives land here because record rendering
+      is this module's responsibility (the busy path itself lives in the
+      application rail).
       Lowered 2217 -> 2211 for #15242 while adding the causal queue-enter outcome:
       stale and repetitive rail comments were condensed without widening the module.
       Baseline 2216 -> 2217 for #14741 (Codex update prompt / managed binary authority

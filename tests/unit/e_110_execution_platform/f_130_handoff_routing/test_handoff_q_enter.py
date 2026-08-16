@@ -517,3 +517,267 @@ class QueueEnterUnconfirmedWordingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class BusyQueuedSubmissionRecordTest(unittest.TestCase):
+    """Review j#106482: the durable record must not deny the busy outcome.
+
+    ADR-0002 / #15537: a busy-baseline queued submission is proven by the
+    composer clearing behind the wait-free full effect fence. The renderer used
+    to map every `sent` / `queue_enter` to the tmux marker-unobserved wording
+    ("the sender did not verify submission"), which is the OPPOSITE of what the
+    busy rail verified; failures likewise claimed "every actual Enter had a
+    working-transition wait armed first", denying the waived pending observer.
+    """
+
+    @staticmethod
+    def _observation(**extra):
+        base = {
+            "observation_kind": "post_choreography_snapshot",
+            "source": "herdr_agent_get",
+            "runtime_state": "busy",
+            "read_ok": True,
+            "read_reason": None,
+            "poll_attempts": 1,
+            "enter_attempts": 1,
+            "first_event_wait_kind": None,
+            "final_event_wait_kind": None,
+            "resend_skipped_reason": "",
+            "baseline_runtime_state": "busy",
+        }
+        base.update(extra)
+        return base
+
+    def _record(self, status, reason, **extra):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            build_delivery_record,
+        )
+
+        outcome = _outcome(
+            status,
+            reason,
+            mode="queue-enter",
+            queue_enter_turn_start_observation=self._observation(**extra),
+        )
+        return build_delivery_record(outcome)
+
+    def test_busy_queued_submission_record_states_composer_clear_not_tmux_wording(
+        self,
+    ) -> None:
+        record = self._record(
+            "sent",
+            "queue_enter",
+            busy_queue_path=True,
+            queued_submission_confirmed=True,
+        )
+        self.assertIn("busy queued submission, composer cleared", record)
+        self.assertIn("noncausal queued submission", record)
+        self.assertIn("#15537", record)
+        self.assertNotIn("marker unobserved", record)
+        self.assertNotIn("did not verify submission", record)
+
+    def test_tmux_queue_enter_record_keeps_marker_unobserved_wording(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            build_delivery_record,
+        )
+
+        record = build_delivery_record(_outcome("sent", "queue_enter"))
+        self.assertIn("marker unobserved", record)
+        self.assertIn("did not verify submission", record)
+        self.assertNotIn("busy queued submission", record)
+
+    def test_busy_uncertain_record_does_not_claim_an_armed_wait(self) -> None:
+        record = self._record(
+            "blocked",
+            "turn_start_unconfirmed",
+            busy_queue_path=True,
+            queued_submission_confirmed=False,
+        )
+        self.assertIn("busy queue path", record)
+        self.assertIn("wait-free full effect fence", record)
+        self.assertIn("waived", record)
+        self.assertNotIn("armed first", record)
+
+    def test_idle_uncertain_record_scopes_the_armed_wait_claim_to_its_series(
+        self,
+    ) -> None:
+        record = self._record("blocked", "turn_start_unconfirmed")
+        self.assertIn("idle/turn-ended series", record)
+        self.assertIn("working-transition wait armed first", record)
+        self.assertNotIn("busy queue path", record)
+
+    def test_malformed_busy_proof_shapes_fail_closed_to_non_busy_wording(
+        self,
+    ) -> None:
+        """Review j#106486: only the producer's exact ``True`` mints busy proof.
+
+        The queue rail writes exact bools. A truthiness reader would promote
+        wire-shaped values it never writes (the string ``"false"``, ints,
+        lists) into a fabricated "sender verified the composer cleared" record.
+        Every non-canonical shape must fall back to the rail-appropriate
+        non-busy wording on both the success and the uncertain path.
+        """
+        shapes = (
+            {"busy_queue_path": "false", "queued_submission_confirmed": "false"},
+            {"busy_queue_path": 1, "queued_submission_confirmed": 1},
+            {"busy_queue_path": [True], "queued_submission_confirmed": [True]},
+            {"busy_queue_path": True, "queued_submission_confirmed": "true"},
+            {"busy_queue_path": "true", "queued_submission_confirmed": True},
+            {"busy_queue_path": True, "queued_submission_confirmed": False},
+            {"busy_queue_path": False, "queued_submission_confirmed": True},
+            {},
+        )
+        for shape in shapes:
+            with self.subTest(shape=shape, path="sent"):
+                record = self._record("sent", "queue_enter", **shape)
+                self.assertNotIn("composer cleared", record)
+                self.assertNotIn("sender verified", record)
+                self.assertIn("marker unobserved", record)
+            with self.subTest(shape=shape, path="uncertain"):
+                record = self._record("blocked", "turn_start_unconfirmed", **shape)
+                if shape.get("busy_queue_path") is True:
+                    continue
+                self.assertNotIn("busy queue path", record)
+                self.assertIn("working-transition wait armed first", record)
+class BusyQueuedSubmissionProjectionTest(unittest.TestCase):
+    """Review j#106497 (finding_busyprojection): derivative projections must not
+    downgrade the exact busy queued-submission proof back to failure.
+
+    The injection stage stays ``uncertain_partial`` (blind-retry axis unchanged),
+    but the positive-delivery axis — the delivery gate, the q-enter front door,
+    the composer residue, the callback disposition, and the carried guidance —
+    must all report the proven queued submission as delivered. tmux / legacy
+    ``sent`` / ``queue_enter`` (no busy observation) and malformed shapes stay
+    fail-closed.
+    """
+
+    BUSY_PROOF = {
+        "observation_kind": "post_choreography_snapshot",
+        "source": "herdr_agent_get",
+        "runtime_state": "busy",
+        "read_ok": True,
+        "read_reason": None,
+        "poll_attempts": 1,
+        "enter_attempts": 1,
+        "baseline_runtime_state": "busy",
+        "busy_queue_path": True,
+        "queued_submission_confirmed": True,
+    }
+    MALFORMED = {
+        **BUSY_PROOF,
+        "busy_queue_path": "false",
+        "queued_submission_confirmed": "false",
+    }
+
+    def _busy_outcome(self):
+        return _outcome(
+            "sent", "queue_enter",
+            queue_enter_turn_start_observation=dict(self.BUSY_PROOF),
+        )
+
+    def test_delivery_gate_reports_busy_queued_submission_positive(self) -> None:
+        import argparse
+
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.delivery_outcome_gate import (  # noqa: E501
+            delivery_was_positive,
+            publish_delivery_outcome,
+        )
+
+        for observation, expected in (
+            (dict(self.BUSY_PROOF), True),
+            (None, False),                      # tmux / legacy queue_enter
+            (dict(self.MALFORMED), False),      # malformed wire shape
+        ):
+            with self.subTest(observation=observation):
+                args = argparse.Namespace()
+                publish_delivery_outcome(
+                    args,
+                    _outcome(
+                        "sent", "queue_enter",
+                        queue_enter_turn_start_observation=observation,
+                    ),
+                )
+                self.assertIs(expected, delivery_was_positive(args))
+
+    def test_front_door_dispatches_busy_queued_submission(self) -> None:
+        outcome = self._busy_outcome()
+        front = SubmitOutcome.from_transport(
+            outcome, plan_intent="reply", rail=RAIL_ANCHORED_REPLY,
+            anchor_required=True, ticketless=False, delivery_id="qe-busy",
+        )
+        self.assertTrue(front.dispatched)
+        self.assertFalse(front.blocked)
+        self.assertIsNone(front.blocked_reason)
+        # blind-retry axis unchanged: stage stays uncertain_partial, retry prohibited
+        self.assertEqual("uncertain_partial", front.injection_stage)
+        self.assertTrue(front.blind_retry_prohibited)
+        # guidance tells the truth instead of "submission is NOT confirmed"
+        self.assertIn("queued submission proven", front.guidance)
+        self.assertNotIn("NOT confirmed", front.guidance)
+
+    def test_front_door_keeps_tmux_and_malformed_queue_enter_blocked(self) -> None:
+        for observation in (None, dict(self.MALFORMED)):
+            with self.subTest(observation=observation):
+                front = SubmitOutcome.from_transport(
+                    _outcome(
+                        "sent", "queue_enter",
+                        queue_enter_turn_start_observation=observation,
+                    ),
+                    plan_intent="reply", rail=RAIL_ANCHORED_REPLY,
+                    anchor_required=True, ticketless=False, delivery_id="qe-x",
+                )
+                self.assertFalse(front.dispatched)
+                self.assertTrue(front.blocked)
+                self.assertNotIn("queued submission proven", front.guidance)
+
+    def test_composer_residue_is_cleared_only_on_the_exact_busy_proof(self) -> None:
+        for observation, expected in (
+            (dict(self.BUSY_PROOF), "cleared"),
+            (None, "typed_but_pending"),
+            (dict(self.MALFORMED), "typed_but_pending"),
+        ):
+            with self.subTest(observation=observation):
+                self.assertEqual(
+                    expected,
+                    classify_composer_residue(
+                        "sent", "queue_enter", mode="queue-enter",
+                        queue_enter_turn_start_observation=observation,
+                    ),
+                )
+
+    def test_callback_disposition_delivers_only_on_the_exact_busy_proof(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.callback_delivery import (  # noqa: E501
+            SEND_DELIVERED,
+            SEND_UNCERTAIN,
+            send_outcome_for_delivery,
+        )
+
+        self.assertEqual(
+            SEND_DELIVERED,
+            send_outcome_for_delivery(
+                "sent", "queue_enter",
+                injection_stage="uncertain_partial",
+                queue_enter_turn_start_observation=dict(self.BUSY_PROOF),
+            ),
+        )
+        for observation in (None, dict(self.MALFORMED)):
+            with self.subTest(observation=observation):
+                self.assertEqual(
+                    SEND_UNCERTAIN,
+                    send_outcome_for_delivery(
+                        "sent", "queue_enter",
+                        injection_stage="uncertain_partial",
+                        queue_enter_turn_start_observation=observation,
+                    ),
+                )
+
+    def test_carried_next_action_is_truthful_on_the_busy_proof(self) -> None:
+        outcome = self._busy_outcome()
+        telemetry = outcome.injection_stage
+        self.assertEqual("uncertain_partial", telemetry["stage"])
+        self.assertTrue(telemetry["blind_retry_prohibited"])
+        self.assertIn("queued submission proven", telemetry["next_action"])
+        self.assertNotIn("NOT confirmed", telemetry["next_action"])
+        generic = _outcome(
+            "sent", "queue_enter",
+            queue_enter_turn_start_observation=dict(self.MALFORMED),
+        ).injection_stage
+        self.assertIn("NOT confirmed", generic["next_action"])

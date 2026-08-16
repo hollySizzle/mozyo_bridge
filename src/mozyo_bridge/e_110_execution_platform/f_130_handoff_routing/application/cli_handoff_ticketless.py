@@ -108,11 +108,15 @@ def _add_ticketless_delivery_options(
         default=MODE_QUEUE_ENTER,
         help=(
             "Pane delivery rail (identical semantics to `handoff send`): "
-            "`queue-enter` (default; body once, Herdr causal wait before each "
-            "Enter and fail-closed `turn_start_absent` / `receiver_blocked` / "
-            "`turn_start_unconfirmed` / `transport_error` result, tmux legacy "
-            "marker retry). A failed post-body generation recheck, first wait "
-            "arm, or deadline check means zero Enter and nonzero blocked; the "
+            "`queue-enter` (default; body once. Herdr: idle/turn-ended gets a "
+            "causal wait before each Enter, a busy baseline takes the #15537 "
+            "wait-free full effect fence and reports the noncausal queued "
+            "submission sent/queue_enter on composer clear; without either "
+            "proof fail-closed `turn_start_absent` / `receiver_blocked` / "
+            "`turn_start_unconfirmed` / `transport_error`. tmux keeps its legacy "
+            "marker retry). A failed post-body generation recheck, deadline "
+            "check, or (idle/turn-ended) first wait "
+            "arm means zero Enter and nonzero blocked; the "
             "staged body makes blind retry unsafe; "
             "`standard` (strict, C-u rollback on marker timeout), or `pending` "
             "(operator/debug)."
@@ -144,7 +148,8 @@ def _add_ticketless_delivery_options(
         help=(
             "Absolute queue-enter retry budget in seconds (default "
             f"{QUEUE_ENTER_RETRY_WINDOW_SECONDS:g}); body is typed once. Herdr "
-            "includes the first pre-armed wait, interval delays, and every "
+            "includes the first pre-armed wait (idle/turn-ended; busy takes the "
+            "#15537 wait-free fence), interval delays, and every "
             "re-armed wait; timeout retries require a fresh strict gate, while "
             "a wait error stops immediately without authorising another Enter "
             "(earlier timeout retries remain recorded). tmux keeps the "
@@ -159,7 +164,8 @@ def _add_ticketless_delivery_options(
         help=(
             "Minimum seconds between queue-enter Enter presses (default "
             f"{QUEUE_ENTER_RETRY_INTERVAL_SECONDS:g}). Herdr re-arms the causal "
-            "wait and re-runs the live gate before every extra Enter; Herdr "
+            "wait (idle/turn-ended series only, #15537) and re-runs the live "
+            "gate before every extra Enter; Herdr "
             "accepts only finite values up to 3600 seconds. tmux keeps the "
             "legacy marker probe loop. `0` disables extra Enter."
         ),

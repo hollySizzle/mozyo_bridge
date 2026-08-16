@@ -750,6 +750,20 @@ class _EffectFencedV2FakeOps(_V2FakeOps):
         super().press_enter(target)
 
 
+class _GateSequenceV2FakeOps(_EffectFencedV2FakeOps):
+    """Effect-fenced fake whose resend gate is consumed per call (race modeling)."""
+
+    def __init__(self, *args, resend_gates=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._resend_gates = list(resend_gates or [])
+
+    def evaluate_queue_enter_resend(self, target, text, receiver, baseline_binding):
+        self.events.append("gate_qe")
+        if self._resend_gates:
+            return self._resend_gates.pop(0)
+        return self.resend_gate
+
+
 class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
     """#14203 j#87409 (B-constrained): the pre-Enter observation-only wait + process binding."""
 
@@ -866,15 +880,15 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
             STAGE_SUBMITTED_CONFIRMED,
         )
 
-    def test_busy_baseline_can_be_nudged_but_never_reports_success(self) -> None:
+    def test_busy_baseline_with_retained_body_still_never_reports_success(self) -> None:
+        # ADR-0002 (#15537): a busy baseline now takes the queued-submission path —
+        # Enter fires without a pending observer and completion polls the composer.
+        # The PROTECTIVE half of the old contract is unchanged: while the body stays
+        # retained in the composer, no amount of Enters turns into a success.
         binding = self._binding()
         ops = _V2FakeOps(
             marker_observed=True,
             queue_enter_snapshot=self._snapshot("busy"),
-            # A timeout can authorise one freshly gated nudge while busy. The
-            # following changed event is not attributable to this send because
-            # the pre-Enter state was busy, so it must stop rather than authorise
-            # another Enter.
             wait_kinds=["timeout", "changed"],
             binding=binding,
             runtime_state="busy",
@@ -891,19 +905,118 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
         )
         self.assertIsNotNone(died)
         self.assertIsNone(code)
-        self.assertEqual(ops.enter_presses, 2)
-        self.assertEqual(ops.events.count("gate_qe"), 1)
         obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
         self.assertNotIn("event_wait_kind", obs)
+        self.assertTrue(obs.get("busy_queue_path"))
+        self.assertFalse(obs.get("queued_submission_confirmed"))
         self.assertEqual(obs.get("baseline_runtime_state"), "busy")
-        self.assertEqual(obs.get("first_event_wait_kind"), "timeout")
-        self.assertEqual(obs.get("final_event_wait_kind"), "changed")
-        self.assertEqual(obs.get("enter_attempts"), 2)
+        self.assertGreaterEqual(obs.get("enter_attempts"), 1)
         self.assertEqual(
             ops.emitted[0].outcome.injection_stage["stage"],
             STAGE_UNCERTAIN_PARTIAL,
         )
         self.assertEqual(ops.emitted[0].outcome.status, "blocked")
+
+    def test_busy_baseline_with_cleared_composer_reports_queued_submission(self) -> None:
+        # ADR-0002 (#15537): the composer releasing the injected body after the
+        # Enter is the busy path's submission evidence — sent / queue_enter / rc 0.
+        binding = self._binding()
+        ops = _V2FakeOps(
+            marker_observed=True,
+            queue_enter_snapshot=self._snapshot("busy"),
+            wait_kinds=["timeout", "changed"],
+            binding=binding,
+            runtime_state="busy",
+            resend_gate=QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT),
+        )
+        code, died = _run(
+            ops,
+            _request(
+                mode=_MODE_QUEUE_ENTER,
+                herdr_send=True,
+                queue_enter_retry_window=4.0,
+                queue_enter_retry_interval=2.0,
+            ),
+        )
+        self.assertIsNone(died)
+        self.assertEqual(code, 0)
+        outcome = ops.emitted[0].outcome
+        self.assertEqual(outcome.status, "sent")
+        self.assertEqual(outcome.reason, "queue_enter")
+        obs = outcome.queue_enter_turn_start_observation
+        self.assertTrue(obs.get("busy_queue_path"))
+        self.assertTrue(obs.get("queued_submission_confirmed"))
+        self.assertNotIn("event_wait_kind", obs)
+        self.assertEqual(obs.get("enter_attempts"), 1)
+
+    def test_busy_first_enter_races_to_blocked_and_actuates_zero_keypresses(self) -> None:
+        # Review j#106470 finding_busyeffectfence race probe 1: the receiver flips to a
+        # runtime block between the busy observation and the actual keypress. The
+        # busy-path effect fence re-proves the FULL gate inside the transport wrapper,
+        # so the Enter is a zero actuation.
+        binding = self._binding()
+        ops = _GateSequenceV2FakeOps(
+            marker_observed=True,
+            queue_enter_snapshot=self._snapshot("busy"),
+            wait_kinds=["timeout"],
+            binding=binding,
+            runtime_state="busy",
+            resend_gates=[
+                QueueEnterResendGate(RESEND_SKIP_RECEIVER_BLOCKED, "blocked"),
+            ],
+        )
+        code, died = _run(
+            ops,
+            _request(
+                mode=_MODE_QUEUE_ENTER,
+                herdr_send=True,
+                queue_enter_retry_window=4.0,
+                queue_enter_retry_interval=2.0,
+            ),
+        )
+        self.assertIsNotNone(died)
+        self.assertIsNone(code)
+        self.assertEqual(ops.enter_presses, 0)
+        self.assertEqual(ops.emitted[0].outcome.status, "blocked")
+        obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
+        self.assertEqual(obs.get("enter_attempts"), 0)
+        self.assertEqual(obs.get("resend_skipped_reason"), RESEND_SKIP_RECEIVER_BLOCKED)
+
+    def test_busy_extra_enter_races_to_generation_drift_and_actuates_zero(self) -> None:
+        # Race probe 2: the pre-loop gate authorises a retry, but the generation is
+        # replaced before the actual transport call. The retry effect boundary
+        # re-proves the gate inside the wrapper: exactly the first Enter actuates,
+        # never the raced extra one.
+        binding = self._binding()
+        ops = _GateSequenceV2FakeOps(
+            marker_observed=True,
+            queue_enter_snapshot=self._snapshot("busy"),
+            wait_kinds=["timeout"],
+            binding=binding,
+            runtime_state="busy",
+            resend_gates=[
+                QueueEnterResendGate(RESEND_SKIP_NONE, "busy"),      # first-enter fence: ok
+                QueueEnterResendGate(RESEND_SKIP_NONE, "busy"),      # completion poll: retained
+                QueueEnterResendGate(RESEND_SKIP_NONE, "busy"),      # pre-press re-proof: ok
+                QueueEnterResendGate(RESEND_SKIP_IDENTITY_DRIFT),    # fence at actual press: drift
+            ],
+        )
+        code, died = _run(
+            ops,
+            _request(
+                mode=_MODE_QUEUE_ENTER,
+                herdr_send=True,
+                queue_enter_retry_window=4.0,
+                queue_enter_retry_interval=2.0,
+            ),
+        )
+        self.assertIsNotNone(died)
+        self.assertIsNone(code)
+        self.assertEqual(ops.enter_presses, 1)
+        obs = ops.emitted[0].outcome.queue_enter_turn_start_observation
+        self.assertEqual(obs.get("enter_attempts"), 1)
+        self.assertFalse(obs.get("queued_submission_confirmed"))
+        self.assertEqual(obs.get("resend_skipped_reason"), RESEND_SKIP_IDENTITY_DRIFT)
 
     def test_generation_drift_refuses_the_extra_enter(self) -> None:
         ops = _V2FakeOps(

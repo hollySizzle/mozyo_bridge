@@ -269,13 +269,13 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
 - **queue-enter の本文は 1 回だけ渡す。** client は結果に関わらず gateway command を **ちょうど 1 回**
   実行し、再実行しない（再実行は Enter の再送ではなく本文の再入力になる）。対象 host が Herdr の場合、
   host 側 rail は body exactly once / first Enter zero-or-one を維持し、tmux compatibility 用の
-  landing-marker wait は実行しない。post-body generation 再確認、Herdr 0.8 の
-  `agent wait TARGET --until working --timeout MS` の arm、deadline check が成功した場合だけ
-  first Enter を発行し、失敗時は `enter_attempts=0` の
+  landing-marker wait は実行しない。post-body generation 再確認と deadline check、および idle / turn-ended 系列では Herdr 0.8 の
+  `agent wait TARGET --until working --timeout MS` の arm が成功した場合だけ
+  first Enter を発行し (busy 系列 (#15537) は arm を要求せず wait 非依存の full effect fence を通す)、失敗時は `enter_attempts=0` の
   `blocked` / `turn_start_unconfirmed` に閉じる。causal turn start 未確認時だけ、同一
   target identity、collision-free launch generation、現在の composer tail にある full marker+body
   （hard-wrap whitespace のみ正規化）、startup / modal / trust / login / selection screen の非該当、runtime
-  read 成功を **各回 fresh に**再確認し、各 Enter より先に working-transition wait を arm する。timeout-only
+  read 成功を **各回 fresh に**再確認し、idle / turn-ended 系列では各 Enter より先に working-transition wait を arm する (busy 系列は #15537 の wait 非依存 full effect fence)。timeout-only
   系列は policy の回数上限と absolute deadline まで Enter-only retry を反復できる。wait error は次の Enter を
   許可せず即時停止し、それ以前の timeout-authorised retries は telemetry に残す。`busy` は queue semantics 上この厳格 gate の候補になれるが、
   busy baseline / snapshot / event だけでは delivery confirmation にならない。tmux host の既存 marker-based
@@ -289,7 +289,8 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   延長しない。`QUEUE_ENTER_RETRY_INTERVAL_SECONDS`（既定2秒）は隣接 Enter 間の最小間隔で、直前の wait が
   既に interval を消費した場合は追加 sleep しない。window / interval のどちらか `0`、または正値でも
   `0.001` 秒未満なら host 側の extra Enter は無効である。initial admission は試みるが、first Enter と
-  observation は generation 再確認・wait arm・deadline check が成功した場合に限る。
+  observation は generation 再確認と deadline check、および idle / turn-ended 系列では wait arm が
+  成功した場合に限る (busy 系列は #15537 の wait 非依存 full effect fence を通す)。
   これは client 側で retry を増やす処理ではなく、対象 host の bounded rail が完了する前に client が command
   を timeout にしないための待機 budget である。`standard` / `pending` を
   明示した action は基礎 deadline のままとする。
@@ -311,8 +312,10 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   composer に置いただけの `pending_input` や Herdr causal turn start 未確認の delivery は **confirmed ではない**が
   **zero-send でもない**。Herdr gateway は未確認を legacy `sent` / exit 0 に倒さず、precise `blocked` reason /
   non-zero で返す。landing marker 観測や post-hoc `busy` snapshot だけでも confirmed にしない。Herdr
-  queue-enter で confirmation に使えるのは、`awaiting_input` / `turn_ended` の readable baseline より先に arm
+  queue-enter で causal confirmation に使えるのは、`awaiting_input` / `turn_ended` の readable baseline より先に arm
   した working-transition event と coherent な target / collision-free launch generation が揃う場合だけである。
+  busy baseline は #15537 により、full effect fence を通した Enter 後の composer clear を証拠に非 causal な
+  `sent` / `queue_enter` (queued submission、`submitted_confirmed` にはしない) を返せる。
   wait absent は `turn_start_absent`、fresh gate の runtime blocked は `receiver_blocked`、timeout/error/unarmed/
   drift/body-screen-state proof failure は `turn_start_unconfirmed`、raised transport failure は `transport_error`。
   正本は `delivery_outcome_gate` / `injection_stage`
@@ -394,13 +397,16 @@ read-only observation + 1 本の routed な preview-first action に限る。
 - Herdr 0.8 の wait argv が `agent wait TARGET --until STATUS --timeout MS` であり、旧
   `wait agent-status ... --status ...` を production fake が受理しないこと。body 後に tmux 由来の
   landing-marker wait を行わず generation recheck → wait arm → Enter の順であること
-- Herdr queue-enter が body / gateway command を再入力せず、first Enter zero-or-one、各実発行 Enter 前の arm、
+- Herdr queue-enter が body / gateway command を再入力せず、first Enter zero-or-one、idle / turn-ended
+  系列での各実発行 Enter 前の arm (busy 系列は ADR-0002 / #15537 の wait 非依存 full effect fence)、
   各 extra Enter 前の fresh strict recheck を行うこと。timeout-only 系列は policy/deadline まで反復でき、
   wait error は次の Enter を許可せず即時停止すること。identity / collision-free launch generation drift、historical transcript
   だけの body、startup/modal、blocked / unknown / state read failure、wait unarmed がその回の extra Enter を
   zero-actuation にすること
-- busy receiver は queue 配送候補として維持されるが busy-only evidence で `submitted_confirmed` にならず、
-  `awaiting_input` / `turn_ended` の armed event + coherent generation だけが confirmation になること
+- busy receiver は queue 配送候補として維持され、composer clear を証拠に `sent` / `queue_enter`
+  (queued submission、`injection_stage=uncertain_partial` のまま) になり得るが、busy-only evidence で
+  `submitted_confirmed` にはならず、`awaiting_input` / `turn_ended` の armed event + coherent generation
+  だけが causal confirmation になること (ADR-0002 / #15537)
 - public retry window が initial wait + 全 interval + 全 re-wait の absolute budget で、再 arm しても延長されないこと。
   interval は隣接 Enter の最小間隔で、window / interval `0` または正の sub-millisecond 値が extra
   Enter を無効にすること

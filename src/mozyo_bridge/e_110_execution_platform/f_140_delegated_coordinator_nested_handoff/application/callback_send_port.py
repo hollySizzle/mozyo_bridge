@@ -62,12 +62,16 @@ def _default_runner(argv: list) -> "tuple[int, str]":
     return proc.returncode, proc.stdout
 
 
-def _parse_outcome(stdout: str) -> Optional["tuple[str, str, str]"]:
-    """Extract ``(status, reason, injection_stage)`` from the handoff ``DeliveryOutcome`` JSON.
+def _parse_outcome(stdout: str) -> Optional["tuple[str, str, str, dict | None]"]:
+    """Extract ``(status, reason, injection_stage, queue_observation)`` from the outcome JSON.
 
     The handoff ``--record-format json`` path prints ``outcome.to_json()``. Scan the output for
     a JSON object carrying both ``status`` and ``reason`` (tolerant of surrounding lines). Any
     parse failure returns ``None`` (the caller fails safe).
+
+    ``queue_observation`` (review j#106497) is the producer's full
+    ``queue_enter_turn_start_observation`` dict when present — it carries the exact busy
+    queued-submission proof (ADR-0002 / #15537) — and ``None`` otherwise.
     """
     for line in reversed(stdout.splitlines()):
         line = line.strip()
@@ -85,7 +89,10 @@ def _parse_outcome(stdout: str) -> Optional["tuple[str, str, str]"]:
             stage_token = (
                 str(stage.get("stage") or "") if isinstance(stage, dict) else ""
             )
-            return str(obj["status"]), str(obj["reason"]), stage_token
+            observation = obj.get("queue_enter_turn_start_observation")
+            if not isinstance(observation, dict):
+                observation = None
+            return str(obj["status"]), str(obj["reason"]), stage_token, observation
     return None
 
 
@@ -176,6 +183,7 @@ class HandoffCallbackSendPort:
                 persist_ok=persist_ok,
                 persist_reason=persist_reason,
                 injection_stage=parsed[2],
+                queue_enter_turn_start_observation=parsed[3],
             )
         # No parseable structured outcome: fail safe. A clean rc still cannot confirm a
         # turn-start, so treat it as uncertain (no auto-retry); a nonzero rc is likewise

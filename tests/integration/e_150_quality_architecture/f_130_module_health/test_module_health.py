@@ -475,7 +475,9 @@ class RealRepoRegressionTest(unittest.TestCase):
                 placeholders,
                 f"{entry.path} has a placeholder resolution_version",
             )
-            self.assertRegex(entry.resolution_version, r"v0\.\d+\.\d+")
+            # #15537: the plan format is any release version, not the 0.x epoch the
+            # gate was born in (v2.0.0 entries are as valid as v0.10.x ones).
+            self.assertRegex(entry.resolution_version, r"v\d+\.\d+\.\d+")
         by_path = {e.path: e for e in cfg.allowlist}
         # presentation_grouping.py was the v0.10.8 / Version #239 split target
         # (US #12322). The split landed (the module became the

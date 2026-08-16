@@ -22,7 +22,11 @@ one question: **may a blind retry duplicate the payload?**
   Enter, no ACK, nothing for the receiver to have half-received. A retry cannot duplicate, so
   a bounded retry is safe.
 - :data:`STAGE_UNCERTAIN_PARTIAL` — the **no-blind-retry** class: text and/or Enter may have
-  reached the receiver and submission is not confirmed. This deliberately covers both a
+  reached the receiver and no CAUSAL submission proof exists. (The herdr busy queued
+  submission, ADR-0002 / #15537, deliberately stays in this class — re-issuing could still
+  duplicate — while the independent positive-delivery axis,
+  :func:`delivery_positively_confirmed`, reports it delivered on the exact composer-clear
+  proof.) This deliberately covers both a
   *known* partial (``pending_input`` parks the body in the composer on purpose; a
   ``marker_timeout`` typed the body and could not verify the rollback cleared it) and an
   *unknown* partial (a transport primitive timed out mid-injection, an event wait expired
@@ -30,8 +34,10 @@ one question: **may a blind retry duplicate the payload?**
   the additive telemetry; this axis answers only the retry question, and for every member the
   answer is the same: **do not blind-retry**.
 - :data:`STAGE_SUBMITTED_CONFIRMED` — the payload was submitted and the submission was
-  positively confirmed. Identical to the #13583 ``delivery_was_positive`` predicate by
-  construction (``sent`` + ``ok``), which is why that gate now reads this module.
+  positively confirmed by causal evidence. The #13583 ``delivery_was_positive`` predicate
+  reads this module but is wider by exactly one case (review j#106497): the exact herdr
+  busy queued submission is also positive while staying ``uncertain_partial`` on THIS
+  axis.
 
 Fail-closed and exhaustive by construction
 ------------------------------------------
@@ -341,6 +347,98 @@ def canonical_v2_generation_binding(observation: object) -> bool:
     )
 
 
+def busy_queue_path_observed(
+    queue_enter_turn_start_observation: object = None,
+) -> bool:
+    """True when the queue-enter rail took the busy queue path (ADR-0002 / #15537).
+
+    The queue rail writes ``busy_queue_path=True`` (exact bool, independent of
+    generation coherence) only when the baseline runtime state was ``busy`` and
+    the pending working-transition observer was waived; Enters then pass the
+    wait-free full effect fence. Like ``canonical_v2_generation_binding``, this
+    reader accepts only the producer's exact ``True`` — truthiness would promote
+    wire-shaped values the producer never writes (``"false"``, ``1``, a list)
+    into effect-fence evidence.
+    """
+    if not isinstance(queue_enter_turn_start_observation, dict):
+        return False
+    return queue_enter_turn_start_observation.get("busy_queue_path") is True
+
+
+def busy_queued_submission_observed(
+    queue_enter_turn_start_observation: object = None,
+) -> bool:
+    """True when the busy queue path proved submission by the composer clearing.
+
+    ADR-0002 / #15537: on a busy baseline no working-transition wait can attribute
+    a turn start to this send, so the rail instead verifies that the injected
+    body cleared the receiver composer — a **noncausal** queued submission
+    reported as ``sent`` / ``queue_enter``. This predicate never implies a causal
+    turn start; ``turn_start_positively_observed`` stays False on this path.
+
+    Both fields must be the producer's exact ``True`` (the rail writes exact
+    bools): a positive "sender verified the composer cleared" claim in the
+    durable record must never be minted from a malformed, stale, or
+    future-wire-shaped value such as the string ``"false"``.
+    """
+    if not isinstance(queue_enter_turn_start_observation, dict):
+        return False
+    observation = queue_enter_turn_start_observation
+    return (
+        observation.get("busy_queue_path") is True
+        and observation.get("queued_submission_confirmed") is True
+    )
+
+
+def busy_queued_submission_delivery(
+    status: object,
+    reason: object,
+    queue_enter_turn_start_observation: object = None,
+) -> bool:
+    """True for the herdr busy queued-submission delivery (ADR-0002 / #15537, pure).
+
+    Review j#106497 (finding_busyprojection): this is the SHARED positive-delivery
+    answer for the busy path, so the delivery gate, the q-enter front door, the
+    composer-residue read, and the callback / outbox disposition cannot answer
+    "was it delivered?" differently again. It is deliberately independent of the
+    injection stage: the stage stays ``uncertain_partial`` (the blind-retry axis
+    is unchanged — re-issuing could still duplicate), while THIS predicate is the
+    positive-delivery axis, proven by the exact producer facts
+    (``busy_queue_path is True`` and ``queued_submission_confirmed is True``).
+    A tmux / legacy / synthetic ``sent`` / ``queue_enter`` carries no such
+    observation and a malformed shape fails the exact-``True`` reader, so
+    neither is promoted.
+    """
+    return (
+        str(status or "").strip() == "sent"
+        and str(reason or "").strip() == "queue_enter"
+        and busy_queued_submission_observed(queue_enter_turn_start_observation)
+    )
+
+
+def delivery_positively_confirmed(outcome: object) -> bool:
+    """True when a whole DeliveryOutcome **positively delivered** (pure, fail-closed).
+
+    Two proofs exist, and only these two (review j#106497):
+
+    - the causal proof: the carried / derived injection stage is
+      :data:`STAGE_SUBMITTED_CONFIRMED` (idle / turn-ended series);
+    - the busy queued-submission proof: :func:`busy_queued_submission_delivery`
+      over the outcome's own status / reason / observation.
+
+    ``None`` (no outcome at all) is ``False``.
+    """
+    if outcome is None:
+        return False
+    if injection_stage_for_outcome(outcome) == STAGE_SUBMITTED_CONFIRMED:
+        return True
+    return busy_queued_submission_delivery(
+        getattr(outcome, "status", None),
+        getattr(outcome, "reason", None),
+        getattr(outcome, "queue_enter_turn_start_observation", None),
+    )
+
+
 def turn_start_positively_observed(
     queue_enter_turn_start_observation: object = None,
     turn_start_outcome: object = None,
@@ -442,8 +540,11 @@ def injection_stage_for(
       confirmed submission;
     - on the tmux ``queue-enter`` rail ``ok`` only means **the landing marker was observed and
       Enter was pressed**; tmux has no causal turn-start gate. The Herdr ``queue-enter`` rail
-      now requires causal turn-start evidence and otherwise fails closed. Older or synthetic
-      outcomes without that evidence remain unconfirmed.
+      requires causal turn-start evidence on an idle / turn-ended baseline; a busy baseline
+      (ADR-0002 / #15537) reports the noncausal ``sent`` / ``queue_enter`` queued submission
+      instead (stage stays ``uncertain_partial``; positive delivery is answered by
+      :func:`delivery_positively_confirmed`). Without either proof it fails closed. Older or
+      synthetic outcomes without evidence remain unconfirmed.
 
     Reading ``ok`` as confirmed on queue-enter was therefore the same optimistic
     delivered-ization the issue's Non-goals prohibit, in a second place: it claimed a
@@ -539,6 +640,37 @@ def stage_guidance(stage: object) -> str:
     return _STAGE_GUIDANCE.get(str(stage or "").strip(), "")
 
 
+#: Truthful guidance for the busy queued submission (review j#106497): the generic
+#: ``uncertain_partial`` text says "submission is NOT confirmed", which is false on this
+#: path — submission WAS proven, by the composer clearing, without a causal turn-start claim.
+BUSY_QUEUED_SUBMISSION_GUIDANCE = (
+    "queued submission proven: the injected body cleared the busy receiver's composer "
+    "behind the wait-free full effect fence (ADR-0002 / #15537), so the receiver CLI "
+    "queued it for its next turn. No causal turn start is claimed and blind retry stays "
+    "prohibited — re-issuing would duplicate. Delivery is an ACK, not task completion; "
+    "the receiver reads the durable anchor and decides."
+)
+
+
+def contextual_stage_guidance(
+    stage: object,
+    *,
+    status: object = None,
+    reason: object = None,
+    queue_enter_turn_start_observation: object = None,
+) -> str:
+    """Stage guidance that tells the truth on the busy queued submission (pure).
+
+    Falls back to :func:`stage_guidance` everywhere else; only the exact busy
+    proof (:func:`busy_queued_submission_delivery`) swaps in the busy text.
+    """
+    if busy_queued_submission_delivery(
+        status, reason, queue_enter_turn_start_observation
+    ):
+        return BUSY_QUEUED_SUBMISSION_GUIDANCE
+    return stage_guidance(stage)
+
+
 def injection_stage_telemetry(
     status: object,
     reason: object,
@@ -570,7 +702,12 @@ def injection_stage_telemetry(
     return {
         "stage": stage,
         "blind_retry_prohibited": blind_retry_prohibited(stage),
-        "next_action": stage_guidance(stage),
+        "next_action": contextual_stage_guidance(
+            stage,
+            status=status,
+            reason=reason,
+            queue_enter_turn_start_observation=queue_enter_turn_start_observation,
+        ),
     }
 
 
