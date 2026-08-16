@@ -195,6 +195,132 @@ adr_conflict_gate:
       anchor 成立後に file 化する (README の status enum に draft は存在しない)
 ```
 
+## Review Depth Tiers — Redmine #15547 (判断正本: ADR-0004)
+
+レビュー深度の段階化契約。単位は US のまま (ADR-0003)、深度だけを変更クラスで変える。
+review 結果の wire format は既存の canonical `review_result` 契約
+(`conclusion: approved|changes_requested`、approved は finding 0 件 / changes_requested は
+1 件以上) を変更しない — 本節はその**中で** light の運用を定める。
+
+```yaml
+review_depth_tiers:
+  # 判断正本は ADR-0004。本節は実行契約 (repo-local 宣言、中央 preset・wire format 不変)。
+  claim_schema:            # review request journal に載せる class 主張
+    class: light | standard          # 欠落・不正値は standard として扱う (invalid -> standard)
+    light_subtype:                   # class=light のとき必須。閉じたリスト外は invalid -> standard
+      - docs_typo_or_wording         # 文書の誤記・清書 (契約内容を変えない)
+      - tests_only                   # tests/** のみの変更
+      - comments_only                # コメント・docstring のみ (契約記述を変えない)
+      - generated_regen              # generator 出力の再生成のみ
+    target_head: <commit sha>        # 主張が指す exact head
+    depth_round: <n>                 # 参考値。authority は reviewer の導出 (下記) であり自己申告ではない
+    reason_or_anchor:                # 再分類時のみ: 格上げ理由 1 行、または格下げ承認 anchor
+  depth_round_derivation:            # reviewer が実行する exact な導出
+    # depth_round は review-depth 専用の「何周目の依頼か」であり、Review Generation Marker
+    # Contract v2 の current review generation とは別概念。対象 review_request journal R ごとに
+    # 一意に定まる。ADR-0004 の trigger は「2 周目の依頼に入った事実」なので、数える対象は
+    # review の**結果**ではなく **request の通し番号**である。
+    - count 対象は canonical な review_request marker
+      (`gate=review_request:head=` を strict parser が同定した journal) のみ。marker を持たない
+      journal は、本文が何を主張していても数えない (散文推定の禁止)。canonical でない依頼の
+      試みは request として存在しない扱い
+    - depth_round(R) = 当該 issue の journal のうち **id <= R の canonical review_request journal 数**
+      (journal 単位 exactly-once。duplicate marker は journal 単位 1 回)。R 自身を含むため値は
+      1 以上で、同じ R に対する導出値は後続 journal の追加で変わらない
+    - 導出例 1 (#15547 実 marker 列、R = j#106456): canonical request は j#106443 / j#106452 /
+      j#106456 の 3 件 → depth_round = **3**
+    - 導出例 2 (approved 後の再依頼 probe): request j10 → approved result j20 → request j30 の列で
+      depth_round(j30) = **2** → light 案件なら自動格上げが発火する (結果が approved でも
+      2 周目の依頼は light の 1 往復契約を再適用できない)
+    - implementer 申告と導出値が食い違う場合は導出値を採用し、差異を review journal に記す
+  actors:
+    implementer: class を主張し、格上げを随時宣言し、light 承認後の Notes を follow-up issue 化する
+    coordinator: owner 裁定の唯一の収集窓口 (owner 承認が要る格下げで登場)
+    reviewer: diff を主張と照合して最終 class を確定し、review journal に記録する
+    owner_or_reviewer: 格下げ (standard -> light) の承認 anchor を発行できる唯一の authority。
+      reviewer 承認は直接発行できるが、owner 承認は owner-question bypass 禁止 (central preset
+      `### Claude Owner-Question Bypass Prohibition`) に従い、implementer の判断待ち記録 →
+      coordinator への canonical handoff → coordinator による owner 裁定 anchor 記録、の順でのみ成立する
+  always_standard:
+    - us_level_audit.task_level例外 の高リスク種別 (主張にかかわらず reviewer が standard へ確定)
+    - light 主張の diff が src の動作コード・高リスクパスに触れている場合 (自動格上げ)
+    - light 案件の導出 depth_round >= 2 (自動格上げ。2 周目が要ること自体が light でなかった証拠)
+  light_contract:
+    - changes_requested にできるのは、ADR-0004 の観測可能 3 条件
+      「壊れる / 契約と矛盾する / 安全境界に触れる」のいずれかを満たす finding のみ
+    - それ未満の指摘は conclusion=approved (finding manifest は空) とし、review journal の
+      本文に `### Notes (non-blocking)` 節として残す (structured finding にしない)
+    - follow-up 起票の単一責任は implementer: US close 前に Notes を follow-up issue 化し、
+      その issue anchor を close journal に記録する。anchor 未記録のまま close しない
+  record_and_notify:
+    - class の主張・確定・再分類・承認 anchor はすべて対象 issue の journal に記録する
+    - 通知は canonical handoff のみ。pane 観測から class を推測しない
+  invalid:
+    - claim_schema の欠落・不正、light_subtype の照合不能、格下げ anchor の検証失敗は、
+      いずれも standard として審査する (fail 側は常に「深い方」)
+```
+
+flow (最小 swimlane。既存の review request/result flow の上に class 判定を重ねるだけで、
+gate 語彙・順序は変更しない):
+
+```plantuml
+@startuml
+|implementer|
+start
+:実装作業 (claim は現時点の class を保持);
+if (light では収まらないと判断した?) then (yes)
+  :格上げを対象 issue journal に 1 行記録\n(以後の claim は standard。承認不要);
+else (no)
+endif
+if (作業中に別成果物 (別の欠陥・別機能) が生えた?) then (yes)
+  :別 issue へ切り出して起票し\nanchor を対象 issue journal に記録\n(本 US は元 scope のまま続行);
+else (no)
+endif
+if (standard を light へ下げたい?) then (yes)
+  if (reviewer 承認で足りる?) then (yes)
+    |owner_or_reviewer|
+    :reviewer が格下げ承認 anchor を\n対象 issue journal に直接発行;
+  else (owner 承認が必要)
+    |implementer|
+    :対象 issue journal に「owner 判断待ち」を記録;
+    :coordinator role へ canonical handoff;
+    |coordinator|
+    :owner 裁定を収集し anchor を\n対象 issue journal に記録\n(owner-question bypass 禁止の正規導線);
+  endif
+  |implementer|
+  :claim_schema.reason_or_anchor に anchor を記載;
+else (no)
+endif
+:canonical review_request journal を発行\n(claim_schema 付き、marker は gate=review_request:head=<full SHA>);
+|reviewer|
+:depth_round を depth_round_derivation で導出\n(申告値は参考。導出値が authority);
+if (claim に格下げ anchor あり?) then (yes)
+  if (anchor が journal 上で検証できる?) then (yes)
+    :light として審査continue;
+  else (no)
+    :standard へ確定 (invalid: anchor 検証失敗);
+  endif
+else (no)
+endif
+if (always_standard に該当?\n(task_level例外種別 / light 主張の動作コード・高リスクパス接触 / 導出 depth_round >= 2)) then (yes)
+  :standard へ確定し、理由を review journal に記録;
+else (no)
+endif
+if (確定 class = light?) then (yes)
+  if (壊れる / 契約矛盾 / 安全境界の finding あり?) then (yes)
+    :conclusion=changes_requested (structured finding 付き);
+  else (no)
+    :conclusion=approved (finding 0 件)\n+ 本文に Notes (non-blocking) 節;
+    |implementer|
+    :close 前に Notes を follow-up issue 化し\nanchor を close journal に記録 (未記録は close 不可);
+  endif
+else (no)
+  :標準深度で審査 (既存 flow のまま);
+endif
+stop
+@enduml
+```
+
 ## Workflow Change Verification
 
 正本は skill `references/workflow.md` `## Workflow 変更の反映確認 (Workflow Change Verification)` (guardrail / skill / gate 変更後の新セッション反映確認、検証対象を直接変更しない通常開発 task の選定、Claude 実装 / Codex 選定・audit、結果記録と follow-up 起票)。本 doc は再掲しない (#13028 で pointer 化)。本 repo での適用: 反映確認は `mozyo_bridge` 本体の通常開発 task で行う。
