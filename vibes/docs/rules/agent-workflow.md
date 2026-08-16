@@ -213,8 +213,14 @@ review_depth_tiers:
       - comments_only                # コメント・docstring のみ (契約記述を変えない)
       - generated_regen              # generator 出力の再生成のみ
     target_head: <commit sha>        # 主張が指す exact head
-    round: <n>                       # この request が何周目か (req marker 連鎖が正本)
+    round: <n>                       # 参考値。authority は reviewer の導出 (下記) であり自己申告ではない
     reason_or_anchor:                # 再分類時のみ: 格上げ理由 1 行、または格下げ承認 anchor
+  round_derivation:                  # reviewer が実行する exact な導出
+    - 対象 issue の canonical marker 連鎖 (`gate=review_request:head=` と、それを `req=` で指す
+      `gate=review_result`) を journal 順に読む
+    - 現在の review generation (最新 request の head 系列に属する request/result の連鎖) に含まれる
+      有効な review_result の数 + 1 が今回の round
+    - implementer 申告の round と導出値が食い違う場合は導出値を採用し、差異を review journal に記す
   actors:
     implementer: class を主張し、格上げを随時宣言し、light 承認後の Notes を follow-up issue 化する
     reviewer: diff を主張と照合して最終 class を確定し、review journal に記録する
@@ -245,39 +251,48 @@ gate 語彙・順序は変更しない):
 @startuml
 |implementer|
 start
-:review request に claim_schema を記録
-(class 欠落/不正は standard 扱い);
-|reviewer|
-:diff を主張と照合;
-if (always_standard に該当?) then (yes)
-  :standard へ確定 (review journal に理由を記録);
+:実装作業 (claim は現時点の class を保持);
+if (light では収まらないと判断した?) then (yes)
+  :格上げを対象 issue journal に 1 行記録\n(以後の claim は standard。承認不要);
 else (no)
-  :主張 class で確定;
+endif
+if (作業中に別成果物 (別の欠陥・別機能) が生えた?) then (yes)
+  :別 issue へ切り出して起票し\nanchor を対象 issue journal に記録\n(本 US は元 scope のまま続行);
+else (no)
+endif
+if (standard を light へ下げたい?) then (yes)
+  |owner_or_reviewer|
+  :格下げ承認 anchor を対象 issue journal に発行;
+  |implementer|
+  :claim_schema.reason_or_anchor に anchor を記載;
+else (no)
+endif
+:canonical review_request journal を発行\n(claim_schema 付き、marker は gate=review_request:head=<full SHA>);
+|reviewer|
+:round を round_derivation で導出\n(申告値は参考。導出値が authority);
+if (claim に格下げ anchor あり?) then (yes)
+  if (anchor が journal 上で検証できる?) then (yes)
+    :light として審査continue;
+  else (no)
+    :standard へ確定 (invalid: anchor 検証失敗);
+  endif
+else (no)
+endif
+if (always_standard に該当?\n(task_level例外種別 / light 主張の動作コード・高リスクパス接触 / 導出 round >= 2)) then (yes)
+  :standard へ確定し、理由を review journal に記録;
+else (no)
 endif
 if (確定 class = light?) then (yes)
   if (壊れる / 契約矛盾 / 安全境界の finding あり?) then (yes)
-    :conclusion=changes_requested
-(structured finding 付き);
+    :conclusion=changes_requested (structured finding 付き);
   else (no)
-    :conclusion=approved (finding 0 件)
-+ 本文に Notes (non-blocking) 節;
+    :conclusion=approved (finding 0 件)\n+ 本文に Notes (non-blocking) 節;
     |implementer|
-    :close 前に Notes を follow-up issue 化し
-anchor を close journal に記録;
+    :close 前に Notes を follow-up issue 化し\nanchor を close journal に記録 (未記録は close 不可);
   endif
 else (no)
   :標準深度で審査 (既存 flow のまま);
 endif
-|implementer|
-:格上げ (light->standard) は随時:
-対象 issue journal 1 行 + 次 request の claim 更新;
-note right
-  格下げ (standard->light) は owner_or_reviewer の
-  承認 anchor を claim_schema.reason_or_anchor に載せ、
-  reviewer が照合してから light として扱う。
-  作業中に別成果物が生えたら本 US で続けず
-  別 issue へ切り出して anchor を journal に残す。
-end note
 stop
 @enduml
 ```
