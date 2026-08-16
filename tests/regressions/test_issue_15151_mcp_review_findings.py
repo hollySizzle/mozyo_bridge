@@ -183,8 +183,11 @@ class Finding1LifecycleTests(unittest.TestCase):
             self.assertEqual(responses[0]["error"]["code"], ERROR_INVALID_PARAMS, missing)
 
     def test_wrong_typed_initialize_params_are_refused(self) -> None:
+        # `("protocolVersion", "")` left this table in R5 (review j#103251 r4f6):
+        # the schema types the member as `string` with no length constraint, so
+        # an empty string is conforming and the refusal was this server's own
+        # invention. The accepted-empty case is pinned in the R5 suite.
         for key, bad in (
-            ("protocolVersion", ""),
             ("protocolVersion", 5),
             ("capabilities", "none"),
             ("clientInfo", []),
@@ -963,7 +966,11 @@ class R3F4DeliveryLandingTests(unittest.TestCase):
         self.assertEqual(landing_from_ledger_record(None), VALUE_UNCONFIRMED)
 
     def test_only_a_confirmed_submission_is_landed(self) -> None:
-        record = self._Record(status="sent", reason="ok", mode="standard")
+        # `rail`, not `mode` (review j#103251 r4f2): a ledger record spells the
+        # rail in its own vocabulary, and the pre-R5 fixture carried a `mode`
+        # attribute no real ledger record has — which is exactly how the
+        # attribute-name mismatch this fixture should have caught went unseen.
+        record = self._Record(status="sent", reason="ok", rail="event_rail")
         self.assertEqual(landing_from_ledger_record(record), VALUE_LANDED)
 
     def test_the_shared_injection_stage_authority_is_what_decides(self) -> None:

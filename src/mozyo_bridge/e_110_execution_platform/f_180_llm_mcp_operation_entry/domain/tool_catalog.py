@@ -200,6 +200,11 @@ _SOURCE_HEALTH_SCHEMA = {
         "notes": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["degraded", "notes"],
+    # What `conforming_skeleton` fills on an error result. The boolean zero would
+    # claim "sources healthy" on a call that just FAILED — the exact structured
+    # misdirection r4f4 exists to prevent — so the neutral here is the axis's own
+    # fail-closed resting value, mirroring `HealthAxis.degraded = True`.
+    "default": {"degraded": True, "notes": []},
 }
 
 
@@ -325,7 +330,12 @@ _WORKFLOW_STEP_PLAN = ToolDefinition(
             "type": "object",
             "properties": {
                 "plan": {"type": "object"},
-                "execution": {"type": "string"},
+                # The default is the tool's fixed EXECUTION_PLAN_ONLY token, so a
+                # consumer asserting "this surface never executed" reads the same
+                # answer on an error result as on a plan; the string zero would
+                # break that contract. Pinned against the application constant by
+                # regression, since the domain layer cannot import it.
+                "execution": {"type": "string", "default": "plan_only"},
                 "source_health": _SOURCE_HEALTH_SCHEMA,
             },
             "required": ["plan", "execution", "source_health"],
@@ -371,7 +381,10 @@ _UNIT_STATE = ToolDefinition(
                 "runtime": {"type": "object"},
                 "delivery": {"type": "object"},
                 "health": {"type": "object"},
-                "read_only": {"type": "boolean"},
+                # `default` is what `conforming_skeleton` fills on an error result
+                # (review j#103251 r4f4): even a refusal comes from a read-only
+                # tool, so the neutral value here is True, not the bool zero.
+                "read_only": {"type": "boolean", "default": True},
             },
             "required": ["unit", "read_only"],
         }
@@ -447,7 +460,11 @@ def catalog_surface_violations(
       :data:`FORBIDDEN_PROPERTY_TOKENS` token — so no tool can accept an arbitrary
       command string, shell argv, or a raw pane / tmux target;
     - every input schema uses only :data:`SUPPORTED_SCHEMA_KEYWORDS` — so no
-      declared constraint goes unchecked at call time.
+      declared constraint goes unchecked at call time;
+    - every OUTPUT schema uses only supported keywords too (added with
+      :func:`validate_output`): since r4f4 the output schema is enforced before
+      send, so an unimplemented keyword there would be a declared constraint
+      ``_validate`` silently skips — the exact defect the input rule prevents.
 
     Output schemas are exempt from the token check: reporting *that* a delivery
     anomaly exists is the read model's job, and refusing the word there would
@@ -458,6 +475,14 @@ def catalog_surface_violations(
     for name, definition in catalog.items():
         if not definition.read_only:
             violations.append(f"{name}: catalog publishes a non-read-only tool")
+        for path, schema in _walk_schema(definition.output_schema, f"{name}(output)"):
+            unsupported = set(schema.keys()) - SUPPORTED_SCHEMA_KEYWORDS
+            if unsupported:
+                violations.append(
+                    f"{path}: unsupported schema keyword(s) "
+                    f"{', '.join(sorted(unsupported))}; validate_output would "
+                    "not enforce them"
+                )
         for path, schema in _walk_schema(definition.input_schema, name):
             unsupported = set(schema.keys()) - SUPPORTED_SCHEMA_KEYWORDS
             if unsupported:
@@ -552,6 +577,55 @@ def validate_arguments(
     return tuple(errors)
 
 
+def validate_output(
+    definition: ToolDefinition, payload: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """Validate a would-be ``structuredContent`` against the declared output schema.
+
+    Review j#103251 r4f4: the MCP spec makes a declared ``outputSchema`` a promise
+    about ``structuredContent``, and this server was breaking it on every error
+    path — a selector refusal or a generic handler failure produced a payload with
+    none of the schema's required members. Validation is the send-side half of the
+    fix; :func:`conforming_skeleton` is the projection half. Violation strings name
+    schema paths and type names only — never payload values.
+    """
+    errors: list[str] = []
+    _validate(payload, definition.output_schema, "structuredContent", errors)
+    return tuple(errors)
+
+
+def conforming_skeleton(schema: Mapping[str, Any]) -> Any:
+    """The minimal value satisfying ``schema``: required members filled, neutrally.
+
+    Recursive, because a required object member can carry its own ``required``
+    list (``source_health`` does). A declared ``default`` wins over the type's
+    neutral zero, so a schema can state what "no answer" means for a member — the
+    read-only flag's neutral is True, and a failed call's ``source_health`` is
+    degraded, never the healthy-looking boolean zero. Used to project an error
+    payload into the declared shape:
+    ``{**conforming_skeleton(schema), **error_fields}``.
+    """
+    if not isinstance(schema, Mapping):
+        return None
+    if "default" in schema:
+        return _plain(schema["default"])
+    kind = schema.get("type")
+    if kind == "object":
+        properties = schema.get("properties")
+        properties = properties if isinstance(properties, Mapping) else {}
+        return {
+            name: conforming_skeleton(properties.get(name, {}))
+            for name in schema.get("required", ()) or ()
+        }
+    if kind == "array":
+        return []
+    if kind == "boolean":
+        return False
+    if kind == "integer":
+        return 0
+    return ""
+
+
 def default_arguments(definition: ToolDefinition) -> dict:
     """Top-level schema defaults, so a handler reads one resolved argument set."""
     properties = definition.input_schema.get("properties")
@@ -585,9 +659,11 @@ __all__ = (
     "ToolDefinition",
     "UnknownToolError",
     "catalog_surface_violations",
+    "conforming_skeleton",
     "default_arguments",
     "list_tools_payload",
     "resolve_arguments",
     "tool_definition",
     "validate_arguments",
+    "validate_output",
 )

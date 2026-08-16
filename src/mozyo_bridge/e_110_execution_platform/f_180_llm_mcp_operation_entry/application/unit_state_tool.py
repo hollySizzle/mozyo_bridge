@@ -91,6 +91,37 @@ _STATE_BLOCKED = "blocked"
 VALUE_LANDED = "landed"
 
 
+#: Ledger ``rail`` token -> the send ``mode`` the shared injection-stage authority
+#: keys its queue-enter carve-out on (review j#103251 r4f2). The ledger stores the
+#: RAIL (`event_rail` / `queue_enter_rail`), not the mode string, and stores the
+#: turn-start observation under ``queue_enter_observation`` — so passing the raw
+#: record to the authority silently dropped both (every ``getattr`` missed), and a
+#: queue-enter ``sent``/``ok`` with an unconfirmed turn start was promoted to a
+#: landing on status/reason alone.
+_LEDGER_RAIL_TO_MODE = {
+    "event_rail": "standard",
+    "queue_enter_rail": "queue-enter",
+}
+
+
+@dataclass(frozen=True)
+class _LedgerOutcomeView:
+    """A ledger record re-spelled in the outcome vocabulary the authority reads.
+
+    Lossless: ``mode`` is the record's rail translated through
+    :data:`_LEDGER_RAIL_TO_MODE`, and both telemetry dicts are passed through
+    verbatim. No ``injection_stage`` attribute is exposed, so the authority always
+    re-derives with this full context instead of trusting a carried stage the
+    ledger never stored.
+    """
+
+    status: object
+    reason: object
+    mode: object
+    queue_enter_turn_start_observation: object
+    turn_start_outcome: object
+
+
 def landing_from_ledger_record(record: object) -> str:
     """Classify one delivery-ledger record's landing, from a POSITIVE signal only.
 
@@ -120,8 +151,28 @@ def landing_from_ledger_record(record: object) -> str:
 
     if record is None:
         return VALUE_UNCONFIRMED
+    # Review j#103251 r4f2: the ledger spells the outcome fields differently from
+    # a DeliveryOutcome (`rail` for the mode, `queue_enter_observation` for the
+    # turn-start observation), so the record must be re-spelled BEFORE the shared
+    # authority reads it — otherwise the queue-enter carve-out never applies and
+    # `sent`/`ok` alone becomes a landing. A rail this reader does not recognise
+    # carries no confirmation basis it can see, and a landing may never be derived
+    # from status/reason alone, so it is unconfirmed outright.
+    rail = str(getattr(record, "rail", "") or "")
+    mode = _LEDGER_RAIL_TO_MODE.get(rail)
+    if mode is None:
+        return VALUE_UNCONFIRMED
+    view = _LedgerOutcomeView(
+        status=getattr(record, "status", None),
+        reason=getattr(record, "reason", None),
+        mode=mode,
+        queue_enter_turn_start_observation=getattr(
+            record, "queue_enter_observation", None
+        ),
+        turn_start_outcome=getattr(record, "turn_start_outcome", None),
+    )
     try:
-        stage = injection_stage_for_outcome(record)
+        stage = injection_stage_for_outcome(view)
     except Exception:  # noqa: BLE001 - an unclassifiable record is unconfirmed
         return VALUE_UNCONFIRMED
     return VALUE_LANDED if stage == STAGE_SUBMITTED_CONFIRMED else VALUE_UNCONFIRMED
@@ -395,7 +446,19 @@ def compose_unit_state(
     # The health axis reports the delivery anomaly verbatim. It is not re-derived
     # or re-classified here: the anomaly's own envelope already says how well it
     # was observed, and a second classification would be a second authority.
-    health = derive_health(reported, anomaly=delivery.anomaly, notes=facts.notes)
+    # `observed_at` (review j#103251 r4f5): the derivation runs against the fields
+    # read in THIS call, so its instant is the same read instant those fields
+    # carry — the workflow read's stamp, or the first stamped group's.
+    health = derive_health(
+        reported,
+        anomaly=delivery.anomaly,
+        notes=facts.notes,
+        observed_at=(
+            facts.workflow_observed_at
+            or facts.runtime_observed_at
+            or facts.delivery_observed_at
+        ),
+    )
 
     return UnitStateReport(
         unit=unit.as_payload(),
@@ -755,9 +818,46 @@ class LiveUnitStateSource:
             }
             break
 
-        pairs = tuple((role, states.get(role, VALUE_UNKNOWN)) for role in roles)
+        provider_for = self._provider_for_consumer_role()
+        # Review j#103251 r4f1: the Unit vocabulary is gateway/worker, but the
+        # live fold's rows are keyed by the PROVIDER the pane runs (codex /
+        # claude) — the decoded mzb1 role segment. Looking a consumer role up
+        # directly therefore reported every healthy producer row as `unknown`.
+        # The provider behind each consumer role comes from the same resolver
+        # the dispatch rail uses, so this read can never disagree with the rail;
+        # an exact consumer-role key still wins, so a future producer that emits
+        # gateway/worker directly needs no change here.
+        pairs = tuple(
+            (
+                role,
+                states.get(
+                    role, states.get(provider_for.get(role, ""), VALUE_UNKNOWN)
+                ),
+            )
+            for role in roles
+        )
         readable = any(state != VALUE_UNKNOWN for _, state in pairs)
         return _RuntimeObservation(backend=backend, roles=pairs, readable=readable)
+
+    def _provider_for_consumer_role(self) -> dict:
+        """``{consumer role -> provider}`` via the dispatch rail's own resolvers.
+
+        Fail-open to an empty mapping: when the binding cannot be resolved, the
+        direct role lookup still runs and degrades to ``unknown`` — the honest
+        answer — rather than guessing a provider the rail would not have used.
+        """
+        try:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+                resolve_gateway_provider,
+                resolve_worker_provider,
+            )
+
+            return {
+                "gateway": str(resolve_gateway_provider(str(self.context.repo_root))),
+                "worker": str(resolve_worker_provider(str(self.context.repo_root))),
+            }
+        except Exception:  # noqa: BLE001 - unresolved binding: no translation
+            return {}
 
     @staticmethod
     def _blocker_claim(

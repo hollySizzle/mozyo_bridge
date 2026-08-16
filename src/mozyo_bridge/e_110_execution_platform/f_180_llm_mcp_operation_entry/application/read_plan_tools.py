@@ -97,6 +97,7 @@ def run_docs_resolve(
     """
     from mozyo_bridge.docs_tools import (
         CatalogContext,
+        CatalogUnreadableError,
         OverlayError,
         resolve_paths_detailed,
     )
@@ -142,7 +143,12 @@ def run_docs_resolve(
             is_error=True,
             summary="the local catalog overlay could not be read",
         )
-    except (OSError, ValueError) as exc:
+    except (CatalogUnreadableError, OSError, ValueError) as exc:
+        # CatalogUnreadableError joined this clause when #15514 rewrote the reader
+        # to raise it instead of the raw OSError / YAML errors it previously let
+        # escape; without it the typed refusal raised straight through this tool.
+        # Its message is value-free by that issue's contract, but this tool keeps
+        # its own fixed reason regardless — one shape for every unreadable cause.
         return ToolOutcome(
             payload={
                 "error": "docs_catalog",
@@ -262,6 +268,32 @@ def run_workflow_glance(
 
 # --- workflow_step_plan ---------------------------------------------------- #
 
+#: The `plan` fields this tool publishes (review j#103251 r4f3). The replayable
+#: contract surface of a WorkflowStepOutcome, and nothing from its execution
+#: wiring: `target_pane` / `self_pane` name live panes, `repo_root` is a private
+#: filesystem path, `project_scope` is internal routing state, and `detail` is
+#: resolver free text that may interpolate any of them. An allowlist — never a
+#: denylist — so a field added to the outcome later stays private until someone
+#: decides, in review, that it is public.
+PLAN_PUBLIC_FIELDS = (
+    "state",
+    "next_action",
+    "execution",
+    "reason",
+    "next_owner",
+    "primitive",
+    "durable_anchor",
+    "caller_role",
+    "callback_classification",
+    "callback_to_role",
+    "ok",
+)
+
+
+def _public_plan(payload: Mapping[str, Any]) -> dict:
+    """The allowlisted projection of a step-outcome payload."""
+    return {name: payload[name] for name in PLAN_PUBLIC_FIELDS if name in payload}
+
 
 def run_workflow_step_plan(
     arguments: Mapping[str, Any], context: ReadPlanContext
@@ -313,8 +345,18 @@ def run_workflow_step_plan(
     # reconcile and the durable startup gate. Reporting the raw rail result here
     # was review j#102599 r3f1: it let this tool describe a forward step as safe
     # on a lane the CLI would have refused to step.
-    plan = resolution.outcome.as_payload()
+    #
+    # And reporting it VERBATIM was review j#103251 r4f3: `as_payload()` carries
+    # the execution wiring the CLI dispatches with — `target_pane` / `self_pane`
+    # (pane identities), `repo_root` (a private filesystem path), `project_scope`
+    # — and `detail` free text the resolver may have threaded any of those into.
+    # This surface is a plan REPORT for an LLM client: it must name what to do
+    # next, never where the server's panes and checkouts live. So the projection
+    # is an explicit allowlist of the replayable contract fields, and everything
+    # else — structured or free-text — is dropped rather than scrubbed.
+    plan = _public_plan(resolution.outcome.as_payload())
     if resolution.reconciled is not None:
+        # Already a public-safe projection by its own contract ("no pane id").
         plan.update(resolution.reconciled.reconcile_payload_fields())
     payload = {
         "plan": plan,
@@ -362,6 +404,7 @@ def _anchor_from(arguments: Mapping[str, Any], notes: list):
 
 __all__ = (
     "EXECUTION_PLAN_ONLY",
+    "PLAN_PUBLIC_FIELDS",
     "ReadPlanContext",
     "ToolOutcome",
     "run_docs_resolve",

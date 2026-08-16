@@ -196,6 +196,17 @@ def _initialize_param_violations(params: Mapping[str, Any]) -> list:
             violations.extend(
                 _type_violations(roots, OPTIONAL_ROOTS_TYPES, "capabilities.roots")
             )
+        experimental = capabilities.get("experimental")
+        if isinstance(experimental, Mapping):
+            # The schema types `experimental` as `{ [key: string]: object }`
+            # (review j#103251 r4f6): the member itself was checked above, but
+            # each of its VALUES must also be an object, and that inner
+            # constraint went unvalidated.
+            violations.extend(
+                f"capabilities.experimental.{name}"
+                for name, value in experimental.items()
+                if not isinstance(value, Mapping)
+            )
     return violations
 
 
@@ -348,11 +359,15 @@ class McpServer:
                 {"missing": missing, "required": list(REQUIRED_INITIALIZE_PARAMS)},
             )
         requested = params.get("protocolVersion")
-        if not isinstance(requested, str) or not requested.strip():
+        if not isinstance(requested, str):
+            # Type only (review j#103251 r4f6): the schema says `string` and
+            # nothing else. The previous non-empty/non-whitespace rule was this
+            # implementation's own invention; an empty string is a conforming —
+            # if unusable — version, and negotiation below answers it with ours.
             return error_response(
                 request.id,
                 ERROR_INVALID_PARAMS,
-                '"protocolVersion" must be a non-empty string',
+                '"protocolVersion" must be a string',
                 {"supported": list(SUPPORTED_PROTOCOL_VERSIONS)},
             )
         # Validate INTO the nested objects, and validate them to *exactly* the

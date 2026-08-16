@@ -44,10 +44,13 @@ from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.
     TOOL_UNIT_STATE,
     TOOL_WORKFLOW_GLANCE,
     TOOL_WORKFLOW_STEP_PLAN,
+    ToolDefinition,
     UnknownToolError,
+    conforming_skeleton,
     resolve_arguments,
     tool_definition,
     validate_arguments,
+    validate_output,
 )
 
 #: name -> handler. Statically bound built-in functions only; there is no
@@ -84,9 +87,48 @@ class DispatchResult:
         return self.protocol_error is not None
 
 
-def _tool_result(outcome: ToolOutcome) -> dict:
-    """Render a handler outcome as an MCP tool result."""
+def _tool_result(outcome: ToolOutcome, definition: ToolDefinition) -> dict:
+    """Render a handler outcome as an MCP tool result — schema-conformant or withheld.
+
+    Review j#103251 r4f4: a declared ``outputSchema`` is a promise about
+    ``structuredContent``, and every error path here was breaking it — a selector
+    refusal or a generic failure carried none of the schema's required members.
+    Two-step, both fail-closed:
+
+    1. An error payload missing required members is projected into the declared
+       shape (``conforming_skeleton`` under it, the typed error fields on top), so
+       a typed refusal stays readable AND conformant.
+    2. Anything still nonconforming — including a SUCCESS payload, which would
+       mean this server's own handler broke its schema — is **withheld**: the
+       result carries no ``structuredContent`` at all and reports the mismatch as
+       a tool error naming schema paths only. A nonconforming structured object
+       misleads a schema-trusting client; no structured object merely degrades it.
+    """
     payload = dict(outcome.payload)
+    violations = validate_output(definition, payload)
+    if violations and outcome.is_error:
+        skeleton = conforming_skeleton(definition.output_schema)
+        payload = {**(skeleton if isinstance(skeleton, dict) else {}), **payload}
+        violations = validate_output(definition, payload)
+    if violations:
+        mismatch = {
+            "error": "output_schema_mismatch",
+            "tool": definition.name,
+            "violations": list(violations),
+        }
+        body = json.dumps(mismatch, ensure_ascii=False, sort_keys=True)
+        return {
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "the tool result did not conform to the declared output "
+                        f"schema and was withheld\n{body}"
+                    ),
+                }
+            ],
+            "isError": True,
+        }
     text = outcome.summary or ""
     body = json.dumps(payload, ensure_ascii=False, sort_keys=True)
     content = [{"type": "text", "text": f"{text}\n{body}" if text else body}]
@@ -140,7 +182,7 @@ def dispatch_tool_call(
             is_error=True,
             summary=f"{definition.name} failed with {type(exc).__name__}",
         )
-    return DispatchResult(result=_tool_result(outcome))
+    return DispatchResult(result=_tool_result(outcome, definition))
 
 
 __all__ = ("DispatchResult", "ProtocolError", "dispatch_tool_call")

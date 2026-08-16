@@ -78,6 +78,12 @@ VALUE_UNCONFIRMED = "unconfirmed"
 #: happened to return nothing.
 SOURCE_UNOBSERVED = "unobserved"
 
+#: The second addition (review j#103251 r4f5): the value was not read from any
+#: single external source — it was DERIVED, in this process, from the other
+#: reported fields. Health verdicts carry this so a consumer can tell "Redmine
+#: said degraded" apart from "the composer computed degraded from what it saw".
+SOURCE_DERIVED = "derived"
+
 #: Axis names, in report order. A closed set: a new axis is a schema change.
 AXIS_WORKFLOW = "workflow"
 AXIS_RUNTIME = "runtime"
@@ -355,19 +361,43 @@ class HealthAxis:
     ``degraded`` is true when any consulted source was unreadable or any reported
     field is stale / expired. ``notes`` records which source degraded, so an empty
     projection is never read as "nothing is wrong".
+
+    The payload wraps every derived member — ``degraded`` / ``freshness`` /
+    ``notes`` — in the same observation envelope every other reported field
+    carries (review j#103251 r4f5): the model's own contract says "there is no
+    bare-scalar path", and these three were bare. Their provenance is
+    :data:`SOURCE_DERIVED` with this read's ``observed_at``: they were computed
+    here, from the reported fields, and a consumer deserves to know that as
+    surely as it knows where ``anomaly`` came from. The values keep their types —
+    a boolean stays a boolean inside its envelope, never a stringified one.
     """
 
     anomaly: ObservedField = UNKNOWN_FIELD
     degraded: bool = True
     freshness: str = FRESHNESS_UNKNOWN
     notes: Tuple[str, ...] = ()
+    #: When the derivation ran — the read instant the composer stamped, or
+    #: ``None`` for a resting axis nothing was derived for.
+    observed_at: Optional[str] = None
+    #: What the derivation was computed FROM. A fixed phrase, never field values.
+    basis: str = "derived from the reported fields' readability and freshness"
+
+    def _derived(self, value: object) -> dict:
+        return {
+            "value": value,
+            "source": SOURCE_DERIVED,
+            "observed_at": self.observed_at,
+            "freshness": self.freshness,
+            "readability": READABILITY_READABLE,
+            "note": self.basis,
+        }
 
     def as_payload(self) -> dict:
         return {
             "anomaly": self.anomaly.as_payload(),
-            "degraded": self.degraded,
-            "freshness": self.freshness,
-            "notes": list(self.notes),
+            "degraded": self._derived(self.degraded),
+            "freshness": self._derived(self.freshness),
+            "notes": self._derived(list(self.notes)),
         }
 
 
@@ -395,6 +425,7 @@ def derive_health(
     *,
     anomaly: ObservedField = UNKNOWN_FIELD,
     notes: Tuple[str, ...] = (),
+    observed_at: Optional[str] = None,
 ) -> HealthAxis:
     """Derive the health axis from the fields the other axes reported.
 
@@ -402,6 +433,9 @@ def derive_health(
     same fail-closed posture as ``derive_display_state``: a partial read is
     degraded, and an unread source is degraded — "healthy" is only claimed when
     everything backing it was actually current.
+
+    ``observed_at`` stamps WHEN this derivation ran (review j#103251 r4f5) — the
+    caller's read instant, carried into every derived member's envelope.
     """
     degraded = not fields or any(
         f.readability != READABILITY_READABLE or f.freshness != FRESHNESS_FRESH
@@ -415,6 +449,7 @@ def derive_health(
         degraded=degraded,
         freshness=worst_freshness(fields),
         notes=tuple(extra),
+        observed_at=observed_at,
     )
 
 
@@ -452,6 +487,7 @@ __all__ = (
     "HealthAxis",
     "ObservedField",
     "RuntimeAxis",
+    "SOURCE_DERIVED",
     "SOURCE_UNOBSERVED",
     "UNDERIVABLE_STATES",
     "UNKNOWN_FIELD",
