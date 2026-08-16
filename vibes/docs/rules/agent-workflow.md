@@ -384,8 +384,11 @@ adversarial_convergence:
       supersede でき、連鎖は線形でなければならない。未 supersede の anchor が 2 個以上並立、
       dangling な supersedes_anchor、別 challenge_ref の anchor への supersede、循環は、いずれも
       conflict であり close blocked (どの anchor も authoritative にならない)。
-      (c) resumption request = **authoritative** anchor を指す `challenge_resolution` を持つ
-      canonical review_request のみ有効。superseded anchor を指す request は解決に数えない。
+      (c) authoritative resumption request = **authoritative** anchor を指す
+      `challenge_resolution` を持つ canonical review_request のうち**最大 id の 1 個**
+      (Review Generation Marker Contract v2 の「最新 request が current generation を開く」と
+      同型の後勝ち規則。明示の supersession key は不要で、先行 resumption 候補は自動的に
+      非 authoritative)。superseded anchor を指す request は候補にもならない。
       (d) challenged request = authoritative result が C である canonical review_request
       (意味検証の基準)
       resumption_request: |
@@ -401,15 +404,17 @@ adversarial_convergence:
       かつ意味的に整合すること:
       (i) pending record が存在する。
       (ii) authoritative anchor が一意に定まる (conflict は blocked)。
-      (iii) authoritative anchor を指す有効な resumption request の authoritative result が
-      存在する。
-      (iv) 意味的一致 — challenge_verdict=update_model は resumption request が `threat_model:`
-      行をちょうど 1 行持ち、その値が challenged request の `threat_model:` 行と byte 一致
-      しないこと。challenge_verdict=defer は解決 result の `resolution_anchor` 付き Deferred
-      entry が `disposition: deferred` を持つこと。challenge_verdict=wontfix_by_policy は同
-      entry が `disposition: wontfix_by_policy` を持つこと。
-      duplicate・malformed・意味不一致はいずれも当該 chain を無効にする。有効で意味整合な
-      chain が 1 本存在するまで close blocked (fail 側は blocked)
+      (iii) **authoritative resumption request (最大 id の 1 個)** の authoritative result が
+      存在する。先行 resumption 候補とその result は判定に使わない。
+      (iv) 意味的一致 — **(iii) の result のみ**で判定する。challenge_verdict=update_model は
+      authoritative resumption request が `threat_model:` 行をちょうど 1 行持ち、その値が
+      challenged request の `threat_model:` 行と byte 一致しないこと。challenge_verdict=defer は
+      同 result の `resolution_anchor` 付き Deferred entry が `disposition: deferred` を持つこと。
+      challenge_verdict=wontfix_by_policy は同 entry が `disposition: wontfix_by_policy` を
+      持つこと。
+      duplicate・malformed・意味不一致・result 未発行は、より新しい意味整合な resumption
+      request とその result が authoritative になるまで close blocked (存在判定 (∃) ではなく
+      「authoritative な 1 本」の判定。fail 側は blocked)
   mandatory_de_escalation:
     severity_vocabulary:
       values: low | medium | high    # closed。canonical finding manifest v1 は変更しない
@@ -515,7 +520,8 @@ else (no)
     |implementer|
     :authoritative anchor (supersession 連鎖の末端) を確認し、
 それを指す challenge_resolution key 付きの新 canonical request を発行
-(update_model なら threat_model 行を challenged request から更新);
+(update_model なら threat_model 行を challenged request から更新。
+この request が最大 id の authoritative resumption になる — 先行候補は自動失効);
     |reviewer|
     :authoritative result を発行 — verdict が defer /
 wontfix_by_policy なら Deferred 節に resolution_anchor 付き entry を
