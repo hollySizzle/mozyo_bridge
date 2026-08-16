@@ -216,24 +216,22 @@ review_depth_tiers:
     depth_round: <n>                 # 参考値。authority は reviewer の導出 (下記) であり自己申告ではない
     reason_or_anchor:                # 再分類時のみ: 格上げ理由 1 行、または格下げ承認 anchor
   depth_round_derivation:            # reviewer が実行する exact な導出
-    # depth_round は review-depth 専用の往復数であり、Review Generation Marker Contract v2 の
-    # current review generation とは別概念。対象 review_request journal R ごとに一意に定まる。
-    - count 対象は canonical な review_result marker
-      (`gate=review_result:conclusion=changes_requested:…` を strict parser が同定した journal)
-      のみ。marker を持たない journal は、本文が何を主張していても**数えない** (散文推定の禁止)
-    - 範囲: 当該 issue の journal のうち id が R より小さいもの (上限 = 対象 request journal。
-      これにより同じ R に対する導出値は後続 journal の追加で変わらない)。下限は issue 先頭
-      (canonical marker のみ数えるため、別の開始境界は置かない)
-    - 分類は exactly-once で 2 種:
-      (a) valid pair — result の `req=` が canonical `gate=review_request:head=` journal を指し、
-          head が一致するもの
-      (b) orphan — canonical grammar の changes_requested result だが (a) の相関が成立しないもの
-      (同一 result journal は (a) に該当すれば (a)、しなければ (b) の一方でのみ数える。
-       duplicate marker は journal 単位で 1 回)
-    - depth_round(R) = (a) + (b) + 1
-    - 導出例 (#15547 実 marker 列、R = j#106452): (a)=1 (j#106449 → req=106443、head 一致)、
-      (b)=1 (j#106427 → req=106418 が canonical request でなく orphan)、
-      j#106438 は marker 0 件のため対象外 → depth_round = 1 + 1 + 1 = **3**
+    # depth_round は review-depth 専用の「何周目の依頼か」であり、Review Generation Marker
+    # Contract v2 の current review generation とは別概念。対象 review_request journal R ごとに
+    # 一意に定まる。ADR-0004 の trigger は「2 周目の依頼に入った事実」なので、数える対象は
+    # review の**結果**ではなく **request の通し番号**である。
+    - count 対象は canonical な review_request marker
+      (`gate=review_request:head=` を strict parser が同定した journal) のみ。marker を持たない
+      journal は、本文が何を主張していても数えない (散文推定の禁止)。canonical でない依頼の
+      試みは request として存在しない扱い
+    - depth_round(R) = 当該 issue の journal のうち **id <= R の canonical review_request journal 数**
+      (journal 単位 exactly-once。duplicate marker は journal 単位 1 回)。R 自身を含むため値は
+      1 以上で、同じ R に対する導出値は後続 journal の追加で変わらない
+    - 導出例 1 (#15547 実 marker 列、R = j#106456): canonical request は j#106443 / j#106452 /
+      j#106456 の 3 件 → depth_round = **3**
+    - 導出例 2 (approved 後の再依頼 probe): request j10 → approved result j20 → request j30 の列で
+      depth_round(j30) = **2** → light 案件なら自動格上げが発火する (結果が approved でも
+      2 周目の依頼は light の 1 往復契約を再適用できない)
     - implementer 申告と導出値が食い違う場合は導出値を採用し、差異を review journal に記す
   actors:
     implementer: class を主張し、格上げを随時宣言し、light 承認後の Notes を follow-up issue 化する
