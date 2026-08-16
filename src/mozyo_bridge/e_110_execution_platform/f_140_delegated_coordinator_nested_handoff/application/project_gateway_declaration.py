@@ -298,7 +298,17 @@ def declare_project_gateway_owner_row(
 
     # The adopted gateway the route resolver matched must be ONE of the resolved slots — so the
     # route join and the slot pins name the same live processes, not two unrelated resolutions.
-    if _norm(observed_route.locator) not in {pin.locator for pin in pins}:
+    # The route's ``locator`` is the candidate's ``pane_id``, and the two backends express that
+    # identity differently: tmux candidates carry the pane id (``%N`` — the pin's ``locator``),
+    # while the herdr backend inventory deliberately stamps the durable ASSIGNED NAME as the
+    # candidate ``pane_id`` (its stable target form). Joining on the pin's locator alone made
+    # the herdr join constitutively impossible — a healthy attested pair still zero-wrote as
+    # ``route_identity_mismatch`` (#15146 j#106290) — so the join accepts either identity form
+    # of the SAME pin; an unrelated name or a foreign pane still mismatches.
+    _route_locator = _norm(observed_route.locator)
+    if _route_locator not in (
+        {pin.locator for pin in pins} | {pin.assigned_name for pin in pins}
+    ):
         return _fail(
             PG_DECL_ROUTE_MISMATCH,
             "the resolved live slots do not include the adopted gateway pane",
