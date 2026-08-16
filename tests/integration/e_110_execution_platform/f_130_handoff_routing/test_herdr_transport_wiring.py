@@ -1635,8 +1635,16 @@ class TmuxBackendUntouchedTest(unittest.TestCase):
         # The 2.0 default flip (Redmine #15531): an undeclared backend selects
         # herdr, so the wiring installs the herdr binding rather than leaving
         # the tmux passthrough. Send-time failure stays fail-closed (typed
-        # refusal, never a silent tmux fallback).
-        binding = self._binding_for(None)
+        # refusal, never a silent tmux fallback). The binary is a local stub
+        # injected via MOZYO_HERDR_BINARY: the wiring resolves the trusted
+        # environment, and relying on an ambient live herdr passed locally
+        # while failing on hosts without one (CI).
+        with tempfile.TemporaryDirectory() as bindir:
+            stub = Path(bindir) / "herdr"
+            stub.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+            stub.chmod(0o755)
+            with patch.dict("os.environ", {"MOZYO_HERDR_BINARY": str(stub)}):
+                binding = self._binding_for(None)
         self.assertIsNotNone(binding)
         self.assertEqual(binding.backend, "herdr")
 

@@ -96,6 +96,11 @@ class GroupedUnitsHttpTest(unittest.TestCase):
         self.repo = Path(self._tmp.name) / "repo"
         (self.repo / ".mozyo-bridge").mkdir(parents=True)
         (self.repo / ".git").mkdir()
+        # tmux inventory rail under test; herdr is the undeclared default since
+        # the 2.0 flip (#15531) and would live-read.
+        (self.repo / ".mozyo-bridge" / "config.yaml").write_text(
+            "terminal_transport:\n  backend: tmux\n", encoding="utf-8"
+        )
         env_patch = patch.dict(
             "os.environ",
             {"MOZYO_BRIDGE_HOME": str(self.home), "MOZYO_REPO": str(self.repo)},
