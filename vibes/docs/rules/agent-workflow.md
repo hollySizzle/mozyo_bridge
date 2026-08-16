@@ -195,6 +195,40 @@ adr_conflict_gate:
       anchor 成立後に file 化する (README の status enum に draft は存在しない)
 ```
 
+## Review Depth Tiers — Redmine #15547 (判断正本: ADR-0004)
+
+レビュー深度の段階化契約。単位は US のまま (ADR-0003)、深度だけを変更クラスで変える。
+
+```yaml
+review_depth_tiers:
+  # 判断正本は ADR-0004。本節は実行契約のみ (repo-local 宣言、中央 preset 不変)。
+  classes:
+    light:
+      # 閉じたリスト。ここに無い変更は light を主張できない。
+      - docs_typo_or_wording      # 文書の誤記・清書 (契約内容を変えない)
+      - tests_only                # tests/** のみの変更
+      - comments_only             # コメント・docstring のみ (契約記述を変えない)
+      - generated_regen           # generator 出力の再生成のみ
+    standard:
+      - light に該当しないすべての変更
+      - us_level_audit.task_level例外 の高リスク種別は宣言にかかわらず常に standard
+  light_contract:
+    - 1 往復: reviewer が差し戻し (changes_requested) にできるのは High/blocker 級
+      (壊れる / 契約と矛盾 / 安全境界に触れる) のみ
+    - それ未満の指摘は approve_with_notes とし、メモは reviewer または implementer が
+      後続タスクとして起票する (黙殺しない)
+  claim_verification:
+    - class は review request の必須 field (省略時は standard)
+    - reviewer は diff を主張 class と照合する。light 主張が src の動作コード・
+      高リスクパスに触れていれば standard へ自動格上げし、その事実を review journal に記す
+  reclassification:
+    - escalate (light -> standard): implementer 単独・随時・journal 1 行で成立。承認不要
+    - de_escalate (standard -> light): reviewer または owner の承認 anchor 必須
+    - auto_escalate: light 案件が review 2 周目に入った時点で standard へ自動格上げ
+    - 膨張 (同一成果物の増大) は escalate で続行。派生 (別成果物の発生) は別 issue へ
+      切り出し、anchor を journal に残す
+```
+
 ## Workflow Change Verification
 
 正本は skill `references/workflow.md` `## Workflow 変更の反映確認 (Workflow Change Verification)` (guardrail / skill / gate 変更後の新セッション反映確認、検証対象を直接変更しない通常開発 task の選定、Claude 実装 / Codex 選定・audit、結果記録と follow-up 起票)。本 doc は再掲しない (#13028 で pointer 化)。本 repo での適用: 反映確認は `mozyo_bridge` 本体の通常開発 task で行う。

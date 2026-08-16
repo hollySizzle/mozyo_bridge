@@ -87,6 +87,15 @@ documents:
     related_document_refs:
       - rule-adr-index
 
+  - id: rule-adr-0004-review-depth-tiers
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0004-review-depth-tiers.md
+    purpose: "ADR-0004: レビュー深度は変更クラスで段階化し、途中再分類できる (#15547)。"
+    audit_role: adr_0004_rule
+    related_document_refs:
+      - rule-adr-index
+
   - id: rule-release-distribution
     type: rule
     status: active
