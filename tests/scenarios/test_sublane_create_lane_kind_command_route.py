@@ -35,6 +35,8 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+import json
+from unittest import mock
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -63,6 +65,38 @@ class SublaneCreateLaneKindCommandRouteTest(unittest.TestCase):
         self.root = Path(self._tmp.name)
         self.repo = self.root / "repo"
         (self.repo / ".mozyo-bridge").mkdir(parents=True)
+        # Parent-authority admission (Redmine #15146): a delegated_coordinator
+        # creation now requires a resolvable workspace identity plus a DECLARED
+        # and VERIFIED parent project_gateway before the request is even built.
+        # This scenario's subject is the placement geometry downstream of that
+        # gate, so the fixture satisfies the gate honestly: a workspace anchor,
+        # a project_gateway role binding, and (in the command wrapper below) an
+        # active owner row for the derived gateway lane.
+        (self.repo / ".mozyo-bridge" / "workspace-anchor.json").write_text(
+            json.dumps(
+                {
+                    "schema_version": 1,
+                    "workspace_id": "c" * 32,
+                    "canonical_session": "mozyo-scenario",
+                    "project_name": "scenario",
+                    "created_at": "2026-08-16T00:00:00+00:00",
+                    "updated_at": "2026-08-16T00:00:00+00:00",
+                }
+            ),
+            encoding="utf-8",
+        )
+        (self.repo / ".mozyo-bridge" / "workflow-role-bindings.json").write_text(
+            json.dumps(
+                {
+                    "schema": "mozyo.workflow-role-bindings",
+                    "version": 1,
+                    "bindings": [
+                        {"role": "project_gateway", "project_scope": "scenario-project"}
+                    ],
+                }
+            ),
+            encoding="utf-8",
+        )
         self.worktree = self.root / "lane-worktree"
         self.worktree.mkdir()
         self.home = self.root / "home"
@@ -113,10 +147,24 @@ class SublaneCreateLaneKindCommandRouteTest(unittest.TestCase):
                 captured["request"] = request
                 raise _StopBeforeActuation()
 
+        class _ActiveRow:
+            lane_disposition = "active"
+
+        class _ActiveStore:
+            def get(self, key):
+                return _ActiveRow()
+
         original = act.SublaneActuateUseCase
         act.SublaneActuateUseCase = _CapturingUseCase
         try:
-            act.cmd_sublane_start(args)
+            # The gateway owner row lives in the operator state store, which the
+            # isolated runner's temp home does not carry; an active row stands in
+            # so the #15146 admission passes on its real code path.
+            with mock.patch(
+                "mozyo_bridge.core.state.lane_lifecycle.LaneLifecycleStore",
+                return_value=_ActiveStore(),
+            ):
+                act.cmd_sublane_start(args)
         except _StopBeforeActuation:
             pass
         finally:
