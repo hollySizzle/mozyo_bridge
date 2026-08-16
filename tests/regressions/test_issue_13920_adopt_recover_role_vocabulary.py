@@ -129,6 +129,8 @@ WK_PROVIDER = "claude"
 PROVIDERS = (GW_PROVIDER, WK_PROVIDER)
 GW_LOC = "w28:p4R"
 WK_LOC = "w28:p4S"
+GW_TERMINAL = "terminal:13920:gateway"
+WK_TERMINAL = "terminal:13920:worker"
 ATTESTED_AT = "2026-07-17T00:00:00+00:00"
 
 
@@ -137,7 +139,12 @@ def _decision(journal: str = JOURNAL) -> DecisionPointer:
 
 
 def _row(provider: str, locator: str) -> dict:
-    return {"name": encode_assigned_name(WS, provider, LANE), "pane_id": locator}
+    terminal_id = GW_TERMINAL if provider == GW_PROVIDER else WK_TERMINAL
+    return {
+        "name": encode_assigned_name(WS, provider, LANE),
+        "pane_id": locator,
+        "terminal_id": terminal_id,
+    }
 
 
 def _pair_rows() -> list:
@@ -285,10 +292,12 @@ class AdoptToRecoverPairSeamTest(_HomeBackedCase):
     """
 
     def _attest(self, provider: str, locator: str) -> None:
+        terminal_id = GW_TERMINAL if provider == GW_PROVIDER else WK_TERMINAL
         HerdrIdentityAttestationStore(home=self.home).upsert(
             IdentityAttestationRecord(
                 assigned_name=encode_assigned_name(WS, provider, LANE),
                 workspace_id=WS, role=provider, lane_id=LANE, locator=locator,
+                terminal_id=terminal_id,
                 verdict=VERDICT_PRESENT, observed_at=ATTESTED_AT,
             )
         )
@@ -544,6 +553,7 @@ class OperatorStartupSeamTest(unittest.TestCase):
     _LANE = "lane-13920"
     _NAME = "worker-a"
     _LOC = "w9:p1"
+    _TERMINAL = "terminal:13920:operator-worker"
     _WORKFLOW_ROLE = "implementation_worker"
 
     class _Binding:
@@ -573,7 +583,8 @@ class OperatorStartupSeamTest(unittest.TestCase):
         """The REAL record a worker slot writes: its ``role`` is the PROVIDER token."""
         return IdentityAttestationRecord(
             assigned_name=self._NAME, workspace_id=self._WS, role=role, lane_id=self._LANE,
-            locator=self._LOC, verdict=VERDICT_PRESENT, observed_at=ATTESTED_AT,
+            locator=self._LOC, terminal_id=self._TERMINAL,
+            verdict=VERDICT_PRESENT, observed_at=ATTESTED_AT,
         )
 
     def _resolve(self, *, pins, binding_provider="claude", attestation_role="claude"):
@@ -606,7 +617,11 @@ class OperatorStartupSeamTest(unittest.TestCase):
             env={},
             repo_root="/repo/root",
             lifecycle_get=lambda ws, lane: record,
-            inventory=lambda env: [{AGENT_KEY_NAME: self._NAME, "pane_id": self._LOC}],
+            inventory=lambda env: [{
+                AGENT_KEY_NAME: self._NAME,
+                "pane_id": self._LOC,
+                "terminal_id": self._TERMINAL,
+            }],
             # The REAL record + the REAL evaluate_attestation — not a stub (review j#80598 F1).
             attestation_read=lambda name: self._attestation(role=attestation_role),
             capture=lambda loc, lines: "",

@@ -169,8 +169,8 @@ def _seed_hibernated_released(
         expected_revision=rec.revision,
         action_id="rel-1",
         observation=build_release_observation([
-            ReleasePin("gateway", "codex-mzb1", "w1:p1"),
-            ReleasePin("worker", "claude-mzb1", "w1:p2"),
+            ReleasePin("gateway", "codex-mzb1", "w1:p1", "startup-action-current"),
+            ReleasePin("worker", "claude-mzb1", "w1:p2", "startup-action-current"),
         ]),
     )
     if release_target == RELEASE_REQUESTED:
@@ -554,6 +554,9 @@ class RetireMigrationCommandTests(unittest.TestCase):
         conn = sqlite3.connect(lane_lifecycle_path())
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            # v11 (#15227) added the terminal-bound owed-close pin. A v5 fixture cannot
+            # retain that newer authority column while merely re-stamping its metadata.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
             # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
             # or the shape is a NEWER table merely re-stamped to an old version.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")
@@ -575,6 +578,9 @@ class RetireMigrationCommandTests(unittest.TestCase):
         conn = sqlite3.connect(lane_lifecycle_path())
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            # v11 (#15227) added the terminal-bound owed-close pin. A v5 fixture cannot
+            # retain that newer authority column while merely re-stamping its metadata.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
             # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
             # or the shape is a NEWER table merely re-stamped to an old version.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")

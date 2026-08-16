@@ -62,6 +62,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_NAME,
     _agent_locator,
     _norm,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
     SLOT_STALE,
@@ -245,6 +246,7 @@ def _attestation_of(
     *,
     assigned_name: str,
     live_locator: str,
+    live_terminal_id: object,
     workspace_id: str,
     provider: str,
     lane: str,
@@ -258,6 +260,7 @@ def _attestation_of(
     join = evaluate_attestation(
         record,
         live_locator=live_locator,
+        live_terminal_id=live_terminal_id,
         expected_workspace_id=workspace_id,
         expected_role=provider,
         expected_lane=lane,
@@ -345,6 +348,9 @@ def _observe_once(
             attestation = _attestation_of(
                 assigned_name=assigned_name,
                 live_locator=live_locator,
+                live_terminal_id=terminal_identity_of_live_slot(
+                    assigned_name, live_locator, rows
+                ),
                 workspace_id=workspace_id,
                 provider=provider,
                 lane=lane,
@@ -675,6 +681,7 @@ def probe_session_health(
             blocker_id=settled.blocker_id,
             compensation=settled.compensation,
             health_detail=settled.detail,
+            launch_terminal_id=slot.launch_terminal_id,
         )
     return probed
 

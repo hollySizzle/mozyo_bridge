@@ -56,7 +56,9 @@ def updater_target_resolver_for(receiver: str) -> Optional[Callable[[str], Any]]
     return builtin_updater_target_probe() if is_supported_provider(receiver) else None
 
 
-def resolve_generation_key(receiver: str, locator: str, *, home: Any = None):
+def resolve_generation_key(
+    receiver: str, locator: str, *, live_rows, home: Any = None
+):
     """The EXACT generation living at ``locator`` right now, or ``None`` (audit j#96966 C14).
 
     The launch-generation store is the authority for this question, and the receipt store
@@ -75,8 +77,14 @@ def resolve_generation_key(receiver: str, locator: str, *, home: Any = None):
         GENERATION_ATTESTED,
         HerdrLaunchGenerationError,
         HerdrLaunchGenerationStore,
+        verified_generation_token,
     )
     from mozyo_bridge.core.state.launch_identity_receipt import GenerationKey
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        _norm,
+        _norm_lane,
+        terminal_identity_of_live_slot,
+    )
 
     provider = str(receiver or "").strip()
     pane = str(locator or "").strip()
@@ -102,6 +110,20 @@ def resolve_generation_key(receiver: str, locator: str, *, home: Any = None):
     if len(matches) != 1:
         return None
     found = matches[0]
+    live_terminal_id = terminal_identity_of_live_slot(
+        found.assigned_name, pane, live_rows
+    )
+    if (
+        live_terminal_id is None
+        or found.terminal_id != live_terminal_id
+        or verified_generation_token(
+            home, assigned_name=found.assigned_name,
+            workspace_id=found.workspace_id, role=found.role,
+            lane_id=found.lane_id, locator=pane,
+            live_terminal_id=live_terminal_id, norm=_norm, norm_lane=_norm_lane,
+        ) != found.startup_action_id
+    ):
+        return None
     return GenerationKey(
         workspace_id=found.workspace_id,
         lane_id=found.lane_id,
@@ -130,7 +152,17 @@ def record_update_evidence(receiver: str, target: str, blocker_id: str) -> None:
 
     if not is_update_derived_blocker(receiver, blocker_id):
         return
-    key = resolve_generation_key(receiver, target)
+    try:
+        import os
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+            list_herdr_agent_rows,
+        )
+
+        live_rows = list_herdr_agent_rows(os.environ)
+    except Exception:  # noqa: BLE001 - no fresh inventory means no evidence binding
+        return
+    key = resolve_generation_key(receiver, target, live_rows=live_rows)
     if key is None:
         # No single attested generation at this pane: there is nothing this observation can
         # be bound TO. Recording it against a guess is the mis-binding C14 forbids.

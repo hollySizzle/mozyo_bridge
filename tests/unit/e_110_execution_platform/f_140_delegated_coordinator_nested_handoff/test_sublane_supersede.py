@@ -13,6 +13,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -26,11 +27,13 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_SUPERSEDED,
     OWNER_RESOLVED,
+    RELEASE_NOT_REQUESTED,
     RELEASE_PARTIAL,
     RELEASE_RELEASED,
     DecisionPointer,
     LaneLifecycleKey,
     LaneLifecycleStore,
+    ReleasePin,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
     HerdrRetireCloseResult,
@@ -53,8 +56,16 @@ REC = "issue_13583_recovery"
 JOURNAL = "76630"
 
 
+def _terminal(role: str, lane: str, locator: str) -> str:
+    return f"terminal:{lane}:{role}:{locator}"
+
+
 def _row(role: str, lane: str, locator: str) -> dict:
-    return {"name": encode_assigned_name(WS, role, lane), "pane_id": locator}
+    return {
+        "name": encode_assigned_name(WS, role, lane),
+        "pane_id": locator,
+        "terminal_id": _terminal(role, lane, locator),
+    }
 
 
 def _attest(role: str, lane: str, locator: str, verdict: str = VERDICT_PRESENT):
@@ -64,6 +75,7 @@ def _attest(role: str, lane: str, locator: str, verdict: str = VERDICT_PRESENT):
         role=role,
         lane_id=lane,
         locator=locator,
+        terminal_id=_terminal(role, lane, locator),
         verdict=verdict,
     )
 
@@ -72,7 +84,7 @@ class _FakeOps:
     """Fake supersede IO port: canned workspace / rows / attestations / close."""
 
     def __init__(self, *, rows, attestations, close_result=None):
-        self._rows = list(rows)
+        self._rows = None if rows is None else list(rows)
         self._attest = dict(attestations)
         self._close_result = close_result
         self.close_calls: list = []
@@ -81,22 +93,30 @@ class _FakeOps:
         return WS
 
     def live_rows(self):
-        return list(self._rows)
+        return None if self._rows is None else list(self._rows)
 
     def read_attestation(self, assigned_name):
         return self._attest.get(assigned_name)
 
     def execute_close(self, plan):
         self.close_calls.append(plan)
-        if self._close_result is not None:
-            return self._close_result
-        return HerdrRetireCloseResult(
+        result = self._close_result or HerdrRetireCloseResult(
             workspace_id=plan.workspace_id,
             lane_id=plan.lane_id,
             closed=tuple(plan.close_targets),
             failed=(),
             foreign_names=plan.foreign_names,
         )
+        closed = set(result.closed)
+        self._rows = [
+            row for row in self._rows
+            if not any(
+                row.get("name") == encode_assigned_name(WS, role, plan.lane_id)
+                and row.get("pane_id") == locator
+                for role, locator in closed
+            )
+        ]
+        return result
 
     def drop_rows_for(self, lane: str) -> None:
         """Simulate the original's slots being gone (a prior close succeeded)."""
@@ -124,6 +144,62 @@ def _request(**kw) -> SupersedeRequest:
 
 
 class SublaneSupersedeTest(unittest.TestCase):
+    def setUp(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_process_release as release,
+        )
+
+        def current_pins(_rows, *, targets, **_kwargs):
+            return tuple(
+                ReleasePin(role, name, locator, f"startup:{role}:{locator}")
+                for role, name, locator in targets
+            )
+
+        def partition(pins, rows, **_kwargs):
+            rows = tuple(rows)
+            names = [row.get("name") for row in rows]
+            locators = [row.get("pane_id") for row in rows]
+            terminals = [row.get("terminal_id") for row in rows]
+            if (
+                len(set(names)) != len(names)
+                or len(set(locators)) != len(locators)
+                or len(set(terminals)) != len(terminals)
+            ):
+                return None
+            live, absent = [], []
+            for pin in pins:
+                exact = [
+                    row for row in rows
+                    if row.get("name") == pin.assigned_name
+                    and row.get("pane_id") == pin.locator
+                ]
+                if len(exact) == 1:
+                    live.append(pin)
+                elif not any(
+                    row.get("name") == pin.assigned_name
+                    or row.get("pane_id") == pin.locator
+                    for row in rows
+                ):
+                    absent.append(pin)
+                else:
+                    return None
+            return tuple(live), tuple(absent)
+
+        def absent(pins, rows, **kwargs):
+            result = partition(pins, rows, **kwargs)
+            return result == ((), tuple(pins))
+
+        self._authority_patchers = (
+            mock.patch.object(release, "current_generation_release_pins",
+                              side_effect=current_pins),
+            mock.patch.object(release, "pinned_generation_partition",
+                              side_effect=partition),
+            mock.patch.object(release, "pinned_generations_absent", side_effect=absent),
+        )
+        for patcher in self._authority_patchers:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+
     def _store(self, tmp) -> LaneLifecycleStore:
         return LaneLifecycleStore(home=Path(tmp))
 
@@ -204,6 +280,40 @@ class SublaneSupersedeTest(unittest.TestCase):
                 DISPOSITION_ACTIVE,
             )
             self.assertEqual(store.resolve_owner(WS, ISSUE).lane_id, ORIG)
+            self.assertEqual(ops.close_calls, [])
+
+    def test_unreadable_initial_inventory_is_zero_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_original(store)
+            before = store.get(LaneLifecycleKey(WS, ORIG))
+            ops = _FakeOps(rows=None, attestations={})
+            outcome = SublaneSupersedeUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.is_blocked)
+            self.assertIsNone(outcome.supersede)
+            self.assertEqual(store.get(LaneLifecycleKey(WS, ORIG)), before)
+            self.assertEqual(ops.close_calls, [])
+
+    def test_unreadable_resume_inventory_never_opens_release(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = self._store(tmp)
+            self._declare_original(store)
+            store.supersede_and_activate(
+                superseded=LaneLifecycleKey(WS, ORIG),
+                expected_revision=1,
+                recovery=LaneLifecycleKey(WS, REC),
+                decision=_decision(),
+            )
+            before = store.get(LaneLifecycleKey(WS, ORIG))
+            ops = _FakeOps(rows=None, attestations={})
+            outcome = SublaneSupersedeUseCase(ops=ops, store=store).run(
+                _request(), execute=True
+            )
+            self.assertTrue(outcome.already_handed_over)
+            self.assertEqual(outcome.release.process_release, RELEASE_NOT_REQUESTED)
+            self.assertEqual(store.get(LaneLifecycleKey(WS, ORIG)), before)
             self.assertEqual(ops.close_calls, [])
 
     def test_blocks_when_original_not_idle(self) -> None:
@@ -357,8 +467,7 @@ class SublaneSupersedeTest(unittest.TestCase):
             # COMPLETION, never a proof of process absence (liveness stays the live inventory),
             # and ZERO panes are actuated — which is what the assertions below pin.
             self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
-            self.assertEqual(len(ops.close_calls), 1)
-            self.assertEqual(ops.close_calls[0].close_targets, ())
+            self.assertEqual(ops.close_calls, [])
             self.assertEqual(outcome.release.closed, ())
             # j#94653 item 3: the SUPERSEDE fences are unaffected by the live-zero release
             # change. The handover authority outcome is asserted explicitly here so a future
@@ -437,10 +546,11 @@ class SublaneSupersedeTest(unittest.TestCase):
             outcome = SublaneSupersedeUseCase(ops=ops, store=store).run(
                 _request(), execute=True
             )
-            self.assertTrue(outcome.supersede.applied)
-            self.assertNotEqual(outcome.release.process_release, RELEASE_RELEASED)
-            self.assertNotEqual(
-                store.get(LaneLifecycleKey(WS, ORIG)).process_release, RELEASE_RELEASED
+            self.assertTrue(outcome.is_blocked)
+            self.assertIsNone(outcome.supersede)
+            self.assertEqual(
+                store.get(LaneLifecycleKey(WS, ORIG)).lane_disposition,
+                DISPOSITION_ACTIVE,
             )
             self.assertEqual(ops.close_calls, [])
 

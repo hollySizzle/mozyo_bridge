@@ -50,11 +50,11 @@ def preflight_managed_launch(
     in the orchestrator (the #13948 j#80989 split rule, which is also why
     ``herdr_slot_execution`` exists).
 
-    Gated on a resolved wrapper AND an actual launch plan: an unwrapped
-    (``attest_launcher == ""``) or adopt-only / dry-run run runs no wrapper, so it is never
-    probed and stays byte-invariant (Redmine #13637 fallback preserved). It is the LAST
-    fail-closed point before any herdr write, so a skewed launcher aborts the run with zero
-    actuation.
+    Gated on a resolved wrapper AND an actual launch plan. An unwrapped launch establishes no
+    generation authority and remains unattested/non-green, while adopt-only / dry-run stays
+    byte-invariant. For a wrapped launch the generation store probe runs before native binding
+    or startup transaction writes. This is the last pre-effect compatibility boundary, so a
+    skewed launcher aborts with zero durable write and zero actuation.
 
     ``epoch_launch`` (Redmine #14756) is resolved here through the SAME predicate the
     per-slot launch uses, so the preflight and the launch cannot disagree about whether an

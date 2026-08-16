@@ -192,6 +192,7 @@ class FakeGenerationStore:
         self.rows = rows
         self.reads = 0
         self.replace_after_reads = 0
+        self.startup_completed = True
 
     def read(self, assigned_name: str):
         self.reads += 1
@@ -213,6 +214,20 @@ class FakeGenerationStore:
                 attested_at=row.attested_at,
             )
         return row
+
+    def verified(self, _home, **expected):
+        row = self.read(expected["assigned_name"])
+        if not self.startup_completed or row is None or any((
+            row.phase != GENERATION_ATTESTED,
+            row.verdict != VERDICT_PRESENT,
+            row.workspace_id != expected["workspace_id"],
+            row.role != expected["role"],
+            row.lane_id != expected["lane_id"],
+            row.locator != expected["locator"],
+            row.terminal_id != expected["live_terminal_id"],
+        )):
+            return ""
+        return row.startup_action_id
 
 
 class HerdrLivePairPlacementTests(unittest.TestCase):
@@ -242,6 +257,7 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         order: tuple[str, str] = PROVIDERS,
         ratio: float = 0.5,
         third_pane: bool = False,
+        cosmetic_root: bool = False,
     ):
         herdr = PairPlacementHerdr("w1")
         root = Path(self.record.canonical_path)
@@ -249,10 +265,20 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         tab = herdr.new_tab()
         first_name = encode_assigned_name(WORKSPACE_ID, order[0], LANE_ID)
         second_name = encode_assigned_name(WORKSPACE_ID, order[1], LANE_ID)
-        first_pane = herdr.seed_pane(tab, first_name)
+        if cosmetic_root:
+            root_pane = herdr.seed_pane(tab)
+            first_pane = herdr.split_pane(
+                tab,
+                root_pane,
+                "right",
+                first_name,
+            )
+        else:
+            first_pane = herdr.seed_pane(tab, first_name)
         second_pane = herdr.split_pane(tab, first_pane, split, second_name)
-        if isinstance(tab.root, Split):
-            tab.root.ratio = ratio
+        pair_split = tab.root.second if cosmetic_root else tab.root
+        if isinstance(pair_split, Split):
+            pair_split.ratio = ratio
         if third_pane:
             herdr.split_pane(tab, second_pane, "right")
 
@@ -266,6 +292,7 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
                 role=provider,
                 lane_id=LANE_ID,
                 locator=pane_by_provider[provider],
+                terminal_id=f"terminal:{pane_by_provider[provider]}",
                 verdict=VERDICT_PRESENT,
                 observed_at="now",
                 reserved_at="now",
@@ -279,6 +306,7 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
             runner=herdr,
             lister=HerdrCliAgentLister("herdr", runner=herdr),
             generation_store=generations,
+            generation_verifier=generations.verified,
             workspace_loader=lambda workspace_id: (
                 self.record if workspace_id == WORKSPACE_ID else None
             ),
@@ -333,6 +361,27 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         generations.replace_after_reads = 2
 
         result = service.apply(WORKSPACE_ID)
+
+        self.assertEqual(result.status, APPLY_REFUSED)
+        self.assertEqual(result.reason, REASON_STALE)
+        self.assertEqual(self._mutations(herdr), [])
+
+    def test_apply_refuses_external_root_split_drift_before_first_effect(self) -> None:
+        service, herdr, _, _ = self._build(
+            split="down",
+            ratio=0.7,
+            cosmetic_root=True,
+        )
+        opening = service.preview(WORKSPACE_ID)
+        self.assertEqual(opening.status, PLAN_READY)
+        herdr.calls.clear()
+        # Change only the external split evidence in the next fresh layout.  Pane
+        # rectangles and the managed pair itself stay byte-identical, so this
+        # specifically pins the scope fingerprint rather than the old bbox check.
+        herdr.layout_split_ratio_overrides_once["split_0_root"] = 0.3
+
+        with patch.object(service, "preview", return_value=opening):
+            result = service.apply(WORKSPACE_ID)
 
         self.assertEqual(result.status, APPLY_REFUSED)
         self.assertEqual(result.reason, REASON_STALE)
@@ -494,6 +543,13 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
         self.assertEqual(self._mutations(herdr), [])
         self.assertFalse(any(call[:2] == ["pane", "layout"] for call in herdr.calls))
 
+    def test_unsettled_startup_transaction_refuses_before_mutation(self) -> None:
+        service, herdr, generations, _ = self._build(split="right")
+        generations.startup_completed = False
+        plan = service.preview(WORKSPACE_ID)
+        self.assertEqual(plan.reason, REASON_GENERATION_UNVERIFIED)
+        self.assertEqual(self._mutations(herdr), [])
+
     def test_provider_mismatch_and_shell_residue_refuse_before_mutation(self) -> None:
         for mode in ("provider", "stale"):
             with self.subTest(mode=mode):
@@ -539,7 +595,7 @@ class HerdrLivePairPlacementTests(unittest.TestCase):
 
         plan = service.preview(WORKSPACE_ID)
 
-        self.assertEqual(plan.reason, "geometry_unsupported")
+        self.assertEqual(plan.reason, REASON_NOT_DEDICATED_PAIR)
         self.assertEqual(self._mutations(herdr), [])
 
     def test_invalid_tab_locator_refuses_before_mutation(self) -> None:

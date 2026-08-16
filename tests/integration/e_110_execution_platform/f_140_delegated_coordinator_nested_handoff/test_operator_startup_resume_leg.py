@@ -783,6 +783,7 @@ class ProductionCompositionTests(unittest.TestCase):
             role="claude",
             lane_id="lane-alpha",
             locator="w1:p1",
+            terminal_id="terminal:w1:p1",
             verdict=VERDICT_PRESENT,
         )
         t = _target()
@@ -790,7 +791,8 @@ class ProductionCompositionTests(unittest.TestCase):
             env={},
             repo_root=str(self.home),
             lifecycle_get=lambda ws, lane: record,
-            inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}],
+            inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1",
+                                    "terminal_id": "terminal:w1:p1"}],
             attestation_read=lambda name: attestation,  # REAL record -> REAL evaluate_attestation
             capture=lambda loc, lines: _READY,
             workspace_resolve=lambda repo_root, execution_root, env: (
@@ -892,13 +894,15 @@ class ProductionCompositionTests(unittest.TestCase):
             role="claude",
             lane_id="lane-alpha",
             locator="w1:p1",
+            terminal_id="terminal:w1:p1",
             verdict=VERDICT_PRESENT,
         )
         resolver = ResumeTargetResolver(
             env={},
             repo_root=str(self.home),
             lifecycle_get=lambda ws, lane: record,
-            inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1"}],
+            inventory=lambda env: [{AGENT_KEY_NAME: "worker-a", "pane_id": "w1:p1",
+                                    "terminal_id": "terminal:w1:p1"}],
             attestation_read=lambda name: attestation,
             capture=lambda loc, lines: _READY,
             workspace_resolve=lambda repo_root, execution_root, env: (

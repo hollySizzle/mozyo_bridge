@@ -225,8 +225,33 @@ class BothOutcomeSystemsTest(unittest.TestCase):
         got = ledger.recent()[0]
         self.assertEqual(got.queue_enter_observation, _QUEUE_ENTER_OBSERVATION)
 
+    def test_transport_failure_override_persists_without_queue_observation(self) -> None:
+        """A raised primitive still leaves one attributable queue-enter row."""
+        primitive = "send_keys(enter) (submit)"
+        ledger = HerdrDeliveryLedger(path=self.path)
+        record = build_herdr_delivery_ledger_record(
+            _outcome(status="blocked", reason="transport_error"),
+            backend=BACKEND_HERDR,
+            rail=RAIL_QUEUE_ENTER,
+            disposition=primitive,
+        )
+
+        self.assertIsNone(record.queue_enter_observation)
+        self.assertEqual(record.backend, BACKEND_HERDR)
+        self.assertEqual(record.rail, RAIL_QUEUE_ENTER)
+        self.assertEqual(record.disposition, primitive)
+
+        ledger.append(record)
+        got = ledger.records_for_marker("mkr-13296-abc")[0]
+        self.assertEqual(got.status, "blocked")
+        self.assertEqual(got.reason, "transport_error")
+        self.assertEqual(got.backend, BACKEND_HERDR)
+        self.assertEqual(got.rail, RAIL_QUEUE_ENTER)
+        self.assertEqual(got.disposition, primitive)
+
     def test_non_herdr_outcome_classifies_other_and_keeps_caller_backend(self) -> None:
         # No herdr telemetry: rail=other; backend is NOT auto-derived to herdr.
+        # Omitting the explicit rail is the legacy compatibility surface.
         record = build_herdr_delivery_ledger_record(
             _outcome(), backend="tmux"
         )
@@ -396,6 +421,22 @@ class RecordBoundaryTest(unittest.TestCase):
                 home=self.home,
             )
         self.assertIsNone(result)
+
+    def test_invalid_rail_raises_in_builder_but_recorder_remains_best_effort(self) -> None:
+        outcome = _outcome(status="blocked", reason="transport_error")
+
+        with self.assertRaisesRegex(ValueError, "unknown herdr delivery ledger rail"):
+            build_herdr_delivery_ledger_record(outcome, rail="free-form-rail")
+
+        self.assertIsNone(
+            record_herdr_delivery(
+                outcome,
+                backend=BACKEND_HERDR,
+                rail="free-form-rail",
+                home=self.home,
+            )
+        )
+        self.assertFalse(herdr_delivery_ledger_path(self.home).exists())
 
 
 class CallerSuppliedRedactionTest(unittest.TestCase):

@@ -23,8 +23,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
     PaneReadResult,
+    TerminalTransportError,
     TerminalTransportConfig,
     TransportResult,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_queue_enter_rail import (
+    queue_enter_effect_fence,
 )
 
 
@@ -60,6 +64,44 @@ def _binding(calls: list[tuple[str, ...]]) -> TransportBinding:
 
 
 class ProjectGatewayEffectGuardTest(unittest.TestCase):
+    def test_queue_fence_runs_after_project_verifier_and_before_enter(self):
+        events: list[str] = []
+
+        def run_tmux(*args: str, check: bool = True):
+            del args, check
+            events.append("send")
+            return subprocess.CompletedProcess([], 0, stdout="", stderr="")
+
+        binding = TransportBinding(
+            backend=BACKEND_HERDR,
+            run_tmux=run_tmux,
+            capture_pane=lambda _target, _lines: "ready",
+        )
+        binding = wiring._guard_queue_enter_effect_fence(binding)
+        binding = wiring._guard_project_gateway_binding_effects(
+            binding, lambda _require_process: events.append("verify")
+        )
+
+        with queue_enter_effect_fence(lambda: events.append("queue-fence")):
+            binding.run_tmux("send-keys", "-t", "w1:p1", "Enter")
+
+        self.assertEqual(events, ["verify", "queue-fence", "send"])
+
+    def test_queue_fence_refusal_after_project_verifier_is_zero_enter(self):
+        calls: list[tuple[str, ...]] = []
+        verifier = Mock()
+        binding = wiring._guard_queue_enter_effect_fence(_binding(calls))
+        guarded = wiring._guard_project_gateway_binding_effects(binding, verifier)
+
+        with queue_enter_effect_fence(
+            Mock(side_effect=TerminalTransportError("wait already settled"))
+        ):
+            with self.assertRaises(TerminalTransportError):
+                guarded.run_tmux("send-keys", "-t", "w1:p1", "Enter")
+
+        verifier.assert_called_once_with(False)
+        self.assertEqual(calls, [])
+
     def test_nonstandard_binding_refuses_generation_drift_before_any_effect(self):
         calls: list[tuple[str, ...]] = []
         verifier = Mock(
@@ -77,7 +119,7 @@ class ProjectGatewayEffectGuardTest(unittest.TestCase):
             )
 
         self.assertEqual(calls, [])
-        verifier.assert_called_once_with()
+        verifier.assert_called_once_with(True)
 
     def test_nonstandard_binding_rechecks_body_and_enter_but_not_capture(self):
         calls: list[tuple[str, ...]] = []
@@ -91,6 +133,9 @@ class ProjectGatewayEffectGuardTest(unittest.TestCase):
         guarded.run_tmux("send-keys", "-t", "w1:p1", "Enter")
 
         self.assertEqual(verifier.call_count, 2)
+        self.assertEqual(
+            [call.args for call in verifier.call_args_list], [(True,), (False,)]
+        )
         self.assertEqual(len(calls), 2)
 
     def test_standard_rail_refuses_drift_before_transport_send(self):
@@ -107,7 +152,25 @@ class ProjectGatewayEffectGuardTest(unittest.TestCase):
 
         self.assertFalse(result.ok)
         self.assertEqual(delegate.effects, [])
-        verifier.assert_called_once_with()
+        verifier.assert_called_once_with(True)
+
+    def test_standard_rail_enter_uses_stable_terminal_not_mutable_snapshot(self):
+        delegate = _RecordingTransport()
+        verifier = Mock()
+        rail = SimpleNamespace(_transport=delegate)
+        wiring._guard_project_gateway_standard_rail_effects(rail, verifier)
+
+        body = rail._transport.send_text("w1:p1", "body")
+        enter = rail._transport.send_keys("w1:p1", "enter")
+
+        self.assertTrue(body.ok)
+        self.assertTrue(enter.ok)
+        self.assertEqual(
+            [call.args for call in verifier.call_args_list], [(True,), (False,)]
+        )
+        self.assertEqual(
+            delegate.effects, [("text", "w1:p1"), ("keys", "w1:p1")]
+        )
 
     def test_runtime_composition_connects_both_effect_boundaries(self):
         calls: list[tuple[str, ...]] = []

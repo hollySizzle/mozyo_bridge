@@ -41,15 +41,17 @@ python smoke/real_tmux_notify_smoke.py
 MOZYO_BRIDGE_COMMAND=mozyo-bridge-testpypi python smoke/real_tmux_notify_smoke.py
 ```
 
-`smoke/real_tmux_notify_smoke.py` は **explicit な strict `--mode standard` rail** のみを自動検証する (v0.4 contract pivot 後は `mozyo-bridge handoff send --mode standard --force` を非 agent な `sh` receiver に対して打つ形)。v0.4 で normative default になった `--mode queue-enter` rail (Asana `1214825156046950` 配下、`vibes/docs/logics/tmux-send-safety-contract.md` の `## Default Delivery Promise (v0.4)` / `## Queue-Enter Default Rail` を正本とする) は (a) real Claude / Codex TUI 上の prompt queue 挙動と pane metadata に依存し、(b) Layer B deterministic preflight (`--force` 不可、window-name / same-session / active-split / per-receiver foreground process allowlist) が non-agent `sh` receiver を typing 前に reject するため、同 smoke では auto-cover できない。v0.4 default を触る変更は同 smoke header の docstring に記載した手順 (`mozyo-bridge handoff send` を `--mode` 指定なしで queue-enter default として marker 観測あり / 観測なしの 2 ケース、`--mode standard` 明示で strict regression 1 ケース、v0.3 preflight spot-check 3 ケース (foreign-session / inactive-split / non-agent reject)、v0.4 force-rejection regression 1 ケースの計 7 ケース) を Asana task に記録する。default promise は `confirmed landing` ではなく `strong preflight 付き practical queued submission` のため、queue-enter rail の auto smoke が無い状態でも product 約束自体は破綻しない (durable record が引き続き source of truth)。
+`smoke/real_tmux_notify_smoke.py` は **explicit な strict `--mode standard` rail** のみを自動検証する (v0.4 contract pivot 後は `mozyo-bridge handoff send --mode standard --force` を非 agent な `sh` receiver に対して打つ形)。real Claude / Codex TUI、Herdr event wait、terminal-bound generationを必要とする既定`queue-enter`はこのscriptだけでは検証できない。
+
+既定queue-enter、Herdr transport、remote Unit Boardのいずれかを変えた候補は、exact candidateをlocal／SSH remote host／Dev Containerの3 runtimeへ固定導入し、Redmine #15140「local／remote／Dev Container Unit統合表示・操作の実機確認」の5 checksを必須release gateとして実行する。少なくとも、(1) `herdr unit-board sources/show`で3 sourceとidentity・role・project・runtime stateを同一画面からreadback、(2) remote coordinatorへのdefault-mode preview後に新しいdurable anchorからapply exactly once、(3) causal confirmation時だけexit 0 + `delivered / ok / submitted_confirmed`、(4) stale／duplicate／接続不能と旧v1 generationでzero-send、(5) test process／lane／worktreeのmanaged cleanupを記録する。exit 3／`uncertain`は成功にせずblind retryしない。container unavailableや候補未導入を「他2 sourceがgreen」で代替しない。旧7-case tmux手動spot-checkは互換回帰として有用だが、この3-runtime Herdr acceptanceの代替ではない。
 
 ### Handoff primitive regression coverage (Asana `1214760806178471`)
 
 `mozyo-bridge handoff send` / `handoff reply` / 上位 alias `mozyo-bridge reply` の primitive regression は in-process unit test で固定済みであり、release 前に published package 専用 smoke を追加する必要はない。具体的カバー:
 
-- `HandoffOrchestratorTest` — standard mode の marker observed + Enter、`pending` mode (Enter 発行せず operator owned)、strict mode marker_timeout `C-u` rollback、anchor / target / non-agent pane の各 invalid 分岐。
-- `RelaxedQueueEnterRailTest` — CLI `--mode` の受理 / 未指定時の v0.4 default 確認 (`queue-enter`)、queue-enter rail observed/unobserved marker の outcome、strict rail rollback、`--force` rejection、target window guard、v0.3 preflight (foreign-session / inactive-split / cross-receiver / weak identity admit)、delivery record の operator-note 文言。
-- `NotifyContractTest` — `notify-codex` / `notify-claude` / `notify-codex-review` / `notify-claude-review-result` が primitive を経由していること (marker shape / body / Enter 発行 / structured outcome)、queue-enter default で marker 未観測でも Enter が出ること、success line 互換、`--record-format` / `--record-command` の伝搬、および `notify-claude-legacy-task` が primitive 経路に乗らず structured outcome を emit しないこと (retired-queue cleanup wrapper の境界)。
+- `HandoffOrchestratorTest` (**tmux compatibility coverage**) — standard mode の marker observed + Enter、`pending` mode (Enter 発行せず operator owned)、strict mode marker_timeout `C-u` rollback、anchor / target / non-agent pane の各 invalid 分岐。Herdr の causal turn-start success を証明する test ではない。
+- `RelaxedQueueEnterRailTest` (**tmux compatibility coverage**) — CLI `--mode` の受理 / 未指定時の v0.4 default 確認 (`queue-enter`)、tmux queue-enter observed/unobserved marker の historical outcome、strict rail rollback、`--force` rejection、target window guard、v0.3 preflight (foreign-session / inactive-split / cross-receiver / weak identity admit)、delivery record の operator-note 文言。Herdr は causal confirmation 時だけ `submitted_confirmed` / exit 0 であり、別の event-rail test と実機 gateで検証する。
+- `NotifyContractTest` (**tmux compatibility coverage**) — `notify-codex` / `notify-claude` / `notify-codex-review` / `notify-claude-review-result` が primitive を経由していること (marker shape / body / Enter 発行 / structured outcome)、tmux queue-enter default で marker 未観測でも Enter が出る historical mapping、success line 互換、`--record-format` / `--record-command` の伝搬、および `notify-claude-legacy-task` が primitive 経路に乗らず structured outcome を emit しないこと (retired-queue cleanup wrapper の境界)。Herdr queue-enter の release acceptance は #15140 の causal checksを使う。
 - `DeliveryRecordTest` + `HandoffRecordEmissionTest` — sent / pending_input / blocked / target_unavailable / target_not_agent / invalid_anchor / invalid_args の各 outcome に対する markdown record + JSON outcome の決定論的生成、`--record-format both|text|json` の組み合わせ、`--record-command` の inline 化。
 - `SharedSkillWorkflowTest::test_workflow_lifecycle_anchors_at_handoff_primitive` + `ScaffoldPresetHandoffPrimitiveDocsTest` — skill workflow.md と asana / redmine scaffold preset の `agent-workflow.md` / `CLAUDE.md` / `AGENTS.md` が primitive を standard path として記述し、`read` / `message` / `type` / `keys` を operator/debug primitive として明記し、`status` / `doctor` / pane scrollback からの推論を禁止する文言を保持していることを doc-regression として固定する。`Standard notification command: mozyo-bridge notify-* --issue --journal` 等の旧 standard wording が再導入されればここで落ちる。
 
@@ -57,9 +59,9 @@ Published-package 専用 smoke は追加しない。理由:
 
 - TestPyPI / PyPI fresh install acceptance (`Beta Tester Install` 節) が installed binary に対して `mozyo-bridge doctor` を実行する。primitive subcommand (`handoff send` / `handoff reply` / `reply` alias / `notify-*` standard variants) が installed binary に欠落していれば parser 構築段階で fail し、`scaffold apply` / `scaffold status` フローまで到達できない。
 - 同じ acceptance flow が installed binary に対して `scaffold apply <preset>` を実行するため、scaffold preset の中身 (上記 `ScaffoldPresetHandoffPrimitiveDocsTest` で固定された primitive guidance を含む) が installed package に乗っていることが確認される。
-- queue-enter rail の **末端 tmux 挙動** は real Claude / Codex TUI に依存し、`sh` receiver に対しては典型的な smoke にできない (上記 7 ケース手順を Asana task に残す運用で代替する)。`--mode standard` 鉄道は本 smoke で end-to-end 検証済み。
+- queue-enter rail の末端挙動はreal Claude / Codex TUIに依存し、`sh` receiverだけのpackage smokeでは代替できない。既定queue-enter／Herdr／remote actionを変更したreleaseは、上記Redmine #15140のexact-candidate 3-runtime smokeを別途完了させる。`--mode standard`のtmux互換だけは本scriptでend-to-end検証する。
 
-新規 smoke を増やす条件: real TUI receiver を伴う queue-enter 自動化が確立した時、または `notify-*` wrapper が primitive 経路を離れた時 (上記 doc-regression テストが落ちて初めて気づくのでは遅いケース)。両条件は現状 false であるため smoke の追加は deferred とする。
+real TUI receiverを伴うqueue-enterの自動化が確立した場合は、その自動smokeを#15140の手動実機項目へ追加する。自動化が無いことは実機gateをdeferする理由にならない。
 
 ## Release Flow
 
@@ -223,11 +225,17 @@ TestPyPI / PyPI の release acceptance では、local checkout / local wheel / e
 TestPyPI:
 
 ```bash
-pipx install --force --backend pip \
+# canonical path (backend flag は script が pipx の対応を検出して付与する):
+scripts/install_testpypi_dev.sh X.Y.Z
+
+# 手動で組む場合 (`--backend pip` は pipx が advertise するときだけ付ける):
+pipx install --force \
   --index-url https://test.pypi.org/simple/ \
   --pip-args "--extra-index-url https://pypi.org/simple/" \
   mozyo-bridge==X.Y.Z
 ```
+
+`--backend pip` は **flag を advertise する pipx にのみ**渡す (古い pipx では argparse error になり install が中断する。Redmine #15507 実測: pipx 1.8.0)。古い pipx は元から pip backend なので省略しても解決経路は変わらない。canonical path は条件判定済みの `scripts/install_testpypi_dev.sh <exact version>` を使うこと。
 
 PyPI:
 
@@ -338,7 +346,7 @@ entry は「何が変わったか」「adopter は何もしないとどうなる
 
 ### 未反映 entry
 
-- なし。
+(なし — 直近の転記: Redmine #15428「rc2→rc3 upgrade contract」と #15242「既定queue-enterのEnter吸収を安全に補完」を **1.0.0** の release notes へ転記済み。転記記録は #15507 の release journal。)
 
 ## Tag and Release
 
@@ -385,8 +393,8 @@ GA / patch 手順:
 - pre-release は production publish を起こしてはならないので、GitHub Release を作らない。
 - bump → push → `Publish to TestPyPI` workflow を `workflow_dispatch` で起動する流れだけで完了する。
   - Helper: `mozyo-bridge release publish --testpypi --source-sha <40-hex> --expected-version 0.1.0a1 --source-ref refs/heads/<branch>` は exact-candidate dispatch を行う (Redmine #13601)。`--source-ref` は **origin 上の ref literal** で綴る (`refs/heads/<branch>` が canonical、短縮 `<branch>` も可)。local remote-tracking 表記 (`origin/<branch>` / `refs/remotes/origin/<branch>`) は **曖昧なため** helper が dispatch 前に exact な訂正付きで reject する (remote が同名 branch を持ちうるので推測しない。「origin 上に存在しないから」ではない)。exactly-one は構造保証ではなく動的検査であり、`ls-remote` の tail 一致は full path にも作用する (Redmine #13883、policy 正本: `release-helper-contract.md` の `### source_ref Spelling Policy` / `### exactly-one は構造保証ではなく動的検査`)。dispatch 前 client preflight が origin 上で non-peel ちょうど 1 件 + tip == source_sha を確認し、zero / multi / mismatch では dispatch を 0 回にする。workflow の event ref は `main` 固定で、exact `source_sha` / `expected_version` / `source_ref` / `dispatch_nonce` を input として渡す。trusted な build job が HEAD == source_sha / source_ref lineage / version mirror == expected_version / 同 SHA の `Test` success / version 未使用を fail-closed 照合し、build job と OIDC publish job を分離する。helper は run-name 中の nonce で run を決定的に相関し (exact 1 件以外は fail-closed)、run-id を active release ticket に貼れる shape で stdout に出す。polling は `mozyo-bridge release workflow wait --run-id <id> --timeout <seconds>` に明示的に委ねる。
-- 検証は `pipx install --backend pip --index-url https://test.pypi.org/simple/ --pip-args "--extra-index-url https://pypi.org/simple/" mozyo-bridge==0.1.0a1` で行い、続けて `README.md` の `Beta Tester Install (GitHub main)` 節の acceptance smoke (rules install → skill install → `mozyo-bridge doctor` → isolated target に対する Asana / Redmine scaffold + doctor) を TestPyPI install に対して実行する。
-- `pipx` が default backend に `uv` を使う環境では、TestPyPI の `--index-url` と dependency 用 `--extra-index-url` の組み合わせが期待通り解決されないことがあるため、TestPyPI 検証では `--backend pip` を明示する。
+- 検証は `scripts/install_testpypi_dev.sh 0.1.0a1` (canonical) で行い、続けて `README.md` の `Beta Tester Install (GitHub main)` 節の acceptance smoke (rules install → skill install → `mozyo-bridge doctor` → isolated target に対する Asana / Redmine scaffold + doctor) を TestPyPI install に対して実行する。
+- `pipx` が default backend に `uv` を使う環境では、TestPyPI の `--index-url` と dependency 用 `--extra-index-url` の組み合わせが期待通り解決されないことがあるため、TestPyPI 検証では `--backend pip` を明示する。ただし `--backend pip` は **flag を advertise する pipx にのみ**渡す (古い pipx では argparse error になり install が中断する。Redmine #15507 実測: pipx 1.8.0)。古い pipx は元から pip backend なので省略しても解決経路は変わらない。canonical path は条件判定済みの `scripts/install_testpypi_dev.sh <exact version>` を使うこと。
 - 必要なら `git tag -a v0.1.0a1 -m "Pre-release v0.1.0a1"` で tag を打って push する。GitHub Release は作らない。
 
 `mozyo-bridge release publish --plan` は現在の git ref / pyproject version / 最新 `Test` workflow conclusion / TestPyPI 既存 version の有無を at-a-glance で集約する。release を進めるか / pre-release に留めるかの判定は引き続き operator が行う (helper は GA / beta / patch を判定しない)。
@@ -400,7 +408,7 @@ GA / patch 手順:
 - workflow 定義 / event ref は `main` 固定。exact `source_sha` を artifact authority、`expected_version` を照合対象、`source_ref` を origin lineage evidence として渡す。任意 staging ref を workflow authority にしない。
 - trusted build job が fail-closed 照合 (HEAD == source_sha / source_ref が origin 上 exact 1 件の named ref でその tip == source_sha / 2-file version mirror == expected_version / candidate test.yml が trusted origin/main の test.yml と byte 一致 (#13601 j#76006 F1) / 同 SHA の `Test` (`test.yml`) success / expected_version が TestPyPI 未使用、`releases` schema 不成立や lookup 不能は fail-closed) を実行し、build job と OIDC publish job を分離する (`id-token: write` + `environment: testpypi` は publish job のみ)。
 - 順序: #13528「TestPyPI publish」→ #13527「exact install QA」。install QA は publish 済み exact version に対して `scripts/install_testpypi_dev.sh <exact version>` で行い、`origin/main` promotion や Version close を前提条件にしない。これにより upstream blocker を全解消しても internal beta 直前で停止する循環がなくなる。
-- automatic main-CI dev publish path は後方互換に維持する。owner 承認済みの `testpypi` required reviewer 導入後は automatic path も deployment approval 待ちになる (意図的な OIDC protection 優先)。
+- automatic main-CI dev publish path (`workflow_run` on `Test`) は owner 決定 (Redmine #15487、2026-08-15) で廃止済み。`testpypi.yml` は `workflow_dispatch` exact-candidate 単一 trigger であり、不在は `tests/regressions/test_issue_13601_testpypi_exact_sha.py` が固定する。required reviewer も撤廃済み (Redmine #15255 j#105330) のため deployment approval 待ちは発生せず、approval authority は Redmine gate と trusted build job の fail-closed 照合、environment 側は main-only deployment branch policy が残る。
 - 外部 environment 変更 (required reviewer / main-only deployment branch policy) と実際の dispatch は implementation review green 後の owner action として分離する。この doc / helper 変更自体は environment を変更せず、publish もしない。
 
 ### Patch Release

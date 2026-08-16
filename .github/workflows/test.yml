@@ -61,8 +61,8 @@ on:
 # so stale commits stop consuming runners. Integration pushes (main / int_* /
 # integration_*), the nightly schedule, and manual dispatch NEVER cancel: each
 # integration SHA, scheduled sweep, and on-demand run keeps its own
-# authoritative verdict (the TestPyPI auto dev path keys on the head_sha of a
-# COMPLETED main `Test` run, so cancelling a main run would drop that gate).
+# authoritative verdict (the TestPyPI exact-candidate gate requires a COMPLETED
+# `Test` success at the candidate SHA, so cancelling a main run would drop it).
 # The `refs/heads/` guard keeps a non-branch ref (e.g. a tag, already excluded by
 # the trigger filter) out of the cancelling class rather than defaulting it in.
 concurrency:
@@ -222,8 +222,8 @@ jobs:
     # integration SHA when an issue branch is integrated to `main` or an
     # `int_*` / `integration_*` branch. Clean Linux single-Python FULL suite +
     # health/docs + wheel/sdist build + fresh-install smoke. This is the
-    # `Test` success the automatic TestPyPI dev path (testpypi.yml) keys on for
-    # `main`.
+    # `Test` success the TestPyPI exact-candidate publish gate (testpypi.yml)
+    # requires for a `main`-integrated candidate SHA.
     name: Integration batch (single-Python full + smoke)
     if: >-
       github.event_name == 'push'

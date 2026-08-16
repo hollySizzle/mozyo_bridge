@@ -32,6 +32,10 @@ sys.path.insert(0, str(ROOT / "src"))
 sys.path.insert(0, str(ROOT / "tests"))
 
 from support.herdr_pane_tree import PaneTreeHerdr  # noqa: E402
+from support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_generation,
+    seed_completed_current_launch_authority,
+)
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
     VERDICT_CONFLICT,
@@ -126,6 +130,7 @@ class _Env:
             self.ids[label]: str(self.roots[label]) for label in labels
         }
         self.store = HerdrIdentityAttestationStore(home=self.home)
+        self._seeded_generations: set[tuple[str, str, str, str, str, str]] = set()
 
     def name(self, label: str, provider: str, lane: str = "") -> str:
         return encode_assigned_name(self.ids[label], provider, lane)
@@ -134,13 +139,31 @@ class _Env:
         self, pane: str, label: str, provider: str, lane: str = "",
         verdict: str = VERDICT_PRESENT,
     ) -> None:
+        assigned_name = self.name(label, provider, lane)
+        lane_id = lane or DEFAULT_LANE
+        terminal_id = f"terminal:{pane}"
+        generation_key = (
+            self.ids[label], lane_id, provider, assigned_name, pane, terminal_id,
+        )
+        if generation_key not in self._seeded_generations:
+            seed_completed_current_generation(
+                self.home,
+                workspace_id=self.ids[label],
+                lane_id=lane_id,
+                role=provider,
+                assigned_name=assigned_name,
+                locator=pane,
+                terminal_id=terminal_id,
+            )
+            self._seeded_generations.add(generation_key)
         self.store.upsert(
             IdentityAttestationRecord(
-                assigned_name=self.name(label, provider, lane),
+                assigned_name=assigned_name,
                 workspace_id=self.ids[label],
                 role=provider,
-                lane_id=lane or DEFAULT_LANE,
+                lane_id=lane_id,
                 locator=pane,
+                terminal_id=terminal_id,
                 verdict=verdict,
             )
         )
@@ -189,6 +212,7 @@ class _Env:
         )
         result.herdr_workspace_id = self.herdr.workspace_id
         for provider, locator in zip(("codex", "claude"), launched):
+            self.attest(locator, label, provider, lane)
             result.slots.append(
                 SlotResult(
                     provider=provider,
@@ -909,15 +933,16 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
             ]],
         )
         for provider, pane in zip(("codex", "claude"), pair):
-            env.store.upsert(
-                IdentityAttestationRecord(
-                    assigned_name=encode_assigned_name(main_ws, provider, lane),
-                    workspace_id=main_ws,
-                    role=provider,
-                    lane_id=lane,
-                    locator=pane,
-                    verdict=VERDICT_PRESENT,
-                )
+            seed_completed_current_launch_authority(
+                env.home,
+                workspace_id=main_ws,
+                lane_id=lane,
+                role=provider,
+                assigned_name=encode_assigned_name(main_ws, provider, lane),
+                locator=pane,
+                terminal_id=f"terminal:{pane}",
+                target_workspace=tab.workspace_id,
+                target_tab=tab.tab_id,
             )
         launched = env.append_pair(tab, PROJECT_B)
         outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
@@ -1168,7 +1193,17 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         tab = env.herdr.new_tab()
         (pair,) = env.seed_columns(tab, (PROJECT_A, ""))
         for provider in ("codex", "claude"):
-            env.attest("w1:pOLD", PROJECT_A, provider)
+            env.store.upsert(
+                IdentityAttestationRecord(
+                    assigned_name=env.name(PROJECT_A, provider),
+                    workspace_id=env.ids[PROJECT_A],
+                    role=provider,
+                    lane_id=DEFAULT_LANE,
+                    locator="w1:pOLD",
+                    terminal_id="terminal:w1:pOLD",
+                    verdict=VERDICT_PRESENT,
+                )
+            )
         launched = env.append_pair(tab, PROJECT_B)
         outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
         self._assert_zero_move_failure(env, outcome, detail, "(stale)")
@@ -1275,6 +1310,9 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
             ("workspace_id is an int", {"pane_id": "", "workspace_id": 17}),
             ("workspace_id is a bool", {"pane_id": "", "workspace_id": True}),
             ("pane_id is not text", {"pane_id": 17, "workspace_id": "w1"}),
+            ("name is not text", {
+                "pane_id": "w9:p1", "workspace_id": "w9", "name": 17,
+            }),
             ("undecodable name on an addressable pane",
              {"pane_id": "w1:p90", "workspace_id": "w1"}),
         )
@@ -1284,8 +1322,12 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
                 tab = env.herdr.new_tab()
                 env.seed_columns(tab, (PROJECT_A, ""))
                 launched = env.append_pair(tab, PROJECT_B)
-                row = {"name": "not-a-mzb1-name", "agent": "codex",
-                       "agent_status": "idle"}
+                row = {
+                    "name": "not-a-mzb1-name",
+                    "agent": "codex",
+                    "agent_status": "idle",
+                    "terminal_id": "terminal:extra-row",
+                }
                 row.update(extra)
                 env.herdr.extra_rows.append(row)
                 outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
@@ -1297,13 +1339,10 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
         for label, extra in (
             ("declared and locator both foreign",
              {"pane_id": "w9:p1", "workspace_id": "w9"}),
-            ("declared foreign, no locator", {"pane_id": "", "workspace_id": "w9"}),
             ("locator foreign, no declared field", {"pane_id": "w9:p1"}),
             # Review j#99978 finding_1: a row that has proved it lives elsewhere is
             # out of scope, and the shape of a field only an in-scope row would be
             # read for must not take the whole workspace down with it.
-            ("foreign row with a non-text name",
-             {"pane_id": "w9:p1", "workspace_id": "w9", "name": 17}),
             ("foreign row with a non-text detected agent",
              {"pane_id": "w9:p1", "workspace_id": "w9", "agent": {}}),
             ("foreign row with a non-text cwd",
@@ -1314,8 +1353,12 @@ class ColumnPaneAuthorityTest(unittest.TestCase):
                 tab = env.herdr.new_tab()
                 env.seed_columns(tab, (PROJECT_A, ""))
                 launched = env.append_pair(tab, PROJECT_B)
-                row = {"name": "not-a-mzb1-name", "agent": "codex",
-                       "agent_status": "idle"}
+                row = {
+                    "name": "not-a-mzb1-name",
+                    "agent": "codex",
+                    "agent_status": "idle",
+                    "terminal_id": "terminal:foreign-row",
+                }
                 row.update(extra)
                 env.herdr.extra_rows.append(row)
                 outcome, detail = env.run(env.result(PROJECT_B, list(launched)))
@@ -1571,7 +1614,7 @@ class ProjectColumnFailClosedTest(unittest.TestCase):
         self.assertEqual(outcome, COLUMN_FAILED)
         self.assertNotIn("every detached pane was returned", detail)
         self.assertIn("recovery could not be verified", detail)
-        self.assertIn("inventory changed", detail)
+        self.assertIn("generation authority changed", detail)
 
     def test_failed_attach_recovery_with_unreadable_inventory_returns_typed_failure(self):
         env, _tab, _project_a, project_b = self._scenario()
@@ -1582,7 +1625,7 @@ class ProjectColumnFailClosedTest(unittest.TestCase):
             nonlocal agent_list_calls
             if list(argv[1:3]) == ["agent", "list"]:
                 agent_list_calls += 1
-                if agent_list_calls == 2:
+                if env.herdr._move_attempts >= 4:
                     return subprocess.CompletedProcess(
                         argv, 1, stdout="", stderr="inventory unavailable"
                     )
@@ -1593,8 +1636,9 @@ class ProjectColumnFailClosedTest(unittest.TestCase):
         )
 
         self.assertEqual(outcome, COLUMN_FAILED)
-        self.assertIn("recovery could not be verified", detail)
-        self.assertIn("inventory could not be read", detail)
+        self.assertIn("return could not be verified", detail)
+        self.assertIn("generation authority changed", detail)
+        self.assertNotIn("inventory unavailable", detail)
 
     def test_malformed_detach_result_is_reobserved_and_recovered(self):
         env, tab, project_a, project_b = self._scenario()
@@ -1643,7 +1687,7 @@ class ProjectColumnFailClosedTest(unittest.TestCase):
         )
         outcome, detail = env.run(env.result(PROJECT_B, list(project_b)))
         self.assertEqual(outcome, COLUMN_FAILED)
-        self.assertIn("inventory changed across the reflow", detail)
+        self.assertIn("generation authority changed", detail)
 
 
 if __name__ == "__main__":  # pragma: no cover

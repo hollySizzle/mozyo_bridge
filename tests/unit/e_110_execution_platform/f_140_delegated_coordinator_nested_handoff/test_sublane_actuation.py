@@ -16,6 +16,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTUATE_BLOCKED,
     ACTUATE_EXECUTED,
     ACTUATE_READY,
+    DISPATCH_DELIVERY_UNCERTAIN,
     DISPATCH_GATEWAY_NOTIFIED,
     DISPATCH_SKIPPED,
     DISPATCH_WORKER_DISPATCHED,
@@ -23,6 +24,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ActuationStep,
     SublaneActuationOutcome,
     render_actuation_journal,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (  # noqa: E501
+    STAGE_UNCERTAIN_PARTIAL,
 )
 
 
@@ -61,6 +65,27 @@ class OutcomePayloadTests(unittest.TestCase):
         self.assertFalse(payload["worker_dispatch_confirmed"])
         self.assertEqual(payload["steps"][0]["status"], "executed")
         self.assertEqual(payload["blocked_reasons"], [])
+        self.assertNotIn("dispatch_injection_stage", payload)
+
+    def test_uncertain_dispatch_is_machine_readable_and_non_retryable(self):
+        outcome = _outcome(
+            status=ACTUATE_BLOCKED,
+            dispatch_result=DISPATCH_DELIVERY_UNCERTAIN,
+            dispatch_injection_stage=STAGE_UNCERTAIN_PARTIAL,
+            dispatch_blind_retry_prohibited=True,
+            blocked_reasons=(REASON_HANDOFF_FAILED,),
+        )
+
+        payload = outcome.as_payload()
+        journal = render_actuation_journal(outcome)
+
+        self.assertEqual(payload["dispatch_result"], "delivery_uncertain")
+        self.assertEqual(
+            payload["dispatch_injection_stage"], STAGE_UNCERTAIN_PARTIAL
+        )
+        self.assertTrue(payload["dispatch_blind_retry_prohibited"])
+        self.assertIn("- dispatch_injection_stage: uncertain_partial", journal)
+        self.assertIn("- dispatch_blind_retry_prohibited: true", journal)
 
     def test_executed_property_flags(self):
         self.assertTrue(_outcome().executed)

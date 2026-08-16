@@ -333,9 +333,9 @@ class ObserveQueueEnterTurnStartTest(unittest.TestCase):
         self.assertEqual(obs.runtime_state, RUNTIME_BUSY)
         self.assertEqual(obs.poll_attempts, 3)
 
-    def test_read_failure_folds_to_unknown_telemetry(self) -> None:
-        # A mechanical read failure never blocks: it degrades to an unknown-state
-        # telemetry record carrying the transport failure reason.
+    def test_read_failure_folds_to_unknown_snapshot(self) -> None:
+        # The snapshot reader represents a mechanical failure as unknown and keeps
+        # the transport reason; the separate causal queue rail owns the outcome.
         reader = _RecordingReader(
             [AgentStateResult.failure(REASON_TRANSPORT_ERROR, "herdr command timed out")]
         )
@@ -406,19 +406,23 @@ class QueueEnterTelemetryDictTest(unittest.TestCase):
 
 
 class QueueEnterRecordLinesTest(unittest.TestCase):
-    def test_line_labels_telemetry_only_and_avoids_event_rail_wording(self) -> None:
+    def test_line_labels_snapshot_only_and_defers_to_causal_envelope(self) -> None:
         obs = QueueEnterTurnStartObservation(
             runtime_state=RUNTIME_BUSY, read_ok=True, read_reason=None, poll_attempts=1
         )
         (line,) = queue_enter_turn_start_record_lines(obs)
         self.assertIn("Queue-enter turn-start observation (herdr agent get)", line)
         self.assertIn("runtime_state busy", line)
-        self.assertIn("Telemetry-only", line)
-        # Must NOT reuse the event rail's wording, and must state it never blocks.
+        self.assertIn("Snapshot-only", line)
+        self.assertIn("does not by itself confirm submission", line)
+        self.assertIn("causal envelope", line)
+        self.assertIn("coherent launch generation", line)
+        # The post-hoc snapshot must not claim event authority or guaranteed success.
         self.assertNotIn("Turn start (herdr rail)", line)
-        self.assertIn("never blocks", line)
+        self.assertNotIn("never blocks", line)
+        self.assertNotIn("Telemetry-only", line)
 
-    def test_awaiting_input_line_says_delivered_not_started(self) -> None:
+    def test_awaiting_input_line_does_not_claim_delivery(self) -> None:
         obs = QueueEnterTurnStartObservation(
             runtime_state=RUNTIME_AWAITING_INPUT,
             read_ok=True,
@@ -427,7 +431,8 @@ class QueueEnterRecordLinesTest(unittest.TestCase):
         )
         (line,) = queue_enter_turn_start_record_lines(obs)
         self.assertIn("runtime_state awaiting_input", line)
-        self.assertIn("delivered", line)
+        self.assertIn("cannot establish submission", line)
+        self.assertNotIn("delivered, but", line)
 
     def test_failed_read_line_reports_reason(self) -> None:
         obs = QueueEnterTurnStartObservation(

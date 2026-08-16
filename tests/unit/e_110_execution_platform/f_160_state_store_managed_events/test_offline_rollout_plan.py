@@ -68,6 +68,7 @@ def _capture() -> OfflineRolloutCapture:
             ),
             StoreSnapshot("attestation", "recognized", 1, content_digest="3" * 64),
             StoreSnapshot("lane_lifecycle", "recognized", 9, content_digest="4" * 64),
+            StoreSnapshot("launch_generation", "recognized", 1, content_digest="5" * 64),
         ),
         supervisors=(
             SupervisorAgentSnapshot(
@@ -78,15 +79,8 @@ def _capture() -> OfflineRolloutCapture:
                 "ok",
                 True,
                 "ready",
-            ),
-            SupervisorAgentSnapshot(
-                "org.mozyo-bridge.callback-supervisor.drain",
-                True,
-                True,
-                124,
-                "ok",
-                True,
-                "ready",
+                "systemd_user",
+                "not_applicable",
             ),
         ),
     )
@@ -115,9 +109,10 @@ class OfflineRolloutPlanTests(unittest.TestCase):
             first.plan["restore_order"],
             ["mzb1_ws_a__codex__default", "mzb1_ws_b__claude__lane_1"],
         )
-        self.assertEqual(first.plan["stores"]["attestation"]["target_version"], 3)
-        self.assertEqual(first.plan["stores"]["lane_lifecycle"]["target_version"], 10)
+        self.assertEqual(first.plan["stores"]["attestation"]["target_version"], 4)
+        self.assertEqual(first.plan["stores"]["lane_lifecycle"]["target_version"], 11)
         self.assertEqual(first.plan["stores"]["startup_transaction"]["target_version"], 2)
+        self.assertEqual(first.plan["stores"]["launch_generation"]["target_version"], 2)
         self.assertEqual(
             first.plan["stores"]["startup_transaction"]["migration_plan_digest"],
             "2" * 64,
@@ -134,6 +129,7 @@ class OfflineRolloutPlanTests(unittest.TestCase):
                 "migrate_attestation",
                 "migrate_lane_lifecycle",
                 "migrate_startup_transaction",
+                "rebuild_launch_generation",
                 "exact_runtime_install",
                 "legacy_lane_epoch_adoption",
                 "top_restore_action_bootstrap",
@@ -224,8 +220,7 @@ class OfflineRolloutPlanTests(unittest.TestCase):
         source = _capture()
         stores = (
             replace(source.stores[0], state="unsupported"),
-            source.stores[1],
-            source.stores[2],
+            *source.stores[1:],
         )
         result = build_offline_rollout_plan(replace(source, stores=stores))
         self.assertFalse(result.ok)
@@ -235,8 +230,7 @@ class OfflineRolloutPlanTests(unittest.TestCase):
         source = _capture()
         stores = (
             replace(source.stores[0], content_digest=""),
-            source.stores[1],
-            source.stores[2],
+            *source.stores[1:],
         )
         result = build_offline_rollout_plan(replace(source, stores=stores))
         self.assertFalse(result.ok)
@@ -326,22 +320,99 @@ class OfflineRolloutPlanTests(unittest.TestCase):
         )
         self.assertNotEqual(first.plan_digest, changed.plan_digest)
 
-    def test_owned_supervisor_pair_is_exactly_required(self) -> None:
+    def test_the_owned_supervisor_set_is_exactly_required(self) -> None:
+        # #15192: the owned roster is ONE registration per host. An empty set, a foreign label, and
+        # a capture still carrying the RETIRED drain agent are all invalid — the last one because it
+        # comes from an un-migrated host, and a rollout must not plan against a host still running
+        # two registrations (review j#102151 Finding 2).
         source = _capture()
-        missing = build_offline_rollout_plan(
-            replace(source, supervisors=source.supervisors[:1])
-        )
+        empty = build_offline_rollout_plan(replace(source, supervisors=()))
         foreign = build_offline_rollout_plan(
+            replace(source, supervisors=(replace(source.supervisors[0], label="foreign"),))
+        )
+        un_migrated = build_offline_rollout_plan(
             replace(
                 source,
                 supervisors=(
                     source.supervisors[0],
-                    replace(source.supervisors[1], label="foreign"),
+                    replace(
+                        source.supervisors[0],
+                        label="org.mozyo-bridge.callback-supervisor.drain",
+                    ),
                 ),
             )
         )
-        self.assertEqual(missing.reason, "supervisor_set_invalid")
+        self.assertEqual(empty.reason, "supervisor_set_invalid")
         self.assertEqual(foreign.reason, "supervisor_set_invalid")
+        self.assertEqual(un_migrated.reason, "supervisor_set_invalid")
+        self.assertEqual(un_migrated.detail, "owned_supervisor_set_required")
+
+    def test_a_single_owned_supervisor_capture_plans_successfully(self) -> None:
+        # The positive half: the post-migration one-row roster the backend actually produces must
+        # PLAN, not merely fail differently. This is the seam that #15192 broke.
+        result = build_offline_rollout_plan(_capture())
+        self.assertTrue(result.ok, getattr(result, "detail", result))
+        by_phase = {row["phase"]: row for row in result.plan["phase_order"]}
+        for phase in ("supervisor_stop", "supervisor_pair_install", "supervisor_pair_readback"):
+            self.assertEqual(
+                by_phase[phase]["supervisor_labels"],
+                ["org.mozyo-bridge.callback-supervisor"],
+                phase,
+            )
+        self.assertEqual(
+            by_phase["supervisor_stop"]["required_readback"],
+            "current_stopped_and_legacy_absent",
+        )
+        self.assertEqual(result.plan["supervisors"][0]["backend"], "systemd_user")
+        self.assertEqual(result.plan["supervisors"][0]["legacy_drain"], "not_applicable")
+
+    def test_launchd_legacy_drain_state_is_bound_into_the_plan(self) -> None:
+        source = _capture()
+        result = build_offline_rollout_plan(
+            replace(
+                source,
+                supervisors=(
+                    replace(
+                        source.supervisors[0], backend="launchd", legacy_drain="owned"
+                    ),
+                ),
+            )
+        )
+        self.assertTrue(result.ok, result)
+        self.assertEqual(result.plan["supervisors"][0]["legacy_drain"], "owned")
+
+    def test_supervisor_backend_and_legacy_state_are_closed(self) -> None:
+        source = _capture()
+        invalid = (
+            replace(source.supervisors[0], backend="", legacy_drain="not_applicable"),
+            replace(source.supervisors[0], backend="systemd_user", legacy_drain="absent"),
+            replace(source.supervisors[0], backend="launchd", legacy_drain="mystery"),
+        )
+        for supervisor in invalid:
+            with self.subTest(supervisor=supervisor):
+                result = build_offline_rollout_plan(
+                    replace(source, supervisors=(supervisor,))
+                )
+                self.assertEqual(result.reason, "supervisor_set_invalid")
+
+    def test_launchd_unverified_legacy_drain_cannot_mint_a_plan(self) -> None:
+        source = _capture()
+        for state in ("absent", "foreign", "unreadable"):
+            with self.subTest(state=state):
+                result = build_offline_rollout_plan(
+                    replace(
+                        source,
+                        supervisors=(
+                            replace(
+                                source.supervisors[0],
+                                backend="launchd",
+                                legacy_drain=state,
+                            ),
+                        ),
+                    )
+                )
+                self.assertEqual(result.reason, "supervisor_set_invalid")
+                self.assertEqual(result.detail, "legacy_drain_not_plannable")
 
     def test_public_plan_copy_cannot_mutate_digest_authority(self) -> None:
         result = build_offline_rollout_plan(_capture())

@@ -1,11 +1,10 @@
 """Canonical release-version mirror primitives (standard-library only).
 
 Single source of truth for *which* files carry the release version and *how*
-each file's version literal is shaped. Both the installed release helper
+each file's version literal is shaped. The installed release helper
 (``mozyo-bridge release bump`` in
 ``e_130_governance_distribution/f_160_release_version_governance/application/release.py``)
-and the dependency-free TestPyPI dev-version script
-(``scripts/compute_testpypi_dev_version.py``) build on these primitives so the
+builds on these primitives so the
 mirror set is defined in exactly one place and read from the contract doc at
 runtime — never hardcoded as two divergent shapes.
 

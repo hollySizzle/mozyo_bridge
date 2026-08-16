@@ -491,47 +491,434 @@ fallback `--run-once` を TTL まで starve させない。token-conditional な
 ### OS scheduler adapter
 
 LaunchAgent / systemd timer / cron は同じ bounded one-shot command を起動する adapter であり、LLM turn 内の
-sleep/poll を要求しない。reconciliation 経路（`--run-once`）と drain 経路（`--drain-only`）は別 cadence の
-別 service definition（`build_service_definition(local_drain=...)`）として表現し、portable default は
+sleep/poll を要求しない。OS scheduler が登録するのは **`--run-once` のみ** であり、`--drain-only` /
+`--watch` は手動・event-driven 入口として残るが OS timer へ登録しない（#15192）。portable default は
 測定に基づく neutral 値（固定の私的運用値を OSS 既定へ焼かない）を持つ。
 
-host realization は operator 契約（`status` / `install` / `restart` / `uninstall`）を共有するが、**内部形状ま
-で同一にはしない**（#15183）。どちらを使うかは `supervisor_service_backend` が platform で解決し（darwin ->
-LaunchAgent、Linux -> systemd user、それ以外 -> typed zero-mutation refusal）、結果 envelope だけを
-`{action, performed, reason, backend, agents: [...]}` に正規化する。`agents` は host adapter が返す owned
-service 行（macOS は 2 行、Linux は 1 行）であり、CLI は platform 分岐なしに両方を描画する。
+host realization は operator 契約（`status` / `install` / `restart` / `uninstall`）を共有する。#15192 以降は
+**operator から見える形**——登録数（各 host 1 個）、実行 command（`workflow supervisor --run-once`）、cadence
+（共通 portable default）、verb の意味、status が答える観測値——も共通である。共通化しないのは **内部実装**で
+あり、launchd と systemd を互いの模倣にせず、cron 等へ無理に統一しない。どちらを使うかは
+`supervisor_service_backend` が platform で解決し（darwin -> LaunchAgent、Linux -> systemd user、それ以外 ->
+typed zero-mutation refusal）、結果 envelope を
+`{action, performed, reason, backend, effect_state, agents: [...]}` に正規化する。`effect_state` は後述の共通
+4 値であり、`performed=false` だけでは区別できない「manager effect 前の拒否」と「作用途中の失敗」を区別する。
+両 adapter が同名・同 signature の 4 verb を公開するため、backend に platform 別の呼び分けは残らない。
 
-**macOS LaunchAgent** の realization は **owned dual-agent lifecycle**（`supervisor_launchd` の `install_pair` /
-`uninstall_pair` / `restart_pair` / `service_status_pair`）: 二つの独立した owned label / plist / log
-（`callback-supervisor` と `callback-supervisor.drain`）を管理する。install は **atomic-or-nothing** で、
-reconcile agent が失敗すれば何もせず、reconcile 成功後に drain agent が失敗すれば両 agent を rollback
-（partial failure で half-installed pair を残さない fail-closed）。各 verb は非 darwin / 実行ファイル欠落 /
-credential 未整備 / not-loaded で zero-mutation 拒否し、既存の RunAtLoad + StartInterval（KeepAlive なし、
-EnvironmentVariables なし）契約を両 agent で維持する。この構成は #15183 で変更しない。
+**macOS LaunchAgent** の realization（`supervisor_launchd`）は **owned agent 1 個**である。#14150 で導入した
+`--drain-only` の第二 agent（`callback-supervisor.drain`）は #15192 で退役した: `--run-once` tick は drain leg
+を含む **superset**（local drain を実行し、watermark が due なら provider leg も実行する）であるため、第二
+agent が買っていたのは capability ではなく latency であり、その対価は Login Items に見える登録がもう 1 つ増え
+ることと、整合を保つべき lifecycle がもう 1 つ増えることだった。各 verb は非 darwin / 実行ファイル欠落 /
+**退役 plist または現行 plist の identity 不明** / not-loaded で zero-mutation 拒否し、RunAtLoad +
+StartInterval（KeepAlive なし、EnvironmentVariables なし）契約を維持する。**credential 未整備は拒否理由ではない**（両 OS 共通、後述の
+「Redmine 未設定は導入の拒否理由にしない」を正本とする）。
+
+責務境界は module 名と一致させる（review j#102843 r15f4）。`supervisor_launchd_agent` は identity・path 名・
+plist text の組立と parse だけを持ち、owned path の read/write は `supervisor_launchd_fs`、process 実行は
+`supervisor_launchd_process` だけが持つ。`supervisor_launchd_probe` は process seam を使って非破壊な
+`launchctl print` を読むが、その分類は mutation authority にならない。lifecycle の許可判断は
+`supervisor_launchd`、退役 agent の移行判断は `supervisor_launchd_migration` に残す。
+
+**mutating lifecycle は cooperating bridge writer 間で 1 本に直列化する**（#15192 j#103093）。launchd は pinned
+`LaunchAgents` directory、systemd は pinned user-unit directory に、current uid 所有・mode `0600`・regular・
+single-link の lifecycle lock file を置き、`install` / `restart` / `uninstall` の filesystem 変更から manager
+unload/reload/attestation/start までを同じ nonblocking exclusive `flock` の内側で行う。既存 entry が symlink / hard
+link / 異なる owner / 異なる mode、または別の cooperating writer が保持中なら、それぞれ typed zero-effect refusal
+（`scheduler_lifecycle_lock_unreadable` / `scheduler_lifecycle_busy`）とする。lock file は通常 artifact として残し、
+unlink / replace しない。
+
+これは **security boundary ではなく cooperative protocol** である。同一 uid の別 process は lock を無視して plist /
+unit を直接変更し、lock 名を unlink し、manager を直接操作できる。そのような **noncooperative same-user writer は保証
+外**であり、stable な drift は fresh read / manager attestation で検出できても、swap-consume-restore を完全には防げ
+ない。これを防ぐには privilege または uid の分離が必要であり、本 user-owned adapter の契約には含めない。
+
+**mutating result は作用段階を closed 4 値で返す。** `none` は scheduler artifact / manager への既知の作用前の
+拒否（private lock metadata の作成は数えない）、`partial` は definition write / enable / reload / unlink 等の先行
+作用はあるが要求した最終作用まで完了していない状態、`uncertain` は bootout / start / restart 等を試みたため実 host
+への最終作用有無を安全に断定できない状態、`complete` は adapter が要求 sequence を最後まで完了した状態である。
+CLI は JSON の field を保つだけでなく text にも `effect_state:` を必ず表示する。`performed=false` と
+`effect_state=none` を同義にせず、再試行・operator 調査の判断から途中作用を隠さない。
+
+**退役 agent の migration**（#15192）。#15192 以前に install した host には第二 LaunchAgent が残る。これを放置
+すると受入条件（macOS は LaunchAgent 1 個）が破れ、既に包含済みの `--drain-only` tick が走り続けるため、
+`install` / `uninstall` が**取り外す**。ただし取り外すのは **自分のもの** と証明できる場合だけである: plist は
+自身の `Label` を持ち launchd はその Label で service を識別するので、退役 path に置かれた別 Label の file は
+他人の agent であり、unlink は他人の service の削除になる。分類は `absent` / `owned` / `foreign` /
+`unreadable` の 4 値で、`owned` だけが削除可能、`foreign` / `unreadable` は typed zero-mutation 拒否とする
+（identity は推測しない）。
+
+**退役 plist を削除できる唯一の authority は `bootout` の成功である**（owner delegation j#102452 /
+gateway disposition j#102458）。`bootout` が **非 0 を返した時点で判定は終了**し、stdout / stderr / exit の
+**文面は一切解釈しない**。plist を保持し `legacy_drain_state_unreadable` を返す。追加の unlink mutation は行わない。
+
+これは文字列規則の追加ではなく **依存関係の除去**である。R3〜R11 の 6 round は launchctl の error 文面を安全に
+解釈しようと試み続けた —— exit code を契約と見なす / substring / 独自の文字集合 / open negation /
+phrase と operand の未結合 / 2 stream を跨いだ位置の捏造 / 解釈不能 stream を沈黙と同一視 / 改行を語間空白と
+同一視。**個々の修正はいずれも局所的には正しく、いずれも「誰も観測していない出力」についての未検証前提に
+依拠していた**。欠陥は特定の前提ではなく、**破壊的操作が文書化されていない grammar の parse に依存していたこと**
+そのものである。依存を外せば class ごと消える。
+
+`launchctl bootout` の rc 0 は「**このプロセスが今その job を unload した**」という、自分が行った action に
+ついての事実であり、散文からの推論ではない。現在の authority はこれだけである。
+
+失敗方向は over-refusal に限定される: 退役 drain が残っても `--run-once` が drain leg を包含するため
+capability の損失はなく、status の `legacy_drain` で operator に可視である。実 macOS の文面・stream・行構造の
+採取（#15194）後に、観測した完全な出力単位に基づいて判定規則を再設計できる。
+
+なお「still loaded」という個別 refusal token は廃止した。稼働中と読取不能の区別は **文面の解釈によってのみ**
+導出可能であり、その解釈を破壊的判断から外した以上、その区別を主張する token は **code が確立できる以上のことを
+述べる**ことになるためである（status の 3 値 `probe_state` は非破壊 projection として維持する）。
+
+**停止は「試みた」ではなく「確認した」でなければならない**（review j#102151 Finding 1）。plist の unlink は
+registration の削除ではない: launchd は bootstrap 済み job を **label** で保持するため、file を消しても job は
+logout まで走り続ける。したがって plist の削除は **「job が消えている」という positive な証拠**が得られた
+場合に限る。その証拠は **`bootout` の rc 0 ただ 1 つ**であり、上記の唯一 authority と同一である。
+
+**identity は mutation の瞬間に再確立する**（review j#102496 r12f1）。分類と unlink / write の間には
+subprocess 呼び出しが挟まるため、両者は**別の時点についての別の事実**である。分類済みの file と実際に
+削除される file が同一である保証はなく、この窓で差し替えられた plist は `state: owned` / `removed: true` を
+返しながら削除された。この段階の再確認だけでは窓を狭めるに留まったが、後述の pinned directory-fd seam では
+分類・read・write・unlink を同じ directory fd 相対に行う。現在の主張は「path を再度信用した」ではなく、
+「**action time で再検証し、その action は pin 済み directory から外へ向きを変えない**」である。
+
+**この identity fence は現行 agent の plist にも等しく適用する**（review j#102496 r12f2）。以前は退役 drain
+path にしか identity 検査がなく、`install` は自 path 上の **他人の Label を持つ plist を上書き**し、
+`uninstall` は **path に居る file を Label 無検査で削除**していた。path は所在であって所有の証明ではない。
+分類は両 agent で **同一関数**を用い、`absent` / `owned` のみ mutation 可能、`foreign` / `unreadable` は
+**launchctl 呼出すら行わない** typed zero-mutation 拒否とする（`plist_foreign_label` / `plist_unreadable`）。
+
+**`uninstall` も bootout 成功なしに成功しない**（review j#102496 r12f3 / j#102550 r13f3）。従来は bootout の
+結果を破棄して削除し、`performed: true` / `removed: true` / reason 空という **成功と区別できない envelope** で
+報告していた。この規則は **plist 不在の branch にも適用する**。当初 absent 分岐だけは「その状態を clear する
+ために bootout を撃つのだから exit code は判定に使わない」としていたが、**前段と後段が矛盾していた**: clear
+するために撃つのなら、成功したかどうかこそが決定的である。失敗時は停止できていないのに CLI が exit 0 を返す。
+
+**過剰拒否は承知の上での選択**であり、範囲は r12f3 より広い: 未 load の label にも bootout は非 0 を返しうる
+ため、**何も入っていない正常 host の uninstall も拒否されうる**。それでも採るのは損害が非対称だからである。
+拒否は可視で再試行可能、誤った成功報告は **operator が「消えた」と信じたまま logout まで走る job** を残す。
+
+**mutation する verb は `restart` も含めて identity を検査する**（review j#102550 r13f1）。旧 `restart` だけは
+plist の**内容**（argv / home pin）のみを読み、`Label` を見ていなかったため、他人の plist が期待どおりの
+`ProgramArguments` を持つだけで `performed: true` の manager effect が成立していた。しかも作用先は **owned
+label** なので、**根拠と行為が別の service を指す**。entry で分類し、各 manager effect の直前に再検証する。
+
+**launchd の manager consumption は verified unload/reload に限定する**（review j#103073 r16f1、#15192
+j#103093）。launchd は loaded job の effective argv を機械可読な安定 API で exact に返さず、`bootstrap` も fd
+ではなく plist path を受け取る。この制約下で `kickstart` による旧定義の再実行は検証不能なので使わない。
+`install` は migration 後の current plist identity/bytes → `print` → fresh current snapshot の順で読み、loaded
+なら **write前に** `bootout` rc 0を必須とする。post-bootout snapshot が同じことを再確認してから expected plist を
+staged writeし、fresh exact expected bytes → `bootstrap` と進む（confirmed absent なら bootout は不要だが、
+`print` 後の fresh snapshot は同じく必須）。bootout 失敗時に disk だけ新定義へ変えず、旧loaded jobが定義更新中に
+interval発火する窓を残さない。`restart` は exact bytes / argv / absolute home pin → `print` → fresh exact snapshot
+→ `bootout` rc 0 → fresh exact snapshot → `bootstrap` の順である。
+ここで exact bytes は Label / argv / home だけの部分一致ではなく、renderer が生成する閉じた plist schema 全体を
+指す。`KeepAlive` / `EnvironmentVariables` / 未知 key / log path driftを含む非canonical plistは、Labelが自分の
+ものでもbootout前に拒否し、bootstrap直前も同じauthenticated bytesを要求する。
+drift / unreadable / bootout failure の後は bootstrap 0 回で、success を返すのは bootstrap rc 0まで完了した時だけ
+である。current manager state unreadable は current plist write 前に止まり `effect_state=none`、ただし legacy
+migration を既に完了した同じ install はその既知作用を隠さず `partial` になる。bootout 非0は current diskを
+変更せず `uncertain`、bootout成功後のwrite/fresh-read/bootstrap失敗は `partial` である。cooperative writer は
+前述の lock で全 sequence から排除される。
+
+**path は「所有の証明」でないだけでなく「その file である証明」でもない**（review j#102550 r13f2）。
+`Path.exists()` は broken symlink を False と答えるため、owned path に置かれた link は `absent` と分類され、
+install が link を辿って **owned path の外に file を作成**した。既存 plist を指す link は、その file が owned
+label を持てば `owned` と分類され、**外部 plist を上書き**した。したがって identity は `lstat` で path 自身に
+対して確立し、**単一 link の regular file だけ**が `owned` になりうる: symlink・非 regular file・
+`st_nlink > 1`（hard link）はすべて `unreadable` とする。hard link を含めるのは同じ class（自 path への write が
+外部の名前にも及ぶ）だからであり、**意図的な過剰拒否として明示**する。
+
+**検査対象は path の全 component である**（review j#102590 r14f1）。`lstat` も `O_NOFOLLOW` も
+**最終 component にしか効かない**。したがって `Library/LaunchAgents` を symlink に差し替えると、leaf の検査は
+すべて成立したまま write / read / unlink が他人の directory で行われた。**leaf の判定を強化しても解決しない**——
+leaf へは祖先を経由して到達するからである。よって trusted root（`os_home`）から順に **各 component を
+`O_NOFOLLOW | O_DIRECTORY` で開いて pin し**、以降の `mkdir` / `open` / `stat` / `unlink` / `rename` を
+**その directory fd 相対**で行う。fd は開いた directory を指すので、後から名前を差し替えても向き先は変わらない。
+`mkdir(parents=True)` は文字列を辿るため使わない。root 自体は信頼の起点として受け入れる（それ以上遡る足場がない）。
+
+**write は truncate せず、staging + rename で行う**（review j#102590 r14f2）。`O_TRUNC` は **fd を検査する前に
+inode を破壊する**ため、分類直後に owned leaf を外部 file の hard link へ差し替えると、hard link を拒否したはずの
+fence を通り抜けてその file が上書きされた。また `os.write` の返却 byte 数を見ない実装は partial write で
+truncate 済みの plist を残したまま成功を返した。同一 directory 内に `O_EXCL` で staging file を作り、全 byte を
+書き切ってから `os.replace` する。さらに staging 名は writer ごとの unguessable token を持ち、`O_EXCL` の
+成功を ownership 証拠とする（review j#102843 r15f2）。固定 `<plist>.mozyo-staging` は複数 writer が互いの
+payload を rename / cleanup できるため使わず、歴史的な固定 staging や他 writer の staging は削除しない。
+これにより (a) 完了まで既存 plist は無傷、(b) 宛先が hard link でも rename は
+**名前を差し替えるだけ**なので相手の inode は元の内容を保つ、(c) 途中失敗は rename 前に検出される。
+
+**所有判定と公開する bytes は同一 fd から取る**（review j#102590 r14f3）。path で分類してから path を開き直すと
+**判定した inode と公開する inode が別になりうる**。実際、分類後に置換すると `owned` と報告しつつ他人の argv を
+projection へ出せた。`read_owned` が (state, bytes) を返し、caller は同じ読みを使う。所有と確認できない場合は
+bytes を返さない。
+
+**status は自分が書いた plist しか読み出さない**（review j#102550 r13f4）。secret-free の約束は「この plist は
+自分が render した」——environment block も credential も入らない——という事実に立脚しており、**path に居る
+任意の file には及ばない**。identity 検査なしに raw `ProgramArguments` を projection へ通していたため、他人の
+plist の引数（再現では `--token <値>`）が JSON payload と CLI text の双方へ露出した。`plist_state` を常に投影し、
+`owned` で、かつ argv が現在 install する exact expected command と一致するときだけ、trusted expected argv を
+出す（review j#102843 r15f3）。owned Label は filename の identity であって任意の `ProgramArguments` の
+安全性証明ではない。drift 時は `executable_matches=false` / `installed_command=[]` とし、raw mismatch bytes を
+repr / JSON / CLI text のどこにも渡さない。**「installed」を「installed by us」と読ませない**ためである。
+
+**失敗も同一 result shape で返す**（review j#102550 r13f5）。`uninstall` の unlink 失敗は構造化 envelope を
+抜けて `OSError` として送出され、例外文に host path を伴っていた。退役 migration が同じ失敗を typed result に
+していたのと非対称である。`plist_removal_failed` として `performed=false` / `removed=false` / `plist_state` と
+共に返し、例外文と path を CLI へ出さない。
+
+**「読めなかった」を「無かった」に畳まない**（review j#102180 finding 1）。probe は `loaded` /
+`confirmed_absent` / `unreadable` の 3 値である。権限不足・service manager 異常・認識できない失敗・
+launchctl 不在はすべて `unreadable` とする。`still_loaded` token を廃止した理由は前述のとおり。どの拒否でも
+plist は**あえて残す**: それが operator にとって「まだ生きている登録があるかもしれない」ことを示す唯一の
+durable な手掛かりであり、消せば live job を隠すことになる。
+
+**以下の parser 規則は `probe_state` という非破壊 projection の精度についてのものであり、削除 authority では
+ない**（gateway disposition j#102458 / review j#102496 r12f4）。かつて「bootout 失敗 + `print` の
+`confirmed_absent`」を **第二の削除 authority** としていた記述は **retired** である。`confirmed_absent` は
+現在いかなる削除も許可しない。規則自体を残すのは、status を誤って表示する価値もないからであり、また緩めれば
+同じ推論が破壊的 path へ再び入り込むためである。**この節を根拠に mutation を追加してはならない。**
+
+not-found の認識は **連言**である（review j#102200 finding r3f1）。`confirmed_absent` は次の**すべて**を要求する:
+(1) `launchctl` の exit code が unknown label のもの、(2) 認識可能な not-found 語を含む、(3) その出力が
+**自分の label を quote 付きで完全一致に名指ししている**、(4) 権限エラー等「不存在以外の理由で読めなかった」
+signal を含まない。
+
+(3) は「owned label が文面のどこかにある」ではなく **not-found clause の service operand が owned である**
+ことを要求する（review j#102383 finding r8f1）。以前は「not-found 語がどこかにある」と「owned label が引用
+span のどこかにある」という **2 つの独立した存在確認**を連言と称していた。しかし
+`Could not find service "com.example.other"; suggestion "<owned>"` は両方を満たしながら **別 service の不在**を
+報告しており、この読みが所有 plist の unlink を authorize した。**「名前を含む」と「その service について
+述べている」は別の主張**である。したがって recognized wording とその直後の引用 span を **1 つの clause**
+として parse し、その operand が exact owned target / bare label の場合のみ `confirmed_absent` とする。
+別 service の not-found と owned label の併記、phrase の前後に owned label があるだけの入力、clause が
+複数ある入力（どれが支配するかの規則がない）は、すべて `unreadable` へ倒す。
+
+**stderr と stdout は独立した原文として parse する**（review j#102417 finding r10f1）。両者を 1 文字列へ
+連結してから parse すると、挿入した改行が「clause と operand の間は空白のみ」を満たし、
+`stderr="Could not find service"` と `stdout='"<owned>"'` のように **どちらの stream 単独にも存在しない文**を
+合成して削除を authorize できた。parser をいくら厳格化しても、**その入力を作る側が検査対象の隣接関係を捏造
+できる**なら意味がない。したがって: (a) stream をまたぐ補完を行わない、(b) recognized clause を含みながら
+operand を解決できない stream があれば `unreadable`（曖昧さを他方の肯定で埋めない）、(c) ours 以外を operand と
+する stream があれば `unreadable`（相反）、(d) いずれかの stream が **同一 stream 内で** ours を operand として
+解決した場合のみ `confirmed_absent`。denial signal はどちらの stream にあっても read 全体を失格させる。
+
+clause と operand の結合は **位置つきの単一 scanner** で行う（review j#102398 finding r9f1）。phrase 探索と
+引用符探索を別々に行うと、次のいずれも「clause」を満たしてしまい所有 plist の削除を authorize した:
+operand が**非引用**で ours が後続の別 span（`... service com.example.other; suggestion "<owned>"`）、
+phrase が**引用 span の内側**にあり「直後の引用符」が span の閉じである入力、**隣接する 2 phrase** を 1 clause へ
+併合した入力。したがって (a) phrase は **span の外側**にあること、(b) clause は **真に重なる** hit のみ併合し
+隣接は別 clause（= 複数 clause は unreadable）、(c) operand span は clause の**直後に開始**し間は空白のみ、
+(d) operand は scanner 自身が確定した完全 span であること、をすべて要求する。
+位置計算は **元文字列上**で行う（`lower()` は長さを変え得る code point があるため、畳んだ写しの offset を
+元文字列へ添字すると位置がずれる）。
+
+(3) の照合は **quoted 完全一致のみ**である（review j#102309 finding r5f1）。以前は label 継続文字を
+「英数 + `.` `-` `_`」と *こちらで定義* し、その集合外を境界とみなしていたが、Apple 正本は `Label` を
+「unique な識別文字列」と述べるのみで **この文字集合を規定していない**。結果として `<owned>@helper` /
+`<owned>:helper` / `<owned>+helper` / `<owned>/helper` という **別ラベル**がすべて owned と一致し、その一致が
+plist 削除の authorization に到達し得た。quote は境界を *観測* にする（推測ではない）。quote されない文面では
+束縛を証明できないため `unreadable` へ倒す —— **実機文面を確定できるまで over-refusal を選ぶ**（#15194）。
+
+(3) の完全一致は **decoded string（code point 列）の完全一致**であり、照合前に case を畳まない
+（review j#102327 finding r6f1）。文面（not-found 語・権限 signal）は散文であり大小文字は契約でないため
+case-insensitive に照合してよいが、**label は identity** である。両者を同じ正規化文字列で扱っていたため、
+`ORG.MOZYO-BRIDGE...DRAIN` という **別の文字列** —— したがって本 adapter が install していない別 job —— の
+not-found が owned の確認済み不在として通り、plist 削除の authorization に到達し得た。Apple 正本は `Label` を
+「job を一意に識別する文字列」と述べるのみで **case-insensitive 照合を規定していない**ため、case-fold は契約ではなく
+*こちらの仮定*であった。大小文字だけが異なる 2 つの label は、実機が別を示すまで **別 label** として扱う（#15194）。
+文面用の正規化文字列と identity 用の未加工文字列は実装上も分離する。
+
+（本節は当初「raw byte の比較」と記していたが、runner は `subprocess.run(..., text=True)` で decode 済み `str` を
+返すため、この経路に byte は存在しない。実装が使っていない語で契約を書くこと自体が欠陥であり、
+review j#102378 finding r7f1 の副次指摘として訂正した。）
+
+(3) の照合は **substring 検索ではなく quoted-name の走査**である（review j#102378 finding r7f1）。
+`f'"{token}"' in message` は「その 2 文字が存在する」ことしか確かめておらず、2 つの quote が **同一 span の両端**である
+保証がなかった。別 label を backslash escape で `"prefix\"<owned>"` と表示した場合、hit の開始 quote は *その別 label の
+データである escaped quote*、終了 quote は外側 delimiter であり、hit は plist 削除の authorization に到達し得た。
+launchctl の error wording は API ではなく、**quote を含む label をどう表示するかは未確認**である。したがって
+走査が認識する grammar は「escape を一切含まない plain な `"` で区切られた span」1 つに限定し、別の grammar が
+使われている兆候 —— backslash の存在、quote 数の不均衡（閉じない span）、隣接する span（`""` 形式の escape の兆候）
+—— が 1 つでもあれば **文面を解析不能として `unreadable` へ倒す**。解析できた場合のみ、完全な span 群と exact 比較する。
+「解析不能」は「一致しない」ではなく、確認済み不在には決してならない。
+
+以前は (1) **または** (2) で足りるとしていたため、`113` + `Operation not permitted`（権限失敗）が不存在と判定され
+所有 plist を削除した。単独の signal はこの帰結を負うには弱すぎる: launchctl の man page は成功=0 / 失敗=非0 しか
+定めておらず **113 を不存在の契約としていない**し、`print` 出力は **API ではなく変更され得ると明記**されている。
+自分の label に束縛した連言にして初めて「行動してよいだけの具体性」を持ち、権限 signal の非存在を要求して初めて
+「読めなかった理由」が「見るものが無い」として通らなくなる。
+
+**認識漏れの失敗方向は over-refusal**（typed reason 付きで install を拒否し plist を保持）であり、under-refusal
+（二重登録）ではない。実機で契約を確定できるまでは拒否側が正直な答えである。実 macOS signal との突合は #15194。
+
+**状態は投影にも出す**（review j#102200 finding r3f2）。内部で 3 値化しても結果を `loaded` / `pid` へ縮約すると、
+「停止確認済み」と「読めなかった」が**同一の辞書**になり operator も共通 CLI も識別できない。status は固定語彙の
+`probe_state`（`loaded` / `confirmed_absent` / `unreadable`）を返す。**両 OS で同じ key・同じ語彙**とする（macOS
+だけに出すと、共通契約を統一するために足した key が逆に契約を host 別に割る）。Linux 側は `systemctl show` が
+読めたか否かから同じ語彙へ写す（`show` は未知 unit にも応答するため、空の結果は「unit 不在」ではなく
+**読み取り失敗**である）。生の launchctl / systemctl 文面と秘密値は投影に出さない。
+
+`systemctl show` の応答が **同一 property を相反する値で複数回**返した場合、`_show` は **read 全体を破棄**する
+（review j#102383 finding r8f2）。dict 代入による last-wins は先行値を黙って失い、`ActiveState=inactive` の後に
+`ActiveState=active` が来れば `loaded`、逆順なら `confirmed_absent` と、**同じ相反集合が行順だけで確定事実を
+反転**させ、その値が実際の `systemctl --user restart` を authorize していた。どちらが authoritative かを決める
+順序 authority は存在しないため、解決せず捨てる（= `unreadable`）。**同値の重複は矛盾ではない**ため保持する
+（規則は重複ではなく相反についてである）。
+
+`restart` は refusal 理由を事実に対応させる: 確認済みで停止していれば `service_not_loaded`、状態を読めなければ
+`service_state_unreadable`。どちらも zero-mutation だが、**「動いていない」と「判別できない」を同じ token で
+報告しない**（本 issue が繰り返し是正してきた区別を refusal 側でも保つ）。
+
+**この refusal 語彙は両 OS 共通の契約である**（review j#102398 finding r9f2）。backend は verb の
+operator-visible な意味を両 host 同一と宣言しているため、token は OS 固有の manager 名詞（timer / LaunchAgent
+等）を含めず、両 adapter が同一 token を publish する。R8 で Linux 側にのみ区別を入れ macOS 側を bool へ縮退した
+ままにしたことで、**共通化を目的とする本 issue で共通性を壊していた**。macOS `restart` も 3 値 probe を保持し、
+`probe_state` を refusal に載せる。両 backend の unreadable / absent / loaded matrix は **backend envelope まで**
+回帰で固定する。
+
+Linux の `ActiveState` 分類は **closed vocabulary** である（review j#102309 finding r5f2）。
+`active` / `reloading` -> `loaded`（systemd は `reloading` を「active かつ設定 reload 中」と定義する）、
+`inactive` / `failed` -> `confirmed_absent`、`activating` / `deactivating`（遷移中）**および未知値** ->
+`unreadable`。以前は「`active` 以外はすべて不在」という **open な否定**で分類しており、reload 中・遷移中・
+将来 systemd が追加する値までを「確認済み不在」と *断定* していた。macOS 側の「unknown を *absent* へ畳まない」
+規則と同じ規則の裏返しであり、**未知値をいかなる確認済み状態へも畳まない**。`loaded` 投影は
+`probe_state == loaded` から導出し、同一 state machine について 2 つの答えが出ないようにする。
+
+この照合は **case-sensitive かつ trim なし**、すなわち値の **exact 比較**である（review j#102327 finding r6f2 /
+j#102378 finding r7f2）。正規化を 1 つ挟むたびに closed vocabulary が開いた: lower() は `INACTIVE` を確認済み不在・
+`ACTIVE` を確認済み稼働として通し、strip は `ActiveState= inactive ` に同じことをした。systemd upstream の D-Bus 契約が
+列挙する `ActiveState` は **padding を持たない lowercase literal** であり、大小文字違いも空白付きも本実装が
+「認識済み」と宣言した語彙ではない。すなわち unknown であり `unreadable` へ倒す（macOS 側 r6f1 / r7f1 と同型の
+「未確認の同一性・状態を確認済み事実へ昇格しない」規則）。
+
+strip を「`key=value` 行の解析に由来する framing」とした当初の根拠は成立しない: `splitlines()` が既に line terminator を
+除いており、最初の `=` より後ろは manager の回答そのものである。したがって authority を担う読取
+（`ActiveState` / `UnitFileState`）では key・value とも manager が書いたまま扱い、**表示専用の値の整形は投影側で行う**。
+両者を同じ reader で正規化すると、表示の都合が migration fence の語彙を広げることになる。
+
+**分類の consumer は 1 つの state machine に 2 つの答えを出さない**（同 finding）。`restart` は raw 値を
+`active` と直接比較していたため、`reloading` の timer が status では `loaded`、restart では
+`service_not_loaded` になっていた。`restart` は status と **同一の分類**を読み、`loaded` の positive な確認が
+取れたときだけ実行する。確認済み不在と読み取り失敗はどちらも拒否側であり、これは macOS adapter の `restart` が
+既に持つ契約と同じである。
+
+**順序は「先に退役、後に install」**であり、これが partial failure 下で不変条件を保つ順序である。逆順（install
+してから migration）にすると途中失敗時に **登録が 2 個** 残る——本変更が終わらせようとしている状態そのものであ
+る。退役を先に行えば残るのは 0 個か 1 個にしかならず、install の再実行は idempotent で、退役した drain leg は
+`--run-once` が既に行うため capability の喪失にならない。refusal 条件（platform / executable /
+退役 plist の identity）はすべて **どちらの mutation よりも前**に評価するので、拒否された install は
+zero-mutation のままである（credential readiness は gate ではないため、この列挙に含まれない）。`uninstall` 側では foreign / unreadable な退役 plist は報告のみで、**自分の** agent
+の削除を妨げない（他人の file を理由に自分の登録を残す方が有害である）。
+
+ただし **global offline rollout の停止 gate は、自分の current agent を消せた事実だけでは通らない**。
+launchd の uninstall が `performed=true` でも、退役 drain の bootout / unlink が失敗すれば
+`effect_state=partial` であり、旧 scheduler が動作中または不明である。この状態で shared store / runtime
+migrationへ進むと、旧processがoffline区間へcallbackを書き得る。したがって停止 readback は top-level
+`effect_state=complete`、current rowの `installed=false` と `loaded=false`、uninstall結果の
+`legacy_drain=owned` / `legacy_drain_removed=true`、fresh statusの `legacy_drain=absent`をすべて要求し、
+uninstall結果とfresh rowのlabelもplanが束縛したcurrent supervisor labelへexact一致させる。plistの不在は
+manager jobの停止を証明しないため、それ単独をpositive evidenceにしない。plan schema v3はcapture時のbackendと
+legacy drain stateを保持し、旧v2 plan/action・field欠落を新しい意味へ読み替えない。launchdでは`owned`だけを
+承認対象となるpending removalとして保持し、`absent` / `foreign` / `unreadable` はplanを発行しない。このため、
+退役plistが既に無いmacOSでは、文書化されたmanager側の確認方法が得られるまでoffline rolloutを意図的に拒否する。
 
 **Linux systemd user timer** の realization（`supervisor_systemd`）は **owned service 1 個 + timer 1 個**であ
-る。timer は 60 秒ごとに `workflow supervisor --run-once` を 1 回起動し、process は毎 tick 終了する。macOS の
-dual-agent 形状は複製しない: `--drain-only` の別 unit 登録、2 組の atomic install / 一括 rollback、macOS 内部
-構造との同等性は、いずれも受入条件から削除された。
+る。timer は portable default cadence ごとに `workflow supervisor --run-once` を 1 回起動し、process は毎 tick
+終了する。
 
-**60 秒 tick は 60 秒 Redmine poll ではない。** provider 読み取りは supervisor 本体が持つ durable な
+systemd 側も責務を分ける。`supervisor_systemd_unit` は unit text の render / parse だけを行い、host file を
+直接開かない。`supervisor_systemd_fs` が trusted root から unit directory の全 component を
+`O_NOFOLLOW | O_DIRECTORY` で pin し、service / timer の read・staged write・unlink を同じ directory fd 相対で
+行う（review j#102843 r15f1）。leaf は regular かつ single-link のときだけ identified とし、symlink・hardlink・
+directory・device・開けない entry は `systemd_unit_unreadable` で mutation 前に拒否する。read は同じ fd から
+identity と bytes を得て、unidentified entry の bytes を parser / status へ渡さない。write は writer-private な
+`O_EXCL` staging を全量書込後に rename し、既存 file を truncate しない。
+
+**systemd は manager-effective definition を typed D-Bus property で exact attestation する**（review
+j#103073 r16f1、#15192 j#103093）。file bytes は `systemctl restart` が使う定義ではなく、user manager が
+`daemon-reload` で読んだ定義が authority である。shell向け表示文字列は parse せず、`busctl --user
+--json=short` で `FragmentPath` / `DropInPaths` / `NeedDaemonReload`、service の `Type` /
+`RemainAfterExit` / `Restart` / `ExecStart` と全 start/stop/reload hook、timer の target / monotonic cadence /
+calendar / persistent / randomized-delay / clock-timezone hook に加え、service の `Environment` /
+`EnvironmentFiles` / `PassEnvironment` / `UnsetEnvironment` を型付きで読む。owned file path、drop-in なし、exact
+argv + absolute home pin、oneshot、余分な hook・unit固有environmentなし、exact timer cadence のすべてが一致するとき
+だけ manager effectを許可する。restartのdisk側もargv/cadenceの部分parseだけでなくrendererのservice/timer bytes全体
+へexact一致させる。欠落・不正型・読取不能は `manager_effective_definition_unreadable`、型は読めるが値が異なる場合は
+`manager_effective_definition_drift` で拒否し、raw manager output / path / argv は result に出さない。
+
+user manager のglobal environmentはuser serviceへ通常継承されるため、「unitに `Environment=` がない」だけでは
+daemon-effective environmentを空と証明しない。owned serviceは値を一切書かず、固定名
+`MOZYO_REDMINE_API_KEY` / `MOZYO_REDMINE_URL` を
+`UnsetEnvironment=` で最終merge後に除去する。typed attestationも `UnsetEnvironment` がこのexact name集合であることを
+要求する。credential値は従来どおりpermission-gated mozyo home fileから解決し、unit / D-Bus result / status / logへ
+値を出さない。`MOZYO_REDMINE_DELIVERY_WRITE` はcredentialではなくlive writeの明示opt-inなのでmaskせず、
+manager environmentからの能力指定を維持する。
+
+`install` の exact sequence は両 unit snapshot → timer `ActiveState` の closed分類 → loadedならeffect直前snapshot
+再照合と timer `stop` rc 0（confirmed absentならstop不要、unreadableならwrite前拒否）→ post-stop snapshot → unit
+staged write → `enable --no-reload`（暗黙 reload を禁止）→ explicit `daemon-reload` → 両 unit の fresh exact bytes →
+manager-effective attestation → timer `start` である。これにより旧timerが定義更新・reload・attestation中に発火し
+ない。timer state unreadable は unit write前の `effect_state=none`、stop非0は旧unit bytesを保持して
+`uncertain`、stop成功後のdisk drift / write / enable / reload / attestation失敗は `partial`、startを試みた後の
+失敗は `uncertain` とする。`restart` は
+両 unit / exact argv / home pin → timer active の positive な確認 → fresh unit snapshot → manager-effective
+attestation → final unit snapshot → service `restart` の順である。いずれも lifecycle lock 内で行い、attestation
+不成立後の `start` / `restart` は 0 回である。systemd manager には caller supplied digest を条件に start する
+compare-and-swap API がないため、noncooperative same-user writer に対する保証は前述の threat boundary を越えない。
+
+**unit の書込先（`XDG_CONFIG_HOME`）は環境変数の値を未加工で読む**（review j#102378 finding r7f3）。これは表示文字列では
+なく **mutation target** である: `install` はここへ unit file を書き、`uninstall` はここの file を削除する。値を strip して
+から絶対 path 判定していたため、XDG Base Directory Specification 0.8 の規則を同時に 2 方向へ破っていた ——
+`" /tmp/x"` は **absolute ではなく**、spec は invalid として無視することを要求するのに、trim が有効な root へ昇格させて
+そこへ install した。`"/tmp/x "` は末尾空白を名前に含む directory を指す **absolute path** なのに、trim が別 directory へ
+書込先を変えた。したがって規則は: **unset または empty のときのみ** default（`~/.config`）、raw が absolute ならその
+**exact path**、それ以外（relative・空白のみ等）は invalid として無視し default を使う。未加工で読むことは user manager と
+一致する唯一の読み方でもある —— manager 自身の unit 探索 path も同じ未加工の変数から決まるため、trim した先へ書けば
+`systemctl --user` から見えない場所へ install することになり、この adapter が無くそうとしている
+silently unscheduled supervisor をこちらから作ることになる。
+
+**OS tick は Redmine poll ではない。** provider 読み取りは supervisor 本体が持つ durable な
 per-workspace cadence watermark（`reconcile_cadence` / `should_reconcile_source`、portable default 300 秒 +
 empty pass での指数 backoff と jitter）で gate される。window 内の tick は provider 読み取り **0** の local pass
 へ downgrade されるので、頻繁な tick は SQLite + Herdr で動き、Redmine は低頻度の取りこぼし回収に留まる。この
 gating は supervisor 本体の責務であり、scheduler adapter 側は cadence を供給するだけで再実装しない。
+
+### OS tick interval の portable default（#15192 実測）
+
+interval は **同一の設定 surface**（`--tick-interval`、既定は
+`DEFAULT_OS_TICK_INTERVAL_SECONDS`）から両 host へ与える。launchd の `StartInterval` と systemd の
+`OnUnitActiveSec` は同じ値を受ける。portable default は **180 秒**で、根拠なく 60 秒へ固定しない（60 は退役し
+た drain agent の cadence の名残であり、専用登録が無くなった今その継承に根拠はない）:
+
+| 観点 | 60s | **180s** | 300s |
+| --- | --- | --- | --- |
+| local attest 済み row の回収最大遅延 | 60s | 180s | 300s |
+| provider 要求 row の回収最大遅延（watermark 300s + tick alignment） | 360s | **480s** | 600s |
+| tick 数 / 日 | 1440 | **480** | 288 |
+
+tick 実測コスト（#15192 参照 host、空 registry の 1 tick）は **約 0.48s wall / 0.47s CPU**。180 秒なら約
+480 tick/日、60 秒なら約 1440 tick/日である。#15192 以前の macOS pair は 1728 tick/日（reconcile 288 + drain
+1440）だったので、単一 180 秒 tick は **約 72% 少ない** scheduled work で、fallback 遅延の悪化は最大 120 秒に
+留まる。対話 latency を担うのは event-driven な `--watch`（#13758）であり、OS timer は取りこぼし回収の
+fallback である。tick 落ちは損失にならない（次 tick が outbox を読み直す）ため、これは safety ではなく latency
+の knob である。
+
+300 秒（= provider cadence と同値）を採らない理由は二つある。tick が Redmine poll に見えること、そして tick が
+watermark と整列するため due を僅かに逃した pass が丸ごと 1 周期待つこと（最悪 600 秒）である。OS tick は
+provider cadence より **厳密に細かい**ことを test で固定する。
 
 owned artifact は XDG user unit directory（`$XDG_CONFIG_HOME/systemd/user`、既定 `~/.config/systemd/user`）下の
 service + timer である。対応関係:
 
 | LaunchAgent | systemd user | 意味 |
 | --- | --- | --- |
-| `RunAtLoad` | `[Timer] OnActiveSec=0s` | timer が active になった瞬間に 1 tick（`enable --now` と以後の user manager 起動の両方を覆う） |
-| `StartInterval=<N>` | `[Timer] OnUnitActiveSec=60s` | 前回実行から N 秒後に再実行 |
+| `RunAtLoad` | `[Timer] OnActiveSec=0s` | timer が active になった瞬間に 1 tick（install は attestation 後に明示 `start`、以後の user manager 起動は enabled timer が担う） |
+| `StartInterval=<N>` | `[Timer] OnUnitActiveSec=<N>s` | 前回実行から N 秒後に再実行（N は共通 portable default / `--tick-interval`） |
 | `KeepAlive` 不在 | `Restart=` / `RemainAfterExit=` 不在 + `Type=oneshot` | bounded one-shot を常駐化・tight relaunch loop 化しない（false 設定ではなく **構造的に不在**） |
-| `EnvironmentVariables` 不在 | `Environment=` / `EnvironmentFile=` 不在 | unit に secret を書き込む code path が存在しない |
+| `EnvironmentVariables` 不在 | `Environment=` / `EnvironmentFile=` 不在 + fixed-name `UnsetEnvironment=` | unit に secret を書かず、user-manager global Redmine envも最終merge後に除去する |
 | `ProgramArguments` | `ExecStart`（token ごとに systemd quote + `%` escape） | shell string ではない構造化 argv。`/bin/sh -c` を経由しない |
 
-`ExecStart` の literal pin には **3 種類の escape が同時に要る**。空白 (token を double quote する)、quote / backslash (`\"` / `\\`)、そして **percent (`%` -> `%%`)** である。3 番目は cosmetic ではない: `ExecStart` は systemd **specifier** を解決するため、executable や `--home` path に含まれる `%h` 等を systemd が load 時に展開する。実測 (#15183 review j#102053 Finding 4): `ExecStart="/opt/%h/mozyo-bridge" "--home" "/tmp/%h"` を書いた unit を `systemctl --user show` で読むと `argv[]=/opt//home/holly/mozyo-bridge --home /tmp//home/holly` となり、unit file の literal 文字列とは別の executable / mozyo home が exec される。quote では展開を抑止できず `%%` だけが literal を固定する。escape を欠くと pin が pin でなくなるうえ、`executable_matches` が file の literal text と比較して `True` を返すため **drift を検出できない**。
+`ExecStart` の literal pin には **3 種類の escape が同時に要る**。空白 (token を double quote する)、quote / backslash (`\"` / `\\`)、そして **percent (`%` -> `%%`)** である。3 番目は cosmetic ではない: `ExecStart` は systemd **specifier** を解決するため、executable や `--home` path に含まれる `%h` 等を systemd が load 時に展開する。実測 (#15183 review j#102053 Finding 4): `ExecStart="/opt/%h/mozyo-bridge" "--home" "/tmp/%h"` を書いた unit を `systemctl --user show` で読むと、展開後の home を中立 sentinel へ置き換えた表記では `argv[]=/opt/EXPANDED-USER-HOME-SENTINEL/mozyo-bridge --home /tmp/EXPANDED-USER-HOME-SENTINEL` となり、unit file の literal 文字列とは別の executable / mozyo home が exec される。quote では展開を抑止できず `%%` だけが literal を固定する。escape を欠くと pin が pin でなくなるうえ、`executable_matches` が file の literal text と比較して `True` を返すため **drift を検出できない**。
 
 readback (`parse_exec_argv`) は renderer の正確な逆で `%%` -> `%` を戻すが、**単独 specifier (`%h` 等) が残る場合は readback 全体を信頼しない** (`unreadable_unit` -> `executable_matches=false`、restart は fail-closed)。systemd しか知らない値へ展開されるため、file 上の argv は実行される argv ではないからである。手書き specifier を literal と誤読しない。
 
@@ -540,18 +927,25 @@ readback (`parse_exec_argv`) は renderer の正確な逆で `%%` -> `%` を戻�
 service unit は `[Install]` を持たない（enable するのは timer のみ。service を直接 enable すると login 時 1 回
 だけ実行され cadence が消える）。timer は `OnCalendar` / `Persistent=` を持たない（取りこぼしの replay は不要で、
 次 tick が前 tick の未処理を reconcile する）。log は systemd journal に出るため owned log path を作らない。
-systemctl 呼び出しは常に構造化 argv（`daemon-reload` / `enable --now` / `disable --now` / `stop` / `restart` /
-`show` / `reset-failed`）で、shell を経由しない。
+systemctl 呼び出しは常に構造化 argv（`enable --no-reload` / `daemon-reload` / `start` / `disable --now` /
+`stop` / `restart` / `show` / `reset-failed`）で、shell を経由しない。
 
-**Redmine 未設定は timer 導入の拒否理由にしない**（macOS adapter との意図的な差異）。credential readiness は
+**Redmine 未設定は導入の拒否理由にしない（両 OS 共通）。** #15192 以前は macOS のみ credential 未整備で
+`install` / `restart` を拒否していたが、これは **install できるか否かという operator から見える答え**が host に
+よって違う状態であり、#15192 が解消しようとしている差そのものだった（review j#102151 Finding 4）。macOS の
+gate は supervisor の目的が Redmine reconciliation のみだった #13683 当時の前提の残存であり、#14150 の local
+drain leg 以降、tick は provider 無しでも SQLite + Herdr から有用な仕事をする。よって macOS を #15183 で承認済
+みの local-capable semantics へ揃えた。credential の扱いは一切緩めない: 値を読むのは
+`resolve_redmine_credentials` のみで、unsafe file には警告を返して値を渡さず、plist / unit / status / log の
+いずれにも credential は出ない。credential readiness は
 zero-mutation refusal の gate ではなく **projection** として `missing` / `incomplete` / `unsafe` / `ready` の
 token で報告する。ローカル情報だけで安全に行える処理を止めないためである。安全境界は破れない —
 値を読むのは `resolve_redmine_credentials` であり、unsafe な file には警告を返して値を渡さないので、timer を
 導入しても不正な credential が使用されることはない。install は unsafe file の修復も迂回もしない。
-zero-mutation 拒否が残るのは install 自体が無意味になる条件だけ、すなわち非 Linux host、**systemd user manager
-到達不能**（`systemctl` 不在、または user bus に到達できない container / no-session 環境）、実行ファイル欠落で
-ある。user manager を持たない環境は「install したが永久に schedule されない」に degrade させず、明示的に
-unsupported として拒否する。
+zero-mutation 拒否が残るのは install 自体が無意味または安全に行えない条件、すなわち非 Linux host、
+**systemd user manager 到達不能**（`systemctl` 不在、または user bus に到達できない container / no-session
+環境）、実行ファイル欠落、および unit path / artifact の identity 不明である。user manager を持たない環境は
+「install したが永久に schedule されない」に degrade させず、明示的に unsupported として拒否する。
 
 status は非破壊で、受入条件が求める観測値を秘密非表示で返す: 導入・有効化状態（`installed` / `timer_enabled` /
 `loaded`）、**次回起動**（`next_elapse` + `next_elapse_basis`、および wall-clock の `last_trigger`）、**直近の
@@ -560,6 +954,25 @@ status は非破壊で、受入条件が求める観測値を秘密非表示で�
 `provider_reconcile_interval_seconds`。restart は owned timer が active な場合だけ作用し、installed command が
 今 install するはずの command と一致しない場合は drift として拒否する（reinstall が正道）。
 
+**この 3 つの観測値の意味は #15192 で両 host 共通にした**（key 名も語彙も同一）。ただし *供給できる範囲* は
+host の manager が公開する情報に従い、**足りない分は key を落とさず explicit unknown で答える**:
+
+- **実行内容**: 両 host が、installed argv と現在の expected argv が exact match した場合に限り、
+  `installed_command` に **expected argv** を出す。値は executable path + 固定 flag + config directory
+  （mozyo home）であり credential ではない。drift / unidentified command は raw 値を出さず `[]` とする。
+  credential の値・URL・header 名は投影に出ない。
+  macOS 側の status は #15192 以前 path を一切出さない契約だったが、Linux（#15183 で review 済み）に合わせて
+  `installed_command` に限って mozyo home を含める。**それ以外の key は従来どおり path を含めない**（test は
+  carve-out を明示した上でこの不変条件を保持する）。
+- **次回起動**: systemd は monotonic / realtime の next-elapse を公開する。launchd は `StartInterval` agent の
+  次回発火時刻を `launchctl print` に一切公開しないため、macOS は `next_elapse=""` +
+  `next_elapse_basis`=unknown を返す。**key を省略しない**のは、key の不在が「予定なし」と読まれる一方、実際に
+  は schedule されているからである。operator が使える cadence は `scheduled_interval_seconds` と直近実行である。
+- **直近の終了結果**: systemd の `Result` 語彙（`success` / `exit-code` / ...）を共通語彙とし、launchd は
+  `launchctl print` の `last exit code` / `last exit status`（綴りは macOS 版で揺れるため両方受理）を同語彙へ
+  写す。launchd は終了時刻を公開しないため `last_exit_at` は空。値の読み取りは pid と同じ規律（ASCII 十進・
+  `pid_t` 幅、読めなければ `None`）で、projection の "never raises" 契約を守る（#14753 と同じ欠陥類型）。
+
 `next_elapse` は必ず `next_elapse_basis` と対で扱う。systemd は `NextElapseUSecRealtime` を **calendar timer に
 しか設定せず**、本 adapter の monotonic timer では `NextElapseUSecMonotonic` 側に値が入る（片方だけ読むと実 timer
 に対し空を返す。#15183 smoke で実測）。monotonic 値は **boot 起点**であり wall clock ではないため、basis 無しの
@@ -567,16 +980,40 @@ status は非破壊で、受入条件が求める観測値を秘密非表示で�
 （human-readable path だけが解釈手段を失う状態を作らない）。
 
 宣言的 definition は backend が実際に **owned する service** に対応させる。`definitions` を owned service と 1 対 1
-の roster とし、Linux では `--drain-only` の definition を出さない（1 個の `--run-once` timer しか導入しないのに
-drain service の存在を示唆しない）。macOS は既存の `definition` / `drain_definition` key を維持する。CLI help も
-同様に、Linux の非 gate（credential 未整備でも導入可、単一 60 秒 timer）と macOS の atomic pair / credential gate
-を書き分け、撤回済み条件を host 共通の事実として書かない。
+の roster とし、`--drain-only` の definition は **どの host の roster にも出さない**（#15192）。これは #15183
+review Finding 6（「導入しない service の存在を示唆しない」）と同じ規則であり、drain 登録がどの host にも無く
+なった今、例外を適用する host が残っていないだけである。`--drain-only` は manual action として残るが、action に
+definition は要らない。CLI help も同様に、host 共通の事実（各 1 登録・共通 cadence・credential 非 gate）を書き、
+撤回済み条件を host 共通の事実として書かない。
+
+### 撤回した surface の互換扱い（#15192 review j#102151 Finding 3）
+
+`drain_definition` key と `--drain-interval` / `--reconciliation-interval` flag は **即時削除しない**。いずれも
+「実登録を設定していなかった」ことは削除の理由になるが、**互換性を不要にする理由にはならない**。`release.md` は
+minor（feature 追加）を後方互換、major を breaking contract と定義し、#15192 は feature であって major decision
+は存在しない。したがって previous release の parser surface を維持する:
+
+| surface | 扱い | 根拠 |
+| --- | --- | --- |
+| `--tick-interval` | 正規の唯一の cadence knob | 受入条件「同じ設定surface」 |
+| `--reconciliation-interval` | deprecated。`--tick-interval` 未指定時は **その synonym として採用** | previous release では definition の interval を実際に設定していたため、無視すると既存 invocation の設定内容が黙って変わる |
+| `--drain-interval` | deprecated。受理するが **inert**（deprecation 通知を出して値を無視） | 設定対象の drain 登録が存在しないため、採用すると嘘になる |
+| `drain_definition` | key は維持するが **retired marker**（`retired: true` / `registered: false`、`command` を持たない） | key を落とすと index する reader が壊れ、従来の内容のままだと F6 が消した「存在の示唆」に戻る |
+
+deprecation は payload の `deprecations` と text 出力の `deprecation:` 行に出す。**沈黙して読み替えない**（何が
+起きたか operator に伝える）。retired marker が「存在の示唆」に当たらないのは、F6 が禁じたのは *service が存在
+するという主張* であって key そのものではなく、`registered: false` は主張ではないためである。
 
 uninstall は unit file を消すだけでは足りず、最後に `reset-failed` で manager 側の状態も消す: 実行中の sweep を
 `stop` すると one-shot は SIGTERM で終了するため systemd が `failed` を記録し、file 削除後もその記録が
 `not-found`/`failed` entry として manager に残る（#15183 の installed-artifact smoke で実測。fake runner の
 hermetic test では manager 側状態を観測できない）。launchd の `bootout` は痕跡を残さないため、「owned artifact
 だけを正確に消す」は manager 側 residue も残さないことを含む。
+systemd uninstallの順序は timer `disable --now` → service `stop` → owned unit unlink → `daemon-reload` →
+`reset-failed` で、各manager commandはrc 0を次段の必要条件とする。disable/stop非0はunitを保持し、manager側でどこまで
+作用したか断定できないため`uncertain`。unlink後のreload/reset非0は実際の`removed`値を返して`partial`とし、後続
+commandを呼ばない。stderrを「既に無い」と解釈して成功へ昇格することはせず、その扱いには別のtyped confirmed-absent
+観測を要する。
 
 `workflow supervisor --service-status` は解決された backend、owned service の redacted host 投影、secret-free な
 definition を表示する。いずれの realization も独自常駐 daemon・無限 poll を導入せず、worktree / local branch /

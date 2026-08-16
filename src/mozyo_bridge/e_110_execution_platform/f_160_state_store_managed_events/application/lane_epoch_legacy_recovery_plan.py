@@ -135,7 +135,8 @@ class LaneEpochRecoveryPlan:
 
 #: The canonical order fixed by j#96861, as operator-facing text. Close first: each step is
 #: re-runnable from the state its predecessor leaves, and in particular a crash after the
-#: adoption is harmless because the store is v3 by then, so the effect-free schema fence
+#: adoption is harmless because the store is terminal-bound v4 and launch-generation v1 has
+#: already been rebuilt for v2, so the effect-free schema fence
 #: cannot refuse the old-pair close that a retry would need.
 CANONICAL_STEPS: tuple = (
     "1. Preflight the exact action / pair / revision / worktree / WIP pins and establish a "
@@ -149,7 +150,7 @@ CANONICAL_STEPS: tuple = (
     "4. Migrate the attestation store backup-first, then read it back strictly.",
     "5. Adopt the lifecycle epoch 0 -> 1. Only now — after the store can hold what this "
     "mints. Reversing 4 and 5 is the self-deadlock j#96861 corrected.",
-    "6. Relaunch a fresh pair on the v3 store with a native epoch 1.",
+    "6. Relaunch a fresh pair on the v4 store with generation v2 and a native epoch 1.",
     "7. Resume / redispatch under the existing recovery contract, or converge on a single "
     "named hibernated stop. One or the other, fixed in advance, so a replay cannot dispatch "
     "twice.",
@@ -190,6 +191,10 @@ def _derive_target_pair(record, view, home: Path, workspace_id: str, lane: str):
     """
     from mozyo_bridge.core.state.herdr_identity_attestation import (
         HerdrIdentityAttestationStore,
+        evaluate_attestation,
+    )
+    from mozyo_bridge.core.state.herdr_inventory_identity import (
+        terminal_inventory_complete,
     )
     from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
 
@@ -205,6 +210,15 @@ def _derive_target_pair(record, view, home: Path, workspace_id: str, lane: str):
 
     store = HerdrIdentityAttestationStore(home=home)
     agents = tuple(getattr(view, "managed_agents", ()))
+    all_agents = tuple(getattr(view, "agents", ()))
+    if (
+        not terminal_inventory_complete(view)
+    ):
+        return (
+            frozenset(), BLOCKED_PAIR_IDENTITY_MISMATCH,
+            "the live inventory contains invalid rows, so the pair cannot be excluded "
+            "from the consumer census",
+        )
     derived: set = set()
     for pin in (pair.gateway, pair.worker):
         name = pin.assigned_name
@@ -237,6 +251,30 @@ def _derive_target_pair(record, view, home: Path, workspace_id: str, lane: str):
                 "locate is one it has not identified",
             )
         agent = matches[0]
+        locator_claims = [item for item in all_agents if item.locator == agent.locator]
+        terminal_claims = [
+            item for item in all_agents
+            if item.terminal_id and item.terminal_id == agent.terminal_id
+        ]
+        live_terminal_id = (
+            agent.terminal_id
+            if len(locator_claims) == 1 and len(terminal_claims) == 1
+            else None
+        )
+        joined = evaluate_attestation(
+            attested,
+            live_locator=agent.locator,
+            live_terminal_id=live_terminal_id,
+            expected_workspace_id=workspace_id,
+            expected_role=pin.provider,
+            expected_lane=lane,
+        )
+        if not joined.ok:
+            return (
+                frozenset(), BLOCKED_PAIR_IDENTITY_MISMATCH,
+                f"slot {name!r} does not have one terminal-bound live attestation; "
+                "it cannot be excluded from the consumer census",
+            )
         # NOTE the axis names. `pin.provider` is joined against the live and attested `role`
         # tokens, because those surfaces spell the provider there; `pin.role` is the
         # gateway/worker slot and has no counterpart on either. Joining them to each other is

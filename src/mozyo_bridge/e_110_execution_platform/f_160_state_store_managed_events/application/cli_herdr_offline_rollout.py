@@ -218,7 +218,7 @@ def register_herdr_offline_rollout_parser(herdr_sub, *, add_repo_option=None) ->
     plan = sub.add_parser(
         "plan",
         help=(
-            "Capture one drift-checked global inventory, registry, WIP, three-store and "
+            "Capture one drift-checked global inventory, registry, WIP, four-store and "
             "supervisor snapshot; emit its canonical stop/migrate/restore plan and digest."
         ),
     )

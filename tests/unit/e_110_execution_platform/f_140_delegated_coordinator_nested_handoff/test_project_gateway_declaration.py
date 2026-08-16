@@ -46,7 +46,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     declare_project_gateway_owner_row,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
-    ADOPT_DECL_AMBIGUOUS_LOCATORS,
     ADOPT_DECL_BAD_ANCHOR,
     ADOPT_DECL_DECLARED,
     ADOPT_DECL_DUPLICATE_CANDIDATES,
@@ -79,6 +78,11 @@ PPATH = "project"                   # repo-relative canonical project path
 CWD = "/repo/cloud-drive/project"   # absolute live pane cwd, under the project
 
 
+def _terminal_id(locator: str) -> str:
+    """Deterministic fake server identity for one live test terminal."""
+    return f"terminal-{locator}"
+
+
 def _route(scope=SCOPE, repo=REPO, path=PPATH, cwd=CWD, locator=GW_LOC) -> ObservedGatewayRoute:
     return ObservedGatewayRoute(
         repo_root=repo, project_scope=scope, project_path=path, cwd=cwd, locator=locator
@@ -88,7 +92,13 @@ def _route(scope=SCOPE, repo=REPO, path=PPATH, cwd=CWD, locator=GW_LOC) -> Obser
 def _row(name: str, locator: str, **extra) -> dict:
     # SLOT_LIVE requires the liveness classifier to see a live pane; include the fields it
     # reads. `classify_named_slot` treats a locator-bearing row with an agent as live.
-    row = {"name": name, "pane_id": locator, "agent": "codex", "status": "idle"}
+    row = {
+        "name": name,
+        "pane_id": locator,
+        "terminal_id": _terminal_id(locator),
+        "agent": "codex",
+        "status": "idle",
+    }
     row.update(extra)
     return row
 
@@ -101,20 +111,20 @@ def _seed_attestations(home, gw_loc=GW_LOC, wk_loc=WK_LOC) -> None:
     store = HerdrIdentityAttestationStore(home=home)
     store.upsert(IdentityAttestationRecord(
         assigned_name=GW_NAME, workspace_id=WS, role="codex", lane_id=LANE,
-        locator=gw_loc, verdict=VERDICT_PRESENT))
+        locator=gw_loc, terminal_id=_terminal_id(gw_loc), verdict=VERDICT_PRESENT))
     store.upsert(IdentityAttestationRecord(
         assigned_name=WK_NAME, workspace_id=WS, role="claude", lane_id=LANE,
-        locator=wk_loc, verdict=VERDICT_PRESENT))
+        locator=wk_loc, terminal_id=_terminal_id(wk_loc), verdict=VERDICT_PRESENT))
 
 
 def _seed_attestations_for(home, gw_name, wk_name, lane, gw_loc=GW_LOC, wk_loc=WK_LOC) -> None:
     store = HerdrIdentityAttestationStore(home=home)
     store.upsert(IdentityAttestationRecord(
         assigned_name=gw_name, workspace_id=WS, role="codex", lane_id=lane,
-        locator=gw_loc, verdict=VERDICT_PRESENT))
+        locator=gw_loc, terminal_id=_terminal_id(gw_loc), verdict=VERDICT_PRESENT))
     store.upsert(IdentityAttestationRecord(
         assigned_name=wk_name, workspace_id=WS, role="claude", lane_id=lane,
-        locator=wk_loc, verdict=VERDICT_PRESENT))
+        locator=wk_loc, terminal_id=_terminal_id(wk_loc), verdict=VERDICT_PRESENT))
 
 
 _UNSET = object()
@@ -242,10 +252,12 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
             store = HerdrIdentityAttestationStore(home=home)
             store.upsert(IdentityAttestationRecord(
                 assigned_name=GW_NAME, workspace_id=WS, role="codex", lane_id=LANE,
-                locator=GW_LOC, verdict=VERDICT_CONFLICT))
+                locator=GW_LOC, terminal_id=_terminal_id(GW_LOC),
+                verdict=VERDICT_CONFLICT))
             store.upsert(IdentityAttestationRecord(
                 assigned_name=WK_NAME, workspace_id=WS, role="claude", lane_id=LANE,
-                locator=WK_LOC, verdict=VERDICT_PRESENT))
+                locator=WK_LOC, terminal_id=_terminal_id(WK_LOC),
+                verdict=VERDICT_PRESENT))
             o = declare_project_gateway_owner_row(
                 journal=JOURNAL, issue=ISSUE, project_scope=SCOPE,
                 workspace_id=WS, providers=("codex", "claude"), rows=_pair_rows(),
@@ -425,9 +437,11 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
             self.assertEqual(o.status, ADOPT_DECL_STALE_SLOT)
             self.assertIsNone(self._row_at(tmp))
 
-    def test_ambiguous_locators_fail_closed(self) -> None:
+    def test_duplicate_locator_snapshot_fails_closed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
-            # Both slots resolve to the SAME locator -> ambiguous / recycled target.
+            # Both slots claim the SAME locator. Even though every row carries a complete
+            # terminal identity, the globally unique inventory snapshot is invalid and the
+            # attestation join fails closed before the older ambiguous-locator branch.
             _seed_attestations(Path(tmp), gw_loc=GW_LOC, wk_loc=GW_LOC)
             rows = [_row(GW_NAME, GW_LOC, agent="codex"), _row(WK_NAME, GW_LOC, agent="claude")]
             o = declare_project_gateway_owner_row(
@@ -436,7 +450,7 @@ class DeclareProjectGatewayOwnerRowTest(unittest.TestCase):
                 expected_repo_root=REPO, expected_project_path=PPATH, observed_route=_route(),
                 dry_run=False, store_factory=lambda: LaneDeclarationStore(home=Path(tmp)),
                 attestation_store_factory=lambda: HerdrIdentityAttestationStore(home=Path(tmp)))
-            self.assertEqual(o.status, ADOPT_DECL_AMBIGUOUS_LOCATORS)
+            self.assertEqual(o.status, ADOPT_DECL_UNATTESTED)
             self.assertIsNone(self._row_at(tmp))
 
     def test_owner_conflict_when_another_lane_owns_scope(self) -> None:
@@ -498,7 +512,10 @@ class _FakeOps:
     def providers(self):
         return self._providers
 
-    def resolve_route(self, project_scope):
+    def resolve_route(self, project_scope, gateway_provider):
+        # #15414 finding_providersnapshot: the use case passes the SAME provider
+        # snapshot it resolved once; record it so tests can pin the threading.
+        self.route_gateway_provider = gateway_provider
         return self._route
 
 
@@ -545,6 +562,31 @@ class ProjectGatewayDeclareUseCaseTest(unittest.TestCase):
             self.assertTrue(o.applied)
             rec = LaneLifecycleStore(home=Path(tmp)).get(LaneLifecycleKey(WS, LANE))
             self.assertEqual(rec.binding_kind, "project_gateway")
+
+    def test_route_consumes_the_single_provider_snapshot(self) -> None:
+        # #15414 finding_providersnapshot (review j#104600): the binding is a
+        # mutable authority resolved ONCE per use-case execution; the route
+        # receives that exact snapshot — a second read could hand the route a
+        # different value than the declaration write pair. The drifting fake
+        # returns a different pair on every read, so any re-read is visible.
+        class _DriftingOps(_FakeOps):
+            def __init__(self):
+                super().__init__()
+                self.provider_reads = 0
+
+            def providers(self):
+                self.provider_reads += 1
+                return (
+                    ("claude", "claude")
+                    if self.provider_reads == 1
+                    else ("codex", "codex")
+                )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            ops = _DriftingOps()
+            self._use_case(tmp, ops).run(self._request(), execute=False)
+            self.assertEqual(1, ops.provider_reads)
+            self.assertEqual("claude", ops.route_gateway_provider)
 
 
 class CanonicalRepoRootTest(unittest.TestCase):

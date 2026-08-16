@@ -373,9 +373,16 @@ class LiveTmuxPaneHealthReadsTest(unittest.TestCase):
             view = LiveTmuxPaneHealthReads(
                 argparse.Namespace(repo=".")
             ).describe()
+        # The view also carries the backend context the verdict needs
+        # (Redmine #15508); assert the short-circuit fields exactly and leave
+        # the backend keys to that regression.
         self.assertEqual(
-            {"tmux_pane": "%5", "tmux_installed": False}, view
+            {"tmux_pane": "%5", "tmux_installed": False},
+            {k: view[k] for k in ("tmux_pane", "tmux_installed")},
         )
+        self.assertEqual({"selected_backend", "herdr_available"}, set(view) - {
+            "tmux_pane", "tmux_installed"
+        })
         run_tmux.assert_not_called()
         pane_lines.assert_not_called()
 
@@ -397,7 +404,10 @@ class LiveTmuxPaneHealthReadsTest(unittest.TestCase):
                 "tmux_installed": True,
                 "tmux_server_connected": False,
             },
-            view,
+            {
+                k: view[k]
+                for k in ("tmux_pane", "tmux_installed", "tmux_server_connected")
+            },
         )
         # The connection probe ran, but pane_lines must not (it would `die`).
         run_tmux.assert_called_once()

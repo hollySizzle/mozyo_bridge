@@ -52,6 +52,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     LiveWorkerRefreshOps,
     port_pin_request,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_live_attestation_time import (  # noqa: E501
+    FreshGenerationBoundary,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E501
     LAUNCH_AUTHORITY_BRANCH_DRIFTED,
     LAUNCH_AUTHORITY_GENERATION_MOVED,
@@ -72,6 +75,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.gateway_turn_recovery import (  # noqa: E501
     TURN_CLASS_UNOBSERVABLE,
+)
+from tests.support.current_launch_authority import (
+    seed_completed_current_launch_authority,
 )
 
 LANE = "issue_14661_lane"
@@ -607,10 +613,28 @@ class RealTurnObservationTests(unittest.TestCase):
     """
 
     REVISION = "4"
-    TOKEN = "startup-abc123"
 
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp())
+        self.authority_home = self.repo / "authority-home"
+        self.token = seed_completed_current_launch_authority(
+            self.authority_home,
+            workspace_id=LOCAL_WS,
+            lane_id=LANE,
+            role=WORKER_PROVIDER,
+            assigned_name="wk",
+            locator="w4B:p10",
+            terminal_id="terminal:w4B:p10",
+            target_workspace="w4B",
+            target_tab="w4B:t1",
+        )
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            HerdrLaunchGenerationStore,
+        )
+
+        generation = HerdrLaunchGenerationStore(home=self.authority_home).read("wk")
+        self.assertIsNotNone(generation)
+        self.attested_at = generation.observed_at
 
     def _ops(self, request, *, binding_revision=None, landed=False):
         marker = build_marker(
@@ -620,11 +644,14 @@ class RealTurnObservationTests(unittest.TestCase):
         binding = {
             "assigned_name": "wk", "locator": "w4B:p10",
             "row_revision": self.REVISION if binding_revision is None else binding_revision,
-            "provider": WORKER_PROVIDER, "startup_action_id": self.TOKEN,
+            "provider": WORKER_PROVIDER, "startup_action_id": self.token,
+            "attestation_observed_at": self.attested_at,
         }
         rec = _record(marker)
         rec.queue_enter_observation = {
-            "event_wait_kind": "changed", "gateway_binding": binding,
+            "observation_version": 2,
+            "event_wait_kind": "changed",
+            "gateway_binding": binding,
         }
         notes = (
             "[mozyo:workflow-event:gate=implementation_done]" if landed else "unrelated prose"
@@ -633,6 +660,7 @@ class RealTurnObservationTests(unittest.TestCase):
             repo_root=self.repo, request=request, ledger=_FakeLedger([rec]),
             journal_reader=lambda issue: [_Entry("92400", notes)],
             journal_reader_fresh=True,
+            attestation_home=self.authority_home,
         )
         return ops
 
@@ -640,6 +668,7 @@ class RealTurnObservationTests(unittest.TestCase):
         return [{
             "name": "wk", "pane_id": "w4B:p10", "status": status,
             "revision": self.REVISION if revision is None else revision,
+            "terminal_id": "terminal:w4B:p10",
         }]
 
     def _observe(self, ops, request, rows=None):
@@ -650,8 +679,8 @@ class RealTurnObservationTests(unittest.TestCase):
                 live_mod, "list_herdr_agent_rows", return_value=rows or self._rows()
             ):
                 with patch.object(
-                    live_mod._gen_authority, "current_request_generation_token",
-                    return_value=self.TOKEN,
+                    live_mod._gen_authority, "repo_scope_workspace_id",
+                    return_value=LOCAL_WS,
                 ):
                     with patch.object(
                         ops, "_lane_generation_bound", return_value=True
@@ -679,10 +708,11 @@ class RealTurnObservationTests(unittest.TestCase):
     def test_the_pin_revision_is_this_surfaces_worker_revision(self):
         # A binding recorded at a DIFFERENT row revision must not bind — proving the pin that
         # reaches the shared authority is really the worker's, not a constant or an ignored
-        # argument.
+        # argument. The generation-bound delivery axis now fails with the same mismatch;
+        # merely finding the record is not a positive delivery confirmation.
         request = _request(worker_revision=self.REVISION)
         obs = self._observe(self._ops(request, binding_revision="99"), request)
-        self.assertTrue(obs.delivery_confirmed)
+        self.assertFalse(obs.delivery_confirmed)
         self.assertFalse(obs.turn_started)
 
     def test_an_unpinned_worker_revision_never_binds(self):
@@ -1211,6 +1241,9 @@ class CloseEdgeProgressRaceTests(unittest.TestCase):
 
 
 class ResumeRailTests(unittest.TestCase):
+    FRESH_OBSERVED_AT = "2026-01-01T00:00:00+00:00"
+    FRESH_STARTUP_ACTION = "startup-current-worker"
+
     def setUp(self):
         self.repo = Path(tempfile.mkdtemp())
         self.ops = LiveWorkerRefreshOps(
@@ -1223,6 +1256,16 @@ class ResumeRailTests(unittest.TestCase):
         self.continuation = ContinuationPointer(
             source="redmine", issue_id=ANCHOR_ISSUE, journal_id=ANCHOR_JOURNAL,
             expected_gate=ANCHOR_GATE, next_semantic_action="callback_recovery_once",
+        )
+
+    def _boundary(self, *, locator="w4B:p22") -> FreshGenerationBoundary:
+        return FreshGenerationBoundary(
+            assigned_name="wk",
+            locator=locator,
+            provider=WORKER_PROVIDER,
+            row_revision="9",
+            observed_at=self.FRESH_OBSERVED_AT,
+            startup_action_id=self.FRESH_STARTUP_ACTION,
         )
 
     def _confirmable(self):
@@ -1239,8 +1282,28 @@ class ResumeRailTests(unittest.TestCase):
         record = _record(
             reply_marker, target="w4B:p22", recorded_at="2026-06-01T00:00:00+00:00"
         )
+        record.queue_enter_observation = {
+            "observation_version": 2,
+            "runtime_state": "awaiting_input",
+            "gateway_binding": {
+                "assigned_name": "wk",
+                "locator": "w4B:p22",
+                "provider": WORKER_PROVIDER,
+                "row_revision": "9",
+                "attestation_observed_at": self.FRESH_OBSERVED_AT,
+                "startup_action_id": self.FRESH_STARTUP_ACTION,
+            },
+        }
         self.ops.ledger = _FakeLedger([record])
-        return [{"name": "wk", "pane_id": "w4B:p22", "status": "idle"}]
+        return [
+            {
+                "name": "wk",
+                "pane_id": "w4B:p22",
+                "terminal_id": "terminal:w4B:p22",
+                "revision": "9",
+                "status": "idle",
+            }
+        ]
 
     def test_resume_confirmed_holds_when_the_slot_is_action_bound(self):
         rows = self._confirmable()
@@ -1249,8 +1312,8 @@ class ResumeRailTests(unittest.TestCase):
                     self.ops, "_providers",
                     return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
                 patch.object(
-                    self.ops, "_fresh_attestation_observed_at",
-                    return_value="2026-01-01T00:00:00+00:00"), \
+                    self.ops, "_fresh_attestation_identity",
+                    return_value=self._boundary()), \
                 patch.object(self.ops, "_fresh_slot_action_bound", return_value=True):
             self.assertTrue(self.ops.resume_confirmed(self.continuation))
 
@@ -1341,8 +1404,8 @@ class ResumeRailTests(unittest.TestCase):
                     self.ops, "_providers",
                     return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)), \
                 patch.object(
-                    self.ops, "_fresh_attestation_observed_at",
-                    return_value="2026-01-01T00:00:00+00:00"), \
+                    self.ops, "_fresh_attestation_identity",
+                    return_value=self._boundary()), \
                 patch.object(self.ops, "_fresh_slot_action_bound", return_value=False):
             self.assertFalse(self.ops.resume_confirmed(self.continuation))
 
@@ -1397,17 +1460,27 @@ class ResumeRailTests(unittest.TestCase):
             )
 
     def test_resume_confirmed_requires_a_distinct_fresh_worker_and_an_attestation(self):
-        rows = [{"name": "wk", "pane_id": "w4B:p10", "status": "idle"}]
+        rows = [
+            {
+                "name": "wk",
+                "pane_id": "w4B:p10",
+                "terminal_id": "terminal:w4B:p10",
+                "revision": "9",
+                "status": "idle",
+            }
+        ]
         with patch.object(live_mod, "list_herdr_agent_rows", return_value=rows):
             with patch.object(
                 self.ops, "_providers", return_value=(WORKER_PROVIDER, GATEWAY_PROVIDER)
             ):
                 with patch.object(
-                    self.ops, "_fresh_attestation_observed_at", return_value=""
+                    self.ops, "_fresh_attestation_identity", return_value=None
                 ):
                     self.assertFalse(self.ops.resume_confirmed(self.continuation))
                 with patch.object(
-                    self.ops, "_fresh_attestation_observed_at", return_value="2026-01-01"
+                    self.ops,
+                    "_fresh_attestation_identity",
+                    return_value=self._boundary(locator="w4B:p10"),
                 ):
                     # Still the OLD locator -> never confirmed.
                     self.assertFalse(self.ops.resume_confirmed(self.continuation))

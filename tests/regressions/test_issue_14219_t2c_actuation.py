@@ -44,6 +44,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (  # noqa: E501
     SUPERVISION_HIBERNATE,
 )
+from tests.support.current_launch_authority import (
+    seed_completed_current_launch_authority,
+)
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -234,10 +237,24 @@ class T2cProductionActuationTest(unittest.TestCase):
         # readable, NON-pending composer (an empty string reads as *unreadable* and fails closed).
         fake = FakeHerdr(read_text="> ")
         ws_id = fake.seed_workspace(cwd=str(self.repo))
-        fake.seed_agent(
-            encode_assigned_name(self.workspace_id, role, lane),
+        assigned_name = encode_assigned_name(self.workspace_id, role, lane)
+        target_tab = f"{ws_id}:t1"
+        locator = fake.seed_agent(
+            assigned_name,
             workspace_id=ws_id,
             status="idle",  # -> awaiting_input (quiescent, safe to release over)
+            tab_id=target_tab,
+        )
+        seed_completed_current_launch_authority(
+            self.home,
+            workspace_id=self.workspace_id,
+            lane_id=lane,
+            role=role,
+            assigned_name=assigned_name,
+            locator=locator,
+            terminal_id=fake.terminal_id_of(locator),
+            target_workspace=ws_id,
+            target_tab=target_tab,
         )
         state_path = self.dir / f"herdr-state-{lane}.json"
         state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
@@ -455,6 +472,17 @@ class T2cProductionActuationTest(unittest.TestCase):
             role="codex",
             assigned_name=encode_assigned_name(self.workspace_id, "codex", LANE),
             locator="%9",
+            startup_action_id=seed_completed_current_launch_authority(
+                self.home,
+                workspace_id=self.workspace_id,
+                lane_id=LANE,
+                role="codex",
+                assigned_name=encode_assigned_name(self.workspace_id, "codex", LANE),
+                locator="%9",
+                terminal_id="terminal:lane_t2c_1:codex:%9",
+                target_workspace="w1",
+                target_tab="w1:t1",
+            ),
         )
         opened = self.store.request_release(
             key, expected_revision=cas.revision, action_id=f"hibernate:{LANE}", observation=build_release_observation([pin],)

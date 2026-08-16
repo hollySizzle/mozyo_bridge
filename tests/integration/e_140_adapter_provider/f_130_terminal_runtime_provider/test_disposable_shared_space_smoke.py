@@ -58,12 +58,136 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     bounded_process_timeout,
     run_disposable_shared_space_smoke,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_harness import (  # noqa: E402,E501
+    SharedSpaceSmokeHarness,
+    isolated_smoke_home,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.shared_space_smoke_observation import (  # noqa: E402,E501
     PHASE_SESSION_START,
     ProjectSmokeObservation,
     SharedSpaceSmokeError,
     SharedSpaceSmokeObservation,
 )
+from tests.support.herdr_fake import FakeHerdr  # noqa: E402
+
+
+class ReceiptBoundWorkspaceCleanupIntegrationTests(unittest.TestCase):
+    """Recorder receipt -> minter capability -> exact fake workspace teardown."""
+
+    class _Process:
+        pid = 4242
+
+        def __init__(self) -> None:
+            self.returncode = None
+
+        def poll(self):
+            return self.returncode
+
+        def wait(self, timeout=None):
+            if self.returncode is None:
+                self.returncode = 0
+            return self.returncode
+
+        def terminate(self):
+            self.returncode = 0
+
+        def kill(self):
+            self.returncode = -9
+
+    def test_successful_create_receipt_is_the_only_cleanup_target(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            base = Path(tmp)
+            operator_home = base / "operator"
+            operator_home.mkdir()
+            smoke_home = base / "smoke"
+            fake = FakeHerdr()
+            process = self._Process()
+
+            def _runner(argv, *args, **kwargs):
+                if list(argv[1:]) == ["server", "stop"]:
+                    process.returncode = 0
+                    return subprocess.CompletedProcess(argv, 0, "", "")
+                return fake.run(argv, *args, **kwargs)
+
+            instance = DisposableHerdrInstance(
+                binary="/bin/true",
+                root=smoke_home / "herdr-instance",
+                base_env={"HOME": str(base / "provider-home")},
+                runner=_runner,
+                popen_factory=lambda argv, **kwargs: process,
+                sleeper=lambda _seconds: None,
+                ambient_env={},
+            )
+            with mock.patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(operator_home)}, clear=False
+            ):
+                with instance:
+                    with isolated_smoke_home(smoke_home) as isolation:
+                        harness = SharedSpaceSmokeHarness(
+                            capability=isolation,
+                            runner=instance.runner,
+                            env=instance.child_env(),
+                        )
+                        created = harness.recorder(
+                            [
+                                "/bin/true",
+                                "workspace",
+                                "create",
+                                "--label",
+                                "coordinators",
+                            ],
+                            capture_output=True,
+                            text=True,
+                        )
+                        self.assertEqual(created.returncode, 0)
+                        [workspace_id] = harness.recorder.created_workspaces
+                        unbound_locator = f"{workspace_id}:p999"
+                        harness.recorder.launched_locators.append(unbound_locator)
+
+                        instance.withhold_root_release(
+                            _lifecycle_module.WITHHOLD_WORKERS_UNVERIFIED
+                        )
+                        instance.permit_root_release()
+                        cleanup = instance.mint_workspace_cleanup(
+                            harness.recorder.workspace_cleanup_receipts()
+                        )
+                        self.assertIsNotNone(cleanup)
+                        self.assertTrue(
+                            harness.cleanup((), workspace_cleanup=cleanup)
+                        )
+                        self.assertEqual(harness.verify_residue(), (0, 0))
+                        self.assertIn(
+                            ["workspace", "close", workspace_id], fake.calls
+                        )
+                        self.assertNotIn(
+                            ["pane", "close", unbound_locator], fake.calls
+                        )
+
+                        observation = ProjectSmokeObservation(
+                            project_key="p0",
+                            workspace_id="project",
+                            outcome="created",
+                            coordinators_workspace_id=workspace_id,
+                        )
+                        summary = SharedSpaceSmokeObservation(
+                            projects=(observation,),
+                            requested_projects=1,
+                            coordinators_create_count=1,
+                            residue_workspaces=0,
+                            residue_agents=0,
+                            residue_verified=True,
+                            cleanup_attempted=True,
+                            cleanup_completed=True,
+                        )
+                        evidence_blob = repr(summary.as_evidence())
+                        self.assertTrue(summary.residue_clear)
+                        self.assertNotIn(workspace_id, evidence_blob)
+                        self.assertNotIn("terminal-", evidence_blob)
+
+            lifecycle_evidence = instance.as_evidence()
+            self.assertTrue(lifecycle_evidence["server_stopped"])
+            self.assertTrue(lifecycle_evidence["workspace_cleanup_completed"])
+            self.assertNotIn(workspace_id, repr(lifecycle_evidence))
 
 
 @unittest.skipUnless(
@@ -318,7 +442,7 @@ class ForkedGateReceiptTests(unittest.TestCase):
 class PartialReceiptRetentionTests(unittest.TestCase):
     """A late collection failure must not take the receipts that already landed.
 
-    Wiping the whole set threw away exact pane locators cleanup still needs and gate
+    Wiping the whole set threw away successful-create cleanup receipts and gate
     counters a worker had already proven (review j#91687 F3).
     """
 
@@ -404,7 +528,7 @@ class PartialReceiptRetentionTests(unittest.TestCase):
             filled = _driver_module._fill_unreported(specs, {0: self._receipt(0)})
 
             self.assertEqual(len(filled), 2)
-            # Kept: the exact locator cleanup needs, and the proven gate snapshot.
+            # Kept: the private locator observation and the proven gate snapshot.
             self.assertEqual(filled[0].launched_locators, ("w1:p3",))
             self.assertIsNotNone(filled[0].endpoint_gate)
             self.assertEqual(filled[0].observation.outcome, "created")
@@ -548,7 +672,7 @@ class ReceiptIdentityTests(unittest.TestCase):
         def join_thread(self):
             pass
 
-    def _receipt(self, index, locator, project_key=None):
+    def _receipt(self, index, locator, project_key=None, created_workspaces=()):
         return _driver_module._ProcessReceipt(
             index=index,
             observation=ProjectSmokeObservation(
@@ -556,6 +680,7 @@ class ReceiptIdentityTests(unittest.TestCase):
                 outcome="created", coordinators_workspace_id="w1",
             ),
             launched_locators=(locator,),
+            created_workspaces=tuple(created_workspaces),
             endpoint_gate=EndpointGateCounters(1, 1, 0, 0, ()),
         )
 
@@ -570,7 +695,7 @@ class ReceiptIdentityTests(unittest.TestCase):
     def _drive(self, tmp: Path, receipts):
         collected: dict = {}
         anomalies: list = []
-        tape: list = []
+        tape = _driver_module._CleanupReceiptTape()
         _driver_module._collect_forked_receipts(
             processes=[self._Inert() for _ in receipts], started=[],
             specs=self._specs(tmp), output=self._Queue(receipts),
@@ -581,7 +706,15 @@ class ReceiptIdentityTests(unittest.TestCase):
     def test_a_duplicate_index_is_refused_and_its_locator_is_kept(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             collected, anomalies, tape = self._drive(
-                Path(tmp), [self._receipt(0, "w1:p1"), self._receipt(0, "w1:p2")]
+                Path(tmp),
+                [
+                    self._receipt(0, "w1:p1"),
+                    self._receipt(
+                        0,
+                        "w1:p2",
+                        created_workspaces=(("workspace-private-id", "coordinators"),),
+                    ),
+                ],
             )
             self.assertEqual(
                 collected[0].launched_locators, ("w1:p1",),
@@ -590,8 +723,11 @@ class ReceiptIdentityTests(unittest.TestCase):
             self.assertEqual(
                 anomalies, [_driver_module.RECEIPT_ANOMALY_DUPLICATE_INDEX]
             )
-            self.assertIn(
-                "w1:p2", tape, "a refused receipt's pane still has to be cleaned up"
+            self.assertIn("w1:p2", tape, "private locator observation was lost")
+            self.assertEqual(
+                tape.created_workspaces,
+                [("workspace-private-id", "coordinators")],
+                "successful create receipt must survive outer receipt refusal",
             )
 
     def test_a_bool_index_is_refused_for_both_values(self) -> None:

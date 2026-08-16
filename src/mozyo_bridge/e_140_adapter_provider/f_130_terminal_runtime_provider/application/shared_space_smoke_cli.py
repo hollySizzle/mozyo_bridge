@@ -8,9 +8,10 @@ redacted, typed report.
 
 Without ``--execute`` it preserves the original read-only preflight.  With
 ``--execute`` it owns a disposable endpoint-bound Herdr server, releases two real OS
-processes into the production shared-space start path, closes the exact launched pane
-locators, proves residue zero, and shuts the server down.  No raw server/socket command
-is exposed to the operator and the report contains counts/bools/closed tokens only.
+processes into the production shared-space start path, contains their exact handles,
+then closes only successfully-created workspaces through a one-shot minter capability,
+proves residue zero, and shuts the server down. No raw server/socket command or runtime
+identity is exposed to the operator; the report contains counts/bools/closed tokens only.
 """
 
 from __future__ import annotations
@@ -77,6 +78,7 @@ def _render_text(report: dict) -> str:
             f"completed_projects={report['completed_projects']}"
             f"/{report['requested_projects']} "
             f"failure_phases={_failure_phases(report)} "
+            f"cleanup_completed={report['cleanup_completed']} "
             f"residue_clear={report['residue_clear']} "
             f"orphaned_workers={report['worker_processes_orphaned']} "
             f"workers_contained={report['workers_contained']} "

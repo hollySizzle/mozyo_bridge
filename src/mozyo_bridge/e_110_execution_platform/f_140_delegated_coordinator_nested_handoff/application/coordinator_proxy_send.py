@@ -192,7 +192,14 @@ def live_named_journal_note(args: argparse.Namespace, issue: str, journal: str) 
     return "", False
 
 
-def live_attestation_join(assigned_name: str, *, locator: str, workspace_id: str, provider: str):
+def live_attestation_join(
+    assigned_name: str,
+    *,
+    locator: str,
+    terminal_id: object,
+    workspace_id: str,
+    provider: str,
+):
     """Join the live slot with its generation-bound startup self-attestation record.
 
     Reuses the **existing** read-side policy :func:`...herdr_identity_attestation.evaluate_attestation`
@@ -211,6 +218,7 @@ def live_attestation_join(assigned_name: str, *, locator: str, workspace_id: str
         join = evaluate_attestation(
             record,
             live_locator=locator,
+            live_terminal_id=terminal_id,
             expected_workspace_id=workspace_id,
             expected_role=provider,
             expected_lane=DEFAULT_LANE,
@@ -246,6 +254,7 @@ def resolve_proxy_target(
         _agent_locator,
         _norm_lane,
         decode_assigned_name,
+        terminal_identity_of_live_slot,
     )
 
     ws = (workspace_id or "").strip()
@@ -255,6 +264,7 @@ def resolve_proxy_target(
 
     assigned_name = ""
     locator = ""
+    terminal_id = None
     live = 0
     with_locator = 0
     for row in rows or ():
@@ -274,6 +284,9 @@ def resolve_proxy_target(
             with_locator += 1
             if not locator:
                 locator = row_locator
+                terminal_id = terminal_identity_of_live_slot(
+                    row.get(AGENT_KEY_NAME), row_locator, rows
+                )
                 assigned_name = str(row.get(AGENT_KEY_NAME) or "")
         elif not assigned_name:
             assigned_name = str(row.get(AGENT_KEY_NAME) or "")
@@ -284,7 +297,11 @@ def resolve_proxy_target(
     if live == 1 and with_locator == 1:
         join = attestation_join or live_attestation_join
         attested, attestation_state, attestation_reason = join(
-            assigned_name, locator=locator, workspace_id=ws, provider=want_provider
+            assigned_name,
+            locator=locator,
+            terminal_id=terminal_id,
+            workspace_id=ws,
+            provider=want_provider,
         )
     status = target_status_from_cardinality(live, with_locator, attested=attested)
     return ProxyTarget(

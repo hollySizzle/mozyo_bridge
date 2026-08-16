@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import math
 import shlex
 import unicodedata
 from dataclasses import asdict, dataclass
@@ -42,7 +43,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.gateway_
 )
 # Redmine #14232: the ONE injection-stage authority + the transport-failure family's wording
 # (see that module's `## Reason wording owned here` note). It imports nothing from here.
-from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import ANCHOR_AUTHORITY_NARRATIVE, ANCHOR_AUTHORITY_NEXT_ACTION, INJECT_FAILED_NARRATIVE, INJECT_FAILED_NEXT_ACTION, TRANSPORT_ERROR_NARRATIVE, TRANSPORT_ERROR_NEXT_ACTION, TRANSPORT_ERROR_RECEIVER_CONTRACT, injection_stage_telemetry  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import ANCHOR_AUTHORITY_NARRATIVE, ANCHOR_AUTHORITY_NEXT_ACTION, INJECT_FAILED_NARRATIVE, INJECT_FAILED_NEXT_ACTION, TRANSPORT_ERROR_NARRATIVE, TRANSPORT_ERROR_NEXT_ACTION, TRANSPORT_ERROR_RECEIVER_CONTRACT, injection_stage_telemetry, turn_start_positively_observed  # noqa: E501
 
 if TYPE_CHECKING:
     from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import RoleProfileResolution
@@ -96,30 +97,21 @@ RECEIVERS: frozenset[str] = frozenset({"claude", "codex"})
 
 # --- queue-enter Enter-only retry policy (Redmine #12580 / #12581) -----------
 #
-# Under the `queue-enter` rail a busy or redrawing Claude/Codex TUI can drop the
-# first Enter even though the marker+body was typed cleanly. The rail therefore
-# re-issues Enter — and ONLY Enter; the marker+body is typed exactly once and is
-# never re-injected — on a fixed interval until the landing marker is observed
-# or the retry window elapses. These two numbers are the policy's only tunables
-# and are kept here as named constants (the config boundary) so a future
-# config-file driver can override them without touching the send path. The CLI
-# (`--queue-enter-retry-window` / `--queue-enter-retry-interval`) defaults to
-# them, and `resolve_queue_enter_retry_policy` is the single resolution seam.
+# Shared queue-enter defaults. The body is typed once; retries are Enter-only.
+# tmux uses marker observation, while Herdr applies its causal rail and bounds.
 QUEUE_ENTER_RETRY_WINDOW_SECONDS = 30.0
 QUEUE_ENTER_RETRY_INTERVAL_SECONDS = 2.0
+# Herdr's one-hour ceiling keeps deadline and wait conversion portable.
+QUEUE_ENTER_RETRY_MAX_SECONDS = 3600.0
 
 
 @dataclass(frozen=True)
 class QueueEnterRetryPolicy:
     """Resolved Enter-only retry policy for the `queue-enter` rail.
 
-    ``window_seconds`` bounds the total time the rail keeps nudging the prompt;
-    ``interval_seconds`` is the delay between successive Enter presses. The
-    derived ``max_retries`` is how many *additional* Enter presses (beyond the
-    initial one) the rail may issue, so the rail re-presses Enter without ever
-    re-typing the marker+body. A non-positive window or interval disables the
-    retry (``max_retries == 0``), collapsing the rail back to the historical
-    single-Enter behavior.
+    ``max_retries`` counts additional Enter presses; the body is never retyped.
+    Non-finite/non-positive values disable retries. Tmux accepts any positive float;
+    the Herdr rail enforces its integer-millisecond bound.
     """
 
     window_seconds: float
@@ -127,7 +119,8 @@ class QueueEnterRetryPolicy:
 
     @property
     def max_retries(self) -> int:
-        if self.window_seconds <= 0 or self.interval_seconds <= 0:
+        values = (self.window_seconds, self.interval_seconds)
+        if not all(math.isfinite(value) for value in values) or min(values) <= 0:
             return 0
         return int(self.window_seconds // self.interval_seconds)
 
@@ -824,22 +817,18 @@ class DeliveryOutcome:
     # Tokens + numbers only, durable-record safe. `None` for the tmux/capture
     # standard rail and every non-herdr path (the explicit fallback).
     turn_start_outcome: Optional[dict[str, Any]] = None
-    # Redmine #13292: additive, telemetry-only queue-enter turn-start observation
-    # (`observation_kind` / `source` / `runtime_state` / `read_ok` / `read_reason` /
-    # `poll_attempts`), built by
-    # `turn_start_observation.QueueEnterTurnStartObservation.to_telemetry_dict`. Set
-    # ONLY on the herdr-backend queue-enter rail, from a read-only post-choreography
-    # `agent get` snapshot taken AFTER the byte-unchanged inject → Enter → retry
-    # choreography. It is deliberately SEPARATE from `turn_start_outcome` (the herdr
-    # event rail's armed-wait telemetry): a post-hoc snapshot does not prove causality
-    # the way an armed `wait agent-status` transition does, so it must not be read as
-    # an event-observed turn start (j#72602 decision 5, design confirmed #13292
-    # j#72759). Telemetry-only: it NEVER influences `status` / `reason` /
-    # `next_action_owner` and never blocks the send — a read failure / `unknown` /
-    # `awaiting_input` all just record telemetry. Tokens + bool + numbers only,
-    # durable-record safe. `None` for the tmux backend, the event-driven standard
-    # rail, and every non-queue-enter path (the explicit fallback).
+    # Redmine #13292 / #15242: queue-enter turn-start observation envelope. Its
+    # original snapshot fields (`runtime_state` / `read_ok` / `read_reason` /
+    # `poll_attempts`) remain advisory: a post-hoc `agent get` snapshot alone cannot
+    # attribute a turn to this send. Under Herdr, #15242 additively carries the armed
+    # wait result and coherent launch-generation binding in this same envelope; that
+    # causal evidence, not the snapshot state, is what can confirm submission. When
+    # it is missing, the queue-enter result may therefore be `blocked` /
+    # `turn_start_unconfirmed`. Tokens + bool + numbers only, durable-record safe.
+    # `None` for the tmux backend, the event-driven standard rail, and every
+    # non-queue-enter path (the explicit fallback).
     queue_enter_turn_start_observation: Optional[dict[str, Any]] = None
+    transport_failure: Optional[dict[str, Any]] = None
     # Redmine #13760: the pre-send startup-admission verdict (`outcome` /
     # `provider_id` / `blocker_id`), built by
     # `herdr_startup_admission.StartupAdmission.to_telemetry_dict`. Set ONLY on a
@@ -1002,22 +991,20 @@ def _herdr_turn_start_token(turn_start_outcome: Optional[dict[str, Any]]) -> Opt
     return None
 
 
+_QUEUE_ENTER_UNCERTAIN_REASONS = frozenset({"turn_start_unconfirmed", "receiver_blocked", "turn_start_absent"})  # noqa: E501
+
+
 def next_action_for(
     status: Status,
     reason: Reason,
     receiver: str,
     *,
+    mode: Optional[str] = None,
     turn_start_outcome: Optional[str] = None,
     auto_target_repo: Optional[dict[str, Any]] = None,
 ) -> tuple[NextActionOwner, str]:
-    """Return the canonical owner/action phrase for an outcome.
-
-    ``turn_start_outcome`` is the herdr event rail's 6-token outcome (``None`` for
-    the tmux/capture standard rail and non-rail paths). It disambiguates the one
-    reason the herdr projection reuses — ``delivered_not_started`` folds onto
-    ``turn_start_unconfirmed`` — so a herdr wait timeout gets an event-wait
-    next-action instead of the capture rail's landing-marker phrasing (Redmine
-    #13255 j#72695).
+    """Return the owner/action, using mode and event token to disambiguate
+    queue-enter, Herdr-standard, and capture-standard unconfirmed outcomes.
     """
     if status == "sent":
         return "receiver", f"read the durable anchor and act from that record as {receiver}"
@@ -1027,17 +1014,8 @@ def next_action_for(
             "inspect the pending prompt at the target pane and decide whether to submit",
         )
     if reason == "marker_timeout":
-        # The previous wording attributed the next action to "record
-        # un-notified ... immediately", which let agents skip the retry budget
-        # entirely after a single transient gate failure (Asana task
-        # 1214779823377861, Asana task 1214774670696760 comment 1214778979254677
-        # for the worked example). The contract is: refresh the read marker,
-        # retry under `--no-submit` up to NO_SUBMIT_RETRY_BUDGET attempts, and
-        # only escalate to `un-notified` after that budget is exhausted AND the
-        # last gate error lacks a literal next-action verb. "un-notified" is
-        # preserved as the terminal escalation label so existing audit tooling
-        # and the preset's "Notification fails" branch continue to grep the
-        # same vocabulary.
+        # Preserve the ordered read-marker / no-submit budget before the stable
+        # `un-notified` terminal (Asana 1214779823377861).
         return (
             "sender",
             (
@@ -1051,14 +1029,21 @@ def next_action_for(
                 "error verbatim."
             ),
         )
+    if mode == MODE_QUEUE_ENTER and reason in _QUEUE_ENTER_UNCERTAIN_REASONS:
+        return (
+            "sender",
+            (
+                f"read the {receiver} pane (`mozyo-bridge read {receiver}`) and the "
+                f"durable anchor before taking any recovery action. Herdr queue-enter "
+                f"ended with `{reason}` after the send began: body and/or Enter may "
+                "have reached the receiver, but no same-generation causal turn start "
+                "was confirmed. Delivery remains uncertain. Do not press Enter or "
+                "resend blindly; reconcile the pane with the durable record before "
+                "an explicitly authorised retry."
+            ),
+        )
     if reason == "turn_start_unconfirmed" and turn_start_outcome == "delivered_not_started":
-        # Redmine #13255 j#72695: the herdr event rail reuses `turn_start_unconfirmed`
-        # for `delivered_not_started`, but its signal is an event-wait timeout (herdr
-        # `wait agent-status --status working`), NOT a landing-marker / tmux-capture
-        # observation. The marker+body was injected once; the rail MAY have
-        # bounded-resent Enter (see the turn-start telemetry line for the count), so
-        # this next-action avoids the capture rail's "typed once and Enter was
-        # pressed" phrasing.
+        # #13255: event-wait timeout; bounded Enter retries are in telemetry.
         return (
             "sender",
             (
@@ -1072,13 +1057,7 @@ def next_action_for(
             ),
         )
     if reason == "turn_start_unconfirmed":
-        # Redmine #13166 / #13262: the standard rail (codex since #13166, claude
-        # since #13262) observed the landing marker and pressed Enter, but the
-        # receiver TUI did not show turn-start activity within the observation
-        # window (the Enter may have been absorbed by a busy / redrawing composer).
-        # No rollback and no re-send were issued — the marker+body was typed once.
-        # The sender re-reads the receiver and, only if the turn genuinely did not
-        # start, re-issues the strict send.
+        # #13166/#13262 capture-standard: re-read before any explicit strict retry.
         return (
             "sender",
             (
@@ -1476,15 +1455,24 @@ RECORD_FORMATS: frozenset[str] = frozenset(
 )
 
 
-def _header_label(status: Status, reason: Reason, mode: Optional[str] = None) -> str:
+def _header_label(
+    status: Status, reason: Reason, mode: Optional[str] = None,
+    queue_observation: Optional[dict[str, Any]] = None,
+) -> str:
     if status == "sent":
         if reason == "queue_enter":
             return "sent (queue-enter, marker unobserved)"
         if mode == MODE_QUEUE_ENTER:
+            if turn_start_positively_observed(queue_observation):
+                return "sent (queue-enter, causal turn start confirmed)"
             return "sent (queue-enter, marker observed)"
         return "sent"
     if status == "pending_input":
         return "pending input"
+    if mode == MODE_QUEUE_ENTER and reason in _QUEUE_ENTER_UNCERTAIN_REASONS:
+        return f"delivery uncertain (queue-enter {reason})"
+    if reason == "transport_error":
+        return "delivery uncertain (transport_error)"
     if reason == "turn_start_unconfirmed":
         return "not delivered (turn start unconfirmed)"
     return f"not delivered ({reason})"
@@ -1497,23 +1485,12 @@ def _outcome_narrative(
     receiver: Optional[str] = None,
     *,
     turn_start_outcome: Optional[str] = None,
+    queue_observation: Optional[dict[str, Any]] = None,
 ) -> str:
-    """Render the human-readable ``- Outcome:`` narrative.
-
-    ``turn_start_outcome`` is the herdr event rail's 6-token outcome (``None`` for
-    the tmux/capture standard rail and non-rail paths); it discriminates the reused
-    ``turn_start_unconfirmed`` reason so a herdr ``delivered_not_started`` describes
-    an event-wait timeout instead of the capture rail's landing-marker observation
-    (Redmine #13255 j#72695).
-    """
+    """Render the outcome, disambiguating reused unconfirmed reasons by rail."""
     if status == "sent":
         if reason == "queue_enter":
-            # Redmine #13262 option (b): make the queue-enter receipt explicit that
-            # landing was NOT pre-confirmed and that the receiver-side durable
-            # record (issue journal) polling is the authoritative fallback — the
-            # queue-enter marker-unobserved path is intentionally NOT blocked
-            # (that would be an option (c) contract change with its own design
-            # record); it stays `sent` / `queue_enter`.
+            # #13262 option (b): tmux marker-unobserved remains sent/queue_enter.
             return (
                 "Landing marker was not observed in the target pane before "
                 "timeout, but Enter was issued under the queue-enter rail "
@@ -1522,6 +1499,12 @@ def _outcome_narrative(
                 "verify submission, so the receiver must poll the durable record "
                 "(the issue journal) as the authoritative fallback rather than "
                 "treating the pane notification as delivery proof."
+            )
+        if mode == MODE_QUEUE_ENTER and turn_start_positively_observed(queue_observation):
+            return (
+                "Herdr queue-enter confirmed a same-generation causal turn start "
+                "after an armed working-transition wait. Enter was pressed and no "
+                "rollback was triggered; the post-hoc snapshot alone was not used as proof."
             )
         if mode == MODE_QUEUE_ENTER:
             return (
@@ -1545,29 +1528,29 @@ def _outcome_narrative(
             "cannot verify from tmux capture that the receiver composer was "
             "cleared."
         )
+    if mode == MODE_QUEUE_ENTER and reason in _QUEUE_ENTER_UNCERTAIN_REASONS:
+        return (
+            f"Herdr queue-enter ended with `{reason}` after the send began. The "
+            "marker+body was typed at most once; depending on the failure point, "
+            "Enter was pressed zero or more times, and every actual Enter had a "
+            "working-transition wait armed first. The body was not re-sent and no "
+            "C-u rollback was issued. No same-generation causal turn start was "
+            "confirmed, so partial delivery remains uncertain and blind retry is "
+            "prohibited."
+        )
     if reason == "turn_start_unconfirmed" and turn_start_outcome == "delivered_not_started":
-        # Redmine #13255 j#72695: the herdr event rail reuses `turn_start_unconfirmed`
-        # for `delivered_not_started`, but there is NO landing-marker wait and NO
-        # tmux capture on this rail — the signal is an event-wait timeout (herdr
-        # `wait agent-status --status working`). The marker+body was injected once;
-        # the rail MAY have bounded-resent Enter (the exact count is in the
-        # turn-start telemetry line), so this narrative must not claim the capture
-        # rail's "typed exactly once ... no re-send" or "cannot confirm from tmux
-        # capture" wording.
+        # #13255: event-wait evidence, not landing-marker/tmux-capture evidence.
         return (
             "herdr turn-start rail (--mode standard): the notification was injected "
-            "and the event wait for a working transition (herdr `wait agent-status "
-            "--status working`) timed out — no turn start was observed within the "
+            "and the event wait for a working transition (herdr `agent wait "
+            "<target> --until working`) timed out — no turn start was observed within the "
             "wait window. The marker+body was injected once; the rail may have "
             "re-issued Enter within its bounded resend budget (see the turn-start "
             "telemetry line for the exact re-send count). There is no landing-marker "
             "or tmux-capture observation on this rail."
         )
     if reason == "turn_start_unconfirmed":
-        # Redmine #13166 shipped this for codex; #13262 generalized the standard
-        # rail to claude. Name the actual rail from the receiver so a claude send
-        # is not mislabelled as codex; default to "codex" preserves the #13166
-        # wording byte-for-byte for any caller that does not thread the receiver.
+        # #13166/#13262: name the receiver-specific capture-standard rail.
         rail = f"{receiver or 'codex'} standard rail"
         return (
             f"Landing marker was observed and Enter was pressed on the {rail}, "
@@ -1681,6 +1664,7 @@ def _receiver_contract_line(
     reason: Reason,
     receiver: str,
     *,
+    mode: Optional[str] = None,
     turn_start_outcome: Optional[str] = None,
 ) -> Optional[str]:
     if status == "sent":
@@ -1693,11 +1677,16 @@ def _receiver_contract_line(
             f"Receiver-side contract: {receiver} must read the durable anchor "
             "manually if action is still required; nothing was submitted at the pane."
         )
+    if mode == MODE_QUEUE_ENTER and reason in _QUEUE_ENTER_UNCERTAIN_REASONS:
+        return (
+            f"Receiver-side contract: {receiver} must read the durable anchor "
+            f"manually if action is still required. Herdr queue-enter ended with "
+            f"`{reason}` after the send began; body and/or Enter may have reached "
+            "the receiver, but submission was not confirmed. Delivery remains "
+            "uncertain and blind retry is prohibited."
+        )
     if reason == "turn_start_unconfirmed" and turn_start_outcome == "delivered_not_started":
-        # Redmine #13255 j#72695: the herdr rail DID inject the notification and
-        # press Enter (unlike the tmux `turn_start_unconfirmed` path's "nothing was
-        # re-submitted"); it just could not confirm a turn started before the event
-        # wait timed out. Say that accurately.
+        # #13255: injected, but the event wait did not confirm turn start.
         return (
             f"Receiver-side contract: {receiver} must read the durable anchor "
             "manually if action is still required; the herdr turn-start rail "
@@ -1900,7 +1889,7 @@ def build_delivery_record(
     operator-supplied field values. It does not affect the ``json`` outcome
     shape.
     """
-    header = f"Delivery result — {_header_label(outcome.status, outcome.reason, outcome.mode)}"
+    header = f"Delivery result — {_header_label(outcome.status, outcome.reason, outcome.mode, outcome.queue_enter_turn_start_observation)}"
     lines = [
         header,
         "",
@@ -1920,7 +1909,7 @@ def build_delivery_record(
         *ticketless_work_intake_lines(outcome.ticketless_work_intake),
         *auto_target_repo_lines(outcome.auto_target_repo),
         f"- Status: `{outcome.status}` (reason: `{outcome.reason}`)",
-        f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode, outcome.receiver, turn_start_outcome=_herdr_turn_start_token(outcome.turn_start_outcome))}",
+        f"- Outcome: {_outcome_narrative(outcome.status, outcome.reason, outcome.mode, outcome.receiver, turn_start_outcome=_herdr_turn_start_token(outcome.turn_start_outcome), queue_observation=outcome.queue_enter_turn_start_observation)}",
         f"- Next action owner: `{outcome.next_action_owner}` — {outcome.next_action}",
     ]
     if command:
@@ -2074,6 +2063,7 @@ def build_delivery_record(
         outcome.status,
         outcome.reason,
         outcome.receiver,
+        mode=outcome.mode,
         turn_start_outcome=_herdr_turn_start_token(outcome.turn_start_outcome),
     )
     if contract:
@@ -2102,6 +2092,7 @@ def make_outcome(
     ticketless_work_intake: Optional["TicketlessWorkIntake"] = None,
     turn_start_outcome: Optional[dict[str, Any]] = None,
     queue_enter_turn_start_observation: Optional[dict[str, Any]] = None,
+    transport_failure: Optional[dict[str, Any]] = None,
     startup_admission: Optional[dict[str, Any]] = None,
     auto_target_repo: Optional[dict[str, Any]] = None,
 ) -> DeliveryOutcome:
@@ -2116,6 +2107,7 @@ def make_outcome(
         status,
         reason,
         receiver,
+        mode=mode,
         turn_start_outcome=_herdr_turn_start_token(turn_start_outcome),
         auto_target_repo=auto_target_repo,
     )
@@ -2154,6 +2146,7 @@ def make_outcome(
         ),
         turn_start_outcome=turn_start_outcome,
         queue_enter_turn_start_observation=queue_enter_turn_start_observation,
+        transport_failure=transport_failure,
         startup_admission=startup_admission,
         auto_target_repo=auto_target_repo,
         injection_stage=injection_stage_telemetry(status, reason, mode=mode, queue_enter_turn_start_observation=queue_enter_turn_start_observation, turn_start_outcome=turn_start_outcome),  # noqa: E501 - Redmine #14232 + review j#95333 F1: the ONE full-context classification (the mode and both turn-start telemetries resolve the queue-enter `ok` cell)
@@ -2176,6 +2169,7 @@ __all__: Iterable[str] = (
     "NO_SUBMIT_RETRY_BUDGET",
     "NormalizedAnchor",
     "QUEUE_ENTER_RETRY_INTERVAL_SECONDS",
+    "QUEUE_ENTER_RETRY_MAX_SECONDS",
     "QUEUE_ENTER_RETRY_WINDOW_SECONDS",
     "QueueEnterRetryOutcome",
     "QueueEnterRetryPolicy",

@@ -129,6 +129,22 @@ def register(sub) -> None:
         ),
     )
     scaffold_apply.add_argument("--dry-run", action="store_true")
+    scaffold_apply.add_argument(
+        "--backend",
+        dest="backend",
+        choices=["herdr", "tmux"],
+        default=None,
+        help=(
+            "Declare the terminal-transport backend for the target by writing "
+            "`terminal_transport.backend: <value>` into its "
+            "`.mozyo-bridge/config.yaml` after the scaffold (Redmine #15527). "
+            "Omitted: no config is written and the runtime default (tmux) "
+            "applies, exactly as before. The written config is operator-owned "
+            "bootstrap output: it is NOT tracked by `scaffold status`, and an "
+            "already-existing config.yaml is never overwritten (the apply "
+            "fails closed instead)."
+        ),
+    )
     apply_replace_group = scaffold_apply.add_mutually_exclusive_group()
     apply_replace_group.add_argument("--backup", action="store_true", help="Back up existing scaffold files before replacing them")
     apply_replace_group.add_argument("--force", action="store_true", help="Replace existing scaffold files without backup")

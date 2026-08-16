@@ -109,6 +109,38 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     home = Path(args.home).expanduser().resolve() if getattr(args, "home", None) else None
     repo_local = bool(getattr(args, "repo_local", False))
     target = scaffold_target_from_args(args)
+    # Say it BEFORE the write (Redmine #15526): a target the resolver will walk
+    # past is worth knowing while it can still be retargeted, not at the next
+    # `mozyo` launch. Advisory only — see `scaffold_target_note`.
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.scaffold_target_note import (  # noqa: E501
+        nested_target_warning,
+    )
+    from mozyo_bridge.shared.paths import infer_git_worktree_root
+
+    warning = nested_target_warning(target, infer_git_worktree_root(target))
+    if warning is not None:
+        print(warning)
+    # Backend declaration (Redmine #15527). Decided BEFORE the scaffold write so an
+    # operator-owned config refuses the whole apply with zero files written, rather
+    # than leaving a scaffolded target whose backend request was silently dropped.
+    declaration = None
+    backend = getattr(args, "backend", None)
+    if backend is not None:
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.scaffold_backend_declaration import (  # noqa: E501
+            backend_declaration,
+        )
+        from mozyo_bridge.shared.errors import die
+
+        # `lexists`, not `exists` (review j#106056 finding_1): a DANGLING symlink at
+        # the config path answers False to `exists()`, and following it on write
+        # would create a file OUTSIDE the target — reproduced before this fix. Any
+        # directory entry at the path, symlink included, is an existing declaration.
+        config_path = target / ".mozyo-bridge" / "config.yaml"
+        declaration = backend_declaration(
+            target, backend, config_exists=os.path.lexists(config_path)
+        )
+        if not declaration.ok:
+            die(declaration.refusal)
     paths = write_scaffold(
         args.preset,
         target,
@@ -123,6 +155,28 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     action = "would write" if args.dry_run else "wrote"
     for path in paths:
         print(f"{action}: {path}")
+    if declaration is not None:
+        # After the manifest-tracked files, deliberately outside the manifest: the
+        # config is operator-owned from its first byte, so `scaffold status` must
+        # stay clean when it is edited later (Redmine #15527).
+        if not args.dry_run:
+            declaration.path.parent.mkdir(parents=True, exist_ok=True)
+            # Exclusive create (review j#106056 finding_1): O_EXCL refuses when the
+            # final component exists — INCLUDING a symlink, dangling or not — so a
+            # link planted between the lexists check and this write cannot redirect
+            # the config outside the target. FileExistsError here is that race.
+            try:
+                fd = os.open(
+                    declaration.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
+                )
+            except FileExistsError:
+                die(
+                    f"refusing --backend {backend}: {declaration.path} appeared "
+                    "between the preflight check and the write; not overwriting it"
+                )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(declaration.content)
+        print(f"{action}: {declaration.path} (backend declaration; not in manifest)")
     return 0
 
 
@@ -267,12 +321,31 @@ def _docs_context_from_args(args: argparse.Namespace):
     return CatalogContext.build(repo_raw, catalog_raw, overlay_raw)
 
 
+def _docs_unreadable_catalog(context, exc) -> None:
+    """Report an unreadable catalog identically wherever it is caught.
+
+    The reason text comes from the reader, which has already removed the
+    catalog's own content from it (Redmine #15514) — so this prints the path
+    and the fixed reason, and never the cause's raw rendering.
+    """
+    print(
+        f"cannot read docs catalog {_docs_relpath(context, context.catalog_path)}",
+        file=sys.stderr,
+    )
+    print(f"- {exc}", file=sys.stderr)
+
+
+def _docs_relpath(context, path) -> str:
+    """Repo-relative path for human-facing notices (absolute when outside)."""
+    try:
+        return path.relative_to(context.repo_root).as_posix()
+    except ValueError:
+        return path.as_posix()
+
+
 def _docs_overlay_relpath(context, overlay_path) -> str:
     """Repo-relative overlay path for human-facing notices."""
-    try:
-        return overlay_path.relative_to(context.repo_root).as_posix()
-    except ValueError:
-        return overlay_path.as_posix()
+    return _docs_relpath(context, overlay_path)
 
 
 def _docs_include_local(args: argparse.Namespace) -> bool:
@@ -283,15 +356,44 @@ def _docs_include_local(args: argparse.Namespace) -> bool:
 
 def cmd_docs_validate(args: argparse.Namespace) -> int:
     from mozyo_bridge.docs_tools import (
+        CatalogUnreadableError,
         validate_catalog,
         validate_file_coverage,
         validate_overlay,
     )
 
     context = _docs_context_from_args(args)
-    errors = validate_catalog(
-        context, strict_metadata=bool(getattr(args, "strict_metadata", False))
-    )
+    # An absent catalog is an EXPECTED state, not a crash: the scaffold ships
+    # `catalog.yaml.example` and the target promotes it when the project adopts
+    # the governed docs catalog. Letting the reader's FileNotFoundError escape
+    # printed a traceback that reads as "the tool is broken" to an operator who
+    # simply has not adopted the catalog yet (Redmine #15513, seen during the
+    # 1.0.0 install QA). Report it the way every other refusal here reports.
+    if not context.catalog_path.exists():
+        print(
+            "catalog validation failed: no docs catalog at "
+            f"{_docs_relpath(context, context.catalog_path)}"
+        )
+        print(
+            "- adopt the governed docs catalog by copying "
+            "`.mozyo-bridge/docs/catalog.yaml.example` to "
+            "`.mozyo-bridge/docs/catalog.yaml` and filling it in, or point "
+            "`--catalog` at an existing catalog"
+        )
+        return 1
+    try:
+        errors = validate_catalog(
+            context, strict_metadata=bool(getattr(args, "strict_metadata", False))
+        )
+    except CatalogUnreadableError as exc:
+        # The reader already stripped the catalog's content out of the reason
+        # (Redmine #15514); `exc` carries a fixed phrase plus at most a position.
+        print(
+            "catalog validation failed: cannot read "
+            f"{_docs_relpath(context, context.catalog_path)}"
+        )
+        print(f"- {exc}")
+        return 1
     notices: list[str] = []
     if getattr(args, "check_file_coverage", False):
         coverage_errors, coverage_notices = validate_file_coverage(
@@ -322,6 +424,7 @@ def cmd_docs_validate(args: argparse.Namespace) -> int:
 
 def cmd_docs_resolve(args: argparse.Namespace) -> int:
     from mozyo_bridge.docs_tools import (
+        CatalogUnreadableError,
         OverlayError,
         render_resolution_json,
         render_resolution_markdown,
@@ -334,6 +437,9 @@ def cmd_docs_resolve(args: argparse.Namespace) -> int:
         results, overlay = resolve_paths_detailed(
             context, list(args.paths), include_local=_docs_include_local(args)
         )
+    except CatalogUnreadableError as exc:
+        _docs_unreadable_catalog(context, exc)
+        return 1
     except OverlayError as exc:
         print(f"local overlay error: {exc}", file=sys.stderr)
         return 1
@@ -358,18 +464,26 @@ def cmd_docs_resolve(args: argparse.Namespace) -> int:
 
 
 def cmd_docs_generate(args: argparse.Namespace) -> int:
-    from mozyo_bridge.docs_tools import generate_file_conventions, run_generate_check
+    from mozyo_bridge.docs_tools import (
+        CatalogUnreadableError,
+        generate_file_conventions,
+        run_generate_check,
+    )
 
     context = _docs_context_from_args(args)
     output = getattr(args, "output", None)
-    if getattr(args, "check", False):
-        ok, output_path, detail = run_generate_check(context, output)
-        if not ok:
-            print(detail, file=sys.stderr)
-            return 1
-        print(detail)
-        return 0
-    output_path = generate_file_conventions(context, output)
+    try:
+        if getattr(args, "check", False):
+            ok, output_path, detail = run_generate_check(context, output)
+            if not ok:
+                print(detail, file=sys.stderr)
+                return 1
+            print(detail)
+            return 0
+        output_path = generate_file_conventions(context, output)
+    except CatalogUnreadableError as exc:
+        _docs_unreadable_catalog(context, exc)
+        return 1
     print(output_path.as_posix())
     return 0
 
@@ -419,6 +533,7 @@ def cmd_scaffold_canonical(args: argparse.Namespace) -> int:
 
 def cmd_docs_audit_impact(args: argparse.Namespace) -> int:
     from mozyo_bridge.docs_tools import (
+        CatalogUnreadableError,
         OverlayError,
         audit_doc_impact_detailed,
         run_generate_check,
@@ -432,6 +547,9 @@ def cmd_docs_audit_impact(args: argparse.Namespace) -> int:
             all_changed=bool(getattr(args, "all_changed", False)),
             include_local=_docs_include_local(args),
         )
+    except CatalogUnreadableError as exc:
+        _docs_unreadable_catalog(context, exc)
+        return 1
     except OverlayError as exc:
         print(f"local overlay error: {exc}", file=sys.stderr)
         return 1

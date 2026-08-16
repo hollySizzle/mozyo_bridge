@@ -508,14 +508,13 @@ class LaneLifecycleStore:
             release = RELEASE_NOT_REQUESTED if rehydrating else current.process_release
             action = "" if rehydrating else current.release_action_id
             pins = "" if rehydrating else current.release_pins
-            # v9 (#14477 j#94707 R4-F1): the release OBSERVATION is part of the release set, so
-            # it clears with the rest of it. A rehydrated lane holding the previous generation's
-            # observation is the same defect shape as a retained ``reconcile_phase``: an old
-            # generation's evidence must never be readable as the current generation's authority.
+            # Release evidence clears together when the lane rehydrates.
             observation = "" if rehydrating else current.release_observation
             replacement = REPLACEMENT_NOT_REQUESTED if rehydrating else current.replacement_state
             replacement_action = "" if rehydrating else current.replacement_action_id
             replacement_pins = "" if rehydrating else current.replacement_pins
+            reconcile_phase = "" if rehydrating else current.reconcile_phase
+            reconcile_close_pin = "" if rehydrating else current.reconcile_close_pin
             # v8 (#14477): resume's freshness boundary moves ONLY here (lane_hibernation_anchor).
             anchor = hibernation_anchor_on_transition(current.hibernated_at, target=target, stamp=stamp)
             # v10 (#14756): minted ONLY here and only INTO ``hibernated``, never cleared on
@@ -543,6 +542,7 @@ class LaneLifecycleStore:
                     "release_action_id = ?, release_pins = ?, release_observation = ?, "
                     "replacement_state = ?, "
                     "replacement_action_id = ?, replacement_pins = ?, declared_slots = ?, "
+                    "reconcile_phase = ?, reconcile_close_pin = ?, "
                     "hibernated_at = ?, lane_epoch = ?, revision = ?, "
                     "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                     "updated_at = ? "
@@ -563,6 +563,8 @@ class LaneLifecycleStore:
                         replacement_action,
                         replacement_pins,
                         declared_slots,
+                        reconcile_phase,
+                        reconcile_close_pin,
                         anchor,
                         epoch,
                         revision,
@@ -743,7 +745,8 @@ class LaneLifecycleStore:
                         "process_release = ?, release_action_id = ?, release_pins = ?, "
                         "release_observation = ?, "
                         "replacement_state = ?, replacement_action_id = ?, "
-                        "replacement_pins = ?, hibernated_at = ?, revision = ?, "
+                        "replacement_pins = ?, reconcile_phase = ?, "
+                        "reconcile_close_pin = ?, hibernated_at = ?, revision = ?, "
                         "decision_source = ?, decision_issue_id = ?, decision_journal = ?, "
                         "updated_at = ? WHERE repo_workspace_id = ? AND lane_id = ? "
                         "AND revision = ?",
@@ -753,17 +756,11 @@ class LaneLifecycleStore:
                             RELEASE_NOT_REQUESTED,
                             "",
                             "",
-                            # v9 (#14477 j#94707 R4-F1): this UPDATE rewrites the INCOMING
-                            # recovery lane's own row, so what clears here is ITS prior release
-                            # cycle's observation — a lane going active carries no release
-                            # evidence, the same reason its own pins and action id clear above.
-                            # It stays the same lane_generation (only `revision` advances; a
-                            # re-incarnation is `open_next_generation`'s job), which is why the
-                            # stale evidence has to be cleared rather than outgrown.
-                            # Corrected per review j#94727 R5-F2 — the previous comment named the
-                            # superseded lane and a generation bump, and both were wrong.
+                            # The incoming active lane carries no prior release evidence.
                             "",
                             REPLACEMENT_NOT_REQUESTED,
+                            "",
+                            "",
                             "",
                             "",
                             "",  # v8 (#14477): a promoted lane is awake -> no boundary

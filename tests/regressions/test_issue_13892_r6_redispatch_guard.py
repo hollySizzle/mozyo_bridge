@@ -30,6 +30,7 @@ from mozyo_bridge.core.state.scratch_retirement_fence import (
     ScratchRetirementFence,
     slot_digest,
 )
+from mozyo_bridge.core.state.scratch_retirement_pin import ScratchRetirementPin
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
     recovery_anchor_delivery_live as delivery_live,
     sublane_hibernated_pair_recovery_live as live,
@@ -69,6 +70,16 @@ class RedispatchRetirementGuardTest(unittest.TestCase):
         self.unit = RetirementUnit(_WS, _LANE, slot_digest([self.gw, self.worker]))
         self.sends = []
 
+    def _pins(self):
+        return (
+            ScratchRetirementPin(
+                "codex", self.gw, "wZ:p3G", "startup:codex:wZ:p3G"
+            ),
+            ScratchRetirementPin(
+                "claude", self.worker, "wZ:p3C", "startup:claude:wZ:p3C"
+            ),
+        )
+
     def _redispatch(self, *, action_id="recover-pair:13847:x:3:2"):
         def _deliver(_self, request):
             self.sends.append(request)
@@ -96,7 +107,7 @@ class RedispatchRetirementGuardTest(unittest.TestCase):
 
     def test_a_retiring_target_stops_the_send(self):
         with self.retirement.transaction(self.unit, live_pair_present=True) as txn:
-            txn.reserve(pinned=(("codex", "wZ:p3G"), ("claude", "wZ:p3C")))
+            txn.reserve(pinned=self._pins())
             result = self._redispatch()
         self.assertEqual(self.sends, [], "sent=0: never redispatch into a retiring pair")
         self.assertEqual(result.status, REDISPATCH_TARGET_RETIRING)
@@ -109,7 +120,7 @@ class RedispatchRetirementGuardTest(unittest.TestCase):
         other. Cancelled is a positive "this will never send".
         """
         with self.retirement.transaction(self.unit, live_pair_present=True) as txn:
-            txn.reserve(pinned=(("codex", "wZ:p3G"), ("claude", "wZ:p3C")))
+            txn.reserve(pinned=self._pins())
             self._redispatch()
         rows = self.outbox.obligations_for_targets(
             workspace_id=_WS, target_assigned_names=(self.gw,)
@@ -128,7 +139,7 @@ class RedispatchRetirementGuardTest(unittest.TestCase):
 
     def test_an_unreadable_authority_stops_the_send(self):
         with self.retirement.transaction(self.unit, live_pair_present=True) as txn:
-            txn.reserve(pinned=(("codex", "wZ:p3G"), ("claude", "wZ:p3C")))
+            txn.reserve(pinned=self._pins())
         self.retirement.seal_path.write_text("deadbeef")  # identity mismatch
         result = self._redispatch()
         self.assertEqual(
@@ -144,7 +155,7 @@ class RedispatchRetirementGuardTest(unittest.TestCase):
         """
         with patch.object(live, "list_herdr_agent_rows", return_value=[]):
             with self.retirement.transaction(self.unit, live_pair_present=True) as txn:
-                txn.reserve(pinned=(("codex", "wZ:p3G"), ("claude", "wZ:p3C")))
+                txn.reserve(pinned=self._pins())
                 result = self.ops.redispatch_to_gateway(
                     action_id="a", gateway_assigned_name=self.gw, issue="13847",
                     lane=_LANE, journal="79612", workspace_id=_WS,

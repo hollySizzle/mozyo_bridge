@@ -17,7 +17,8 @@ literal (Redmine #14187 Acceptance 4/6).
 from __future__ import annotations
 
 import threading
-from dataclasses import dataclass
+import weakref
+from dataclasses import InitVar, dataclass
 from typing import Sequence
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
@@ -46,12 +47,11 @@ class SharedSpaceSmokeError(RuntimeError):
 
 
 class SmokeIsolationError(SharedSpaceSmokeError):
-    """Isolation / cleanup authority could not be established (pre-actuation).
+    """The pre-actuation isolated-home boundary could not be established.
 
     Raised BEFORE any herdr command runs when the requested smoke home is not
-    provably distinct from the real operator home, so the harness never creates
-    something it could not later tear down exactly (Redmine #14187 Acceptance 5 —
-    "cleanup 不能時は create 前に fail-closed").
+    provably distinct from the real operator home. Isolation does not itself authorize
+    cleanup; the disposable minter's successful-create receipt capability does.
     """
 
 
@@ -59,7 +59,7 @@ class SmokeIsolationError(SharedSpaceSmokeError):
 #: The phase a project run failed in, or :data:`PHASE_NONE`. A closed enum so the
 #: durable evidence names *where* a run stopped without ever carrying a raw message.
 PHASE_NONE = "none"
-PHASE_ISOLATION = "isolation"  # pre-create: cleanup authority not established
+PHASE_ISOLATION = "isolation"  # pre-create: isolated-home boundary not established
 PHASE_LOCK_ACQUIRE = "lock_acquire"  # single-flight fence could not be acquired (zero create)
 PHASE_LOCK_RELEASE = "lock_release_after_create"  # fence release failed AFTER create/adopt
 PHASE_LAUNCHER_PREFLIGHT = "launcher_preflight"  # managed-launch launcher incompatible
@@ -106,6 +106,48 @@ def _classify_failure_phase(exc: BaseException) -> str:
 
 # -- redaction-safe command observation ----------------------------------------
 
+_WORKSPACE_CREATE_RECEIPTS_TOKEN = object()
+_MINTED_WORKSPACE_CREATE_RECEIPTS: (
+    "weakref.WeakSet[SuccessfulWorkspaceCreateReceipts]"
+) = weakref.WeakSet()
+
+
+@dataclass(frozen=True, eq=False)
+class SuccessfulWorkspaceCreateReceipts:
+    """Opaque, redacted target set minted only from recorder success receipts."""
+
+    _workspace_ids: tuple[str, ...]
+    _mint_token: InitVar[object] = None
+
+    def __post_init__(self, _mint_token: object) -> None:
+        if _mint_token is not _WORKSPACE_CREATE_RECEIPTS_TOKEN:
+            raise SharedSpaceSmokeError(
+                "workspace cleanup receipts must be minted by RecordingHerdrRunner"
+            )
+
+    def __repr__(self) -> str:
+        return (
+            "<SuccessfulWorkspaceCreateReceipts "
+            f"workspace_count={len(self._workspace_ids)}>"
+        )
+
+
+def _mint_workspace_create_receipts(
+    workspace_ids: Sequence[str],
+) -> SuccessfulWorkspaceCreateReceipts:
+    receipts = SuccessfulWorkspaceCreateReceipts(
+        tuple(workspace_ids), _mint_token=_WORKSPACE_CREATE_RECEIPTS_TOKEN
+    )
+    _MINTED_WORKSPACE_CREATE_RECEIPTS.add(receipts)
+    return receipts
+
+
+def _is_minted_workspace_create_receipts(receipts: object) -> bool:
+    return (
+        isinstance(receipts, SuccessfulWorkspaceCreateReceipts)
+        and receipts in _MINTED_WORKSPACE_CREATE_RECEIPTS
+    )
+
 
 class RecordingHerdrRunner:
     """Wrap an injected ``runner``; record redaction-safe herdr command observations.
@@ -120,7 +162,8 @@ class RecordingHerdrRunner:
     - ``workspace list`` — a bare count (the label read the shared path performs);
     - ``agent start`` — the durable ``mzb1_...`` identity recovered from the
       run-owned prepared pane (a mozyo identity token, not a secret);
-    - ``pane close`` — the exact ``wN:pM`` handle.
+    - ``pane close`` — an exact handle used by the production placement path (never
+      cleanup authority for this smoke).
 
     It never records ``--env`` values, ``--cwd`` paths, or any full payload, so the
     tape can be summarised into a Redmine journal without leaking a home path or a
@@ -130,14 +173,12 @@ class RecordingHerdrRunner:
     list→create critical section; this lock only keeps the *tape* consistent).
 
     **Actuation-receipt authority (review j#83905 F2).** The tape also records the
-    *results* of successful mutations — the ``pane_id`` a ``workspace create`` /
-    ``agent start`` actually landed, and the ``(workspace_id -> label)`` a create
-    minted — parsed from the forwarded response. This is what makes cleanup and residue
-    verification independent of the per-project observations: a worker that crashes
-    AFTER its ``agent start`` succeeds loses its observation, but the pane it launched
-    is already on this tape, so :meth:`SharedSpaceSmokeHarness.cleanup` still closes it
-    and :meth:`verify_residue` still counts it. Only a ``returncode == 0`` response with
-    a parseable id is recorded (a failed / mislocated launch left no live pane).
+    *results* of successful mutations — the pane an ``agent start`` landed and the
+    ``(workspace_id -> label)`` a ``workspace create`` minted — parsed from the
+    forwarded response.  Only the latter is destructive cleanup authority: the
+    disposable server minter can bind a one-shot ``workspace close`` capability to
+    those successful create receipts after exact worker containment.  Launched pane
+    locators remain observation/residue data and are never replayed as cleanup targets.
     """
 
     def __init__(self, inner) -> None:
@@ -152,7 +193,8 @@ class RecordingHerdrRunner:
         #: Exact ``wN:pM`` handles passed to ``pane close``.
         self.pane_close_handles: list = []
         #: RECEIPT — ``wN:pM`` pane locators every SUCCESSFUL ``agent start`` landed
-        #: (parsed from the response), the authoritative teardown set.
+        #: (parsed from the response), for private observation only.  Generation is
+        #: unbound, so these values are never destructive cleanup authority.
         self.launched_locators: list = []
         #: RECEIPT — ``{workspace_id: label}`` every SUCCESSFUL ``workspace create``
         #: minted (id from the response, label from the request).
@@ -263,6 +305,11 @@ class RecordingHerdrRunner:
                 * max(0, int(coordinators_create_count))
             )
 
+    def workspace_cleanup_receipts(self) -> SuccessfulWorkspaceCreateReceipts:
+        """Mint a redacted set from successful create receipts on this tape only."""
+        with self._lock:
+            return _mint_workspace_create_receipts(tuple(self.created_workspaces))
+
     @property
     def coordinators_create_count(self) -> int:
         """How many workspaces were created carrying the exact ``coordinators`` label."""
@@ -347,6 +394,7 @@ class SharedSpaceSmokeObservation:
     residue_agents: int = -1  # after cleanup; MUST be 0 (unset/failed = not verified)
     residue_verified: bool = False  # cleanup residue was read back successfully
     cleanup_attempted: bool = False
+    cleanup_completed: bool = False
 
     @property
     def all_projects_completed(self) -> bool:
@@ -393,6 +441,7 @@ class SharedSpaceSmokeObservation:
         """
         return (
             self.cleanup_attempted
+            and self.cleanup_completed
             and self.all_projects_completed
             and self.residue_verified
             and self.residue_workspaces == 0
@@ -417,6 +466,7 @@ class SharedSpaceSmokeObservation:
             "residue_agents": self.residue_agents,
             "residue_verified": self.residue_verified,
             "cleanup_attempted": self.cleanup_attempted,
+            "cleanup_completed": self.cleanup_completed,
             "converged": self.converged,
             "residue_clear": self.residue_clear,
             "projects": [
@@ -445,6 +495,7 @@ __all__ = (
     "RecordingHerdrRunner",
     "SharedSpaceSmokeError",
     "SharedSpaceSmokeObservation",
+    "SuccessfulWorkspaceCreateReceipts",
     "SmokeIsolationError",
     "_classify_failure_phase",
     "_flag_value",

@@ -82,6 +82,7 @@ def live_row(**changes: object) -> dict[str, object]:
     values: dict[str, object] = {
         "name": ASSIGNED_NAME,
         "pane_id": LOCATOR,
+        "terminal_id": "terminal:fixture",
         "agent": PROVIDER,
         "status": "done",
         "revision": REVISION,
@@ -97,6 +98,7 @@ def attestation(**changes: object) -> SimpleNamespace:
         "role": PROVIDER,
         "lane_id": LANE,
         "locator": LOCATOR,
+        "terminal_id": "terminal:fixture",
         "verdict": "present",
         "observed_at": "2026-07-26T00:00:00+00:00",
         "replacement_action_id": ACTION_ID,
@@ -110,7 +112,8 @@ class FakeRail:
         self.result = result
         self.calls: list[tuple[str, str]] = []
 
-    def drive_turn_start(self, target: str, body: str):
+    def drive_turn_start(self, target: str, body: str, **kwargs):
+        # ``**kwargs`` absorbs the Redmine #15202 ``screen_guard`` the live seam binds.
         self.calls.append((target, body))
         if isinstance(self.result, BaseException):
             raise self.result
@@ -411,39 +414,23 @@ class RecoveryAnchorDeliveryLiveTest(unittest.TestCase):
                 self.assertEqual(DETAIL_ATTESTATION_MISMATCH, result.detail)
                 self.assertEqual([], rail.calls)
 
-    def test_v1_attestation_requires_the_exact_bound_side_authority(self) -> None:
+    def test_legacy_side_authority_is_diagnostic_only(self) -> None:
         with self._home() as raw_home:
             service = FakeLiveService(
                 Path(raw_home),
                 rail=FakeRail(TurnStartResult(outcome=OUTCOME_STARTED)),
             )
-            binding = SimpleNamespace(phase="bound", old_locator="s:OLD")
-            store = SimpleNamespace(read=lambda action, assigned_name: binding)
-            with patch.object(
-                delivery_live, "selected_attestation_store_is_v1", return_value=True
-            ), patch.object(
-                delivery_live,
-                "HerdrIdentityReplacementBindingStore",
-                return_value=store,
-            ), patch.object(
-                delivery_live, "replacement_action_is_bound", return_value=True
-            ) as joined:
-                self.assertTrue(
-                    service._attestation_bound_to_action(attestation(), request())
+            self.assertTrue(
+                service._attestation_bound_to_action(
+                    attestation(), request(), live_terminal_id="terminal:fixture")
+            )
+            self.assertFalse(
+                service._attestation_bound_to_action(
+                    attestation(replacement_action_id=""),
+                    request(),
+                    live_terminal_id="terminal:fixture",
                 )
-            joined.assert_called_once()
-            with patch.object(
-                delivery_live, "selected_attestation_store_is_v1", return_value=True
-            ), patch.object(
-                delivery_live,
-                "HerdrIdentityReplacementBindingStore",
-                return_value=store,
-            ), patch.object(
-                delivery_live, "replacement_action_is_bound", return_value=False
-            ):
-                self.assertFalse(
-                    service._attestation_bound_to_action(attestation(), request())
-                )
+            )
 
     def test_retirement_guard_is_the_final_pre_drive_zero_send(self) -> None:
         with self._home() as raw_home:

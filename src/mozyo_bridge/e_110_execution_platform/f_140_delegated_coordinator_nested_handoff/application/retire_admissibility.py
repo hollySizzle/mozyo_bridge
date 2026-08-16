@@ -23,7 +23,15 @@ kinds of durable evidence measured at action time, plus the operator's fallback 
   accepted, and whose acceptance target was obtained by a successor issue that acknowledges the
   supersession. Its round can never be approved, so the generation fence can only ever refuse it
   — and the two escapes from that (a false ``--latest-generation-admissible`` assert, or reading
-  the successor's approval as this lane's) are exactly what the reproduction #14577 refused.
+  the successor's approval as this lane's) are exactly what the reproduction #14577 refused;
+- :func:`...retire_superseded_audit_failure.resolve_superseded_audit_failure_admissible` — the
+  SUPERSEDED AUDIT FAILURE terminal (#15166), likewise in its own module. The shape above but with
+  NO formal Review Gate at all: a no-change verification lane whose round-1 verdict was recorded by
+  an independent audit journal (``review_request`` was never posted, so no ``## Gate: review``
+  exists), superseded by a successor whose own Review was approved. With zero review rounds the
+  generation fence refuses forever and the #14755 terminal refuses too — it REQUIRES a round that
+  concluded ``changes_requested`` — so the reproduction #15164 j#101825 sat permanently on
+  ``stale_review_generation``.
 
 The routes are independent and each can only ever admit; none can weaken another. A lane that
 fails all of them is blocked exactly as it was before any of them existed.
@@ -45,6 +53,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_superseded_audit_failure import (  # noqa: E501  (re-export)
+    REASON_AUDIT_ROUTE_UNREADABLE,
+    REASON_AUDIT_TARGET_UNRESOLVED,
+    resolve_superseded_audit_failure_admissible as _resolve_superseded_audit_failure_admissible,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.retire_superseded_failure import (  # noqa: E501  (re-export)
     REASON_SUPERSEDED_ROUTE_UNREADABLE,
     REASON_SUPERSEDED_TARGET_UNRESOLVED,
@@ -705,7 +718,10 @@ def _resolve_latest_generation_admissible(
     waiver = bool(getattr(args, "no_change_review_waiver", False))
     # Redmine #14755: the superseded-failure terminal is a FOURTH, live for the same reason.
     superseded = bool(getattr(args, "superseded_failure_terminal", False))
-    if path or exemption_path or waiver or superseded:
+    # Redmine #15166: the superseded-AUDIT-failure terminal is a FIFTH, live for the same reason
+    # plus one of its own — two of its conjuncts are negative claims over the whole record.
+    audit_terminal = bool(getattr(args, "superseded_audit_failure_terminal", False))
+    if path or exemption_path or waiver or superseded or audit_terminal:
         if _resolve_review_generation_admissible(args):
             return GenerationAdmissibility(True, "")
         if _resolve_review_exemption_admissible(args, target=target):
@@ -721,6 +737,7 @@ def _resolve_latest_generation_admissible(
         for route in (
             _resolve_no_change_waiver_admissible,
             _resolve_superseded_failure_admissible,
+            _resolve_superseded_audit_failure_admissible,
         ):
             result = route(args, target=target, repo_root=repo_root)
             if result.admissible:
@@ -790,6 +807,8 @@ REASON_WAIVER_ISSUER_UNRESOLVED = "waiver_issuer_unresolved"
 __all__ = (
     "GenerationAdmissibility",
     "LaneChangeMeasurement",
+    "REASON_AUDIT_ROUTE_UNREADABLE",
+    "REASON_AUDIT_TARGET_UNRESOLVED",
     "REASON_SUPERSEDED_ROUTE_UNREADABLE",
     "REASON_SUPERSEDED_TARGET_UNRESOLVED",
     "REASON_WAIVER_ISSUER_UNRESOLVED",
@@ -803,5 +822,6 @@ __all__ = (
     "_resolve_no_change_waiver_admissible",
     "_resolve_review_exemption_admissible",
     "_resolve_review_generation_admissible",
+    "_resolve_superseded_audit_failure_admissible",
     "_resolve_superseded_failure_admissible",
 )

@@ -1,9 +1,4 @@
-"""Owner-approved pending-composer quarantine and receiver replacement (#13763).
-
-The use case never submits, clears, types, or sends a key.  Its only mutation is
-closing one exact generation-pinned managed process and asking the existing
-adopt-or-launch actuator to recreate that same lane/provider slot.
-"""
+"""Owner-approved, generation-pinned receiver quarantine/replacement (#13763)."""
 
 from __future__ import annotations
 
@@ -33,6 +28,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     ReleasePinError,
 )
 from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+    LaneLifecycleReader,
     lifecycle_migration_payload,
 )
 from mozyo_bridge.core.state.lane_lifecycle_model import (
@@ -69,12 +65,31 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     GhostComposerRenderPolicy,
     RenderGhostFacts,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_quarantine_disposition import (  # noqa: E501
+    disposition_drift,
+    disposition_lifecycle_reason,
+    disposition_request_reason,
+    register_disposition_flags,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.recovery_owner_approval_live import (  # noqa: E501
+    fresh_live_redmine_journal_reader,
+    verify_live_generation_mismatch_disposition_approval,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.generation_mismatch_disposition import (  # noqa: E501
+    DISPOSITION_LIFECYCLE_UNREADABLE,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_pending_composer import (  # noqa: E501
     AMBIGUOUS,
+    GEN_AXIS_IDENTITY,
+    GEN_AXIS_PAIR,
+    GEN_AXIS_REVISION,
+    GEN_AXIS_ROW_AMBIGUOUS,
+    GEN_AXIS_WORKSPACE_CWD,
     UNCORRELATED,
     PendingComposerClassification,
     PendingComposerSignal,
     classify_pending_composer,
+    ordered_generation_axes,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (  # noqa: E501
     _tab_id_of_row,
@@ -88,6 +103,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (  # noqa: E501
     HerdrCliAgentStateReader,
@@ -132,8 +148,6 @@ def observe_composer_text(content: object) -> ComposerObservation:
         return ComposerObservation(False, None)
     if not prompt_body:
         return ComposerObservation(True, False)
-    # A marker may be hard-wrapped mid-token. Collapse whitespace only inside the
-    # current composer tail, never the whole pane/scrollback.
     composer_tail = "".join("".join(lines[prompt_index:]).split())
     markers = tuple(dict.fromkeys(_HANDOFF_MARKER_RE.findall(composer_tail)))
     return ComposerObservation(True, True, markers)
@@ -150,6 +164,36 @@ class QuarantineRequest:
     action_generation: str
     approval_observed_at: str
     approved_revision: int
+    approved_generation_axes: tuple[str, ...] = ()
+    approved_pending_identity: str = ""
+    approved_pending_effect: str = ""
+    approved_lane_generation: int = -1
+    approved_lifecycle_revision: int = -1
+
+    @property
+    def has_disposition_tokens(self) -> bool:
+        return bool(
+            self.approved_generation_axes
+            or self.approved_pending_identity
+            or self.approved_pending_effect
+            or self.approved_lane_generation != -1
+            or self.approved_lifecycle_revision != -1
+        )
+
+    @property
+    def is_disposition(self) -> bool:
+        """Whether all five disposition authorities are present and positive."""
+        return bool(
+            self.approved_generation_axes
+            and self.approved_pending_identity
+            and self.approved_pending_effect
+            and isinstance(self.approved_lane_generation, int)
+            and not isinstance(self.approved_lane_generation, bool)
+            and self.approved_lane_generation > 0
+            and isinstance(self.approved_lifecycle_revision, int)
+            and not isinstance(self.approved_lifecycle_revision, bool)
+            and self.approved_lifecycle_revision > 0
+        )
 
 
 @dataclass(frozen=True)
@@ -158,10 +202,8 @@ class QuarantineInspection:
     signal: PendingComposerSignal
     row_revision: int = -1
     attested_at: str = ""
-    #: Is a managed process still live at the exact pinned ``(assigned name, locator)``?
-    #: ``None`` means the inventory could not prove either way — never read as absence
-    #: (R1-F1 j#78347): only a POSITIVE absence lets a redrive skip the owed close.
     receiver_present: Optional[bool] = None
+    composer_generation: str = ""
     detail: str = ""
 
     @property
@@ -195,9 +237,6 @@ class QuarantineOutcome:
     closed_old_receiver: bool = False
     fresh_locator: str = ""
     detail: str = ""
-    #: The shared-store schema migration this quarantine's replacement write gate performed, if
-    #: any (Redmine #13844 R3-F2): the typed audit record so the migration is legible in JSON/text,
-    #: not only the pre-migration stderr advisory.
     lifecycle_migration: Optional[dict[str, Any]] = None
 
     @property
@@ -227,6 +266,8 @@ class QuarantineOutcome:
 class SublaneQuarantineOps(Protocol):
     def inspect(self, request: QuarantineRequest) -> QuarantineInspection: ...
 
+    def current_close_pin(self, request: QuarantineRequest) -> Optional[ReleasePin]: ...
+
     def close_receiver(
         self, request: QuarantineRequest, pin: ReleasePin
     ) -> CloseReceiverResult: ...
@@ -236,6 +277,10 @@ class SublaneQuarantineOps(Protocol):
     def verify_fresh_receiver(
         self, request: QuarantineRequest, *, fresh_after: str
     ) -> FreshReceiverVerification: ...
+
+    def approval_verified(
+        self, request: QuarantineRequest, inspection: QuarantineInspection
+    ) -> bool: ...
 
 
 def _parse_time(value: object) -> Optional[datetime]:
@@ -265,12 +310,6 @@ class SublaneQuarantineUseCase:
         classification: PendingComposerClassification,
         **changes: Any,
     ) -> QuarantineOutcome:
-        # Redmine #13844 R5-F1: carry the schema migration THIS run performed into the outcome at
-        # EVERY return, read from the OPERATION-SCOPED capture (reset at run() start, set only
-        # after this run's migrating write) — NOT from the store's mutable / potentially reused
-        # ``last_write_preparation``. So a preflight-only run, or a reused store whose earlier run
-        # migrated, reports ``None`` here (no side effect fabricated); a run that actually migrated
-        # keeps it across its later ``intact`` writes.
         changes.setdefault(
             "lifecycle_migration", getattr(self, "_operation_migration", None)
         )
@@ -289,16 +328,14 @@ class SublaneQuarantineUseCase:
         inspection: QuarantineInspection,
         classification: PendingComposerClassification,
     ) -> str:
-        """Why this approval may not act on the receiver that is live RIGHT NOW.
-
-        The approval names one composer of one agent generation.  These three fences
-        are what make it that narrow, so they must hold at every moment we are about
-        to close — not only when the generation was opened (R1-F1 j#78347: a crash
-        between the request CAS and the close leaves an owed close whose target may
-        since have taken new input or started working; killing it then would destroy
-        an input the owner never approved discarding).
-        """
-        if not classification.quarantine_candidate:
+        request_reason = disposition_request_reason(request)
+        if request_reason:
+            return request_reason
+        if request.is_disposition:
+            drift = disposition_drift(request, inspection, classification)
+            if drift:
+                return f"disposition approval does not match live state ({drift})"
+        elif not classification.quarantine_candidate:
             return "classification is not quarantine-eligible; zero actuation"
         if inspection.row_revision != request.approved_revision:
             return "approval is stale for the current agent/composer revision"
@@ -308,24 +345,29 @@ class SublaneQuarantineUseCase:
             return "approval predates the current attested agent generation"
         return ""
 
+    def _disposition_lifecycle_reason(
+        self,
+        request: QuarantineRequest,
+        key: LaneLifecycleKey,
+        *,
+        expected_revision: int,
+    ) -> str:
+        if not request.has_disposition_tokens:
+            return ""
+        try:
+            record = LaneLifecycleReader(path=self.store.path).get(key)
+        except (LaneLifecycleError, OSError):
+            return DISPOSITION_LIFECYCLE_UNREADABLE
+        return disposition_lifecycle_reason(
+            request, record, expected_revision=expected_revision
+        )
+
     def _capture_migration(self) -> None:
-        """Fold THIS run's schema migration into the operation-scoped accumulator (Redmine #13844
-        R6-F1). Call this immediately after EVERY schema-needing store write in this run — not
-        only the new-generation ``request_replacement``: a redrive of an EXISTING requested /
-        pending generation skips ``request_replacement`` and migrates on its first
-        ``record_replacement_outcome`` instead. The store is most-recent, so right after a write
-        its ``last_write_preparation`` reflects THAT write; ``or`` keeps the FIRST migration so a
-        later ``intact`` write never clears it. A non-migrating write folds ``None`` (no-op)."""
         self._operation_migration = self._operation_migration or lifecycle_migration_payload(
             getattr(self.store, "last_write_preparation", None)
         )
 
     def run(self, request: QuarantineRequest, *, execute: bool) -> QuarantineOutcome:
-        # Redmine #13844 R5-F1: the schema migration this ONE command performs is captured
-        # operation-scoped — reset at the start of every run(), so a REUSED use case / store never
-        # carries a PAST run's migration into this action's audit. It is folded in after EACH of
-        # this run's schema-needing writes (see :meth:`_capture_migration`); a read-only / preflight
-        # run never sets it.
         self._operation_migration: Optional[dict[str, Any]] = None
         inspection = self.ops.inspect(request)
         classification = inspection.classification
@@ -340,8 +382,15 @@ class SublaneQuarantineUseCase:
                 ),
             )
 
-        # Positive durable approval and exact generation are mandatory before any
-        # lifecycle write or process close.
+        request_reason = disposition_request_reason(request)
+        if request_reason:
+            return self._base_outcome(
+                request,
+                classification,
+                executed=True,
+                detail=f"disposition approval refused ({request_reason}); zero actuation",
+            )
+
         try:
             decision = DecisionPointer(
                 source="redmine",
@@ -381,6 +430,18 @@ class SublaneQuarantineUseCase:
                 executed=True,
                 detail="approval timestamp / agent revision is incomplete",
             )
+        if request.is_disposition:
+            verifier = getattr(self.ops, "approval_verified", None)
+            if verifier is None or not verifier(request, inspection):
+                return self._base_outcome(
+                    request,
+                    classification,
+                    executed=True,
+                    detail=(
+                        "the pinned journal is not a fresh structured direct-owner "
+                        "approval for this exact disposition; zero actuation"
+                    ),
+                )
 
         try:
             key = LaneLifecycleKey(
@@ -397,7 +458,21 @@ class SublaneQuarantineUseCase:
             current = self.store.get_replacement(key)
         except (LaneLifecycleError, ReleasePinError, OSError):
             current = None
-        if current is None or not current.lane_active or current.issue_id != decision.issue_id:
+        if current is None:
+            lifecycle_reason = self._disposition_lifecycle_reason(
+                request, key, expected_revision=request.approved_lifecycle_revision
+            )
+            return self._base_outcome(
+                request,
+                classification,
+                executed=True,
+                detail=(
+                    f"disposition lifecycle refused ({lifecycle_reason}); zero actuation"
+                    if lifecycle_reason
+                    else "lane lifecycle owner is absent / foreign / inactive"
+                ),
+            )
+        if not current.lane_active or current.issue_id != decision.issue_id:
             return self._base_outcome(
                 request,
                 classification,
@@ -405,25 +480,49 @@ class SublaneQuarantineUseCase:
                 detail="lane lifecycle owner is absent / foreign / inactive",
             )
 
-        try:
-            pin = ReleasePin(
-                role=request.role,
-                assigned_name=request.assigned_name,
-                locator=request.locator,
+        stored_generation = current.state in (
+            REPLACEMENT_REQUESTED, REPLACEMENT_PENDING, REPLACEMENT_REPLACED,
+        )
+        if stored_generation:
+            if current.pin_version != 2 or len(current.pins) != 1:
+                return self._base_outcome(
+                    request, classification, executed=True,
+                    replacement_state=current.state,
+                    detail="stored replacement pin is legacy or malformed; zero-close",
+                )
+            pin = current.pins[0]
+        else:
+            pin = self.ops.current_close_pin(request)
+            if pin is None:
+                return self._base_outcome(
+                    request, classification, executed=True,
+                    replacement_state=current.state,
+                    detail=(
+                        "approved receiver lacks exact completed current-generation authority"
+                    ),
+                )
+        exact_generation = current.action_id == expected_action and (
+            not stored_generation
+            or (
+                pin.role == _norm(request.role)
+                and pin.assigned_name == _norm(request.assigned_name)
+                and pin.locator == _norm(request.locator)
             )
-        except ReleasePinError:
-            return self._base_outcome(
-                request,
-                classification,
-                executed=True,
-                replacement_state=current.state,
-                detail="approved receiver pin is incomplete",
-            )
-
-        exact_generation = (
-            current.action_id == expected_action and current.pins == (pin,)
         )
         if current.state == REPLACEMENT_REPLACED and exact_generation:
+            lifecycle_reason = self._disposition_lifecycle_reason(
+                request,
+                key,
+                expected_revision=request.approved_lifecycle_revision + 3,
+            )
+            if lifecycle_reason:
+                return self._base_outcome(
+                    request,
+                    classification,
+                    executed=True,
+                    replacement_state=current.state,
+                    detail=f"disposition lifecycle refused ({lifecycle_reason}); zero actuation",
+                )
             return self._base_outcome(
                 request,
                 classification,
@@ -443,11 +542,21 @@ class SublaneQuarantineUseCase:
                         "in flight"
                     ),
                 )
+            offset = 1 if current.state == REPLACEMENT_REQUESTED else 2
+            lifecycle_reason = self._disposition_lifecycle_reason(
+                request,
+                key,
+                expected_revision=request.approved_lifecycle_revision + offset,
+            )
+            if lifecycle_reason:
+                return self._base_outcome(
+                    request,
+                    classification,
+                    executed=True,
+                    replacement_state=current.state,
+                    detail=f"disposition lifecycle refused ({lifecycle_reason}); zero actuation",
+                )
         else:
-            # Opening a NEW generation depends on the current transient composer
-            # observation. A stored generation is resumed instead of re-opened — but
-            # resuming never means acting blind: an owed close re-runs these same
-            # fences below (R1-F1 j#78347).
             stale = self._approval_stale_reason(request, inspection, classification)
             if stale:
                 return self._base_outcome(
@@ -456,6 +565,17 @@ class SublaneQuarantineUseCase:
                     executed=True,
                     replacement_state=current.state,
                     detail=stale,
+                )
+            lifecycle_reason = self._disposition_lifecycle_reason(
+                request, key, expected_revision=request.approved_lifecycle_revision
+            )
+            if lifecycle_reason:
+                return self._base_outcome(
+                    request,
+                    classification,
+                    executed=True,
+                    replacement_state=current.state,
+                    detail=f"disposition lifecycle refused ({lifecycle_reason}); zero actuation",
                 )
             opened = self.store.request_replacement(
                 key,
@@ -484,15 +604,19 @@ class SublaneQuarantineUseCase:
 
         closed = current.state == REPLACEMENT_PENDING
         if current.state == REPLACEMENT_REQUESTED:
-            # The close is still owed, so it is about to kill whatever is live at the
-            # pinned locator *now* — not necessarily what the owner looked at (R1-F1
-            # j#78347). Re-run the approval fences at this edge unless the old receiver
-            # is POSITIVELY gone: an absent one is the crash-after-close case (contract
-            # 5), whose redrive owes only the launch. An inventory that cannot prove
-            # absence is not absence — it re-validates and fails closed.
-            if inspection.receiver_present is not False:
+            close_inspection = self.ops.inspect(request)
+            close_classification = close_inspection.classification
+            if close_inspection.workspace_id != key.repo_workspace_id:
+                return self._base_outcome(
+                    request,
+                    close_classification,
+                    executed=True,
+                    replacement_state=REPLACEMENT_REQUESTED,
+                    detail="workspace identity drifted at close boundary; owed close withheld",
+                )
+            if close_inspection.receiver_present is not False:
                 stale = self._approval_stale_reason(
-                    request, inspection, classification
+                    request, close_inspection, close_classification
                 )
                 if stale:
                     return self._base_outcome(
@@ -502,6 +626,19 @@ class SublaneQuarantineUseCase:
                         replacement_state=REPLACEMENT_REQUESTED,
                         detail=f"{stale}; owed close withheld",
                     )
+            lifecycle_reason = self._disposition_lifecycle_reason(
+                request,
+                key,
+                expected_revision=request.approved_lifecycle_revision + 1,
+            )
+            if lifecycle_reason:
+                return self._base_outcome(
+                    request,
+                    classification,
+                    executed=True,
+                    replacement_state=REPLACEMENT_REQUESTED,
+                    detail=f"disposition lifecycle refused ({lifecycle_reason}); owed close withheld",
+                )
             close = self.ops.close_receiver(request, pin)
             if not (close.closed or close.old_absent):
                 return self._base_outcome(
@@ -539,8 +676,20 @@ class SublaneQuarantineUseCase:
                     detail="replacement row vanished after pending record",
                 )
 
-        # ``pending`` is deliberately the durable partial-launch state. A redrive
-        # starts here and never closes the old locator a second time.
+        lifecycle_reason = self._disposition_lifecycle_reason(
+            request,
+            key,
+            expected_revision=request.approved_lifecycle_revision + 2,
+        )
+        if lifecycle_reason:
+            return self._base_outcome(
+                request,
+                classification,
+                executed=True,
+                replacement_state=REPLACEMENT_PENDING,
+                closed_old_receiver=closed,
+                detail=f"disposition lifecycle refused ({lifecycle_reason}); launch withheld",
+            )
         try:
             self.ops.heal_receiver(request)
         except Exception as exc:  # noqa: BLE001 - fixed type only, no body/detail persisted
@@ -563,6 +712,20 @@ class SublaneQuarantineUseCase:
                 replacement_state=REPLACEMENT_PENDING,
                 closed_old_receiver=closed,
                 detail="fresh receiver verification failed; redrive launch only",
+            )
+        lifecycle_reason = self._disposition_lifecycle_reason(
+            request,
+            key,
+            expected_revision=request.approved_lifecycle_revision + 2,
+        )
+        if lifecycle_reason:
+            return self._base_outcome(
+                request,
+                classification,
+                executed=True,
+                replacement_state=REPLACEMENT_PENDING,
+                closed_old_receiver=closed,
+                detail=f"disposition lifecycle refused ({lifecycle_reason}); completion withheld",
             )
         replaced = self.store.record_replacement_outcome(
             key,
@@ -591,13 +754,16 @@ class SublaneQuarantineUseCase:
 @dataclass
 class LiveSublaneQuarantineOps:
     repo_root: Path
+    home: Optional[Path] = None
     env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
     runner: Optional[Runner] = None
     timeout: float = COMMAND_TIMEOUT_SECONDS
-    #: Redmine #14065 Phase 2: injected ghost render policy (``None`` = gate OFF /
-    #: byte-unchanged); ``render_facts_reader`` lets a hermetic test supply facts.
     ghost_policy: Optional[GhostComposerRenderPolicy] = None
     render_facts_reader: Optional[Callable[[str], RenderGhostFacts]] = None
+    composer_generation_reader: Optional[Callable[[str], str]] = None
+    journal_reader: Optional[object] = None
+    journal_reader_fresh: bool = False
+    issuer_resolver: Optional[object] = None
 
     def _rows(self) -> Sequence[Mapping[str, object]]:
         return list_herdr_agent_rows(self.env)
@@ -672,16 +838,19 @@ class LiveSublaneQuarantineOps:
             and _norm(row.get(AGENT_KEY_NAME)) == _norm(request.assigned_name)
         ]
         exact = [row for row in matches if _agent_locator(row) == _norm(request.locator)]
-        # Presence is the exact pinned pair being live AT ALL — deliberately not the
-        # unique-row test below. An ambiguous inventory still means something is live at
-        # that locator, so an owed close must re-validate rather than treat it as the
-        # crash-after-close case (R1-F1 j#78347).
         present = bool(exact)
         row = exact[0] if len(exact) == 1 and len(matches) == 1 else None
         if row is None:
             return QuarantineInspection(
                 workspace_id=workspace_id,
-                signal=PendingComposerSignal(True, None, "unknown", False, False),
+                signal=PendingComposerSignal(
+                    True,
+                    None,
+                    "unknown",
+                    False,
+                    False,
+                    generation_axes=(GEN_AXIS_ROW_AMBIGUOUS,),
+                ),
                 receiver_present=present,
                 detail="generation_mismatch",
             )
@@ -699,12 +868,14 @@ class LiveSublaneQuarantineOps:
             if isinstance(revision_raw, int) and not isinstance(revision_raw, bool)
             else -1
         )
-        generation_ok = (
-            identity_ok
-            and revision == request.approved_revision
-            and self._cwd_matches(row, self.repo_root)
-            and self._pair_ok(rows, workspace_id=workspace_id, lane=request.lane)
+        axis_checks = (
+            (GEN_AXIS_IDENTITY, identity_ok),
+            (GEN_AXIS_REVISION, revision == request.approved_revision),
+            (GEN_AXIS_WORKSPACE_CWD, self._cwd_matches(row, self.repo_root)),
+            (GEN_AXIS_PAIR, self._pair_ok(rows, workspace_id=workspace_id, lane=request.lane)),
         )
+        generation_axes = tuple(axis for axis, ok in axis_checks if not ok)
+        generation_ok = not generation_axes
         attestation_record = None
         try:
             attestation_record = HerdrIdentityAttestationStore().read(
@@ -715,6 +886,8 @@ class LiveSublaneQuarantineOps:
         attestation = evaluate_attestation(
             attestation_record,
             live_locator=_norm(request.locator),
+            live_terminal_id=terminal_identity_of_live_slot(
+                request.assigned_name, request.locator, rows),
             expected_workspace_id=workspace_id,
             expected_role=_norm(request.role),
             expected_lane=_norm_lane(request.lane),
@@ -736,22 +909,12 @@ class LiveSublaneQuarantineOps:
         except Exception:  # noqa: BLE001 - transport failure is inventory_unreadable
             runtime_state = "unknown"
             observation = ComposerObservation(False, None)
-        correlated: list[str] = []
+        from .herdr_live_attestation_time import correlated_delivery_markers, fresh_attestation_identity
+        boundary = fresh_attestation_identity(
+            home=None, rows=rows, assigned_name=request.assigned_name,
+            workspace_id=workspace_id, role=request.role, lane=request.lane)
         ledger = HerdrDeliveryLedger()
-        for marker in observation.marker_ids:
-            records = ledger.records_for_marker(marker)
-            if any(
-                _norm(record.target) in (
-                    _norm(request.locator),
-                    _norm(request.assigned_name),
-                )
-                for record in records
-            ):
-                correlated.append(marker)
-        # Redmine #14065 Phase 2: a dim ghost the provider declares empties the text
-        # pending candidate at action time; everything else (normal/mixed/unknown,
-        # unreadable, unresolved provider, missing observation, no injected policy)
-        # preserves. The render read runs only when the text observation reported pending.
+        correlated = correlated_delivery_markers(observation.marker_ids, ledger, boundary)
         effective_has_pending = apply_ghost_empty(
             observation.has_pending,
             policy=self.ghost_policy,
@@ -760,6 +923,17 @@ class LiveSublaneQuarantineOps:
             locator=_norm(request.locator),
             facts_reader=self.render_facts_reader,
         )
+        composer_generation = ""
+        if (
+            effective_has_pending is True
+            and not observation.marker_ids
+            and self.composer_generation_reader is not None
+        ):
+            try:
+                generation = self.composer_generation_reader(_norm(request.locator))
+                composer_generation = generation if isinstance(generation, str) else ""
+            except Exception:  # noqa: BLE001 - missing provider authority fails closed
+                composer_generation = ""
         signal = PendingComposerSignal(
             inventory_readable=observation.readable,
             has_pending=effective_has_pending,
@@ -768,6 +942,7 @@ class LiveSublaneQuarantineOps:
             generation_matches=generation_ok,
             correlated_marker_ids=tuple(correlated),
             correlation_ambiguous=len(observation.marker_ids) > 1,
+            generation_axes=generation_axes,
         )
         return QuarantineInspection(
             workspace_id=workspace_id,
@@ -777,7 +952,33 @@ class LiveSublaneQuarantineOps:
                 attestation_record.observed_at if attestation_record else ""
             ),
             receiver_present=present,
+            composer_generation=composer_generation,
             detail="classified_without_persisting_composer_body",
+        )
+
+    def approval_verified(
+        self, request: QuarantineRequest, inspection: QuarantineInspection
+    ) -> bool:
+        return verify_live_generation_mismatch_disposition_approval(
+            self, request, inspection
+        )
+
+    def current_close_pin(self, request: QuarantineRequest) -> Optional[ReleasePin]:
+        from .herdr_destructive_close_identity import current_generation_release_pin
+
+        try:
+            rows = tuple(self._rows())
+            workspace_id = repo_scope_workspace_id(self.repo_root)
+        except Exception:  # noqa: BLE001 - destructive authority is unreadable
+            return None
+        return current_generation_release_pin(
+            rows,
+            home=self.home,
+            workspace_id=workspace_id,
+            lane_id=request.lane,
+            role=request.role,
+            assigned_name=request.assigned_name,
+            locator=request.locator,
         )
 
     def close_receiver(
@@ -785,28 +986,26 @@ class LiveSublaneQuarantineOps:
     ) -> CloseReceiverResult:
         workspace_id = repo_scope_workspace_id(self.repo_root)
         try:
-            rows = self._rows()
+            rows = tuple(self._rows())
+            from .herdr_destructive_close_identity import pinned_generation_partition
+            partition = pinned_generation_partition(
+                (pin,), rows, home=self.home, workspace_id=workspace_id,
+                lane_id=request.lane,
+            )
+            if partition is None:
+                return CloseReceiverResult(False, detail="close_generation_not_current")
+            live_pins, absent_pins = partition
+            if absent_pins:
+                return CloseReceiverResult(
+                    closed=False, old_absent=True, detail="old_receiver_absent"
+                )
             plan = pin_matched_close_plan(
-                (pin,), rows, workspace_id=workspace_id, lane_id=request.lane
+                live_pins, rows, workspace_id=workspace_id, lane_id=request.lane
             )
         except Exception:  # noqa: BLE001 - close preflight failure is zero close
             return CloseReceiverResult(False, detail="close_preflight_unreadable")
         if plan is None:
             return CloseReceiverResult(False, detail="close_pin_inconsistent")
-        if not plan.close_targets:
-            # Old exact locator already vanished. A recycled assigned name at a
-            # different locator is NOT absence; it is a newer generation and stale approval.
-            recycled = any(
-                isinstance(row, Mapping)
-                and _norm(row.get(AGENT_KEY_NAME)) == pin.assigned_name
-                and _agent_locator(row) != pin.locator
-                for row in rows
-            )
-            return CloseReceiverResult(
-                closed=False,
-                old_absent=not recycled,
-                detail="old_receiver_absent" if not recycled else "assigned_name_recycled",
-            )
         result = execute_herdr_retire_close(
             HerdrRetireClosePlan(
                 workspace_id=plan.workspace_id,
@@ -817,6 +1016,16 @@ class LiveSublaneQuarantineOps:
             runner=self.runner,
             timeout=self.timeout,
         )
+        if result.closed and not result.failed:
+            try:
+                from .herdr_destructive_close_identity import pinned_generations_absent
+                absent = pinned_generations_absent(
+                    (pin,), tuple(self._rows()), home=self.home,
+                    workspace_id=workspace_id, lane_id=request.lane)
+            except Exception:  # noqa: BLE001 - absence must be positively proven
+                absent = False
+            if not absent:
+                return CloseReceiverResult(False, detail="close_absence_unproven")
         return CloseReceiverResult(
             closed=bool(result.closed) and not result.failed,
             detail="closed" if result.closed and not result.failed else "close_failed",
@@ -864,6 +1073,8 @@ class LiveSublaneQuarantineOps:
         joined = evaluate_attestation(
             record,
             live_locator=locator,
+            live_terminal_id=terminal_identity_of_live_slot(
+                request.assigned_name, locator, rows),
             expected_workspace_id=workspace_id,
             expected_role=request.role,
             expected_lane=request.lane,
@@ -908,14 +1119,33 @@ def cmd_sublane_quarantine(args: argparse.Namespace) -> int:
         action_generation=getattr(args, "action_generation", "") or "",
         approval_observed_at=getattr(args, "approval_observed_at", "") or "",
         approved_revision=int(getattr(args, "approved_revision", -1)),
+        approved_generation_axes=ordered_generation_axes(
+            tuple(
+                token.strip()
+                for token in (getattr(args, "approved_generation_axes", "") or "").split(",")
+                if token.strip()
+            )
+        ),
+        approved_pending_identity=getattr(args, "approved_pending_identity", "") or "",
+        approved_pending_effect=getattr(args, "approved_pending_effect", "") or "",
+        approved_lane_generation=int(getattr(args, "approved_lane_generation", -1)),
+        approved_lifecycle_revision=int(
+            getattr(args, "approved_lifecycle_revision", -1)
+        ),
+    )
+    journal_reader, journal_reader_fresh = (
+        fresh_live_redmine_journal_reader()
+        if request.is_disposition and bool(getattr(args, "execute", False))
+        else (None, False)
     )
     use_case = SublaneQuarantineUseCase(
-        ops=LiveSublaneQuarantineOps(repo_root=repo_root),
+        ops=LiveSublaneQuarantineOps(
+            repo_root=repo_root,
+            journal_reader=journal_reader,
+            journal_reader_fresh=journal_reader_fresh,
+        ),
         store=LaneReplacementStore(),
     )
-    # Redmine #13844 R4-F1: the use case already carries the schema migration (from the store's
-    # ACCUMULATED preparation) in ``outcome.lifecycle_migration`` — the CLI does NOT re-read the
-    # mutable "last write" (which a later ``intact`` write would have cleared).
     outcome = use_case.run(request, execute=bool(getattr(args, "execute", False)))
     if bool(getattr(args, "json", False)):
         print(json.dumps(outcome.as_payload(), ensure_ascii=False, indent=2, sort_keys=True))
@@ -928,9 +1158,12 @@ def register_sublane_quarantine_parser(sublane_sub: Any) -> None:
     parser = sublane_sub.add_parser(
         "quarantine",
         help=(
-            "Redmine #13763: classify one exact pending composer and, only with a "
+            "Redmine #13763 / #15193: classify one exact pending composer and, only with a "
             "positive generation-bound owner approval, replace that managed receiver "
-            "without generic Enter/C-u/body typing. Default is read-only preflight."
+            "without generic Enter/C-u/body typing. A receiver whose generation mismatches "
+            "AND holds a real pending input additionally requires the five --approved-* "
+            "disposition tokens, which bind the approval to the exact mismatch and state "
+            "what becomes of that input. Default is read-only preflight."
         ),
     )
     for flag, dest, help_text in (
@@ -959,6 +1192,7 @@ def register_sublane_quarantine_parser(sublane_sub: Any) -> None:
         type=int,
         help="Herdr agent/composer revision observed by the approval",
     )
+    register_disposition_flags(parser)
     parser.add_argument(
         "--execute",
         action="store_true",

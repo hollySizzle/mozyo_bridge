@@ -29,13 +29,14 @@ Safety posture (Redmine #14187 Acceptance 1/5/6)
 - **Isolation is proven before any actuation.** Every run happens under an
   explicitly-provided isolated operator home; :func:`prove_smoke_isolation` fails
   closed BEFORE the first herdr command unless that home is provably distinct from
-  (and not nested with) the real operator home. This is also the *cleanup authority*
-  gate: the harness only ever creates inside the isolated home, so it can always tear
-  down exactly what it made (Acceptance 5 — "cleanup 不能時は create 前に fail-closed").
-- **Cleanup is by exact identity.** Teardown closes only the exact pane handles this
-  run launched (a herdr workspace auto-vanishes with its last pane — live-measured
-  #13380), then :meth:`verify_residue` proves zero residue by reading the labels and
-  the live inventory back.
+  (and not nested with) the real operator home. Isolation is necessary but is not
+  destructive cleanup authority: only the disposable server minter can supply the
+  receipt-bound capability described next.
+- **Cleanup is receipt- and ownership-bound.** This generic harness never replays a
+  launched pane locator as a destructive target: locators are generation-unbound. A
+  disposable server minter may inject its one-shot capability, fixed to successful
+  ``workspace create`` receipts and available only after exact worker containment;
+  then :meth:`verify_residue` proves zero residue by reading inventory back.
 - **Evidence is redaction-safe.** :class:`RecordingHerdrRunner` records only command
   *kinds* and the non-secret herdr/mozyo identity tokens (``coordinators`` label,
   ``mzb1_...`` names, ``wN:pM`` handles); it never records ``--env`` values, home
@@ -84,7 +85,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     SHARED_COORDINATOR_WORKSPACE_LABEL,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
-    _invoke,
     _list_rows,
     _list_workspace_labels,
 )
@@ -96,6 +96,9 @@ from mozyo_bridge.core.state.coordinator_placement_fence import (
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
     COMMAND_TIMEOUT_SECONDS,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.disposable_herdr_instance import (  # noqa: E501
+    OwnedWorkspaceCleanupCapability,
 )
 
 
@@ -153,9 +156,8 @@ class _OwnedSmokeStartupTransactionFence(StartupTransactionFence):
 def prove_smoke_isolation(isolated_home: Path, *, operator_home: Path) -> Path:
     """Fail closed unless ``isolated_home`` is a safe, distinct smoke home.
 
-    The cleanup-authority gate (Redmine #14187 Acceptance 5): the harness only ever
-    creates inside the isolated home, so it can always tear down exactly what it made
-    — but ONLY if that home is provably NOT the real operator home and NOT nested with
+    A necessary isolation gate (Redmine #14187 Acceptance 5): the harness may only
+    create inside a home provably distinct from the operator home and not nested with
     it either way (a real home *inside* the smoke home would be a cleanup target; the
     smoke home *inside* the real home would leak writes into it). Returns the resolved
     isolated home on success; raises :class:`SmokeIsolationError` (before any herdr
@@ -294,15 +296,15 @@ class _ProjectSpec:
 
 
 class SharedSpaceSmokeHarness:
-    """Drive + observe + tear down the real ``shared_space`` path in an isolated home.
+    """Drive and observe ``shared_space``; accept only opaque disposable cleanup.
 
     Construct with the :class:`IsolationCapability` :func:`isolated_smoke_home` minted
     (the verified isolation proof — review j#83905 F1), an injected ``runner`` (the fake
     for tests, a real subprocess runner for the #14185 live smoke), and the trusted
     launch ``env`` (must carry ``MOZYO_HERDR_BINARY`` — the harness never resolves a
     binary itself). The ``runner`` is wrapped in a :class:`RecordingHerdrRunner` that
-    keeps the actuation-receipt tape (what was created / launched / closed) so cleanup
-    and residue verification never depend on a crashed project's observation.
+    keeps the actuation-receipt tape so residue verification never depends on a
+    crashed project's observation. It does not mint destructive authority itself.
 
     The harness makes NO placement decision: every project runs the production
     :func:`prepare_session` in ``shared_space`` mode for the DEFAULT (coordinator)
@@ -398,13 +400,13 @@ class SharedSpaceSmokeHarness:
                 "Refuse to actuate (Redmine #14187 Acceptance 1/5/6; review j#83870 F1)."
             )
 
-    # -- clean-slate preflight (cleanup authority, herdr dimension) ------------
+    # -- clean-slate preflight (non-ownership guard, herdr dimension) -----------
 
     def preflight_clean_slate(self) -> None:
         """Fail closed (zero actuation) unless no ``coordinators`` space exists yet.
 
-        The cleanup-authority gate in the herdr-server dimension (Redmine #14187
-        Acceptance 5): the isolated home isolates the mozyo registry / fence / store,
+        This is not cleanup authority. In the herdr-server dimension (Redmine #14187
+        Acceptance 5), the isolated home isolates the mozyo registry / fence / store,
         but the ``coordinators`` LABEL is global to the herdr server. If a REAL shared
         coordinators workspace already exists (an operator who runs ``shared_space``),
         the resolver would ADOPT it and this run would launch test coordinator pairs
@@ -581,34 +583,23 @@ class SharedSpaceSmokeHarness:
 
     # -- teardown by exact identity ------------------------------------------
 
-    def cleanup(self, observations: Sequence[ProjectSmokeObservation] = ()) -> None:
-        """Close exactly the panes this run launched (herdr auto-vanishes the workspace).
+    def cleanup(
+        self,
+        observations: Sequence[ProjectSmokeObservation] = (),
+        *,
+        workspace_cleanup: Optional[OwnedWorkspaceCleanupCapability] = None,
+    ) -> bool:
+        """Consume a disposable minter's receipt-bound workspace capability.
 
-        Teardown by exact identity (Redmine #14187 Acceptance 5), driven by the
-        **actuation-receipt tape** (review j#83905 F2): the recorder captured the
-        ``wN:pM`` locator of every SUCCESSFUL ``agent start``, so this is the authoritative
-        set of panes actually launched — a superset of the per-project observations. A
-        worker that crashed AFTER its ``agent start`` succeeded lost its observation, but
-        its pane is on the tape, so it is still closed here (never a scanned-for pane, so
-        a user's own shell can never be mis-closed; the harness never issues a generic
-        kill). A herdr workspace with its last pane closed auto-vanishes (live-measured
-        #13380). A close that fails is left for :meth:`verify_residue` to catch, not
-        hidden. ``observations`` is accepted for API stability but the tape is the source.
+        ``launched_locators`` are deliberately ignored. A raw pane locator carries no
+        terminal-generation binding, so a generic/non-disposable harness has zero
+        destructive cleanup calls and cannot report residue clear. The concrete
+        capability supplies its own fixed target set; this method never accepts a
+        workspace id or derives one from an observation or inventory scan.
         """
-        for locator in list(self.recorder.launched_locators):
-            if not locator:
-                continue
-            try:
-                _invoke(
-                    self._binary,
-                    ["pane", "close", locator],
-                    self.recorder,
-                    self.timeout,
-                    env=None,
-                )
-            except HerdrSessionStartError:
-                # Residue verification is the proof; a close failure surfaces there.
-                continue
+        if not isinstance(workspace_cleanup, OwnedWorkspaceCleanupCapability):
+            return False
+        return workspace_cleanup.close_all()
 
     def verify_residue(
         self, observations: Sequence[ProjectSmokeObservation] = ()
@@ -675,16 +666,20 @@ class SharedSpaceSmokeHarness:
     # -- the whole smoke ------------------------------------------------------
 
     def smoke(
-        self, specs: Sequence[_ProjectSpec]
+        self,
+        specs: Sequence[_ProjectSpec],
+        *,
+        workspace_cleanup: Optional[OwnedWorkspaceCleanupCapability] = None,
     ) -> SharedSpaceSmokeObservation:
-        """Run the whole concurrent shared-space smoke: drive → observe → clean → verify.
+        """Run concurrent smoke; cleanup only through an opaque minter capability.
 
         The single entry the CLI / #14185 call: run every project concurrently,
-        summarise the redaction-safe convergence evidence, tear down by exact
-        identity, and prove zero residue.
+        summarise redaction-safe convergence evidence, and consume
+        ``workspace_cleanup`` when supplied. Without that capability the generic
+        harness performs zero destructive cleanup and deliberately reports non-clear.
 
-        Two cleanup-authority gates run FIRST, before any project launches, so the
-        public use-case is itself the safety authority (not the caller's discipline —
+        Two isolation/clean-slate gates run FIRST, before any project launches, so the
+        public use-case does not rely on the caller's discipline —
         review j#83870 F1): :meth:`preflight_clean_slate` calls
         :meth:`_assert_isolation_bound` (the ambient home must be the isolated one) and
         then refuses a pre-existing ``coordinators`` space. Either failure aborts the
@@ -703,7 +698,10 @@ class SharedSpaceSmokeHarness:
         # session may still have created the one owned shared workspace; deriving this
         # count from successful project observations would erase that actuation.
         coordinators_create_count = self.recorder.coordinators_create_count
-        self.cleanup(observations)
+        cleanup_attempted = workspace_cleanup is not None
+        cleanup_completed = self.cleanup(
+            observations, workspace_cleanup=workspace_cleanup
+        )
         residue_verified = True
         residue_workspaces, residue_agents = -1, -1
         try:
@@ -724,7 +722,8 @@ class SharedSpaceSmokeHarness:
             residue_workspaces=residue_workspaces,
             residue_agents=residue_agents,
             residue_verified=residue_verified,
-            cleanup_attempted=True,
+            cleanup_attempted=cleanup_attempted,
+            cleanup_completed=cleanup_completed,
         )
 
 
@@ -741,7 +740,7 @@ def smoke_shared_space_preflight(
     establishes the isolated home (:func:`isolated_smoke_home`, which fails closed
     unless the home is provably distinct from the operator's — the operator home is the
     ambient ``mozyo_bridge_home()``, never a caller argument, review j#83935 F1), then
-    runs the herdr clean-slate cleanup-authority gate
+    runs the herdr clean-slate non-ownership guard
     (:meth:`SharedSpaceSmokeHarness.preflight_clean_slate`, a read-only ``workspace
     list``). It **actuates no agent** — the live coordinator launch is the #14185
     driver's isolated-instance job. Returns counts / bools / closed tokens only (no home

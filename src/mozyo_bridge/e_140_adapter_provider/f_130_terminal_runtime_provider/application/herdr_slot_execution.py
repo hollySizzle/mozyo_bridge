@@ -91,6 +91,8 @@ def _execute_slot(
     prepared_callback: Optional[Callable[..., None]] = None,
     native_binding: Optional[HerdrNativeIdentityBinding] = None,
     shim_dir: str = "",
+    workspace_effect_fence: Optional[Callable[[], None]] = None,
+    pane_owner=None,
 ) -> SlotResult:
     if plan.kind == "adopt":
         return SlotResult(
@@ -196,7 +198,15 @@ def _execute_slot(
         runner=runner,
         timeout=timeout,
         env=env,
+        effect_fence=workspace_effect_fence,
     )
+    if pane_owner is not None:
+        pane_owner.own_pane(
+            prepared.locator,
+            prepared.workspace_id,
+            prepared.tab_id,
+            prepared.terminal_id,
+        )
     # This callback is intentionally adjacent to the successful split parse.  Herdr
     # exposes no atomic "split + durable receipt" primitive, so this is the smallest
     # possible unrecorded interval; agent start is never attempted before it returns.
@@ -207,7 +217,10 @@ def _execute_slot(
         native_name=binding.native_name,
         target_workspace=prepared.workspace_id,
         target_tab=prepared.tab_id,
+        terminal_id=prepared.terminal_id,
     )
+    if pane_owner is not None:
+        pane_owner.release_pane(prepared.locator)
     # Record the exact returned pane before validating its placement. A mislocated
     # split is still this run's side effect and must remain reachable by rollback.
     if prepared.workspace_id != target_workspace:
@@ -234,6 +247,7 @@ def _execute_slot(
         runner=runner,
         timeout=timeout,
         env=env,
+        effect_fence=workspace_effect_fence,
     )
     launch_argv = build_agent_start_argv(
         assigned_name=plan.assigned_name,
@@ -255,6 +269,7 @@ def _execute_slot(
         runner=runner,
         timeout=timeout,
         env=env,
+        effect_fence=workspace_effect_fence,
     )
     started_agent = _parse_started_agent_identity(started.stdout)
     if started_agent is None:
@@ -263,11 +278,16 @@ def _execute_slot(
             "(expected result.agent.pane_id in an agent_started payload); refuse to "
             "return a blank handle"
         )
-    locator, landed_tab, returned_native_name = started_agent
+    locator, landed_tab, returned_native_name, terminal_id = started_agent
     if returned_native_name != binding.native_name:
         raise HerdrSessionStartError(
             f"herdr agent start for {plan.provider!r} returned a different native "
             "identity than the collision-checked launch binding"
+        )
+    if terminal_id != prepared.terminal_id:
+        raise HerdrSessionStartError(
+            f"herdr agent start for {plan.provider!r} returned a different terminal "
+            "identity than the prepared pane receipt"
         )
     if not valid_target(locator):
         raise HerdrSessionStartError(
@@ -325,6 +345,7 @@ def _execute_slot(
         outcome=SLOT_LAUNCHED,
         locator=locator,
         detail=detail,
+        launch_terminal_id=terminal_id,
     )
 
 

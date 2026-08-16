@@ -643,6 +643,21 @@ documents:
       - rule-public-private-boundary
       - spec-project-map
 
+  - id: logic-multi-source-unit-board
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/multi-source-unit-board.md
+    purpose: local／remote host／Dev Containerの複数Herdrサーバーからpublic-safeなUnit情報をclient側で集約表示し、host-aware identity・source unavailable/stale/duplicateのfail-closed投影・remote Unit操作の対象環境coordinator gateway routeを固定する実装正本。
+    audit_role: multi_source_unit_board_logic
+    related_document_refs:
+      - logic-herdr-unit-board
+      - logic-local-remote-cockpit-host-boundary
+      - logic-unit-target-model
+      - logic-herdr-plugin-presentation-consumer-boundary
+      - rule-public-private-boundary
+      - spec-herdr-native-identity
+      - spec-project-map
+
   - id: logic-herdr-unit-board
     type: logic
     status: active
@@ -650,6 +665,7 @@ documents:
     purpose: managed Herdr agent pairをproject・workflow role・責務・lane work label・runtime stateで識別するpublic-safe Unit board、display metadata再同期、preview-first pair配置操作、shared Unit列移動との分離を固定する実装正本。
     audit_role: herdr_unit_board_logic
     related_document_refs:
+      - logic-multi-source-unit-board
       - logic-herdr-plugin-presentation-consumer-boundary
       - logic-plugin-ready-adapter-boundary
       - logic-delegated-coordinator-cockpit-display
@@ -1591,13 +1607,34 @@ documents:
     type: logic
     status: active
     canonical_path: vibes/docs/logics/tiered-ci-gate-policy.md
-    purpose: "全 branch push で Python 3.10-3.13 full matrix を反復していた CI を risk tier 別 gate へ再編する設計正本 (Redmine #13734 / 親 US #13732)。issue-branch push を quick/affected 単一 Python に縮小し full matrix を auto 発火させない routing、integration push (main/int_*/integration_*) の exact-SHA clean single-Python full + wheel/sdist + fresh-install smoke を 1 回、TestPyPI build job の manual/auto 両 event inline clean-full + artifact/install smoke による pre-publish gate 抜け封鎖 (#13601 OIDC 境界と data gate 温存)、nightly の 3.10-3.13 full matrix 維持、production publish workflow の exact release/tag SHA full matrix + tag<->version mirror + fresh-install の機械強制と OIDC publish job 分離、concurrency cancel/serialize と run summary provenance、現行 green 証跡の非無効化を定義する。CI authority は unittest discover / tests profile のままで #13733 local 並列 runner に依存しない。"
+    purpose: "全 branch push で Python 3.10-3.13 full matrix を反復していた CI を risk tier 別 gate へ再編する設計正本 (Redmine #13734 / 親 US #13732)。issue-branch push を quick/affected 単一 Python に縮小し full matrix を auto 発火させない routing、integration push (main/int_*/integration_*) の exact-SHA clean single-Python full + wheel/sdist + fresh-install smoke を 1 回、TestPyPI build job の inline clean-full + artifact/install smoke による pre-publish gate 抜け封鎖 (#13601 OIDC 境界と data gate 温存。auto dev path は #15487 で廃止)、nightly の 3.10-3.13 full matrix 維持、production publish workflow の exact release/tag SHA full matrix + tag<->version mirror + fresh-install の機械強制と OIDC publish job 分離、concurrency cancel/serialize と run summary provenance、現行 green 証跡の非無効化を定義する。CI authority は unittest discover / tests profile のままで #13733 local 並列 runner に依存しない。"
     audit_role: tiered_ci_gate_policy_logic
     related_document_refs:
       - logic-test-runtime-profiling-policy
       - logic-module-health-gate
       - logic-release-flow
       - logic-release-helper-contract
+
+  - id: logic-ci-quick-full-lane-policy
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/ci-quick-full-lane-policy.md
+    purpose: "issue-branch push の quick/affected lane と full unittest lane の分割契約 (Redmine #12753 / 親 US #12510)。どの push がどちらの lane を発火させるか、affected 判定の入力、full lane へ昇格する条件を定める。tiered-ci-gate-policy が quick/full lane split の正本として本 doc を名指しで参照しており (同 doc の関連文書節)、pre-commit-focused-verification と test-runtime-profiling-policy も参照する。#15518 まで catalog 未登録で path resolution から到達できなかったため、参照側だけが権威として扱う片側依存になっていた。"
+    audit_role: ci_quick_full_lane_policy_logic
+    related_document_refs:
+      - logic-tiered-ci-gate-policy
+      - logic-pre-commit-focused-verification
+      - logic-test-runtime-profiling-policy
+
+  - id: logic-herdr-poc-experiment-log
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/herdr-poc-13175-experiment-log.md
+    purpose: "terminal / transport / state 検知層の移行先候補として herdr を評価した PoC の実測記録 (Redmine #13175)。kill criteria 4 点に対する各実験を目的 / 実行 / 結果 / 学びの固定形式で残し、失敗・誤読・観測方法の欠陥も削除せず保持する。herdr バージョン更新時など将来の再評価で判定を再現するための証拠であり、現行 herdr backend の設計判断 (fail-closed 方針、identity / generation の扱い) の出所でもある。#15518 まで catalog 未登録だった。"
+    audit_role: herdr_poc_experiment_log
+    related_document_refs:
+      - spec-herdr-native-identity
+      - logic-herdr-scenario-test-foundation
 
 file_conventions:
   - id: fc-agent-routers
@@ -1620,6 +1657,7 @@ file_conventions:
       - .mozyo-bridge/docs/catalog.yaml.example
       - .mozyo-bridge/docs/file_conventions.generated.yaml
       - .mozyo-bridge/scaffold.json
+      - .mozyo-bridge/config.yaml
       - .mozyo-bridge/project-defaults.yaml
       - .mozyo-bridge/workspace-defaults.yaml
       - .mozyo-bridge/workspace-anchor.json
@@ -1633,6 +1671,16 @@ file_conventions:
       - rule-project-agent-workflow
       - rule-codex-autonomous-guardrail-lane
       - logic-workspace-defaults-renderer
+
+  - id: fc-project-identity-descriptor
+    name: project-scoped runtime identity descriptor
+    patterns:
+      - .mozyo-bridge/project.env
+      - project.env
+    severity: block
+    document_refs:
+      - logic-project-scoped-workspace-identity
+      - spec-project-map
 
   - id: fc-public-readme
     name: public README and user-facing install guidance
@@ -1656,11 +1704,39 @@ file_conventions:
       - logic-object-oriented-architecture-policy
       - skill-workflow-reference
 
+  - id: fc-multi-source-unit-board
+    name: Multi-source Herdr Unit board sources, aggregation, and remote action rail
+    patterns:
+      - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/unit_board_sources.py
+      - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/unit_board_aggregate.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/unit_board_sources_loader.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/remote_unit_action.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_multi_source_unit_board.py
+      - tests/unit/e_120_operations_cockpit/f_110_cockpit_read_model/test_unit_board_sources.py
+      - tests/unit/e_120_operations_cockpit/f_110_cockpit_read_model/test_unit_board_aggregate.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_unit_board_sources_loader.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_herdr_multi_source_unit_board.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_remote_unit_action.py
+      - tests/unit/e_140_adapter_provider/f_130_terminal_runtime_provider/test_cli_herdr_unit_board_sources.py
+      - tests/regressions/test_issue_15138_local_only_unit_board_preserved.py
+      - vibes/docs/logics/multi-source-unit-board.md
+    severity: block
+    document_refs:
+      - logic-multi-source-unit-board
+      - logic-herdr-unit-board
+      - logic-local-remote-cockpit-host-boundary
+      - logic-unit-target-model
+      - rule-public-private-boundary
+      - rule-project-agent-workflow
+      - spec-herdr-native-identity
+      - spec-project-map
+
   - id: fc-herdr-unit-board
     name: Herdr Unit board projection, runtime adapter, plugin, and tests
     patterns:
       - herdr-plugins/mozyo-unit-board/**
       - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/herdr_unit_board.py
+      - src/mozyo_bridge/e_120_operations_cockpit/f_110_cockpit_read_model/domain/public_safe_text.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/cli_herdr_unit_board.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_unit_board_placement_ui.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/infrastructure/herdr_unit_board_runtime.py
@@ -1672,6 +1748,7 @@ file_conventions:
     severity: block
     document_refs:
       - logic-herdr-unit-board
+      - logic-multi-source-unit-board
       - logic-herdr-plugin-presentation-consumer-boundary
       - logic-plugin-ready-adapter-boundary
       - logic-delegated-coordinator-cockpit-display
@@ -2245,6 +2322,7 @@ file_conventions:
     name: disposable Herdr instance lifecycle and shared-space live smoke actuation
     patterns:
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_herdr_instance.py
+      - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_workspace_cleanup.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_endpoint_gate_evidence.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/disposable_shared_space_smoke.py
       - src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/shared_space_smoke_harness.py

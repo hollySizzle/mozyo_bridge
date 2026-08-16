@@ -115,9 +115,9 @@ def epoch_store_admission(
     same reason rather than for symmetry: a field that cannot survive the older shape must be
     refused where the operator can see it, not dropped silently.
 
-    Returns ``None`` for every admissible case — an epoch-less launch (the pre-#14756 shape,
-    and any lane whose lifecycle row has minted no epoch) loses nothing on an older shape, so
-    the mixed-runtime home keeps working exactly as #13882 requires.
+    This helper classifies only the epoch-column loss. It is not standalone launch
+    admission: the enclosing v4 terminal-identity store gate rejects every v1-v3 managed
+    write even when ``epoch_launch`` is false.
     """
     if not epoch_launch or store_version >= EPOCH_MIN_STORE_VERSION:
         return None
@@ -138,7 +138,7 @@ def replacement_store_admission(
     lifecycle_home: str = "",
     attestation_home: str = "",
 ) -> Optional[str]:
-    """The reason token refusing an epoch-bearing REPLACEMENT, or ``None`` (Redmine #14756).
+    """The store reason refusing a REPLACEMENT before close, or ``None``.
 
     The pre-effect half of :func:`epoch_store_admission`, joined for the one caller that
     cannot wait for the launch preflight to answer: a replacement action closes the old slot
@@ -148,25 +148,12 @@ def replacement_store_admission(
     predicates the preflight uses (:func:`resolve_launch_lane_epoch` and
     :func:`epoch_store_admission`). No third opinion about the epoch exists.
 
-    **Scoped to the epoch axis, deliberately.** The launcher-capability join
-    (``decide_store_compatibility``) also rules on the launcher's advertised shapes and on
-    the ``replacement_action_id`` column; those need a launcher probe (a subprocess) and
-    would be a second surface classifying facts this one has no business re-deciding. What
-    this adds is only the axis whose refusal must arrive before a close.
-
-    The store shape is required to be *knowable* only once an epoch is actually at stake:
-
-    - no epoch minted for the lane -> ``None``. This is the conditional-C rule 1 case
-      (j#96844): a true legacy ``lane_epoch=0`` lane keeps its existing v1 side-binding heal
-      path byte-for-byte, because refusing it would delete a working recovery rail without
-      making any epoch storable.
-    - store absent -> ``None``. The first attestation write creates it at the current
-      version, which carries ``lane_epoch``.
-    - store recognized -> the epoch/version verdict, i.e. conditional-C rule 2.
-    - store unreadable / unsupported -> refuse with that state's own token. An unknowable
-      shape is not an adequate one, and this is the branch where an epoch is already at
-      stake, so folding "cannot read" into "fine" would be exactly the #13682 R1-F1 mistake
-      of reading an absence of measurement as a measurement of absence.
+    Every replacement is terminal-bound current authority, whether or not its lane has
+    minted an epoch. Therefore the pre-close fence requires an absent or exact-v4
+    attestation store and an absent or exact-v2 launch-generation store. v1-v3 and unknown
+    stores remain readable diagnostics only; admitting them here would close the old slot
+    before the managed-launch preflight later refused the relaunch. The epoch check remains
+    an additional conjunct for an epoch-bearing lane.
 
     The two homes are separate parameters because the two reads are separate stores — the
     lifecycle DB mints the epoch, the attestation DB has to hold it — and the recovery ops
@@ -179,25 +166,46 @@ def replacement_store_admission(
         herdr_identity_attestation_path,
     )
     from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+        HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
         STORE_ABSENT,
         STORE_RECOGNIZED,
         probe_store_schema,
     )
+    from mozyo_bridge.core.state.herdr_launch_generation import (
+        GENERATION_STORE_ABSENT,
+        GENERATION_STORE_HEALTHY,
+        herdr_launch_generation_path,
+        probe_launch_generation_store,
+    )
 
-    if not launch_carries_lane_epoch(workspace_id, lane_id, store_home=lifecycle_home):
-        return None
     home = Path(attestation_home) if attestation_home else None
     try:
         observation = probe_store_schema(herdr_identity_attestation_path(home))
     except Exception:  # noqa: BLE001 — an unprobeable store is an inadequate one, not a crash
         return STORE_EPOCH_UNSUPPORTED
     if observation.state == STORE_ABSENT:
-        return None
-    if observation.state != STORE_RECOGNIZED:
+        pass
+    elif observation.state != STORE_RECOGNIZED:
         return observation.state
+    elif int(observation.version or 0) != HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION:
+        return "attestation_store_launcher_cannot_write"
+    try:
+        generation_state, _detail = probe_launch_generation_store(
+            herdr_launch_generation_path(home)
+        )
+    except Exception:  # noqa: BLE001 - an unknown generation store cannot authorize close
+        return "generation_store_corrupt"
+    if generation_state not in (GENERATION_STORE_ABSENT, GENERATION_STORE_HEALTHY):
+        return generation_state
+    if not launch_carries_lane_epoch(workspace_id, lane_id, store_home=lifecycle_home):
+        return None
     refusal = epoch_store_admission(
         epoch_launch=True,
-        store_version=int(observation.version or 0),
+        store_version=(
+            HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
+            if observation.state == STORE_ABSENT
+            else int(observation.version or 0)
+        ),
         migrate_hint=MIGRATE_HINT,
     )
     return refusal[0] if refusal is not None else None

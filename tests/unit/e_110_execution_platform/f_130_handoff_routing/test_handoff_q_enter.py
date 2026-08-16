@@ -51,6 +51,21 @@ def _outcome(status, reason, *, mode="queue-enter", **extra):
     )
 
 
+def _canonical_binding(*, action_id: str, observed_at: str) -> dict[str, str]:
+    assigned_name = "mzb1_ws_codex_lane"
+    terminal_id = "terminal-q-enter"
+    locator = "%2"
+    revision = "1"
+    return {
+        "provider": "codex",
+        "assigned_name": assigned_name,
+        "locator": locator,
+        "row_revision": revision,
+        "attestation_observed_at": observed_at,
+        "startup_action_id": action_id,
+    }
+
+
 class ResolveSubmitPlanTest(unittest.TestCase):
     def test_consultation_callback_resolves_no_anchor_ticketless_rail(self) -> None:
         plan = resolve_submit_plan("consultation_callback")
@@ -327,7 +342,10 @@ class SubmitOutcomeTest(unittest.TestCase):
         under a coherent generation, NOT the post-hoc `runtime_state` poll. So `busy` alone no
         longer confirms, and a causal start confirms whatever the later poll happens to read.
         """
-        binding = {"provider": "codex", "assigned_name": "mzb1_ws_codex_lane", "locator": "%2", "row_revision": "1", "attestation_observed_at": "2026-07-29T20:10:01+00:00", "startup_action_id": "startup-abc"}
+        binding = _canonical_binding(
+            action_id="startup-abc",
+            observed_at="2026-07-29T20:10:01+00:00",
+        )
         for runtime_state, causal, expect_dispatched in (
             ("busy", False, False),            # non-causal poll: not a confirmation
             ("awaiting_input", False, False),
@@ -345,6 +363,7 @@ class SubmitOutcomeTest(unittest.TestCase):
                 if causal:
                     observation.update(
                         event_wait_kind="changed", gateway_binding=binding,
+                        baseline_runtime_state="turn_ended",
                         observation_version=2,
                     )
                 outcome = SubmitOutcome.from_transport(
@@ -370,6 +389,130 @@ class SubmitOutcomeTest(unittest.TestCase):
         self.assertFalse(outcome.dispatched)
         self.assertEqual("uncertain_partial", outcome.injection_stage)
         self.assertTrue(outcome.blind_retry_prohibited)
+
+
+class QueueEnterUnconfirmedWordingTest(unittest.TestCase):
+    """Queue-enter uncertainty must not inherit the standard/tmux narrative."""
+
+    def test_make_outcome_threads_mode_into_all_uncertain_wording(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            build_delivery_record,
+        )
+
+        for reason, enter_attempts in (
+            ("turn_start_unconfirmed", 0),
+            ("receiver_blocked", 1),
+            ("turn_start_absent", 1),
+        ):
+            with self.subTest(reason=reason):
+                outcome = _outcome(
+                    "blocked",
+                    reason,
+                    mode="queue-enter",
+                    queue_enter_turn_start_observation={
+                        "observation_kind": "post_choreography_snapshot",
+                        "source": "herdr_agent_get",
+                        "runtime_state": "awaiting_input",
+                        "read_ok": True,
+                        "read_reason": None,
+                        "poll_attempts": 1,
+                        "enter_attempts": enter_attempts,
+                        "first_event_wait_kind": None,
+                        "final_event_wait_kind": None,
+                        "resend_skipped_reason": "identity_unconfirmed",
+                    },
+                )
+                record = build_delivery_record(outcome)
+                lowered = record.lower()
+
+                self.assertIn(
+                    f"delivery uncertain (queue-enter {reason})", lowered
+                )
+                self.assertIn(f"ended with `{reason}`", lowered)
+                self.assertIn("marker+body was typed at most once", lowered)
+                self.assertIn("enter was pressed zero or more times", lowered)
+                self.assertIn("every actual enter", lowered)
+                self.assertIn("no c-u rollback", lowered)
+                self.assertIn("partial delivery remains uncertain", lowered)
+                self.assertIn("blind retry is prohibited", lowered)
+                self.assertIn("read the codex pane", outcome.next_action.lower())
+
+                for forbidden in (
+                    "standard rail",
+                    "nothing was submitted",
+                    "not delivered",
+                    "telemetry-only",
+                    "never blocks",
+                    "armed a working-transition wait before enter",
+                    "no re-send were issued",
+                ):
+                    self.assertNotIn(forbidden, lowered)
+
+    def test_queue_transport_error_wording_is_backend_neutral(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            build_delivery_record,
+        )
+
+        outcome = _outcome("blocked", "transport_error", mode="queue-enter")
+        lowered = build_delivery_record(outcome).lower()
+
+        self.assertIn("delivery uncertain (transport_error)", lowered)
+        self.assertIn("enter may have been pressed zero or more times", lowered)
+        self.assertIn("marker+body was typed at most once", lowered)
+        self.assertNotIn("herdr", lowered)
+        self.assertNotIn("armed", lowered)
+        self.assertNotIn("no re-send were issued", lowered)
+
+    def test_causal_queue_success_does_not_claim_marker_observation(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            build_delivery_record,
+        )
+
+        binding = _canonical_binding(
+            action_id="startup-causal",
+            observed_at="2026-08-10T00:00:00+00:00",
+        )
+        outcome = _outcome(
+            "sent",
+            "ok",
+            mode="queue-enter",
+            queue_enter_turn_start_observation={
+                "observation_version": 2,
+                "event_wait_kind": "changed",
+                "baseline_runtime_state": "turn_ended",
+                "gateway_binding": binding,
+            },
+        )
+        record = build_delivery_record(outcome)
+
+        self.assertIn("causal turn start confirmed", record)
+        self.assertIn("same-generation causal turn start", record)
+        self.assertNotIn("Landing marker observed", record)
+
+    def test_tmux_queue_success_keeps_marker_observed_wording(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            build_delivery_record,
+        )
+
+        record = build_delivery_record(
+            _outcome("sent", "ok", mode="queue-enter")
+        )
+
+        self.assertIn("sent (queue-enter, marker observed)", record)
+        self.assertIn("Landing marker observed", record)
+
+    def test_standard_unconfirmed_wording_is_preserved(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            build_delivery_record,
+        )
+
+        outcome = _outcome(
+            "blocked", "turn_start_unconfirmed", mode="standard"
+        )
+        record = build_delivery_record(outcome)
+        self.assertIn("codex standard rail", record)
+        self.assertIn("No C-u rollback and no re-send were issued", record)
+        self.assertIn("tmux capture", record)
 
 
 if __name__ == "__main__":

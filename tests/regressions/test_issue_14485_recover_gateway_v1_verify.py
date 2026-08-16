@@ -153,10 +153,13 @@ class _AttestCase(unittest.TestCase):
 
     def _attest_v1(self, home: Path, *, locator: str = FRESH) -> IdentityAttestationRecord:
         _seed_v1_attestation_store(home)
-        record = HerdrIdentityAttestationStore(home=home).upsert(IdentityAttestationRecord(
-            assigned_name=NAME, workspace_id=WS, role=ROLE, lane_id=LANE, locator=locator,
-            verdict="present", observed_at=OBSERVED,
-        ))
+        with sqlite3.connect(herdr_identity_attestation_path(home)) as conn:
+            conn.execute(
+                "INSERT INTO herdr_identity_attestations VALUES (?,?,?,?,?,?,?,?)",
+                (NAME, WS, ROLE, LANE, locator, "present", "", OBSERVED),
+            )
+        record = HerdrIdentityAttestationStore(home=home).read(NAME)
+        self.assertIsNotNone(record)
         # The premise the whole issue rests on: the v1 row is normal-shaped, so the direct
         # field is empty even though this launch WAS a replacement.
         self.assertEqual(record.replacement_action_id, "")
@@ -200,18 +203,21 @@ class _AttestCase(unittest.TestCase):
             attestation_home=home,
         )
         port._q = lambda: (q or _FreshQ())  # type: ignore[method-assign]
+        port._rows = lambda: ({"name": (request or _request()).assigned_name,
+                               "pane_id": (q or _FreshQ())._locator,
+                               "terminal_id": "terminal:fresh"},)  # type: ignore[method-assign]
         return port
 
 
 class V1SideBindingVerificationTests(_AttestCase):
-    """The fix: a v1 normal attestation + the exact bound side record verifies as BOUND."""
+    """Legacy side records stay diagnostic and never become current authority."""
 
     def test_bound_v1_side_record_verifies(self):
         home = self._home()
         record = self._attest_v1(home)
         self._bind_side_record(home, record)
         self.assertEqual(
-            self._port(home).verify_attestation(ACTION, _pin()), ATTEST_BOUND
+            self._port(home).verify_attestation(ACTION, _pin()), ATTEST_MISMATCH
         )
 
     def test_without_the_side_record_the_same_fixture_fails_closed(self):
@@ -223,7 +229,7 @@ class V1SideBindingVerificationTests(_AttestCase):
         port = self._port(home)
         self.assertEqual(port.verify_attestation(ACTION, _pin()), ATTEST_MISMATCH)
         self._bind_side_record(home, record)
-        self.assertEqual(port.verify_attestation(ACTION, _pin()), ATTEST_BOUND)
+        self.assertEqual(port.verify_attestation(ACTION, _pin()), ATTEST_MISMATCH)
 
     def test_reserved_but_never_bound_fails_closed(self):
         home = self._home()
@@ -234,7 +240,7 @@ class V1SideBindingVerificationTests(_AttestCase):
         )
         self._bind_side_record(home, record)  # same reservation, now published
         self.assertEqual(
-            self._port(home).verify_attestation(ACTION, _pin()), ATTEST_BOUND
+            self._port(home).verify_attestation(ACTION, _pin()), ATTEST_MISMATCH
         )
 
     def test_a_different_action_is_never_adopted(self):
@@ -242,7 +248,7 @@ class V1SideBindingVerificationTests(_AttestCase):
         record = self._attest_v1(home)
         self._bind_side_record(home, record)
         port = self._port(home)
-        self.assertEqual(port.verify_attestation(ACTION, _pin()), ATTEST_BOUND)
+        self.assertEqual(port.verify_attestation(ACTION, _pin()), ATTEST_MISMATCH)
         self.assertEqual(
             port.verify_attestation(f"{ACTION}:other", _pin()), ATTEST_MISMATCH
         )
@@ -253,7 +259,7 @@ class V1SideBindingVerificationTests(_AttestCase):
         self._bind_side_record(home, record)
         self.assertEqual(
             self._port(home, q=_FreshQ(locator=FRESH)).verify_attestation(ACTION, _pin()),
-            ATTEST_BOUND,
+            ATTEST_MISMATCH,
         )
         for foreign in (OLD, "w3N:p2Y", ""):
             self.assertEqual(
@@ -266,7 +272,7 @@ class V1SideBindingVerificationTests(_AttestCase):
         home = self._home()
         record = self._attest_v1(home)
         self._bind_side_record(home, record)
-        self.assertEqual(self._port(home).verify_attestation(ACTION, _pin()), ATTEST_BOUND)
+        self.assertEqual(self._port(home).verify_attestation(ACTION, _pin()), ATTEST_MISMATCH)
         # Each of these is the ONLY mutation against the same bound fixture.
         self.assertEqual(
             self._port(home, request=_request(role="claude")).verify_attestation(
@@ -296,7 +302,7 @@ class V1SideBindingVerificationTests(_AttestCase):
         home = self._home()
         record = self._attest_v1(home)
         self._bind_side_record(home, record)
-        self.assertEqual(self._port(home).verify_attestation(ACTION, _pin()), ATTEST_BOUND)
+        self.assertEqual(self._port(home).verify_attestation(ACTION, _pin()), ATTEST_MISMATCH)
 
         def boom(root):
             raise RuntimeError("workspace identity unresolvable")
@@ -309,7 +315,7 @@ class V1SideBindingVerificationTests(_AttestCase):
         record = self._attest_v1(home)
         self._bind_side_record(home, record)
         port = self._port(home)
-        self.assertEqual(port.verify_attestation(ACTION, _pin()), ATTEST_BOUND)
+        self.assertEqual(port.verify_attestation(ACTION, _pin()), ATTEST_MISMATCH)
         path = herdr_identity_replacement_binding_path(home)
         self.assertTrue(path.exists())
         path.write_bytes(b"not a sqlite database at all\n" * 64)
@@ -348,6 +354,7 @@ class V2DirectVerificationRegressionTests(_AttestCase):
         record = HerdrIdentityAttestationStore(home=home).upsert(IdentityAttestationRecord(
             assigned_name=NAME, workspace_id=WS, role=ROLE, lane_id=LANE, locator=FRESH,
             verdict="present", observed_at=OBSERVED, replacement_action_id=action_id,
+            terminal_id="terminal:fresh",
         ))
         self.assertFalse(selected_attestation_store_is_v1(home))
         return record
@@ -361,6 +368,44 @@ class V2DirectVerificationRegressionTests(_AttestCase):
         home = self._home()
         self._attest_v2(home, action_id="some-other-action")
         self.assertEqual(self._port(home).verify_attestation(ACTION, _pin()), ATTEST_MISMATCH)
+
+    def test_current_locator_terminal_and_identity_axes_fail_closed(self):
+        home = self._home()
+        self._attest_v2(home, action_id=ACTION)
+        self.assertEqual(self._port(home).verify_attestation(ACTION, _pin()), ATTEST_BOUND)
+        for locator in (OLD, "foreign", ""):
+            self.assertEqual(self._port(home, q=_FreshQ(locator=locator)).verify_attestation(
+                ACTION, _pin()), ATTEST_MISMATCH)
+        port = self._port(home)
+        port._rows = lambda: ({"name": NAME, "pane_id": FRESH,
+                               "terminal_id": "different"},)  # type: ignore[method-assign]
+        self.assertEqual(port.verify_attestation(ACTION, _pin()), ATTEST_MISMATCH)
+        self.assertEqual(self._port(home, request=_request(role="claude")).verify_attestation(
+            ACTION, _pin()), ATTEST_MISMATCH)
+        self.assertEqual(self._port(home, request=_request(lane="foreign")).verify_attestation(
+            ACTION, _pin()), ATTEST_MISMATCH)
+        self.assertEqual(self._port(home).verify_attestation(
+            ACTION, _pin(old_locator="foreign")), ATTEST_MISMATCH)
+        live.repo_scope_workspace_id = lambda root: "foreign"
+        self.assertEqual(self._port(home).verify_attestation(ACTION, _pin()), ATTEST_MISMATCH)
+
+    def test_current_unreadable_foreign_name_and_boot_race_are_non_green(self):
+        home = self._home()
+        self._attest_v2(home, action_id=ACTION)
+        self.assertEqual(self._port(home).verify_attestation(ACTION, _pin()), ATTEST_BOUND)
+        foreign = encode_assigned_name(WS, ROLE, "foreign")
+        self.assertEqual(self._port(home, request=_request(
+            assigned_name=foreign)).verify_attestation(ACTION, _pin()), ATTEST_PENDING)
+        self.assertEqual(self._port(home, q=_FreshQ(ok=False)).verify_attestation(
+            ACTION, _pin()), ATTEST_PENDING)
+        def boom(_root):
+            raise RuntimeError("workspace identity unresolvable")
+        live.repo_scope_workspace_id = boom
+        self.assertEqual(self._port(home).verify_attestation(
+            ACTION, _pin()), ATTEST_MISMATCH)
+        live.repo_scope_workspace_id = lambda _root: WS
+        herdr_identity_attestation_path(home).write_bytes(b"not sqlite")
+        self.assertEqual(self._port(home).verify_attestation(ACTION, _pin()), ATTEST_PENDING)
 
     def test_a_v2_row_with_an_empty_direct_field_never_borrows_the_v1_side_record(self):
         # The v1 decomposition is a carve-out for the v1 store only.  On a migrated (v2) store
@@ -389,17 +434,19 @@ class SharedEvaluatorTests(unittest.TestCase):
 
     def test_absent_record_is_never_a_binding(self):
         self.assertFalse(replacement_action_bound_after_identity_join(
-            None, action_id=ACTION, live_locator=FRESH, workspace_id=WS, role=ROLE,
+            None, action_id=ACTION, live_locator=FRESH, live_terminal_id="terminal:fresh",
+            workspace_id=WS, role=ROLE,
             lane=LANE, assigned_name=NAME, old_locator=OLD,
         ))
 
     def test_an_empty_action_is_never_a_binding(self):
         record = IdentityAttestationRecord(
             assigned_name=NAME, workspace_id=WS, role=ROLE, lane_id=LANE, locator=FRESH,
-            verdict="present", observed_at=OBSERVED,
+            verdict="present", observed_at=OBSERVED, terminal_id="terminal:fresh",
         )
         self.assertFalse(replacement_action_bound_after_identity_join(
-            record, action_id="", live_locator=FRESH, workspace_id=WS, role=ROLE,
+            record, action_id="", live_locator=FRESH, live_terminal_id="terminal:fresh",
+            workspace_id=WS, role=ROLE,
             lane=LANE, assigned_name=NAME, old_locator=OLD,
         ))
 

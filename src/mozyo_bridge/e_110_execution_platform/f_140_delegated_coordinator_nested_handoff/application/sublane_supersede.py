@@ -44,6 +44,7 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DISPOSITION_SUPERSEDED,
     OWNER_RESOLVED,
+    RELEASE_NOT_REQUESTED,
     CasOutcome,
     DecisionPointer,
     DecisionPointerError,
@@ -211,7 +212,7 @@ class SublaneSupersedeOps(Protocol):
 
     def workspace_id(self) -> str: ...
 
-    def live_rows(self) -> Sequence[Mapping[str, object]]: ...
+    def live_rows(self) -> Optional[Sequence[Mapping[str, object]]]: ...
 
     def read_attestation(
         self, assigned_name: str
@@ -239,15 +240,15 @@ class LiveSublaneSupersedeOps:
         except (OSError, ValueError):
             return ""
 
-    def live_rows(self) -> Sequence[Mapping[str, object]]:
+    def live_rows(self) -> Optional[Sequence[Mapping[str, object]]]:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
             list_herdr_agent_rows,
         )
 
         try:
             return list_herdr_agent_rows(self.env)
-        except Exception:  # noqa: BLE001 — inventory unavailable -> no live slots (fail closed)
-            return ()
+        except Exception:  # noqa: BLE001 — unreadable is not positive empty inventory
+            return None
 
     def read_attestation(
         self, assigned_name: str
@@ -389,6 +390,22 @@ class SublaneSupersedeUseCase:
             )
 
         rows = self.ops.live_rows()
+        if rows is None:
+            preflight = SupersedePreflight(
+                original_identity_known=False,
+                recovery_both_slots_live=False,
+                recovery_attested=False,
+                original_idle=request.assertions.original_idle,
+                recovery_attestation_detail="live inventory unreadable",
+            )
+            return SupersedeOutcome(
+                executed=False,
+                preflight=preflight,
+                issue=issue,
+                original_lane=original_lane,
+                recovery_lane=recovery_lane,
+                detail="live inventory unreadable; fail closed before supersession",
+            )
         both_live, attested, attest_detail = self._recovery_attested(
             rows, workspace_id, recovery_lane
         )
@@ -468,6 +485,18 @@ class SublaneSupersedeUseCase:
         a worktree, deletes a branch, or writes a metadata tombstone, and a partial close
         leaves the generation open and re-drivable.
         """
+        rows = self.ops.live_rows()
+        if rows is None:
+            try:
+                record = self.store.get(original_key)
+                release_state = record.process_release if record is not None else RELEASE_NOT_REQUESTED
+            except (LaneLifecycleError, OSError):
+                release_state = "release_unavailable"
+            return ReleaseOutcome(
+                action_id=f"supersede:{original_key.lane_id}",
+                process_release=release_state,
+                detail="release inventory unreadable; zero write and zero close",
+            )
         return drive_process_release(
             store=self.store,
             ops=self.ops,
@@ -475,6 +504,7 @@ class SublaneSupersedeUseCase:
             lane_id=original_lane,
             workspace_id=workspace_id,
             action_id=f"supersede:{original_key.lane_id}",
+            rows=rows,
         )
 
 

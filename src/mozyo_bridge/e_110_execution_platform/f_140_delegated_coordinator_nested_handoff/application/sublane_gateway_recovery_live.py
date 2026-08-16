@@ -72,8 +72,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.lane_launch_authority import (  # noqa: E501
     launch_authority_current,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
-    replacement_store_admission as _replacement_store_admission,
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_replacement_launch_admission import (  # noqa: E501
+    replacement_managed_launch_admission as _replacement_store_admission,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_AWAITING_INPUT,
@@ -86,6 +86,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    encode_assigned_name,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
     SLOT_LIVE,
@@ -209,6 +210,10 @@ class LiveGatewayRecoveryOps:
         return _replacement_store_admission(
             key.workspace_id,
             pin.lane_id,
+            repo_root=self.repo_root,
+            env=self.env,
+            runner=self.runner,
+            timeout=self.timeout,
             lifecycle_home=str(self.lifecycle_home) if self.lifecycle_home else "",
             attestation_home=str(self.attestation_home) if self.attestation_home else "",
         )
@@ -404,6 +409,7 @@ class LiveGatewayRecoveryOps:
             rec, request=self.request, repo_root=self.repo_root,
             attestation_home=self.attestation_home,
             pin_revision=self.request.gateway_revision,
+            live_terminal_id=self._live_terminal_identity(),
         )
 
     def _record_generation_bound(self, rec) -> bool:
@@ -411,20 +417,34 @@ class LiveGatewayRecoveryOps:
             rec, request=self.request, repo_root=self.repo_root,
             attestation_home=self.attestation_home,
             pin_revision=self.request.gateway_revision,
+            live_terminal_id=self._live_terminal_identity(),
         )
 
     def _current_request_generation_token(self) -> str:
         return _gen_authority.current_request_generation_token(
             request=self.request, repo_root=self.repo_root,
             attestation_home=self.attestation_home,
+            live_terminal_id=self._live_terminal_identity(),
         )
+
+    def _live_terminal_identity(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            terminal_identity_of_live_slot,
+        )
+
+        try:
+            return terminal_identity_of_live_slot(
+                self.request.assigned_name, self.request.locator, self._rows()
+            )
+        except Exception:  # noqa: BLE001 - unreadable/ambiguous inventory fails closed
+            return None
 
     def observe_turn(self, request: GatewayRefreshRequest) -> GatewayTurnObservation:
         _worker_provider, gateway_provider = self._providers()
         if not gateway_provider:
             return GatewayTurnObservation()  # unresolvable binding => unobservable
         record = self._anchor_delivery_record(gateway_provider)
-        delivery_confirmed = record is not None
+        delivery_confirmed = record is not None and self._record_generation_bound(record)
         turn_started = record is not None and self._record_observed_turn_start(record)
         settled = False
         try:
@@ -520,8 +540,22 @@ class LiveGatewayRecoveryOps:
         # j#87378 F3: the forward must have been delivered to the CURRENT same-lane worker's
         # exact locator — a record targeting a foreign / wrong pane never lands. An
         # unresolvable / ambiguous worker is unobservable, never a guess.
-        worker_locator = self._same_lane_worker_locator(worker_provider)
-        if not worker_locator:
+        try:
+            workspace_id = repo_scope_workspace_id(self.repo_root)
+            from .herdr_live_attestation_time import fresh_attestation_identity
+            boundary = fresh_attestation_identity(
+                home=self.attestation_home,
+                rows=self._rows(),
+                assigned_name=encode_assigned_name(
+                    workspace_id, worker_provider, self.request.lane
+                ),
+                workspace_id=workspace_id,
+                role=worker_provider,
+                lane=self.request.lane,
+            )
+        except Exception:  # noqa: BLE001 - unreadable worker authority is unobservable
+            boundary = None
+        if boundary is None:
             return False, False, False
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             RedmineAnchor,
@@ -548,36 +582,13 @@ class LiveGatewayRecoveryOps:
                 and _norm(rec.journal_id) == _norm(request.resume_anchor_journal)
                 and _norm(rec.receiver) == worker_provider
                 and _norm(rec.backend) == "herdr"
-                and _norm(rec.target) == worker_locator
+                and _norm(rec.target) == boundary.locator
                 and _norm(rec.status) == "sent"
                 and _norm(rec.reason) == "ok"
+                and boundary.matches_delivery(rec)
             ):
                 return True, False, True
         return False, True, True
-
-    def _same_lane_worker_locator(self, worker_provider: str) -> str:
-        """The CURRENT same-lane worker's exact live locator, or ``""`` (fail-closed)."""
-        try:
-            workspace_id = repo_scope_workspace_id(self.repo_root)
-            rows = self._rows()
-        except Exception:  # noqa: BLE001
-            return ""
-        found = []
-        for row in rows:
-            if not isinstance(row, Mapping):
-                continue
-            decoded = decode_assigned_name(row.get(AGENT_KEY_NAME))
-            if not decoded.ok or decoded.identity is None:
-                continue
-            identity = decoded.identity
-            if (
-                identity.workspace_id == workspace_id
-                and _norm_lane(identity.lane_id) == _norm_lane(self.request.lane)
-                and identity.role == worker_provider
-                and classify_named_slot(row) == SLOT_LIVE
-            ):
-                found.append(_agent_locator(row))
-        return found[0] if len(found) == 1 else ""
 
     # -- exactly-once anchor resume (the governed rail + the REAL ledger oracle) ---
 
@@ -753,11 +764,8 @@ class LiveGatewayRecoveryOps:
         _worker, gateway_provider = self._providers()
         if not gateway_provider:
             return False
-        fresh_observed_at = self._fresh_attestation_observed_at()
-        if not fresh_observed_at:
-            return False
-        fresh_locator = self._fresh_gateway_locator()
-        if not fresh_locator or fresh_locator == _norm(self.request.locator):
+        boundary = self._fresh_attestation_identity()
+        if boundary is None or boundary.locator == _norm(self.request.locator):
             return False
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
             RedmineAnchor,
@@ -781,7 +789,6 @@ class LiveGatewayRecoveryOps:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_stale_worker_recovery_live import (  # noqa: E501
             _recorded_after,
         )
-
         for rec in records:
             if (
                 _norm(rec.notification_marker) == marker
@@ -791,28 +798,27 @@ class LiveGatewayRecoveryOps:
                 and _norm(rec.receiver) == gateway_provider
                 and _norm(rec.provider) in ("", gateway_provider)
                 and _norm(rec.backend) == "herdr"
-                and _norm(rec.target) == fresh_locator
+                and _norm(rec.target) == boundary.locator
                 and _norm(rec.status) == "sent"
                 and _norm(rec.reason) == "ok"
-                and _recorded_after(rec.recorded_at, fresh_observed_at)
+                and _recorded_after(rec.recorded_at, boundary.observed_at)
+                and boundary.matches_delivery(rec)
             ):
                 return True
         return False
 
-    def _fresh_attestation_observed_at(self) -> str:
-        from mozyo_bridge.core.state.herdr_identity_attestation import (
-            HerdrIdentityAttestationStore,
-        )
-
+    def _fresh_attestation_identity(self):
         try:
-            record = HerdrIdentityAttestationStore(home=self.attestation_home).read(
-                _norm(self.request.assigned_name)
+            from .herdr_live_attestation_time import fresh_attestation_identity
+            rows = self._rows()
+            return fresh_attestation_identity(
+                home=self.attestation_home, rows=rows,
+                assigned_name=self.request.assigned_name,
+                workspace_id=repo_scope_workspace_id(self.repo_root),
+                role=self.request.provider, lane=self.request.lane,
             )
-        except Exception:  # noqa: BLE001 - unreadable attestation => no boundary
-            return ""
-        if record is None:
-            return ""
-        return _norm(getattr(record, "observed_at", ""))
+        except Exception:  # noqa: BLE001 - unreadable authority fails closed
+            return None
 
 
 __all__ = (

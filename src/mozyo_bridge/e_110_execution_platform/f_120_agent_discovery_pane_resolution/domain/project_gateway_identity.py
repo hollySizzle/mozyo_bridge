@@ -209,13 +209,16 @@ class GatewayLaneIdentity:
 
 
 def gateway_lane_identity_from_scope(
-    scope: ProjectScope, *, repo_root: str
+    scope: ProjectScope, *, repo_root: str, role: str = AGENT_KIND_CODEX
 ) -> GatewayLaneIdentity:
     """Derive a :class:`GatewayLaneIdentity` from an adopted project scope (#12658).
 
     The project metadata is the source of the *project* identity (scope / label /
     path / parent workspace); ``repo_root`` is the live Git worktree authority
-    supplied by the caller. The role-class / policy fields take their gateway
+    supplied by the caller. ``role`` is the gateway's expected live provider —
+    the caller passes the scope's provider_binding resolution (Redmine #15414);
+    the default keeps the historical codex contract for callers that predate the
+    binding. The remaining role-class / policy fields take their gateway
     defaults. No pane id, no live state — the route registry record is derived,
     never stored in ``project.env``.
     """
@@ -225,6 +228,7 @@ def gateway_lane_identity_from_scope(
         project_path=scope.path,
         repo_root=repo_root,
         workspace=scope.parent_workspace,
+        role=role,
     )
 
 

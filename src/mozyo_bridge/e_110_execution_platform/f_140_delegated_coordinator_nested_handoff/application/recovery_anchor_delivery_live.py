@@ -12,12 +12,6 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
     VERDICT_PRESENT,
 )
-from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
-    BINDING_BOUND,
-    HerdrIdentityReplacementBindingStore,
-    replacement_action_is_bound,
-    selected_attestation_store_is_v1,
-)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     build_marker,
     build_notification_body,
@@ -58,10 +52,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_NAME,
     _agent_locator,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
     SLOT_LIVE,
     classify_named_slot,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_admission import (  # noqa: E501
+    make_resend_screen_guard,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (  # noqa: E501
     OUTCOME_PRECONDITION_NOT_IDLE,
@@ -184,8 +182,12 @@ class LiveRecoveryAnchorDeliveryService:
                 self._record(outcome, request, turn_start_telemetry=None)
                 return outcome
         try:
+            # Redmine #15202: bind the receiver provider's declared startup screens into
+            # the rail's WAIT_ERROR Enter-resend gate (unbound, that resend is withheld).
             result = rail.drive_turn_start(
-                request.target_locator, f"{marker} {body}"
+                request.target_locator,
+                f"{marker} {body}",
+                screen_guard=make_resend_screen_guard(request.provider),
             )
         except (Exception, SystemExit):  # injection may have happened
             outcome = self._uncertain(marker)
@@ -253,6 +255,9 @@ class LiveRecoveryAnchorDeliveryService:
                 marker, rail, self._zero(DETAIL_TARGET_UNRESOLVED, marker)
             )
         row = named[0]
+        live_terminal_id = terminal_identity_of_live_slot(
+            request.target_assigned_name, request.target_locator, rows
+        )
         if _norm(_agent_locator(row)) != _norm(request.target_locator):
             return _DeliveryPreflight(
                 marker, rail, self._zero(DETAIL_TARGET_IDENTITY_MISMATCH, marker)
@@ -315,11 +320,15 @@ class LiveRecoveryAnchorDeliveryService:
             == _norm(request.target_locator)
             and _norm(getattr(attestation, "verdict", "")) == VERDICT_PRESENT
             and bool(_norm(getattr(attestation, "observed_at", "")))
+            and live_terminal_id is not None
+            and getattr(attestation, "terminal_id", "") == live_terminal_id
         ):
             return _DeliveryPreflight(
                 marker, rail, self._zero(DETAIL_ATTESTATION_MISMATCH, marker)
             )
-        if not self._attestation_bound_to_action(attestation, request):
+        if not self._attestation_bound_to_action(
+            attestation, request, live_terminal_id=live_terminal_id
+        ):
             return _DeliveryPreflight(
                 marker, rail, self._zero(DETAIL_ATTESTATION_MISMATCH, marker)
             )
@@ -357,41 +366,11 @@ class LiveRecoveryAnchorDeliveryService:
         return target_is_retiring(assigned_name)
 
     def _attestation_bound_to_action(
-        self, attestation: object, request: RecoveryAnchorDeliveryRequest
+        self, attestation: object, request: RecoveryAnchorDeliveryRequest, *, live_terminal_id
     ) -> bool:
-        """Join either native-v2 action binding or the v1 side-binding authority."""
-        home = self.attestation_home or mozyo_bridge_home()
-        try:
-            is_v1 = selected_attestation_store_is_v1(home)
-        except Exception:  # noqa: BLE001 - unknown store generation fails closed
-            return False
-        if not is_v1:
-            return (
-                _norm(getattr(attestation, "replacement_action_id", ""))
-                == _norm(request.target_action_id)
-            )
-        try:
-            binding = HerdrIdentityReplacementBindingStore(home=home).read(
-                _norm(request.target_action_id),
-                _norm(request.target_assigned_name),
-            )
-        except Exception:  # noqa: BLE001 - unreadable side authority fails closed
-            return False
-        return bool(
-            binding is not None
-            and binding.phase == BINDING_BOUND
-            and replacement_action_is_bound(
-                attestation,
-                action_id=_norm(request.target_action_id),
-                live_locator=_norm(request.target_locator),
-                expected_workspace_id=_norm(request.workspace_id),
-                expected_role=_norm(request.provider),
-                expected_lane=_norm(request.lane_id),
-                expected_assigned_name=_norm(request.target_assigned_name),
-                expected_old_locator=_norm(binding.old_locator),
-                home=home,
-            )
-        )
+        """Join the already identity-checked v4 row to its exact direct action."""
+        action = _norm(request.target_action_id)
+        return bool(action and _norm(getattr(attestation, "replacement_action_id", "")) == action)
 
     def _build_rail(self):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail import (  # noqa: E501
@@ -402,6 +381,7 @@ class LiveRecoveryAnchorDeliveryService:
         )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_turn_start import (  # noqa: E501
             HerdrCliWaitPrimitive,
+            make_locator_identity_probe,
         )
 
         try:
@@ -413,7 +393,17 @@ class LiveRecoveryAnchorDeliveryService:
                 resolution.path, runner=self.runner, timeout=self.timeout
             )
             wait = HerdrCliWaitPrimitive(resolution.path)
-            return HerdrTurnStartRail(transport=transport, reader=reader, wait=wait)
+            return HerdrTurnStartRail(
+                transport=transport,
+                reader=reader,
+                wait=wait,
+                # Redmine #15202: without a live identity probe the rail withholds the
+                # WAIT_ERROR Enter resend entirely, so this seam would silently keep the
+                # #15199 shape it is meant to recover from.
+                identity_probe=make_locator_identity_probe(
+                    resolution.path, runner=self.runner
+                ),
+            )
         except Exception:  # noqa: BLE001 - unavailable capability is a zero-send
             return None
 

@@ -27,9 +27,9 @@ from __future__ import annotations
 import re
 import time
 import uuid
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from mozyo_bridge.core.state.herdr_native_identity_binding import is_native_name
 from mozyo_bridge.core.state.startup_execution_events import (
@@ -60,7 +60,7 @@ _HERDR_TAB_ID = re.compile(r"^(w[A-Za-z0-9]+):t[A-Za-z0-9]+$")
 
 
 class PaneBoundReceiptError(ValueError):
-    """A prepared-pane receipt is not the exact v1 authority shape."""
+    """A prepared-pane receipt is not an exact supported authority shape."""
 
 
 @dataclass(frozen=True)
@@ -70,6 +70,7 @@ class PaneBoundReceipt:
     workspace_id: str
     tab_id: str
     native_name: str
+    terminal_id: str = field(default="", repr=False)
 
 
 def new_action_nonce() -> str:
@@ -90,6 +91,9 @@ class StartupTransaction:
         fence: StartupTransactionFence,
         unit: StartupUnit,
         nonce: str,
+        effect_fence: Optional[Callable[[], None]] = None,
+        completion_fence: Optional[Callable[[], None]] = None,
+        refuse_nonterminal_slot_overlap: bool = False,
         busy_retry_budget_seconds: float = RECORD_LAUNCH_BUSY_RETRY_BUDGET_SECONDS,
         sleep=None,
         monotonic=None,
@@ -97,6 +101,9 @@ class StartupTransaction:
         self._fence = fence
         self._unit = unit
         self._nonce = nonce
+        self._effect_fence = effect_fence
+        self._completion_fence = completion_fence
+        self._refuse_nonterminal_slot_overlap = refuse_nonterminal_slot_overlap
         self._action = None
         self._busy_retry_budget_seconds = max(float(busy_retry_budget_seconds), 0.0)
         self._sleep = sleep if sleep is not None else time.sleep
@@ -108,8 +115,17 @@ class StartupTransaction:
 
     def reserve(self) -> str:
         """Durably record the identity BEFORE the run's first side effect."""
-        self._action = self._fence.reserve(self._unit, self._nonce)
+        self._before_effect()
+        self._action = self._fence.reserve(
+            self._unit,
+            self._nonce,
+            refuse_nonterminal_slot_overlap=self._refuse_nonterminal_slot_overlap,
+        )
         return self._action.action_id
+
+    def _before_effect(self) -> None:
+        if self._effect_fence is not None:
+            self._effect_fence()
 
     def ensure_execution_events(self) -> None:
         """Preflight the optional execution-events projection (Redmine #14231).
@@ -126,6 +142,7 @@ class StartupTransaction:
                 "execution-events preflight was called before reserve(); the reserve "
                 "must precede every side effect"
             )
+        self._before_effect()
         ensure_execution_events_table(self._fence, self._action.action_id)
 
     def record_launch(self, slot, *, receipt: str = "") -> None:
@@ -149,7 +166,9 @@ class StartupTransaction:
             )
         )
 
-    def _record_participant(self, participant: Participant) -> None:
+    def _record_participant(
+        self, participant: Participant, *, recheck_effect_fence: bool = True
+    ) -> None:
         if self._action is None:
             raise StartupTransactionError(
                 "a participant was recorded before its startup action was reserved; "
@@ -158,6 +177,8 @@ class StartupTransaction:
         deadline = self._monotonic() + self._busy_retry_budget_seconds
         while True:
             try:
+                if recheck_effect_fence:
+                    self._before_effect()
                 self._action = self._fence.record_participant(
                     self._action.action_id, participant
                 )
@@ -189,7 +210,8 @@ class StartupTransaction:
                 assigned_name=assigned_name,
                 locator=locator,
                 receipt=receipt,
-            )
+            ),
+            recheck_effect_fence=False,
         )
 
     def settle(self, *, owed: bool, launched: bool) -> None:
@@ -210,17 +232,24 @@ class StartupTransaction:
         if self._action is None:
             return
         action_id = self._action.action_id
+        self._before_effect()
         self._fence.set_phase(action_id, PHASE_HEALTH_CHECK)
         if not owed:
+            if self._completion_fence is not None:
+                self._completion_fence()
+            self._before_effect()
             self._fence.set_phase(action_id, PHASE_SUCCESS_OWED)
+            self._before_effect()
             self._action = self._fence.set_phase(action_id, PHASE_COMPLETED_SUCCESS)
             return
         if not launched:
             # Nothing of ours is out there; there is nothing to roll back. Saying
             # `rollback_owed` here would invite the rail to look for participants that
             # do not exist and report a blocked compensation for a debt that is not one.
+            self._before_effect()
             self._action = self._fence.set_phase(action_id, PHASE_COMPLETED_SUCCESS)
             return
+        self._before_effect()
         self._action = self._fence.set_phase(action_id, PHASE_ROLLBACK_OWED)
 
 
@@ -233,6 +262,9 @@ def open_startup_transaction(
     home: Optional[Path] = None,
     fence: Optional[StartupTransactionFence] = None,
     nonce: str = "",
+    effect_fence: Optional[Callable[[], None]] = None,
+    completion_fence: Optional[Callable[[], None]] = None,
+    refuse_nonterminal_slot_overlap: bool = False,
 ) -> Optional[StartupTransaction]:
     """Reserve this run's action, or ``None`` for a dry run (which starts nothing).
 
@@ -253,6 +285,9 @@ def open_startup_transaction(
             workspace_id=workspace_id, lane_id=lane_id, providers=tuple(providers)
         ),
         nonce=nonce or new_action_nonce(),
+        effect_fence=effect_fence,
+        completion_fence=completion_fence,
+        refuse_nonterminal_slot_overlap=refuse_nonterminal_slot_overlap,
     )
     transaction.reserve()
     transaction.ensure_execution_events()
@@ -272,15 +307,25 @@ def launch_receipt(*, target_workspace: str, target_tab: str) -> str:
 
 
 def pane_bound_receipt(
-    *, target_workspace: str, target_tab: str, native_name: str
+    *,
+    target_workspace: str,
+    target_tab: str,
+    native_name: str,
+    terminal_id: str = "",
 ) -> str:
     """Strict receipt identifying a Herdr 0.8 pane prepared before agent start."""
     receipt = PaneBoundReceipt(
         workspace_id=target_workspace,
         tab_id=target_tab,
         native_name=native_name,
+        terminal_id=terminal_id,
     )
     _validate_pane_bound_receipt(receipt)
+    if receipt.terminal_id:
+        return (
+            f"pane_bound_v2 workspace={receipt.workspace_id} tab={receipt.tab_id} "
+            f"native={receipt.native_name} terminal={receipt.terminal_id}"
+        )
     return (
         f"pane_bound_v1 workspace={receipt.workspace_id} tab={receipt.tab_id} "
         f"native={receipt.native_name}"
@@ -288,7 +333,7 @@ def pane_bound_receipt(
 
 
 def parse_pane_bound_receipt(value: object) -> Optional[PaneBoundReceipt]:
-    """Decode only the byte-exact ``pane_bound_v1`` receipt grammar.
+    """Decode the byte-exact ``pane_bound_v1`` / ``pane_bound_v2`` grammar.
 
     A legacy launch receipt is outside this codec and returns ``None``.  Anything that
     claims to be a pane-bound receipt — including an unknown future version — but is not
@@ -304,22 +349,29 @@ def parse_pane_bound_receipt(value: object) -> Optional[PaneBoundReceipt]:
             "prepared-pane receipt marker is not in its canonical byte position"
         )
     parts = value.split(" ")
-    if (
-        len(parts) != 4
-        or parts[0] != "pane_bound_v1"
-        or not parts[1].startswith("workspace=")
-        or not parts[2].startswith("tab=")
-        or not parts[3].startswith("native=")
+    v1 = len(parts) == 4 and parts[0] == "pane_bound_v1"
+    v2 = len(parts) == 5 and parts[0] == "pane_bound_v2"
+    if not (
+        (v1 or v2)
+        and parts[1].startswith("workspace=")
+        and parts[2].startswith("tab=")
+        and parts[3].startswith("native=")
+        and (not v2 or parts[4].startswith("terminal="))
     ):
         raise PaneBoundReceiptError(
-            "prepared-pane receipt is not the exact pane_bound_v1 field shape"
+            "prepared-pane receipt is not an exact supported field shape"
         )
     receipt = PaneBoundReceipt(
         workspace_id=parts[1][len("workspace=") :],
         tab_id=parts[2][len("tab=") :],
         native_name=parts[3][len("native=") :],
+        terminal_id=parts[4][len("terminal=") :] if v2 else "",
     )
     _validate_pane_bound_receipt(receipt)
+    if v2 and not receipt.terminal_id:
+        raise PaneBoundReceiptError(
+            "pane_bound_v2 receipt has no terminal identity"
+        )
     return receipt
 
 
@@ -336,6 +388,13 @@ def _validate_pane_bound_receipt(receipt: PaneBoundReceipt) -> None:
     if not is_native_name(receipt.native_name):
         raise PaneBoundReceiptError(
             "prepared-pane receipt has an invalid canonical Herdr native name"
+        )
+    if receipt.terminal_id and (
+        receipt.terminal_id != receipt.terminal_id.strip()
+        or any(char.isspace() for char in receipt.terminal_id)
+    ):
+        raise PaneBoundReceiptError(
+            "prepared-pane receipt has an invalid terminal identity"
         )
 
 

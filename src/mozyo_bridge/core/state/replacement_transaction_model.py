@@ -275,15 +275,13 @@ def transaction_phase_prerequisite_met(
     return True
 
 
-#: The transaction phases in which NO destructive participant effect can yet have run: the
-#: header is written / claimed / the non-self replacement has begun but — as long as every
-#: participant is still ``close_owed`` — nothing has been closed, launched, or verified, and
-#: the continuation drain (``draining_continuation`` / ``completed``) has not started. A
-#: transaction outside this set, or one whose participants have advanced past ``close_owed``,
-#: has already actuated (Redmine #13806 recover-stale convergence) and is an immutable fence.
-_ZERO_EFFECT_PHASES = frozenset(
-    {PHASE_PLANNED, PHASE_CLAIMED, PHASE_REPLACING_NONSELF}
-)
+#: The transaction phases in which NO destructive participant effect can yet have run.  A
+#: ``replacing_nonself`` row is deliberately excluded even when every participant remains
+#: ``close_owed``: the actuator performs the external close before persisting the participant
+#: transition, so a crash in that interval has exactly that durable shape after a close already
+#: succeeded.  Without a durable close-attempt/effect receipt, only ``planned`` and ``claimed``
+#: prove zero external effect (Redmine #15227 independent close-boundary audit).
+_ZERO_EFFECT_PHASES = frozenset({PHASE_PLANNED, PHASE_CLAIMED})
 
 
 def transaction_has_zero_actuation_effect(
@@ -295,17 +293,17 @@ def transaction_has_zero_actuation_effect(
     requires (Redmine #13806 recover-stale convergence): a stuck transaction may be corrected
     to a fresh generation only while it has actuated nothing. That is exactly:
 
-    - the transaction phase is one of :data:`_ZERO_EFFECT_PHASES` (``planned`` / ``claimed`` /
-      ``replacing_nonself``) — never ``draining_continuation`` / ``completed`` (a redispatch
-      send may have fired) nor any self-close phase; AND
+    - the transaction phase is one of :data:`_ZERO_EFFECT_PHASES` (``planned`` / ``claimed``)
+      — never ``replacing_nonself`` (a close may have fired before its participant CAS),
+      ``draining_continuation`` / ``completed`` (a redispatch send may have fired), nor any
+      self-close phase; AND
     - **every** participant is still ``close_owed`` — none has been closed (``launch_owed``),
       relaunched (``verify_owed``), or verified (``replaced``).
 
-    Both conditions are needed: a row can sit at ``replacing_nonself`` (a real value the
-    installed a10 residue holds) with every participant still ``close_owed`` — that is
-    zero-effect — whereas a ``replacing_nonself`` row whose one worker is already
-    ``launch_owed`` has closed the old slot and must never be re-anchored. Any unknown /
-    corrupt phase falls outside the closed set and returns ``False`` (fail closed).
+    Both conditions are needed.  Participant state alone cannot prove a
+    ``replacing_nonself`` row is pre-close because close is effect-before-CAS; that ambiguous
+    state is therefore an immutable fence even if every participant says ``close_owed``. Any
+    unknown / corrupt phase falls outside the closed set and returns ``False`` (fail closed).
     """
     if norm(record.phase) not in _ZERO_EFFECT_PHASES:
         return False

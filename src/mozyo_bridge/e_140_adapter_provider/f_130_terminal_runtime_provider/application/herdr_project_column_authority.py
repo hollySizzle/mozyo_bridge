@@ -53,7 +53,7 @@ Three rules follow, and every part of this module obeys them:
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional, Protocol, Sequence
 
@@ -82,6 +82,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _agent_locator,
     _norm,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
     SLOT_STALE,
@@ -122,6 +123,8 @@ class CoordinatorPane:
     foreground_cwd: str = ""
     #: The canonical provider herdr detected (``""`` when absent or unrecognised).
     detected_provider: str = ""
+    #: Internal-only server-owned generation identity; never rendered publicly.
+    terminal_id: str = field(default="", repr=False)
     #: herdr reported the pane as shell residue (identity outlived its agent).
     stale: bool = False
 
@@ -230,6 +233,7 @@ class StoreAttestationPort:
         join = evaluate_attestation(
             self._store.read(pane.assigned_name),
             live_locator=pane.locator,
+            live_terminal_id=pane.terminal_id,
             expected_workspace_id=pane.workspace_id,
             expected_role=pane.role,
             expected_lane=pane.lane_id,
@@ -538,6 +542,9 @@ def coordinator_panes_in(
                 cwd=_norm(row.get("cwd")),
                 foreground_cwd=_norm(row.get("foreground_cwd")),
                 detected_provider=_detected_provider(row),
+                terminal_id=terminal_identity_of_live_slot(
+                    row.get(AGENT_KEY_NAME), locator, rows
+                ) or "",
                 stale=classify_named_slot(row) == SLOT_STALE,
             )
         )

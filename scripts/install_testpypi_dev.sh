@@ -1,36 +1,40 @@
 #!/usr/bin/env sh
 set -eu
 
-# Install or update the local pipx runtime from a TestPyPI dev artifact and
+# Install or update the local pipx runtime from a TestPyPI artifact and
 # verify the installed CLI surface. This aligns the normal-PATH runtime
-# (default pipx target: ~/.local/bin/mozyo-bridge) with the dev artifact that
-# the automated `.github/workflows/testpypi.yml` main-CI job publishes, so
-# #12709-style real smoke evidence does not depend on source-runtime,
+# (default pipx target: ~/.local/bin/mozyo-bridge) with the exact-candidate
+# artifact the manual `.github/workflows/testpypi.yml` dispatch publishes
+# (the automatic main-CI dev path was removed by Redmine #15487), so real
+# smoke evidence does not depend on source-runtime,
 # `PYTHONPATH=src`, or an ad-hoc current-checkout reinstall.
 #
 # It NEVER publishes anything; it only installs locally and reads CLI help.
 #
 # Usage:
-#   scripts/install_testpypi_dev.sh <version>   # pin the exact dev version
+#   scripts/install_testpypi_dev.sh <version>   # pin the exact version
 #
-# You MUST pass the exact dev version (e.g. 0.9.2.dev20260628090000123456789).
-# Read it, and the commit SHA it maps to, from the source CI run's job summary
-# in the "Publish to TestPyPI" workflow (see references/release.md).
+# You MUST pass the exact version (e.g. 1.0.0rc5). Read it, and the commit
+# SHA it maps to, from the "Publish to TestPyPI" run's job summary
+# (see references/release.md).
 #
 # Why exact-only (no `latest`): this install uses TestPyPI as --index-url and
 # PyPI as --extra-index-url so dependencies still resolve from PyPI. pip
-# considers candidates for the TARGET package from BOTH indexes, and a dev
-# release (0.9.2.devN) sorts BEFORE the PyPI final (0.9.2). An unpinned install
-# could therefore resolve the PyPI production release instead of the intended
-# TestPyPI dev artifact and silently taint smoke evidence. Pinning the exact
-# dev version is safe because that version exists ONLY on TestPyPI (production
-# PyPI never hosts dev releases), so the target can only resolve from TestPyPI.
+# considers candidates for the TARGET package from BOTH indexes with NO
+# priority between them (pip `install` "Finding Packages"), so an unpinned
+# install could resolve the PyPI production release and silently taint smoke
+# evidence. The exact pin alone does NOT prove the TestPyPI source either: if
+# the SAME version ever existed on PyPI, pip may serve either artifact and the
+# post-install `--version` check cannot tell them apart. Source provenance is
+# therefore proven mechanically below (Redmine #15487 R2 finding_1): right
+# before the pipx mutation the script requires the pinned version to be ABSENT
+# from production PyPI, failing closed on any unprovable lookup.
 
 usage() {
   cat <<USAGE
 Usage: $0 <version>
 
-  <version>  Exact PEP 440 dev version to install, e.g.
+  <version>  Exact PEP 440 version to install, e.g. 1.0.0rc5 or
              0.9.2.dev20260628090000123456789
 
 Pass the exact version from the 'Publish to TestPyPI' run summary so smoke
@@ -58,9 +62,9 @@ if ! command -v pipx >/dev/null 2>&1; then
 fi
 
 if [ "$version" = "latest" ]; then
-  echo "error: 'latest' is not supported; pass the exact dev version." >&2
+  echo "error: 'latest' is not supported; pass the exact version." >&2
   echo "       An unpinned install can resolve the PyPI production release" >&2
-  echo "       instead of the intended TestPyPI dev artifact." >&2
+  echo "       instead of the intended TestPyPI artifact." >&2
   echo >&2
   usage >&2
   exit 64
@@ -77,14 +81,6 @@ if ! command -v python3 >/dev/null 2>&1; then
   echo "       TestPyPI Simple JSON response without substring matches." >&2
   exit 1
 fi
-
-case "$version" in
-  *.dev*) : ;;  # looks like a dev release; proceed
-  *)
-    echo "warning: '$version' has no '.dev' segment; this runbook targets" >&2
-    echo "         TestPyPI dev artifacts. Continuing with the exact pin." >&2
-    ;;
-esac
 
 # TestPyPI's project JSON can expose a newly uploaded release before the
 # Simple Index used by pip has propagated through Warehouse/CDN caches. A
@@ -155,19 +151,126 @@ raise SystemExit(1)
   simple_attempt=$((simple_attempt + 1))
 done
 
+# --- PyPI absence gate (source provenance, Redmine #15487 R2 finding_1) ---
+# pip gives --index-url no priority over --extra-index-url, so the pinned
+# version must be proven ABSENT from production PyPI immediately before the
+# mutation — otherwise pip may serve the PyPI artifact under the same version
+# and the smoke evidence cannot prove its TestPyPI origin. A 404 proves the
+# project (and thus the version) is absent; a 200 listing without the
+# version's files proves the version is absent; anything else — the version
+# present, an unreadable payload, an unexpected status, or a failed lookup —
+# refuses fail-closed with the pipx environment untouched.
+pypi_url="https://pypi.org/simple/mozyo-bridge/"
+# The response file is created EXCLUSIVELY by mktemp: a predictable path in a
+# shared tmp would let another process pre-plant a symlink there, and
+# `curl --output` would then truncate/overwrite whatever the symlink points at
+# (Redmine #15487 R3 finding_1). mktemp failure refuses before the mutation,
+# and the trap removes the file on normal exit and on signals alike.
+if ! pypi_body="$(mktemp "${TMPDIR:-/tmp}/mozyo-pypi-absence.XXXXXX")"; then
+  echo "error: could not create a private temp file for the PyPI response;" >&2
+  echo "       refusing (fail-closed). Environment unchanged." >&2
+  exit 75
+fi
+cleanup_pypi_body() { rm -f "$pypi_body"; }
+trap cleanup_pypi_body EXIT
+trap 'cleanup_pypi_body; trap - EXIT; exit 129' HUP
+trap 'cleanup_pypi_body; trap - EXIT; exit 130' INT
+trap 'cleanup_pypi_body; trap - EXIT; exit 143' TERM
+pypi_code=""
+if ! pypi_code="$(curl \
+  --silent \
+  --show-error \
+  --location \
+  --header "Cache-Control: no-cache" \
+  --header "Accept: application/vnd.pypi.simple.v1+json" \
+  --output "$pypi_body" \
+  --write-out '%{http_code}' \
+  "$pypi_url")"; then
+  echo "error: PyPI lookup failed; cannot prove '$version' is absent from" >&2
+  echo "       production PyPI (fail-closed). Environment unchanged." >&2
+  exit 75
+fi
+case "$pypi_code" in
+  404)
+    echo "OK: PyPI does not host mozyo-bridge; '$version' cannot resolve from PyPI"
+    ;;
+  200)
+    if MOZYO_PYPI_EXPECTED_VERSION="$version" python3 -c '
+import json
+import os
+import sys
+
+try:
+    payload = json.load(sys.stdin)
+except (json.JSONDecodeError, UnicodeError):
+    raise SystemExit(2)
+
+files = payload.get("files")
+if not isinstance(files, list):
+    raise SystemExit(2)
+
+version = os.environ["MOZYO_PYPI_EXPECTED_VERSION"]
+wheel_prefix = f"mozyo_bridge-{version}-"
+sdist_names = {
+    f"mozyo_bridge-{version}.tar.gz",
+    f"mozyo_bridge-{version}.zip",
+}
+for item in files:
+    filename = item.get("filename") if isinstance(item, dict) else None
+    if isinstance(filename, str) and (
+        filename.startswith(wheel_prefix) or filename in sdist_names
+    ):
+        raise SystemExit(1)
+raise SystemExit(0)
+' < "$pypi_body"; then
+      echo "OK: PyPI Simple Index does not list $version"
+    else
+      pypi_check_status=$?
+      if [ "$pypi_check_status" -eq 1 ]; then
+        echo "error: version '$version' EXISTS on production PyPI; the pinned" >&2
+        echo "       install cannot prove a TestPyPI source (pip treats both" >&2
+        echo "       indexes as acceptable for the same version). Refusing;" >&2
+        echo "       environment unchanged. Publish a distinct candidate" >&2
+        echo "       version instead." >&2
+      else
+        echo "error: PyPI Simple response is unreadable; cannot prove" >&2
+        echo "       '$version' is absent (fail-closed). Environment unchanged." >&2
+      fi
+      exit 75
+    fi
+    ;;
+  *)
+    echo "error: unexpected PyPI Simple status '$pypi_code'; cannot prove" >&2
+    echo "       '$version' is absent (fail-closed). Environment unchanged." >&2
+    exit 75
+    ;;
+esac
+cleanup_pypi_body
+
 spec="mozyo-bridge==$version"
-echo "Installing TestPyPI dev artifact: $spec"
+echo "Installing TestPyPI artifact: $spec"
 
 # Force the pip backend so TestPyPI serves mozyo-bridge while PyPI still serves
-# its dependencies. The exact dev version exists ONLY on TestPyPI (PyPI never
-# hosts dev releases), so the target resolves from TestPyPI even though PyPI is
+# its dependencies. The exact candidate version is published only to TestPyPI,
+# so the pinned target resolves from TestPyPI even though PyPI is
 # an extra-index for dependencies. --pre lets pip accept the pre-release;
 # --no-cache-dir prevents a just-published exact version from being hidden by a
 # stale cached Simple Index response. --force reinstalls / updates the existing
 # pipx app in place on the normal PATH.
+#
+# `--backend` only exists on the pipx versions that can choose a non-pip
+# backend; passing it to an older pipx is an argparse error, not a no-op, so it
+# is applied ONLY when this pipx advertises it. A pipx without the flag has no
+# alternative backend to select — pip is already what it uses — so omitting it
+# preserves the intended resolution rather than weakening it.
+backend_args=""
+if pipx install --help 2>&1 | grep -q -- "--backend"; then
+  backend_args="--backend pip"
+fi
+# shellcheck disable=SC2086 # backend_args is a controlled, word-split-by-design pair
 pipx install \
   --force \
-  --backend pip \
+  $backend_args \
   --index-url https://test.pypi.org/simple/ \
   --pip-args "--extra-index-url https://pypi.org/simple/ --pre --no-cache-dir" \
   "$spec"
@@ -182,19 +285,19 @@ if [ -z "$bin_path" ]; then
 fi
 
 # Required surface: the two console entry points must both report the EXACT
-# dev version we pinned. `--version` prints `<prog> <version>` (argparse
+# version we pinned. `--version` prints `<prog> <version>` (argparse
 # `%(prog)s {__version__}`), so the version token is the last whitespace field.
-# Both entry points share the runtime `__version__`, and the TestPyPI dev build
+# Both entry points share the runtime `__version__`, and the TestPyPI build
 # mirrors that literal to the pinned version (Redmine #13586); if either CLI
 # disagrees, the installed artifact is not the pinned build and smoke evidence
 # would be inaccurate, so fail non-zero rather than merely displaying it.
 assert_cli_version() {
   cli_name="$1"
-  raw="$("$cli_name" --version)"   # e.g. "mozyo-bridge 0.10.0.dev123"
+  raw="$("$cli_name" --version)"   # e.g. "mozyo-bridge 1.0.0rc5"
   got="${raw##* }"                 # last whitespace field == version token
   if [ "$got" != "$version" ]; then
     echo "error: '$cli_name --version' reported '$got' but the requested" >&2
-    echo "       TestPyPI dev version is '$version'. The installed artifact" >&2
+    echo "       TestPyPI version is '$version'. The installed artifact" >&2
     echo "       does not match the pinned version; refusing so smoke" >&2
     echo "       evidence cannot silently tie to the wrong build." >&2
     exit 1

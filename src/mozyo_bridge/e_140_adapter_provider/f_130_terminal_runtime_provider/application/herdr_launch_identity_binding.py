@@ -90,6 +90,7 @@ def reserve_session_launch_identities(
     lane_id: str,
     resolved: Optional[Mapping] = None,
     attest_launcher: str = "",
+    effect_fence=None,
 ) -> None:
     """Bracket 1 — reserve ``unbound_pending`` before the first Herdr side effect.
 
@@ -121,6 +122,8 @@ def reserve_session_launch_identities(
             # the action's manifest, so this is an absence the manifest already states.
             continue
         try:
+            if effect_fence is not None:
+                effect_fence()
             store.reserve(
                 _key(workspace_id, lane_id, provider, assigned, transaction.action_id),
                 identity_digest=digest,
@@ -162,6 +165,7 @@ def finalize_lane_identity_receipts(
     result: Any,
     lane_generation: str = "",
     lifecycle_revision: str = "",
+    live_rows=(),
 ) -> None:
     """Bracket 3 — attest, after the lifecycle row exists, with the composite proof.
 
@@ -204,7 +208,9 @@ def finalize_lane_identity_receipts(
         if not provider or not assigned or not locator:
             continue
         if not _generation_attested(
-            store_home, assigned=assigned, action_id=action_id, locator=locator
+            store_home, assigned=assigned, action_id=action_id, locator=locator,
+            workspace_id=result.workspace_id, lane_id=result.lane_id,
+            role=provider, live_rows=live_rows,
         ):
             # The launch generation for this slot is not finalized against THIS action and
             # THIS locator, so the composite proof does not hold — C13's "never promote the
@@ -231,7 +237,8 @@ def finalize_lane_identity_receipts(
 
 
 def _generation_attested(
-    store_home: Path, *, assigned: str, action_id: str, locator: str
+    store_home: Path, *, assigned: str, action_id: str, locator: str,
+    workspace_id: str, lane_id: str, role: str, live_rows
 ) -> bool:
     """True iff the launch-generation authority attested THIS action at THIS locator.
 
@@ -240,26 +247,32 @@ def _generation_attested(
     launch receipt, the startup-transaction participant, the wrapper's own execution event
     and the exact main attestation all agreed. Asking it is asking all of them.
     """
-    from mozyo_bridge.core.state.herdr_launch_generation import (
-        GENERATION_ATTESTED,
-        HerdrLaunchGenerationError,
-        HerdrLaunchGenerationStore,
+    from mozyo_bridge.core.state.herdr_launch_generation import verified_generation_token
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        _norm, _norm_lane, terminal_identity_of_live_slot,
     )
+    terminal_id = terminal_identity_of_live_slot(assigned, locator, live_rows)
+    return verified_generation_token(
+        Path(store_home), assigned_name=assigned, workspace_id=workspace_id,
+        role=role, lane_id=lane_id, locator=locator, live_terminal_id=terminal_id,
+        norm=_norm, norm_lane=_norm_lane,
+    ) == action_id
 
+
+def finalize_lane_receipts_from_inventory(*, store_home: Path, result: Any, env) -> None:
+    """Finalize from one fresh view; unreadable inventory leaves receipts pending."""
     try:
-        generation = HerdrLaunchGenerationStore(home=Path(store_home)).read(assigned)
-    except (HerdrLaunchGenerationError, OSError):
-        return False
-    if generation is None:
-        return False
-    return (
-        generation.phase == GENERATION_ATTESTED
-        and generation.startup_action_id == action_id
-        and generation.locator == locator
-    )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+            list_herdr_agent_rows,
+        )
+        rows = tuple(list_herdr_agent_rows(env))
+    except Exception:  # noqa: BLE001
+        rows = ()
+    finalize_lane_identity_receipts(store_home=store_home, result=result, live_rows=rows)
 
 
 __all__ = (
     "finalize_lane_identity_receipts",
+    "finalize_lane_receipts_from_inventory",
     "reserve_session_launch_identities",
 )

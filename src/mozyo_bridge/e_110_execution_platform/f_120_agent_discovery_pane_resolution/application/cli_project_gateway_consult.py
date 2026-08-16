@@ -36,6 +36,7 @@ from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.cli_project_gateway_resolve import (
     _route_from_args,
+    _route_provider,
     render_gateway_resolution,
 )
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_backend_inventory import (
@@ -95,7 +96,8 @@ def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
     The forward (department-root -> project-gateway) counterpart of the return
     ``handoff ticketless-callback`` rail. It resolves the single project gateway by
     semantic identity (the same fail-closed ``--target-repo`` + ``--target-project``
-    + ``--to codex`` resolution as ``project-gateway handoff``), then delivers the
+    + bound-``--to`` resolution as ``project-gateway handoff``; the gateway's
+    provider comes from the scope's provider_binding, Redmine #15414), then delivers the
     consultation through the gated :func:`orchestrate_handoff` **without a Redmine
     anchor and without fabricating one** — closing the GK3500 rerun blocker where
     the root coordinator had found exactly one gateway but the anchored
@@ -113,18 +115,10 @@ def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
     consultation_callback`` (#12703 / #12705 / #12737). Fails closed (no delivery,
     no payload injected) when no unique project gateway exists.
     """
-    # Same boundary as `project-gateway handoff`: the gateway is a Codex unit. The
-    # implementation worker (Claude) is reached only after the gateway mints a
-    # Redmine anchor, so a direct project-Claude consultation send is forbidden.
-    if args.to != AGENT_KIND_CODEX:
-        die(
-            "`project-gateway consult` delivers to the project gateway, which is a "
-            f"Codex unit; `--to {args.to}` is not allowed. The implementation "
-            "worker (Claude) is reached only after the gateway creates a Redmine "
-            "anchor — use `--to codex`. Direct project-Claude send is forbidden by "
-            "the ticketless project gateway contract."
-        )
-
+    # Same boundary as `project-gateway handoff`: the gateway's provider is the
+    # scope's provider_binding resolution. The implementation worker is reached
+    # only after the gateway mints a Redmine anchor, so a direct project-worker
+    # consultation send is forbidden.
     if not args.target_repo or args.target_repo == "auto":
         die(
             "`project-gateway consult` resolves the pane semantically, so it needs "
@@ -136,6 +130,29 @@ def cmd_project_gateway_consult(args: argparse.Namespace) -> int:
             "`project-gateway consult` requires `--target-project <project_scope>` "
             "to resolve the project gateway. To gate on the Git repo root only, use "
             "`handoff ticketless-callback` with an explicit `--target`."
+        )
+    # The receiver must be the GATEWAY role's bound provider (Redmine #15414;
+    # historically the fixed codex route). The role-canonical boundary is
+    # unchanged: the implementation worker is reached only after the gateway
+    # creates a Redmine anchor, so a direct worker send stays forbidden — the
+    # gate now names the provider the workspace's provider_binding actually
+    # binds to the gateway instead of a constant.
+    try:
+        gateway_provider = _route_provider(
+            repo_root=args.target_repo, project_scope=args.target_project
+        )
+    except ProjectGatewayInventoryError as exc:
+        return render_inventory_error(
+            exc, as_json=getattr(args, "as_json", False)
+        )
+    if args.to != gateway_provider:
+        die(
+            "`project-gateway consult` delivers to the project gateway; this "
+            f"scope's provider_binding binds the gateway to `{gateway_provider}`, "
+            f"so `--to {args.to}` is not allowed. The implementation worker is "
+            "reached only after the gateway creates a Redmine anchor — use "
+            f"`--to {gateway_provider}`. A direct project-worker send is "
+            "forbidden by the ticketless project gateway contract."
         )
     if getattr(args, "target", None):
         die(
@@ -219,11 +236,13 @@ def register_consult(gateway_sub) -> None:
             "(Redmine #12740). Resolves the gateway by semantic identity (no %%pane "
             "copy), then delivers WITHOUT a Redmine anchor and without fabricating "
             "one — the forward counterpart of `handoff ticketless-callback`. "
-            "Requires --target-repo + --target-project and --to codex. The "
-            "worker-dispatch / implementation / domain-probe Redmine-anchor gate is "
-            "NOT relaxed (this rail forwards a consultation only). Fails closed (no "
-            "delivery) on missing / ambiguous resolution. Use the anchored "
-            "`project-gateway handoff` once a Redmine anchor exists for worker work."
+            "Requires --target-repo + --target-project; --to must be the provider "
+            "the scope's provider_binding binds to the gateway (historically "
+            "codex). The worker-dispatch / implementation / domain-probe "
+            "Redmine-anchor gate is NOT relaxed (this rail forwards a consultation "
+            "only). Fails closed (no delivery) on missing / ambiguous resolution. "
+            "Use the anchored `project-gateway handoff` once a Redmine anchor "
+            "exists for worker work."
         ),
     )
     # Reuse the ticketless delivery knobs (no --source / --issue / --journal anchor

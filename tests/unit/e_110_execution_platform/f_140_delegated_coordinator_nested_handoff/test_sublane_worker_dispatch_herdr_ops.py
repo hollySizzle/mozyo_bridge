@@ -48,7 +48,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_worker_dispatch import (  # noqa: E501
     ADMISSION_HEALTHY,
-    ADMISSION_STALE_WORKER_RECOVERY_REQUIRED,
     ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT,
     REASON_FOREIGN_SENDER,
     WORKER_DISPATCH_DELIVERY_FAILED,
@@ -61,6 +60,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 from tests.support.agent_provider_binaries import provider_bin_path, with_provider_path
+from tests.support.current_launch_authority import (
+    seed_completed_current_generation,
+    seed_completed_current_launch_authority,
+)
 from tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_sublane_actuator_herdr_ops import (  # noqa: E501
     HERDR_ENV,
     _fake_binary,
@@ -69,6 +72,7 @@ from tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_hand
 
 LANE_LABEL = "issue_13357_dispatch_worker_herdr"
 ISSUE = "13357"
+ATTESTED_AT = "2026-07-15T12:00:00+00:00"
 
 
 def _healthy_admission() -> WorkerDispatchAdmission:
@@ -264,30 +268,72 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             if redmine_error
             else {"return_value": redmine_source}
         )
-        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
-        with patch.object(ops, "worker_provider", return_value="claude"), patch(
-            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.list_herdr_agent_rows",
-            return_value=rows,
-        ), patch(
-            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.repo_scope_workspace_id",
-            return_value="ws",
-        ), patch(
-            "mozyo_bridge.core.state.lane_lifecycle.LaneLifecycleStore.get",
-            return_value=lifecycle,
-        ), patch(
-            "mozyo_bridge.core.state.herdr_identity_attestation.HerdrIdentityAttestationStore.read",
-            side_effect=read_attestation,
-        ), patch(
-            "mozyo_bridge.core.state.herdr_delivery_ledger.HerdrDeliveryLedger.records_for_issue",
-            return_value=list(delivery_records),
-        ), patch(
-            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution.resolve_gateway_provider",
-            return_value="codex",
-        ), patch(
-            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source.LiveRedmineJournalSource.from_environment",
-            **source_patch,
-        ):
-            return ops.observe_worker_dispatch_admission(lane=lane, request=request)
+        current_rows = []
+        for source_row in rows:
+            current_row = dict(source_row)
+            locator = str(current_row.get("pane_id") or "").strip()
+            if locator:
+                current_row.setdefault("terminal_id", f"terminal:{locator}")
+                current_row.setdefault("revision", "1")
+            current_rows.append(current_row)
+
+        with tempfile.TemporaryDirectory() as current_home_raw:
+            current_home = Path(current_home_raw)
+            gateway_action_id = seed_completed_current_generation(
+                current_home,
+                workspace_id="ws",
+                lane_id=LANE_LABEL,
+                role="codex",
+                assigned_name=gateway_name,
+                locator="w28:p74",
+                terminal_id="terminal:w28:p74",
+            )
+            current_delivery_records = []
+            for source_record in delivery_records:
+                record_values = vars(source_record).copy()
+                observation = dict(
+                    record_values.get("queue_enter_observation") or {}
+                )
+                binding = dict(observation.get("gateway_binding") or {})
+                if binding:
+                    observation["observation_version"] = 2
+                    binding.setdefault("attestation_observed_at", ATTESTED_AT)
+                    if binding.get("startup_action_id") == "startup-current":
+                        binding["startup_action_id"] = gateway_action_id
+                    observation["gateway_binding"] = binding
+                    record_values["queue_enter_observation"] = observation
+                current_delivery_records.append(SimpleNamespace(**record_values))
+
+            ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
+            with patch.dict(
+                os.environ,
+                {"MOZYO_BRIDGE_HOME": str(current_home)},
+                clear=False,
+            ), patch.object(
+                ops, "worker_provider", return_value="claude"
+            ), patch(
+                "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.list_herdr_agent_rows",
+                return_value=current_rows,
+            ), patch(
+                "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.repo_scope_workspace_id",
+                return_value="ws",
+            ), patch(
+                "mozyo_bridge.core.state.lane_lifecycle.LaneLifecycleStore.get",
+                return_value=lifecycle,
+            ), patch(
+                "mozyo_bridge.core.state.herdr_identity_attestation.HerdrIdentityAttestationStore.read",
+                side_effect=read_attestation,
+            ), patch(
+                "mozyo_bridge.core.state.herdr_delivery_ledger.HerdrDeliveryLedger.records_for_issue",
+                return_value=current_delivery_records,
+            ), patch(
+                "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution.resolve_gateway_provider",
+                return_value="codex",
+            ), patch(
+                "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.live_redmine_journal_source.LiveRedmineJournalSource.from_environment",
+                **source_patch,
+            ):
+                return ops.observe_worker_dispatch_admission(lane=lane, request=request)
 
     def _attestation(self):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
@@ -300,7 +346,9 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             role="claude",
             lane_id=LANE_LABEL,
             locator="w28:p75",
+            terminal_id="terminal:w28:p75",
             verdict="present",
+            observed_at=ATTESTED_AT,
             replacement_action_id="",
         )
 
@@ -315,7 +363,9 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             role="codex",
             lane_id=LANE_LABEL,
             locator="w28:p74",
+            terminal_id="terminal:w28:p74",
             verdict="present",
+            observed_at=ATTESTED_AT,
             replacement_action_id="",
         )
 
@@ -334,6 +384,7 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             status="sent",
             reason="ok",
             queue_enter_observation={
+                "observation_version": 2,
                 "read_ok": True,
                 "runtime_state": "busy",
                 "gateway_binding": {
@@ -342,6 +393,7 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
                     "provider": "codex",
                     "startup_action_id": "startup-current",
                     "row_revision": "1",
+                    "attestation_observed_at": ATTESTED_AT,
                 },
             },
         )
@@ -355,6 +407,8 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             {
                 "name": encode_assigned_name("ws", "codex", LANE_LABEL),
                 "pane_id": "w28:p74",
+                "terminal_id": "terminal:w28:p74",
+                "revision": "1",
                 "provider": "codex",
                 "agent": "codex",
                 "agent_status": "working",
@@ -362,6 +416,8 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             {
                 "name": encode_assigned_name("ws", "claude", LANE_LABEL),
                 "pane_id": "w28:p75",
+                "terminal_id": "terminal:w28:p75",
+                "revision": "1",
                 "provider": "claude",
                 "agent": "claude",
                 "agent_status": "idle",
@@ -541,7 +597,7 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
         )
 
-    def test_current_slot_absence_routes_recovery_without_send_authority(self):
+    def test_current_slot_absence_without_terminal_observation_fails_closed(self):
         attestation = self._attestation()
         attestation.replacement_action_id = "replace-7"
         result = self._observe(
@@ -550,8 +606,9 @@ class WorkerAdmissionObservationTests(unittest.TestCase):
             lifecycle_overrides={"replacement_action_id": "replace-7"},
         )
         self.assertEqual(
-            result.decision, ADMISSION_STALE_WORKER_RECOVERY_REQUIRED
+            result.decision, ADMISSION_WORKER_LIVENESS_AUTHORITY_CONFLICT
         )
+        self.assertFalse(result.facts.generation_binding_current)
 
     def test_live_locator_drift_from_declared_worker_pin_is_conflict(self):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
@@ -796,17 +853,102 @@ class DispatchContainmentTests(unittest.TestCase):
 
 class TurnStartLedgerTests(unittest.TestCase):
     def _observe(self, record):
-        ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
-        with patch.object(ops, "worker_provider", return_value="claude"), patch(
-            "mozyo_bridge.core.state.herdr_delivery_ledger.HerdrDeliveryLedger.records_for_issue",
-            return_value=[record],
-        ):
-            return ops._observe_worker_turn_start(
-                "mzb1_ws_claude_lane",
-                issue=ISSUE,
-                journal="81683",
-                worker_locator="w28:p75",
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+            RedmineAnchor,
+            build_marker,
+        )
+
+        worker_name = "mzb1_ws_claude_lane"
+        terminal_id = "terminal:w28:p75"
+        with tempfile.TemporaryDirectory() as current_home_raw:
+            current_home = Path(current_home_raw)
+            startup_action_id = seed_completed_current_launch_authority(
+                current_home,
+                workspace_id="ws",
+                lane_id=LANE_LABEL,
+                role="claude",
+                assigned_name=worker_name,
+                locator="w28:p75",
+                terminal_id=terminal_id,
+                target_workspace="w28",
+                target_tab="w28:t1",
             )
+            attestation = HerdrIdentityAttestationStore(home=current_home).read(
+                worker_name
+            )
+            self.assertIsNotNone(attestation)
+
+            record_values = vars(record).copy()
+            observation = dict(record_values.get("queue_enter_observation") or {})
+            observation.update(
+                {
+                    "observation_version": 2,
+                    "gateway_binding": {
+                        "assigned_name": worker_name,
+                        "locator": "w28:p75",
+                        "provider": "claude",
+                        "row_revision": "1",
+                        "startup_action_id": startup_action_id,
+                        "attestation_observed_at": attestation.observed_at,
+                    },
+                }
+            )
+            record_values.update(
+                {
+                    "notification_marker": build_marker(
+                        RedmineAnchor(issue=ISSUE, journal="81683"),
+                        "implementation_request",
+                        "claude",
+                    ),
+                    "source": "redmine",
+                    "issue_id": ISSUE,
+                    "journal_id": "81683",
+                    "receiver": "claude",
+                    "provider": None,
+                    "backend": "herdr",
+                    "rail": "queue_enter_rail",
+                    "target": "w28:p75",
+                    "status": "sent",
+                    "reason": "ok",
+                    "queue_enter_observation": observation,
+                }
+            )
+            current_record = SimpleNamespace(**record_values)
+            current_rows = [
+                {
+                    "name": worker_name,
+                    "pane_id": "w28:p75",
+                    "terminal_id": terminal_id,
+                    "revision": "1",
+                }
+            ]
+
+            ops = HerdrWorkerDispatchOps(Path("/repo"), LANE_LABEL, ISSUE)
+            with patch.dict(
+                os.environ,
+                {"MOZYO_BRIDGE_HOME": str(current_home)},
+                clear=False,
+            ), patch.object(
+                ops, "worker_provider", return_value="claude"
+            ), patch(
+                "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.list_herdr_agent_rows",
+                return_value=current_rows,
+            ), patch(
+                "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection.repo_scope_workspace_id",
+                return_value="ws",
+            ), patch(
+                "mozyo_bridge.core.state.herdr_delivery_ledger.HerdrDeliveryLedger.records_for_issue",
+                return_value=[current_record],
+            ):
+                return ops._observe_worker_turn_start(
+                    worker_name,
+                    issue=ISSUE,
+                    journal="81683",
+                    worker_locator="w28:p75",
+                )
 
     def test_queue_event_busy_is_causally_started_even_without_provider_projection(self):
         record = SimpleNamespace(

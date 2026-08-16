@@ -17,9 +17,11 @@ fake raises); it never falls back to a real backend.
 from __future__ import annotations
 
 import contextlib
+import hashlib
 import json
 import os
 import sys
+import time
 from pathlib import Path
 
 # The adapter runs as a subprocess of the installed CLI; put the repo's test-support package on
@@ -28,7 +30,11 @@ _REPO_ROOT = Path(__file__).resolve().parents[2]
 if str(_REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(_REPO_ROOT))
 
-from tests.support.herdr_fake import FakeHerdr  # noqa: E402
+from tests.support.herdr_fake import (  # noqa: E402
+    WAIT_ABSENT_MESSAGE,
+    WAIT_TIMEOUT_MESSAGE,
+    FakeHerdr,
+)
 
 
 def _state_path() -> Path:
@@ -39,11 +45,177 @@ def _state_path() -> Path:
     return Path(raw)
 
 
+def _flag_value(argv: list[str], flag: str) -> str:
+    try:
+        index = argv.index(flag)
+    except ValueError:
+        return ""
+    return argv[index + 1] if index + 1 < len(argv) else ""
+
+
+def _wait_registration_path(state_path: Path, target: str) -> Path:
+    """A target-scoped adapter handshake; its name contains no pane identity."""
+    digest = hashlib.sha256(target.encode("utf-8")).hexdigest()[:24]
+    return state_path.with_name(f".{state_path.name}.wait-{digest}")
+
+
+def _pid_is_live(raw: str) -> bool:
+    try:
+        pid = int(raw.strip())
+        if pid <= 0:
+            return False
+        os.kill(pid, 0)
+    except (OSError, TypeError, ValueError):
+        return False
+    return True
+
+
+def _has_live_registration(path: Path) -> bool:
+    try:
+        raw = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return False
+    except OSError:
+        return False
+    if _pid_is_live(raw):
+        return True
+    path.unlink(missing_ok=True)
+    return False
+
+
+def _wait_for_live_registration(path: Path, *, timeout: float = 1.0) -> bool:
+    """Let the wait subprocess publish its handshake before an Enter can fire."""
+    deadline = time.monotonic() + timeout
+    while True:
+        if _has_live_registration(path):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)
+
+
+def _load_fake(state_path: Path) -> FakeHerdr:
+    try:
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError) as exc:
+        raise RuntimeError(f"unreadable state {state_path}: {exc}") from exc
+    return FakeHerdr.from_state(state)
+
+
+def _persist_fake(state_path: Path, fake: FakeHerdr) -> None:
+    state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+
+
+def _emit_process(proc) -> int:
+    out, err = proc.communicate()
+    if out:
+        sys.stdout.write(out)
+    if err:
+        sys.stderr.write(err)
+    return int(proc.returncode or 0)
+
+
+def _run_wait(argv: list[str], state_path: Path) -> int:
+    """Keep the installed wait process live until a later Enter fires its transition.
+
+    The in-process canonical fake delays its state change until ``communicate()``. Across an
+    executable boundary, immediately communicating would make the process exit *before* the
+    product's Enter effect fence. This adapter therefore publishes a PID handshake, leaves the
+    process alive, and observes the successful Enter invocation consume the same canonical armed
+    transition from the shared state. No body send, absent wait, or timeout can fire it.
+    """
+    target = argv[2] if len(argv) > 2 else ""
+    wanted = _flag_value(argv, "--until")
+    try:
+        timeout_ms = max(1, int(_flag_value(argv, "--timeout") or "1000"))
+    except ValueError:
+        timeout_ms = 1000
+    registration = _wait_registration_path(state_path, target)
+    proc = None
+    try:
+        with _state_lock(state_path):
+            try:
+                fake = _load_fake(state_path)
+            except RuntimeError as exc:
+                sys.stderr.write(f"fake_herdr_cli: {exc}\n")
+                return 2
+            proc = fake.popen([sys.argv[0], *argv])
+            if proc.returncode != 0:
+                return _emit_process(proc)
+            try:
+                registration.write_text(str(os.getpid()), encoding="utf-8")
+            except OSError as exc:
+                sys.stderr.write(
+                    f"fake_herdr_cli: could not register causal wait: {exc.__class__.__name__}\n"
+                )
+                return 2
+
+        deadline = time.monotonic() + timeout_ms / 1000.0
+        while time.monotonic() < deadline:
+            with _state_lock(state_path):
+                try:
+                    current = _load_fake(state_path)
+                except RuntimeError as exc:
+                    sys.stderr.write(f"fake_herdr_cli: {exc}\n")
+                    return 2
+                agent = current._resolve_agent(target)
+                if agent is None:
+                    sys.stderr.write(WAIT_ABSENT_MESSAGE)
+                    return 1
+                transition_pending = any(
+                    armed_target == target and to_status == wanted
+                    for armed_target, to_status in current._armed_transitions
+                )
+                if agent.status == wanted and not transition_pending:
+                    assert proc is not None
+                    return _emit_process(proc)
+            time.sleep(0.005)
+        sys.stderr.write(WAIT_TIMEOUT_MESSAGE)
+        return 1
+    finally:
+        registration.unlink(missing_ok=True)
+
+
+def _is_enter_send(argv: list[str]) -> bool:
+    return (
+        argv[:2] == ["pane", "send-keys"]
+        and len(argv) > 3
+        and argv[3].strip().lower() == "enter"
+    )
+
+
+def _fire_enter_transition(fake: FakeHerdr, target: str) -> None:
+    """Apply one target-matching transition through the canonical fake wait process."""
+    wanted = next(
+        (
+            to_status
+            for armed_target, to_status in fake._armed_transitions
+            if armed_target == target
+        ),
+        "",
+    )
+    if not wanted:
+        return
+    proc = fake.popen(
+        [
+            sys.argv[0],
+            "agent",
+            "wait",
+            target,
+            "--until",
+            wanted,
+            "--timeout",
+            "1",
+        ]
+    )
+    proc.communicate()
+
+
 @contextlib.contextmanager
 def _state_lock(state_path: Path):
     """Serialize the read->mutate->write cycle across concurrent adapter invocations.
 
-    The standard-rail turn-start choreography ARMS its ``wait agent-status`` (a non-blocking
+    The standard-rail turn-start choreography ARMS its ``agent wait`` (a non-blocking
     background invocation of this adapter) and THEN injects (``pane send-text`` / ``send-keys``,
     further invocations) — so two adapter processes hold the SAME state file at once. Without a
     lock their read-modify-write cycles interleave and one clobbers the other (a stale snapshot
@@ -68,33 +240,40 @@ def _state_lock(state_path: Path):
 
 def main(argv: list[str]) -> int:
     state_path = _state_path()
+    if argv[:2] == ["agent", "wait"]:
+        return _run_wait(argv, state_path)
+
+    enter_send = _is_enter_send(argv)
+    registration = None
+    wait_registered = False
+    if enter_send:
+        # Popen returning is not a child-readiness handshake. Give the wait subprocess a short,
+        # bounded chance to register before consuming its transition. The ordinary fake send
+        # itself still succeeds without a waiter, but an unarmed Enter must never manufacture a
+        # causal turn-start confirmation.
+        registration = _wait_registration_path(state_path, argv[2])
+        wait_registered = _wait_for_live_registration(registration)
     # One atomic read->mutate->write cycle: a concurrently-armed ``wait`` and an injecting ``send``
     # can no longer lose each other's writes (the intermittent-uncertain race above).
     with _state_lock(state_path):
         try:
-            state = json.loads(state_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError) as exc:
-            sys.stderr.write(f"fake_herdr_cli: unreadable state {state_path}: {exc}\n")
+            fake = _load_fake(state_path)
+        except RuntimeError as exc:
+            sys.stderr.write(f"fake_herdr_cli: {exc}\n")
             return 2
-        fake = FakeHerdr.from_state(state)
-        # The turn-start wait rail (``wait agent-status``) is the canonical fake's POPEN seam, not
-        # its run seam — model it here so the installed CLI's delivery confirmation observes an
-        # armed transition (Redmine #14097 Design Consultation j#84712). Any other argv replays
-        # through run.
-        if argv[:2] == ["wait", "agent-status"]:
-            proc = fake.popen([sys.argv[0], *argv])
-            out, err = proc.communicate()
-            state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
-            if out:
-                sys.stdout.write(out)
-            if err:
-                sys.stderr.write(err)
-            return int(proc.returncode or 0)
         # ``fake.run`` takes the full argv (binary + command); replay exactly this invocation.
         result = fake.run([sys.argv[0], *argv])
+        if (
+            enter_send
+            and result.returncode == 0
+            and wait_registered
+            and registration is not None
+            and _has_live_registration(registration)
+        ):
+            _fire_enter_transition(fake, argv[2])
         # Persist any mutation (pane close / agent start) so a later invocation sees it.
         try:
-            state_path.write_text(json.dumps(fake.to_state()), encoding="utf-8")
+            _persist_fake(state_path, fake)
         except OSError as exc:  # pragma: no cover - a temp write failure is a smoke infra fault
             sys.stderr.write(f"fake_herdr_cli: could not persist state: {exc}\n")
             return 2

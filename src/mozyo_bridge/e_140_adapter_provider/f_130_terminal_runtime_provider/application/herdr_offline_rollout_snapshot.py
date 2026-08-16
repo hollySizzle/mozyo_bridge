@@ -1,7 +1,7 @@
 """Read-only live snapshot adapter for ``herdr offline-rollout plan`` (#14838).
 
 The adapter deliberately performs every authority read twice.  A plan is emitted only
-when the registry, global Herdr inventory, worktree fingerprints, three store schemas and
+when the registry, global Herdr inventory, worktree fingerprints, four store schemas and
 supervisor pair are byte-equivalent before/after collection.  This is a bounded snapshot
 barrier, not a process lock; any visible drift refuses rather than fabricating atomicity.
 """
@@ -11,6 +11,7 @@ from __future__ import annotations
 import hashlib
 import os
 import sqlite3
+import stat
 from pathlib import Path
 from typing import Callable, Mapping, Optional
 
@@ -21,6 +22,13 @@ from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     STORE_ABSENT as ATTESTATION_ABSENT,
     STORE_RECOGNIZED as ATTESTATION_RECOGNIZED,
     probe_store_schema,
+)
+from mozyo_bridge.core.state.herdr_launch_generation import (
+    GENERATION_STORE_ABSENT,
+    GENERATION_STORE_HEALTHY,
+    herdr_launch_generation_path,
+    launch_generation_artifacts_secure,
+    probe_launch_generation_store,
 )
 from mozyo_bridge.core.state.lane_lifecycle_readonly import (
     LIFECYCLE_SCHEMA_ABSENT,
@@ -54,8 +62,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_lane_topology import (  # noqa: E501
     bind_lane_worktree,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_launchd import (  # noqa: E501
-    service_status_pair,
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.supervisor_service_backend import (  # noqa: E501
+    service_status as read_supervisor_status,
 )
 from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.domain.offline_rollout_plan import (  # noqa: E501
     AgentSnapshot,
@@ -68,6 +76,7 @@ from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.doma
     STORE_ABSENT,
     STORE_ATTESTATION,
     STORE_LANE_LIFECYCLE,
+    STORE_LAUNCH_GENERATION,
     STORE_RECOGNIZED,
     STORE_STARTUP_TRANSACTION,
     StoreSnapshot,
@@ -237,6 +246,7 @@ def _inventory_snapshot(repo_root: Path, env: Mapping[str, str], inventory_reade
                 agent.runtime_state,
                 agent.raw_status,
                 agent.locator,
+                agent.terminal_id,
                 agent.decode_reason,
             )
             for agent in view.agents
@@ -256,6 +266,13 @@ def _inventory_projection_complete(view) -> bool:
         and raw_count >= 0
         and invalid_count == 0
         and raw_count == len(view.agents)
+        and all(
+            type(agent.terminal_id) is str
+            and agent.terminal_id
+            and agent.terminal_id.strip() == agent.terminal_id
+            for agent in view.agents
+        )
+        and len({agent.terminal_id for agent in view.agents}) == len(view.agents)
     )
 
 
@@ -314,6 +331,85 @@ def _startup_store_snapshot(home: Path) -> StoreSnapshot:
         version,
         content_digest=content_digest,
         migration_plan_digest=migration_digest,
+    )
+
+
+def _launch_generation_store_snapshot(home: Path) -> StoreSnapshot:
+    """Recognize exact v1 predecessor or current v2 without mutating either."""
+    path = herdr_launch_generation_path(home)
+    state, _detail = probe_launch_generation_store(path)
+    if state == GENERATION_STORE_ABSENT:
+        return StoreSnapshot(STORE_LAUNCH_GENERATION, STORE_ABSENT, None)
+    if state == GENERATION_STORE_HEALTHY:
+        return StoreSnapshot(
+            STORE_LAUNCH_GENERATION, STORE_RECOGNIZED, 2,
+            content_digest=_sqlite_content_digest(path),
+        )
+    expected_v1 = (
+        "assigned_name", "startup_action_id", "phase", "workspace_id", "role",
+        "lane_id", "locator", "verdict", "observed_at", "reserved_at", "attested_at",
+    )
+    try:
+        if not _launch_generation_v1_artifact_valid(path):
+            return StoreSnapshot(STORE_LAUNCH_GENERATION, "unsupported", None)
+        metadata = path.lstat()
+        if (
+            not stat.S_ISREG(metadata.st_mode)
+            or metadata.st_uid != os.geteuid()
+            or stat.S_IMODE(metadata.st_mode) != 0o600
+        ):
+            return StoreSnapshot(STORE_LAUNCH_GENERATION, "unsupported", None)
+        with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            info = tuple(
+                (row[1], str(row[2]).upper(), row[3], row[5])
+                for row in conn.execute("PRAGMA table_info(herdr_launch_generations)")
+            )
+            tables = tuple(row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ))
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return StoreSnapshot(STORE_LAUNCH_GENERATION, "unreadable", None)
+    if (
+        version != 1
+        or tuple(row[0] for row in info) != expected_v1
+        or any(row[1:] != ("TEXT", 1, 1 if index == 0 else 0)
+               for index, row in enumerate(info))
+        or tables != ("herdr_launch_generations",)
+    ):
+        return StoreSnapshot(STORE_LAUNCH_GENERATION, "unsupported", None)
+    return StoreSnapshot(
+        STORE_LAUNCH_GENERATION, STORE_RECOGNIZED, 1, upgrade_required=True,
+        content_digest=_sqlite_content_digest(path),
+    )
+
+
+def _launch_generation_v1_artifact_valid(path: Path) -> bool:
+    """Exact legacy v1 shape/security gate used by plan and destructive backup authority."""
+    expected = (
+        "assigned_name", "startup_action_id", "phase", "workspace_id", "role",
+        "lane_id", "locator", "verdict", "observed_at", "reserved_at", "attested_at",
+    )
+    try:
+        if not launch_generation_artifacts_secure(path):
+            return False
+        with sqlite3.connect(path.resolve().as_uri() + "?mode=ro", uri=True) as conn:
+            version = conn.execute("PRAGMA user_version").fetchone()[0]
+            info = tuple(
+                (row[1], str(row[2]).upper(), row[3], row[5])
+                for row in conn.execute("PRAGMA table_info(herdr_launch_generations)")
+            )
+            tables = tuple(row[0] for row in conn.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+            ))
+    except (OSError, sqlite3.DatabaseError, TypeError, ValueError):
+        return False
+    return bool(
+        version == 1
+        and tuple(row[0] for row in info) == expected
+        and all(row[1:] == ("TEXT", 1, 1 if index == 0 else 0)
+                for index, row in enumerate(info))
+        and tables == ("herdr_launch_generations",)
     )
 
 
@@ -384,14 +480,18 @@ def _store_snapshots(home: Path) -> tuple[StoreSnapshot, ...]:
                 else ""
             ),
         ),
+        _launch_generation_store_snapshot(home),
         _startup_store_snapshot(home),
     )
 
 
 def _supervisor_snapshots(home: Path, reader) -> tuple[SupervisorAgentSnapshot, ...]:
-    pair = reader(mozyo_home=home)
+    # The platform-resolving backend, not a host adapter: it normalizes whichever OS scheduler owns
+    # this host into the same `agents` roster (#15192 retired the launchd-only `*_pair` verbs).
+    projection = reader(mozyo_home=home)
+    backend = str(projection.get("backend") or "")
     snapshots = []
-    for row in pair.get("agents", ()):  # public projection is already secret-safe
+    for row in projection.get("agents", ()):  # public projection is already secret-safe
         pid = row.get("pid")
         snapshots.append(
             SupervisorAgentSnapshot(
@@ -402,6 +502,12 @@ def _supervisor_snapshots(home: Path, reader) -> tuple[SupervisorAgentSnapshot, 
                 home_pin=str(row.get("home_pin") or ""),
                 executable_matches=bool(row.get("executable_matches")),
                 credential_readiness=str(row.get("credential_readiness") or ""),
+                backend=backend,
+                legacy_drain=(
+                    str(row.get("legacy_drain") or "")
+                    if backend == "launchd"
+                    else "not_applicable"
+                ),
             )
         )
     return tuple(snapshots)
@@ -425,7 +531,7 @@ def capture_offline_rollout_snapshot(
     workspace_reader: Callable = list_workspaces,
     worktree_reader: Callable = read_live_worktree_fingerprint,
     store_reader: Callable = _store_snapshots,
-    supervisor_reader: Callable = service_status_pair,
+    supervisor_reader: Callable = read_supervisor_status,
     lifecycle_records_reader: Optional[Callable] = None,
     lane_worktree_binder: Callable = bind_lane_worktree,
 ) -> OfflineRolloutCapture | OfflineRolloutPlanResult:

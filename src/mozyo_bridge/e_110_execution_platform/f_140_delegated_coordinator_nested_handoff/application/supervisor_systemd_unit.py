@@ -2,8 +2,8 @@
 
 Everything here answers "what exactly goes in the unit files, and what does an installed unit say"
 — path resolution, argv resolution, systemd quoting / specifier escaping, unit rendering, and
-unit-file readback. All of it is **pure or read-only**: no ``systemctl``, no host mutation, no
-credential resolution. The lifecycle verbs that drive the host manager live in the sibling
+parsing bytes supplied by the pinned filesystem seam. All of it is **pure**: no filesystem access,
+no ``systemctl``, no host mutation, no credential resolution. The lifecycle verbs live in the sibling
 :mod:`...application.supervisor_systemd`, which re-exports every public name below so the adapter's
 surface is a single import for callers.
 
@@ -22,6 +22,7 @@ from pathlib import Path
 from typing import Callable, Optional, Sequence
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    DEFAULT_OS_TICK_INTERVAL_SECONDS,
     DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
     DEFAULT_SUPERVISOR_SERVICE_LABEL,
 )
@@ -56,7 +57,12 @@ TIMER_UNIT_NAME = "mozyo-bridge-callback-supervisor.timer"
 #: :data:`DEFAULT_RECONCILIATION_INTERVAL_SECONDS` (300s), so a tick inside that window makes zero
 #: provider reads. Raising this constant would make local work less prompt; it would NOT make
 #: Redmine reads more frequent, and lowering the provider cadence is not this module's decision.
-DEFAULT_TICK_INTERVAL_SECONDS = 60
+#:
+#: Since #15192 the value is the SHARED portable default both OS adapters register at (see
+#: :data:`DEFAULT_OS_TICK_INTERVAL_SECONDS` for the measurement it rests on) rather than a
+#: Linux-private number: one operator-facing cadence knob means the same thing on both hosts. The
+#: alias is kept because it is this adapter's published name for that cadence.
+DEFAULT_TICK_INTERVAL_SECONDS = DEFAULT_OS_TICK_INTERVAL_SECONDS
 
 #: The executable name resolved from PATH at install time (never a shell string).
 SUPERVISOR_EXECUTABLE_NAME = "mozyo-bridge"
@@ -71,6 +77,15 @@ _SYSTEMCTL = "systemctl"
 #: The ``[Timer]`` delay that runs one tick the moment the timer becomes active (on ``enable --now``
 #: and on every later user-manager start).
 RUN_AT_LOAD_DELAY = "0s"
+
+#: Names removed from the final service environment after all manager-global, unit-local, and PAM
+#: environment sources have been merged.  Values are never serialized; credentials come from the
+#: permission-gated mozyo home file so daemon-effective readiness stays independent of an
+#: operator's prior ``systemctl --user import-environment`` calls.
+MASKED_MANAGER_ENVIRONMENT = (
+    "MOZYO_REDMINE_API_KEY",
+    "MOZYO_REDMINE_URL",
+)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,11 +159,22 @@ def unit_dir(os_home: Optional[Path] = None) -> Path:
     holds an absolute path, else ``~/.config/systemd/user``. Writing anywhere else would produce an
     install that ``systemctl --user`` cannot see — a silently unscheduled supervisor, which is the
     exact failure this adapter exists to remove.
+
+    The environment value is read **exactly as set**, with no trimming (review j#102378 finding
+    r7f3). This is not a display string: :func:`install` writes the two unit files into the
+    directory this returns and :func:`uninstall` unlinks files from it, so a normalization here
+    changes what gets created and deleted. Trimming broke both halves of the XDG Base Directory
+    Specification's rule at once — a value like ``" /tmp/x"`` is *not* absolute and the spec says an
+    implementation must treat it as invalid and ignore it, yet the trim promoted it to a valid root
+    and installed there; and ``"/tmp/x "`` *is* absolute, naming a directory whose name ends in a
+    space, yet the trim redirected the write to a different directory. Only unset and empty select
+    the default. Reading it raw is also the only reading that can agree with the user manager, whose
+    own unit search path comes from the same unmodified variable.
     """
     if os_home is not None:
         return Path(os_home) / CONFIG_DIR_RELATIVE / UNIT_DIR_RELATIVE
-    xdg = (os.environ.get("XDG_CONFIG_HOME") or "").strip()
-    config_root = Path(xdg) if xdg and os.path.isabs(xdg) else Path.home() / CONFIG_DIR_RELATIVE
+    xdg = os.environ.get("XDG_CONFIG_HOME") or ""
+    config_root = Path(xdg) if os.path.isabs(xdg) else Path.home() / CONFIG_DIR_RELATIVE
     return config_root / UNIT_DIR_RELATIVE
 
 
@@ -230,11 +256,12 @@ def format_exec_argv(command: Sequence[str]) -> str:
       systemd *specifiers*, so an unescaped ``%h`` in an executable or ``--home`` path is expanded
       by systemd at load time. Measured on a live user manager (review j#102053 Finding 4): a unit
       whose ``ExecStart`` read ``"/opt/%h/mozyo-bridge" "--home" "/tmp/%h"`` was reported by
-      ``systemctl show`` as ``argv[]=/opt//home/holly/mozyo-bridge --home /tmp//home/holly`` — a
-      different executable and a different mozyo home than the unit's literal text. Quoting does
-      not suppress specifier expansion; only ``%%`` does. Without this, the pin is not a pin, and
-      ``executable_matches`` compares the file's literal text and reports ``True`` while systemd
-      execs something else.
+      ``systemctl show`` (with the expanded home neutralized) as
+      ``argv[]=/opt/EXPANDED-USER-HOME-SENTINEL/mozyo-bridge --home
+      /tmp/EXPANDED-USER-HOME-SENTINEL`` — a different executable and a different mozyo home than
+      the unit's literal text. Quoting does not suppress specifier expansion; only ``%%`` does.
+      Without this, the pin is not a pin, and ``executable_matches`` compares the file's literal
+      text and reports ``True`` while systemd execs something else.
 
     This is a *value*, never a shell string: systemd execs the argv directly, with no ``/bin/sh``.
     Callers must reject :func:`unrenderable_argv_reason` tokens first — this function assumes the
@@ -336,7 +363,8 @@ def render_service_unit(command: Sequence[str]) -> str:
     Structurally minimal and secret-free:
 
     - **No** ``Environment=`` / ``EnvironmentFile=`` key exists in the output, so no secret can be
-      serialized in.
+      serialized in. ``UnsetEnvironment=`` names the Redmine inputs without their values and masks
+      any same-named user-manager global environment after systemd merges all sources.
     - **No** ``Restart=`` and **no** ``RemainAfterExit=`` key: the command is a bounded sweep that
       exits and the ``.timer`` re-runs it. A restart directive on a one-shot would be a tight
       relaunch loop, so it is absent by design.
@@ -353,6 +381,7 @@ def render_service_unit(command: Sequence[str]) -> str:
             "[Service]",
             "Type=oneshot",
             f"ExecStart={format_exec_argv(command)}",
+            f"UnsetEnvironment={' '.join(MASKED_MANAGER_ENVIRONMENT)}",
             f"SyslogIdentifier={Path(SUPERVISOR_UNIT.service_unit).stem}",
             "",
         )
@@ -392,16 +421,22 @@ def render_timer_unit(*, interval_seconds: int = DEFAULT_TICK_INTERVAL_SECONDS) 
 # ---------------------------------------------------------------------------
 
 
-def read_unit_keys(target: Path) -> Optional[dict[str, list[str]]]:
-    """Parse an installed unit file into ``{key: [values]}``; ``None`` if unreadable.
+def parse_unit_keys(payload: bytes | str) -> Optional[dict[str, list[str]]]:
+    """Parse pinned unit bytes into ``{key: [values]}``; ``None`` if undecodable.
 
     Section-flat on purpose: this adapter only asks "does key X exist / what is its value", and the
     owned units never reuse a key name across sections. Comments, section headers, and blank lines
-    are dropped; a line without ``=`` is ignored rather than raising.
+    are dropped; a line without ``=`` is ignored rather than raising. The caller obtains ``payload``
+    from :mod:`supervisor_systemd_fs`; this text layer never re-opens a path.
     """
-    try:
-        raw = target.read_text(encoding="utf-8")
-    except (OSError, UnicodeDecodeError):
+    if isinstance(payload, bytes):
+        try:
+            raw = payload.decode("utf-8")
+        except UnicodeDecodeError:
+            return None
+    elif isinstance(payload, str):
+        raw = payload
+    else:
         return None
     keys: dict[str, list[str]] = {}
     for line in raw.splitlines():
@@ -494,6 +529,7 @@ __all__ = (
     "TIMER_UNIT_NAME",
     "TIMERS_TARGET",
     "RUN_AT_LOAD_DELAY",
+    "MASKED_MANAGER_ENVIRONMENT",
     "DEFAULT_TICK_INTERVAL_SECONDS",
     "SUPERVISOR_EXECUTABLE_NAME",
     "SUPERVISOR_ARGV_TAIL",
@@ -524,7 +560,7 @@ __all__ = (
     "parse_exec_argv",
     "render_service_unit",
     "render_timer_unit",
-    "read_unit_keys",
+    "parse_unit_keys",
     "installed_command",
     "installed_interval_seconds",
     "extract_pinned_home",

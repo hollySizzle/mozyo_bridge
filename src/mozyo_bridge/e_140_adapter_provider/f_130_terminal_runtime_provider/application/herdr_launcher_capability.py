@@ -5,12 +5,12 @@ The #13748 launcher preflight (:func:`...herdr_pane_lifecycle
 ``herdr agent-attest`` subcommand by matching :data:`...herdr_launch_argv
 .ATTEST_CAPABILITY_MARKER` (``--assigned-name``) in its ``--help`` output. That is a
 **subcommand-marker** check only. It cannot see the failure #13847 closes: the source
-runtime's startup self-attestation store is schema v2
+runtime's startup self-attestation store is schema v4
 (:data:`...herdr_identity_attestation.HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION`), but a
 managed launch may be wrapped through an *older installed* launcher whose attestation
 store is v1. Both launchers carry ``agent-attest`` and ``--assigned-name`` — so the
 subcommand-marker probe passes — yet the v1 launcher, injected with the source runtime's
-shared ``MOZYO_BRIDGE_HOME``, opens the v2 store, hits the exact-version write guard
+shared ``MOZYO_BRIDGE_HOME``, opens the v4 store, hits the exact-version write guard
 (``_connect_rw``), silently drops the attestation, and ``exec``s the provider anyway. The
 pair boots **live but unattested / stale**, and every downstream verify (adopt, resume,
 recover) fails closed with no public recovery — the live evidence in the issue.
@@ -60,6 +60,21 @@ from typing import Optional
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
     MIGRATE_HINT as _MIGRATE_HINT,
     epoch_store_admission,
+)
+
+# The store-side half of the join, plus the verdict type and store vocabulary it owns
+# (Redmine #15520). Re-exported below so every existing importer of this module — and
+# there are many — keeps working unchanged; the split exists for `doctor`, which needs
+# the store question without probing a launcher.
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_store_admission import (  # noqa: E501
+    STORE_JOIN_OK,
+    STORE_LAUNCHER_CANNOT_WRITE,
+    STORE_MAINTENANCE_IN_PROGRESS,
+    STORE_REPLACEMENT_UNSUPPORTED,
+    STORE_UNREADABLE,
+    STORE_UNSUPPORTED,
+    LauncherCapabilityVerdict,
+    decide_store_admission,
 )
 from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     STORE_ABSENT as _STORE_ABSENT_STATE,
@@ -254,16 +269,6 @@ class LauncherCapabilityObservation:
         return frozenset({self.advertised_schema_version})
 
 
-@dataclass(frozen=True)
-class LauncherCapabilityVerdict:
-    """The fail-closed capability verdict. ``ok`` is True only for a full match."""
-
-    ok: bool
-    reason: str
-    #: An operator-facing, value-free explanation (never a path / secret) suitable for
-    #: the fail-closed error the probe raises.
-    detail: str
-
 
 def build_attest_capability_contract_line(schema_version: int) -> str:
     """The capability contract token the source ``agent-attest --help`` advertises (pure).
@@ -311,7 +316,9 @@ def build_attest_capability_epilog() -> str:
     """
     from mozyo_bridge.core.state.herdr_identity_attestation import (
         HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
-        RECOGNIZED_SCHEMA_VERSIONS,
+    )
+    from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
+        WRITABLE_SCHEMA_VERSIONS,
     )
     from mozyo_bridge.core.state.herdr_launch_generation import (
         HERDR_LAUNCH_GENERATION_PROTOCOL_VERSION,
@@ -326,7 +333,7 @@ def build_attest_capability_epilog() -> str:
             HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
         )
         + "\nwritable attestation store shapes (Redmine #13882):\n"
-        + build_attest_capability_stores_line(RECOGNIZED_SCHEMA_VERSIONS)
+        + build_attest_capability_stores_line(WRITABLE_SCHEMA_VERSIONS)
         + "\nrepo-local config parse contract (Redmine #14258):\n"
         + build_attest_capability_config_parse_line(CONFIG_PARSE_CONTRACT_VERSION)
         + "\nreadable shared lane lifecycle schema (Redmine #14258):\n"
@@ -529,26 +536,6 @@ def decide_generation_protocol_capability(
     )
 
 
-# --- Store-join verdict vocabulary (Redmine #13882; fail-closed). ---------------------
-#: The selected store's shape is writable by the probed launcher for this launch kind.
-STORE_JOIN_OK = "attestation_store_ok"
-#: The store file exists but cannot be opened / queried at all.
-STORE_UNREADABLE = "attestation_store_unreadable"
-#: The store's recorded version / on-disk shape is not one this runtime recognizes.
-STORE_UNSUPPORTED = "attestation_store_unsupported"
-#: The store is older than this runtime and the probed launcher cannot prove it writes
-#: that shape — the exact live-but-unattested class of #13882.
-STORE_LAUNCHER_CANNOT_WRITE = "attestation_store_launcher_cannot_write"
-#: Maintenance holds the store exclusively, so admission fails closed at acquisition
-#: (Redmine #13882 j#80190 boundary 1) — before any workspace / tab / agent exists.
-STORE_MAINTENANCE_IN_PROGRESS = "attestation_store_maintenance_in_progress"
-#: A replacement launch was requested against a store whose shape has no
-#: ``replacement_action_id`` column.
-STORE_REPLACEMENT_UNSUPPORTED = "attestation_store_replacement_unsupported"
-
-#: The store shape that first carried ``replacement_action_id`` (#13806). A replacement
-#: launch cannot be attested by anything older.
-_REPLACEMENT_MIN_STORE_VERSION = 2
 
 
 def decide_store_compatibility(
@@ -579,55 +566,23 @@ def decide_store_compatibility(
        dropped" shape, on the axis the resume generation proof depends on);
     5. the probed launcher cannot prove it writes this shape ->
        :data:`STORE_LAUNCHER_CANNOT_WRITE`;
-    6. otherwise :data:`STORE_JOIN_OK` — including the v1-store / normal-launch case,
-       which acceptance 2 admits via the proven backward-compatible write path.
+    6. otherwise :data:`STORE_JOIN_OK` — only an absent store or an exact writable-v4
+       store. Recognized v1-v3 stores remain readable diagnostics but are never writable
+       managed-launch authority.
+
+    Steps 1-4b and the required-version check live in :func:`decide_store_admission`
+    (Redmine #15520) so a caller without a launcher observation — ``doctor`` — asks the
+    same question against the same code. Only step 5 needs the probed launcher.
     """
-    if store.state == _STORE_UNREADABLE_STATE:
-        return LauncherCapabilityVerdict(
-            False,
-            STORE_UNREADABLE,
-            "the selected attestation store could not be read (corrupt, or not a "
-            "database); an unreadable store is not an empty one, so no launch may "
-            "proceed against it — its attestations could not be verified afterwards",
-        )
-    if store.state == _STORE_UNSUPPORTED_STATE:
-        hint = (
-            "it is newer than this runtime understands; use a newer runtime"
-            if store.upgrade_required
-            else "its recorded version and on-disk shape disagree (partial / corrupt / "
-            f"foreign); restore from a backup or rebuild it with "
-            f"`mozyo-bridge herdr attestation-store rebuild --write`"
-        )
-        return LauncherCapabilityVerdict(
-            False,
-            STORE_UNSUPPORTED,
-            f"the selected attestation store has an unsupported schema "
-            f"(recorded version {store.version}) — {hint}. Launching would boot a pair "
-            f"whose self-attestations this runtime could never read",
-        )
-    if store.state == _STORE_ABSENT_STATE:
-        return LauncherCapabilityVerdict(
-            True,
-            STORE_JOIN_OK,
-            f"no attestation store exists yet; the first self-attestation creates it at "
-            f"v{int(required_schema_version)}",
-        )
-    version = int(store.version or 0)
-    if replacement_launch and version < _REPLACEMENT_MIN_STORE_VERSION:
-        return LauncherCapabilityVerdict(
-            False,
-            STORE_REPLACEMENT_UNSUPPORTED,
-            f"this is a replacement launch, but the selected attestation store is "
-            f"v{version}, whose shape has no `replacement_action_id` column. Attesting "
-            f"it would silently drop the replacement binding a recovery matches on "
-            f"exactly, so the pair would relaunch unverifiable. Migrate the store first: "
-            f"{_MIGRATE_HINT}",
-        )
-    epoch_refusal = epoch_store_admission(
-        epoch_launch=epoch_launch, store_version=version, migrate_hint=_MIGRATE_HINT
+    admission = decide_store_admission(
+        store,
+        required_schema_version=required_schema_version,
+        replacement_launch=replacement_launch,
+        epoch_launch=epoch_launch,
     )
-    if epoch_refusal is not None:
-        return LauncherCapabilityVerdict(False, *epoch_refusal)
+    if admission is not None:
+        return admission
+    version = int(store.version or 0)
     if version not in observation.writable_store_versions:
         provable = (
             "advertises no writable-store set, so it is credited only with its native "
@@ -981,5 +936,6 @@ __all__ = (
     "build_attest_capability_stores_line",
     "parse_launcher_capability_output",
     "decide_launcher_capability",
+    "decide_store_admission",
     "decide_store_compatibility",
 )

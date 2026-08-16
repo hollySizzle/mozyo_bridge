@@ -2517,7 +2517,10 @@ class R14DeclaresNothingTest(unittest.TestCase):
                     f"{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}",
                     "mozyo_attest_capability_stores="
                     + "_".join(str(v) for v in sorted(RECOGNIZED_STORE_VERSIONS)),
-                    "mozyo_attest_capability_lifecycle=1_2_3_4_5_6_7_8_9_10",
+                    "mozyo_attest_capability_lifecycle="
+                    + "_".join(
+                        str(v) for v in sorted(readable_lane_lifecycle_versions())
+                    ),
                     "mozyo_generation_protocol_capability=1",
                 )
             )

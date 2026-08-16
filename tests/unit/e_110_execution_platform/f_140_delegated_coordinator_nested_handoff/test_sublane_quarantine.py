@@ -41,6 +41,10 @@ sys.path.insert(0, str(ROOT / "src"))
 import json
 import sqlite3
 
+from tests.support.current_launch_authority import (
+    seed_completed_current_launch_authority,
+)
+
 from mozyo_bridge.core.state.lane_lifecycle import (
     DISPOSITION_ACTIVE,
     DecisionPointer,
@@ -111,6 +115,7 @@ AGENT_REVISION = 7
 MARKER = "[mozyo:handoff:source=redmine:issue=13763:journal=78011:kind=implementation_request:to=claude]"
 
 ACTION = quarantine_action_id(lane_id=LANE, role=ROLE, locator=OLD_LOCATOR)
+STARTUP_ACTION = "startup-quarantine-current"
 
 
 def _signal(**kw) -> PendingComposerSignal:
@@ -171,6 +176,14 @@ class _FakeOps:
     ) -> CloseReceiverResult:
         self.closed_pins.append(pin)
         return self._close
+
+    def current_close_pin(self, request: QuarantineRequest) -> ReleasePin:
+        return ReleasePin(
+            role=request.role,
+            assigned_name=request.assigned_name,
+            locator=request.locator,
+            startup_action_id=STARTUP_ACTION,
+        )
 
     def heal_receiver(self, request: QuarantineRequest) -> None:
         self.heals += 1
@@ -538,7 +551,12 @@ class OwedCloseRevalidationTest(_QuarantineCase):
             self.key,
             expected_revision=row.revision,
             action_id=ACTION,
-            pins=(ReleasePin(role=ROLE, assigned_name=NAME, locator=OLD_LOCATOR),),
+            pins=(ReleasePin(
+                role=ROLE,
+                assigned_name=NAME,
+                locator=OLD_LOCATOR,
+                startup_action_id=STARTUP_ACTION,
+            ),),
             decision=DecisionPointer(
                 source="redmine", issue_id=ISSUE, journal_id=APPROVAL_JOURNAL
             ),
@@ -688,8 +706,12 @@ class ComposerObservationTest(unittest.TestCase):
         self.assertEqual(observation.marker_ids, ())
 
 
-def _agent_row(name: str, locator: str) -> dict:
-    return {"name": name, "pane_id": locator}
+def _agent_row(name: str, locator: str, terminal_id: str = "") -> dict:
+    return {
+        "name": name,
+        "pane_id": locator,
+        "terminal_id": terminal_id or f"terminal:{locator}",
+    }
 
 
 class _StubOps(LiveSublaneQuarantineOps):
@@ -749,6 +771,9 @@ class CloseReceiverTest(unittest.TestCase):
     """The close plan may only ever target the exact pinned generation."""
 
     def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
         patcher = mock.patch.object(
             quarantine_module, "repo_scope_workspace_id", return_value=WS
         )
@@ -764,10 +789,38 @@ class CloseReceiverTest(unittest.TestCase):
         )
         exec_patcher.start()
         self.addCleanup(exec_patcher.stop)
-        self.pin = ReleasePin(role=ROLE, assigned_name=NAME, locator=OLD_LOCATOR)
+        terminal_id = f"terminal:{OLD_LOCATOR}"
+        startup_action_id = seed_completed_current_launch_authority(
+            self.home,
+            workspace_id=WS,
+            lane_id=LANE,
+            role=ROLE,
+            assigned_name=NAME,
+            locator=OLD_LOCATOR,
+            terminal_id=terminal_id,
+            target_workspace=WS,
+            target_tab=f"{WS}:t1",
+        )
+        self.pin = ReleasePin(
+            role=ROLE,
+            assigned_name=NAME,
+            locator=OLD_LOCATOR,
+            startup_action_id=startup_action_id,
+        )
 
     def test_exact_pinned_locator_is_closed(self) -> None:
-        ops = _StubOps([_agent_row(NAME, OLD_LOCATOR), _agent_row(GATEWAY_NAME, f"{WS}:p43")])
+        ops = _StubOps(
+            [_agent_row(NAME, OLD_LOCATOR), _agent_row(GATEWAY_NAME, f"{WS}:p43")],
+            home=self.home,
+        )
+        self.executed.side_effect = lambda plan, **_kwargs: (
+            ops._stub_rows.clear()
+            or HerdrRetireCloseResult(
+                workspace_id=plan.workspace_id,
+                lane_id=plan.lane_id,
+                closed=((ROLE, OLD_LOCATOR),),
+            )
+        )
         result = ops.close_receiver(_request(), self.pin)
 
         self.assertTrue(result.closed)
@@ -779,20 +832,21 @@ class CloseReceiverTest(unittest.TestCase):
         # The live pane at the approved locator belongs to a DIFFERENT lane: the pin
         # set is inconsistent, so the whole generation fails closed.
         foreign = encode_assigned_name(WS, ROLE, "issue_99999_other")
-        ops = _StubOps([_agent_row(foreign, OLD_LOCATOR)])
+        ops = _StubOps([_agent_row(foreign, OLD_LOCATOR)], home=self.home)
         result = ops.close_receiver(_request(), ReleasePin(
-            role=ROLE, assigned_name=foreign, locator=OLD_LOCATOR
+            role=ROLE, assigned_name=foreign, locator=OLD_LOCATOR,
+            startup_action_id=self.pin.startup_action_id,
         ))
 
         self.assertFalse(result.closed)
         self.assertFalse(result.old_absent)
-        self.assertEqual(result.detail, "close_pin_inconsistent")
+        self.assertEqual(result.detail, "close_generation_not_current")
         self.executed.assert_not_called()
 
     def test_vanished_receiver_is_absent_not_a_failure(self) -> None:
         # The old process is already gone (crash / operator close). Nothing to close;
         # the generation may proceed to relaunch.
-        ops = _StubOps([_agent_row(GATEWAY_NAME, f"{WS}:p43")])
+        ops = _StubOps([_agent_row(GATEWAY_NAME, f"{WS}:p43")], home=self.home)
         result = ops.close_receiver(_request(), self.pin)
 
         self.assertFalse(result.closed)
@@ -803,12 +857,12 @@ class CloseReceiverTest(unittest.TestCase):
         # The slot was relaunched into a NEWER agent generation under the same assigned
         # name. Treating that as "old receiver absent" would let a stale approval march
         # on and replace a receiver the owner never looked at.
-        ops = _StubOps([_agent_row(NAME, FRESH_LOCATOR)])
+        ops = _StubOps([_agent_row(NAME, FRESH_LOCATOR)], home=self.home)
         result = ops.close_receiver(_request(), self.pin)
 
         self.assertFalse(result.closed)
         self.assertFalse(result.old_absent)
-        self.assertEqual(result.detail, "assigned_name_recycled")
+        self.assertEqual(result.detail, "close_generation_not_current")
         self.executed.assert_not_called()
 
 
@@ -830,6 +884,9 @@ class QuarantineMigrationAuditTest(_QuarantineCase):
         conn = sqlite3.connect(path)
         try:
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_phase")
+            conn.execute(
+                "ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin"
+            )
             # v7 (Redmine #13647) added lane_kind; a faithful pre-v7 rewind drops it too,
             # or the shape is a NEWER table merely re-stamped to an old version.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_kind")

@@ -15,12 +15,89 @@ need the full stage order.
 
 > 人間向けのリリースノートは [`RELEASE_NOTES.md`](RELEASE_NOTES.md) にあります。
 
-1. **Install the CLI** and confirm `tmux` is on `PATH`:
+### Herdr support and breaking upgrades
+
+The 1.0 release-candidate line is verified against **Herdr 0.8.0 only**.
+Older Herdr versions and newer versions that have not completed this project's
+tests and acceptance checks are unsupported; “latest” does not mean automatic
+forward compatibility.
+
+Herdr is a separate product (<https://herdr.dev>) and is **not bundled with
+this package**: it is redistributed by its own project, ships its own updater,
+and is a platform binary, so vendoring it would mean shipping someone else's
+release on our cadence. Install it yourself:
+
+```bash
+brew install herdr    # Homebrew currently carries the supported 0.8.0
+herdr --version       # expect: herdr 0.8.0
+```
+
+On platforms without Homebrew, follow the instructions at <https://herdr.dev>.
+`mozyo-bridge` finds the binary through `MOZYO_HERDR_BINARY` or the trusted
+`PATH`, and refuses to fall back to tmux when the herdr backend is selected but
+no binary resolves.
+
+Update Herdr the way you installed it — its own updater is only for its own
+installer, and is disabled for package-manager installs:
+
+| installed with | update with |
+| --- | --- |
+| Homebrew | `brew upgrade herdr` |
+| Herdr's own installer | `herdr update` |
+| mise / Nix | that tool's own upgrade path |
+
+Any of them can move you off the version this project verified, so check
+`herdr --version` against the supported version above after updating.
+
+When upgrading an existing Herdr-backed installation, checkpoint the work in
+progress, stop the old session, and start a fresh named session from the new
+environment. Pre-1.0 sessions, launch receipts, and terminal identities are not
+migrated in place, and in-place downgrade is not supported. Compatibility code
+for old Herdr command grammars or persisted sessions is intentionally not kept.
+
+This is a deliberate policy for the initial, centrally managed small user
+cohort: the implementation, test, and incident-analysis cost of parallel legacy
+paths exceeds their operational benefit. If a broader or independently managed
+user base needs rolling upgrades later, that migration contract must be designed
+and tested as a separate feature before support is claimed.
+
+#### Identity store migration between release candidates (rc2 → rc3)
+
+Upgrading the CLI does not migrate the home-scoped identity stores by itself.
+The rc2 → rc3 cutover established this contract (observed live on Z690,
+Redmine #15422): after installing the new version and stopping the old
+session, and **before the first managed launch** from the new runtime:
+
+1. `mozyo-bridge herdr attestation-store status` (read-only). If it reports a
+   recognized older shape, run
+   `mozyo-bridge herdr attestation-store migrate --write` — backup-first and
+   idempotent. The managed-launch preflight refuses older shapes fail-closed,
+   so every managed launch stays blocked until this migration runs.
+2. `mozyo-bridge herdr launch-generation-store status` (read-only). If the
+   pre-upgrade store is reported corrupt from the new runtime's point of view,
+   run `mozyo-bridge herdr launch-generation-store rebuild --write` after the
+   old pairs are closed — the rail refuses a healthy store and refuses while
+   any managed agent still holds a generation. The next managed launch
+   re-derives the store.
+
+Both rails are dry-run by default (`--write` performs the change) and rotate
+the previous store into `~/.mozyo_bridge/backups/` before touching anything; a
+failed backup aborts with the store byte-unchanged.
+
+1. **Install the CLI**, then make sure the terminal backend your project
+   selects is present:
 
    ```bash
    pipx install mozyo-bridge
    mozyo-bridge --version
    ```
+
+   The default backend is tmux, so `tmux` must be on `PATH` unless the project
+   declares `terminal_transport.backend: herdr` in `.mozyo-bridge/config.yaml`
+   — in which case `herdr` is the prerequisite instead (see “Herdr support and
+   breaking upgrades” for how to install it). `mozyo-bridge doctor` judges the
+   backend the project actually selects, so it will not ask a herdr-only host
+   for tmux.
 
    Alternative install path:
 
@@ -969,6 +1046,20 @@ mozyo-bridge scaffold apply none --target /path/to/project
 
 When `--target` or `--repo` is omitted, scaffold writes to the current working directory. Use an explicit target to scaffold a different directory.
 
+To adopt the herdr terminal backend from day one, add `--backend herdr` (Redmine #15527):
+
+```bash
+mozyo-bridge scaffold apply redmine-governed --target /path/to/project --backend herdr
+```
+
+This additionally writes `.mozyo-bridge/config.yaml` declaring
+`terminal_transport.backend: herdr`. The file is operator-owned bootstrap output —
+it is **not** tracked by `scaffold status`, so editing it later never reports drift —
+and an already-existing `config.yaml` (any directory entry, symlinks included) makes
+the apply fail closed instead of overwriting it. `--backend tmux` writes the explicit
+tmux declaration the same way. **Omitting `--backend` changes nothing**: no config is
+written and the runtime default (tmux) applies, exactly as before this flag existed.
+
 This creates:
 
 - `AGENTS.md`
@@ -1160,8 +1251,8 @@ mozyo-bridge notify-claude \
   - target pane は **sender と同じ tmux session** にあること (= mozyo session 内から実行) (`Reason: invalid_args`)
   - target pane は所属 window の **active split** であること、**または** standard_target_admission (Redmine #12597) を満たすこと。登録済み inactive split が minimal admission contract (live pane / strong role match / `workspace_id` present / unambiguous) を満たせば、rail が `tmux select-pane` で active 化して delivery する (pane selection のみ。raw `send-keys` / `paste-buffer` / low-level `type` / `keys` は recovery に使わない)。admission 不通過 (例: `workspace_id` 無し) または `--no-target-activation` では従来通り `Reason: invalid_args` で fail-closed し strict-rail recovery を返す
   - foreground process が receiver の allowlist にマッチすること (`Reason: target_not_agent`): literal `claude` (receiver=`claude`) / literal `codex` (receiver=`codex`) は **strong identity**、literal `node` および versioned native binary basename は Claude Code / Codex CLI どちらも採るため **weak identity** (両 receiver で admit、cross-binding 防御は window-name binding + operator 規律に retreat)。
-  すべて pass した場合、marker 観測ありで `sent` / `ok`、marker 未観測でも Enter を発行して `sent` / `queue_enter` を durable record に残す。default rail の promise は **strong preflight 付き practical queued submission** であり、confirmed landing ではない。受信側は引き続き Asana task comment / Redmine journal を正本として読む。
-- **strict explicit fallback** は `mozyo-bridge handoff send --mode standard` (および `mozyo-bridge message --submit` 標準動作)。短い marker を送信文へ付与し、target pane 上で marker を確認できた場合だけ Enter を送る。確認できない場合は入力欄を `C-u` で消し、Enter を送らず `blocked` / `marker_timeout` で失敗する (fail-closed)。strict landing observation が必要な送信 (regression check / brand-new pane で queue-pickup 確率が未確認 / observability test / 厳格な landing evidence が監査要件) または default scope 外 (`mozyo-bridge message` / non-agent pane) のときに明示的に選ぶ。v0.4 で default ではなくなったが contract からは削除しない。挙動は v0.1 以降一切変更しない。
+  すべて pass した後の結果は backend で異なる。tmux は従来どおり、marker 観測ありで `sent` / `ok`、未観測でも Enter を発行して `sent` / `queue_enter` を残すため、保証は **strong preflight 付き practical queued submission** までである。Herdr は本文を1回だけ入力し、各 Enter の前に working-transition wait を arm する。既定30秒の単一budget内で2秒間隔の Enter-only fallbackを行い、同じterminalと`pane_bound_v2` launch tokenに結び付いた idle/turn-ended→working transitionを確認した場合だけ `sent` / `ok`になる。確認できない、waitが先に終了した、期限を過ぎた、identity・本文・画面・runtime stateを再確認できない場合は非0の`blocked`へ閉じ、本文を再入力しない。`busy` receiverへEnterを送る場合はあるが、busy自体を成功証拠にはしない。候補版より前の`pane_bound_v1` pairは自動昇格せず、`session-start`再実行だけでもv2にならない。移行可能なscratch pairと、汎用refresh railが未実装のmanaged/default pairの境界は`vibes/docs/specs/herdr-native-identity.md`を参照する。受信側は引き続きAsana task comment / Redmine journalを正本として読む。
+- **strict explicit fallback** は `mozyo-bridge handoff send --mode standard` (および `mozyo-bridge message --submit` 標準動作)。tmuxでは短い marker を送信文へ付与し、target pane 上で marker を確認できた場合だけ Enter を送り、確認できなければ入力欄を `C-u` で消して `blocked` / `marker_timeout` になる。Herdr standardはevent-driven turn-start railで本文を1回だけ送り、開始を確認できなければfail-closedする。strict landing / turn-start evidenceが必要な送信、またはdefault scope外 (`mozyo-bridge message` / non-agent pane) のときに明示的に選ぶ。v0.4でdefaultではなくなったがcontractからは削除しない。
 - どちらの rail を使った場合でも durable record (Asana task comment / Redmine journal) が正本。pane notification は pointer。詳細・state machine 全体・例外条件は `vibes/docs/logics/tmux-send-safety-contract.md` の `## Default Delivery Promise (v0.4)` / `## Queue-Enter Default Rail` 節を参照。
 
 ## Legacy Queue

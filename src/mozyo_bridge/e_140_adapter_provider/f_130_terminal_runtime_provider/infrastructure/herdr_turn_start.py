@@ -1,4 +1,4 @@
-"""Built-in herdr CLI ``wait agent-status`` wait primitive + rail resolver (Redmine #13248).
+"""Built-in herdr CLI ``agent wait`` wait primitive + rail resolver (Redmine #13248).
 
 The core seam
 (:mod:`mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_rail`)
@@ -6,7 +6,7 @@ defines the pure check-then-wait :class:`HerdrTurnStartRail`, the closed
 outcome / wait vocabularies, and the injected wait-primitive *port*
 (:class:`TurnStartWaitPort` / :class:`ArmedWait`). This module is the single
 concrete, built-in provider that fills the wait port: a subprocess wrapper over
-the herdr CLI ``wait agent-status`` surface (PoC E9 / E12–E14), plus a fail-closed
+the Herdr 0.8 CLI ``agent wait --until`` surface, plus a fail-closed
 resolver that wires the whole rail (transport #13245 + state reader #13246 + this
 wait primitive) from the same default-off backend selection and trusted-env binary
 the sibling resolvers use. Core still owns the orchestration and the vocabularies;
@@ -15,7 +15,7 @@ dependency points provider -> core.
 
 Why a two-phase arm / collect (not a single blocking call)
 ----------------------------------------------------------
-``wait agent-status`` waits for a *change into* ``working`` and (E9 c2) does not
+``agent wait --until working`` waits for a *change into* ``working`` and does not
 return when the pane is already there, so the rail must **arm the wait before it
 injects** — otherwise the transition the injection triggers can land in the race
 window between a snapshot read and a (blocking) wait call. A single blocking call
@@ -62,6 +62,9 @@ import os
 import subprocess
 from typing import Callable, Mapping, Optional
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_wait import (  # noqa: E501
+    build_herdr_agent_wait_argv,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (
     HERDR_STATUS_WORKING,
 )
@@ -78,6 +81,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     ArmedWait,
     HerdrTurnStartRail,
     WaitResult,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
+    process_generation_of_locator,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_discovery import (  # noqa: E501
+    HerdrCliAgentLister,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_state import (
     HerdrCliAgentStateReader,
@@ -118,7 +127,7 @@ _TIMEOUT_INDICATORS = (
 
 
 class _HerdrArmedWait:
-    """A herdr ``wait agent-status`` subprocess that has been armed, not yet reaped.
+    """A Herdr ``agent wait`` subprocess that has been armed, not yet reaped.
 
     Holds the live ``Popen`` (or a pre-failed sentinel result). :meth:`collect`
     blocks on it up to the outer bound and classifies the exit; :meth:`cancel`
@@ -149,7 +158,8 @@ class _HerdrArmedWait:
             return WaitResult.timeout(
                 "herdr wait exceeded the outer subprocess bound"
             )
-        except OSError as exc:
+        except (OSError, ValueError) as exc:
+            self._reap()
             return WaitResult.error(
                 f"herdr wait failed to reap ({exc.__class__.__name__})"
             )
@@ -159,6 +169,14 @@ class _HerdrArmedWait:
         if self._prefailed is not None or self._proc is None:
             return
         self._reap()
+
+    def pending(self) -> bool:
+        if self._prefailed is not None or self._proc is None:
+            return False
+        try:
+            return self._proc.poll() is None
+        except (OSError, ValueError):
+            return False
 
     def _reap(self) -> None:
         proc = self._proc
@@ -188,7 +206,7 @@ def _classify_exit(returncode: object, stderr: object) -> WaitResult:
 
 
 class HerdrCliWaitPrimitive:
-    """A :class:`TurnStartWaitPort` over the herdr CLI ``wait agent-status``.
+    """A :class:`TurnStartWaitPort` over the Herdr CLI ``agent wait``.
 
     :meth:`arm` builds an explicit argv list (never a shell string) and starts it
     **non-blocking** through the injected ``popen`` factory, returning an
@@ -231,16 +249,12 @@ class HerdrCliWaitPrimitive:
                     f"wait timeout_ms must be a positive int, got {timeout_ms!r}"
                 ),
             )
-        argv = [
+        argv = build_herdr_agent_wait_argv(
             self._binary,
-            "wait",
-            "agent-status",
             target,
-            "--status",
-            self._status,
-            "--timeout",
-            str(timeout_ms),
-        ]
+            until=self._status,
+            timeout_ms=timeout_ms,
+        )
         outer_timeout = timeout_ms / 1000.0 + self._margin
         try:
             proc = self._popen(
@@ -264,6 +278,42 @@ class HerdrCliWaitPrimitive:
                 ),
             )
         return _HerdrArmedWait(proc, subprocess_timeout=outer_timeout)
+
+
+def make_locator_identity_probe(
+    binary: str,
+    *,
+    runner: Optional[Runner] = None,
+) -> Callable[[str], Optional[str]]:
+    """A live "which process holds this locator now" probe (Redmine #15202).
+
+    The rail's WAIT_ERROR Enter-resend may only fire once it has re-established that
+    the target locator still addresses the agent the send was authorised against
+    (audit j#102755 finding 3). This binds the pure
+    :func:`~...domain.herdr_identity.process_generation_of_locator` fold over a
+    **fresh** ``agent list`` snapshot — a new listing on every call, deliberately
+    un-memoised, because a cached snapshot would make the before/after comparison
+    vacuous and turn the guard into decoration. The token pins assigned name,
+    Herdr's stable terminal id, locator, and row revision. Terminal id distinguishes
+    terminal instances. Revision is retained as a conservative mutation fence; Herdr
+    0.8 derives it from ``terminal.revision``, so it is not a process-generation id.
+
+    Fail-closed and total: an unreadable listing, an unknown locator, a blank name,
+    missing / malformed terminal id or row revision, or an ambiguous locator (two rows
+    claiming it) all answer ``None``, and the rail reads ``None`` as "identity
+    unconfirmed" and withholds the extra Enter. Never raises, so a listing fault
+    degrades the resend rather than the send.
+    """
+    lister = HerdrCliAgentLister(binary, runner=runner)
+
+    def _probe(target: str) -> Optional[str]:
+        try:
+            rows = lister.list_agent_rows()
+        except (Exception, SystemExit):
+            return None
+        return process_generation_of_locator(target, rows)
+
+    return _probe
 
 
 def _resolve_herdr_binary(
@@ -324,11 +374,13 @@ def resolve_turn_start_rail(
         wait_timeout_ms=wait_timeout_ms,
         max_enter_resends=max_enter_resends,
         inject_settle_seconds=inject_settle_seconds,
+        identity_probe=make_locator_identity_probe(binary, runner=runner),
     )
 
 
 __all__ = (
     "SUBPROCESS_TIMEOUT_MARGIN_SECONDS",
     "HerdrCliWaitPrimitive",
+    "make_locator_identity_probe",
     "resolve_turn_start_rail",
 )

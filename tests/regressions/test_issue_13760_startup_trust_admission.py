@@ -73,7 +73,12 @@ class Issue13760StartupTrustAdmissionTest(unittest.TestCase):
             [], get_states=["idle"], wait_results=[(0, "")], pane_content=screen
         )
         result, herdr, _ws, out, err = self._run(
-            agent_rows_fn=_wiring._same_lane_rows(), herdr=herdr, mode=mode
+            agent_rows_fn=_wiring._same_lane_rows(),
+            herdr=herdr,
+            mode=mode,
+            queue_binding=(
+                _wiring._queue_binding if mode == "queue-enter" else None
+            ),
         )
         return result, herdr, _wiring._outcome_from(out), out, err
 

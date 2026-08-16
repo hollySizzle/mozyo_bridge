@@ -19,6 +19,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
 
@@ -30,6 +31,7 @@ from mozyo_bridge.core.state.herdr_launch_generation import (  # noqa: E402
 )
 from tests.support.current_launch_authority import (  # noqa: E402
     RECEIPT_CAPABLE_ACTION_ID,
+    seed_completed_current_launch_authority,
     seed_current_generation,
 )
 from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
@@ -256,9 +258,23 @@ class _RefreshCase(unittest.TestCase):
         self.store = ReplacementTransactionStore(home=self.home)
         self.workspace_id = "ws"
         self.port = FakeActuatorPort()
-        # Ruling j#97105: the refresh reads this worker's CURRENT launch-generation row.
-        # A home without one is a missing current authority, which refuses -- so the
-        # pre-#14741 path is a recorded fact about this exact slot.
+        self.terminal_id = f"terminal:{WORKER['old_locator']}"
+        # Positive worker refreshes carry a complete fresh terminal snapshot; negative
+        # tests replace only the durable authority and continue to measure missing / legacy /
+        # mismatch as zero effect against this same live slot.
+        rows = [{
+            "name": WORKER["assigned_name"],
+            "pane_id": WORKER["old_locator"],
+            "terminal_id": self.terminal_id,
+        }]
+        inventory = patch(
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "sublane_herdr_projection.list_herdr_agent_rows",
+            return_value=rows,
+        )
+        inventory.start()
+        self.addCleanup(inventory.stop)
         self._seed_current_authority()
 
     def _seed_current_authority(self, **overrides):
@@ -268,7 +284,16 @@ class _RefreshCase(unittest.TestCase):
             locator=WORKER["old_locator"],
         )
         base.update(overrides)
-        seed_current_generation(self.home, **base)
+        if "action_id" in overrides or overrides.get("attested") is False:
+            seed_current_generation(self.home, **base)
+            return
+        seed_completed_current_launch_authority(
+            self.home,
+            **base,
+            terminal_id=self.terminal_id,
+            target_workspace="w4B",
+            target_tab="w4B:t1",
+        )
 
     def _request(self, **overrides) -> WorkerRefreshRequest:
         base = dict(

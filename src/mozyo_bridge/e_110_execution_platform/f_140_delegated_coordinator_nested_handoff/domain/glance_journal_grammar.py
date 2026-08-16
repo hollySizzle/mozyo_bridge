@@ -724,6 +724,8 @@ class GateFacts:
     #: glance and retire cannot differ (#14539 j#90137 F3); that holds because the #14755 terminal
     #: is retire-only with NO glance projection, so exporting ids adds no authority to this fold.
     review_round_journals: Tuple[int, ...] = ()
+    #: Redmine #15166 BARE export: newest round's reviewed head (CANONICAL ``review_result`` only).
+    review_round_head: str = ""
 
 
 @dataclass(frozen=True)
@@ -903,6 +905,10 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
     ) = _review_round_state(recognized)
     # Computed once: the derived fact and its negation-for-declared-waivers must agree.
     waived = waived_now(review_waiver, zero_change, round_ids)
+    # Redmine #15166: newest round's reviewed head, same markers + disposition helper as above.
+    _round = str(max(round_ids)) if round_ids else ""
+    _canonical = _round and _review_result_disposition(issue_markers, _round)[0] == _MARKER_CANONICAL
+    round_head = review_result_head(issue_markers, _CORRELATION_ISSUE, _round) if _canonical else ""
     return GateFacts(
         latest_gate=latest.gate,
         latest_gate_journal=str(latest.journal_id),
@@ -934,6 +940,7 @@ def fold_issue_gate_facts(journals: Sequence[Tuple[object, str]]) -> Optional[Ga
         review_round_conclusion=round_conclusion,
         review_round_blocker=round_blocker,
         review_round_journals=tuple(round_ids),
+        review_round_head=round_head,
     )
 
 

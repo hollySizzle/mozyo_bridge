@@ -114,8 +114,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatch_herdr_ops import (  # noqa: E501
     HerdrWorkerDispatchOps,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
-    replacement_store_admission as _replacement_store_admission,
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_replacement_launch_admission import (  # noqa: E501
+    replacement_managed_launch_admission as _replacement_store_admission,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.agent_state import (  # noqa: E501
     RUNTIME_BUSY,
@@ -127,6 +127,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
     SLOT_LIVE,
@@ -227,7 +228,7 @@ class LiveRecoveryActuatorPort:
     def _q(self) -> LiveSublaneQuarantineOps:
         return LiveSublaneQuarantineOps(
             repo_root=self.repo_root, env=self.env, runner=self.runner,
-            timeout=self.timeout,
+            timeout=self.timeout, home=self.attestation_home,
         )
 
     def _rows(self) -> Sequence[Mapping[str, object]]:
@@ -365,15 +366,12 @@ class LiveRecoveryActuatorPort:
         return str(record.revision), str(record.lane_generation)
 
     def close_exact_generation(self, pin: ParticipantPin) -> str:
-        try:
-            release = ReleasePin(
-                role=pin.provider, assigned_name=pin.assigned_name, locator=pin.old_locator
-            )
-        except ReleasePinError:
+        quarantine = self._q()
+        request = _quarantine_request(self.request)
+        release = quarantine.current_close_pin(request)
+        if release is None:
             return CLOSE_ERROR
-        result: CloseReceiverResult = self._q().close_receiver(
-            _quarantine_request(self.request), release
-        )
+        result: CloseReceiverResult = quarantine.close_receiver(request, release)
         # A positively-absent old slot is treated as "already closed" by the tranche B step
         # only via observe_old_slot; here a close request that finds the exact slot gone
         # (old_absent) is not an error — the caller advances via bounded recovery.
@@ -388,16 +386,10 @@ class LiveRecoveryActuatorPort:
         action id): a fresh relaunch that does not carry the exact replacement action can never
         be verified as THIS recovery's worker.
 
-        **The exact pin IS the launch's binding context (Redmine #14480).** While the selected
-        identity-attestation store is v1, the action binding is a side record keyed on the exact
-        participant, so ``launch_or_resume_v1_replacement`` requires the target's ``provider`` /
-        ``assigned_name`` / ``old_locator`` and refuses a partial context with
-        ``replacement_binding_context_missing``. Passing only the action id therefore did not
-        launch "generically" — it could not launch AT ALL under v1, which is what #14479 j#88695
-        measured: two consecutive ``effect_failed: launch`` on a committed-close replay whose
-        lane authority was ``ok``. The pin is the single authority already carried through
-        close and verify; the launch now reads its context from that same pin instead of
-        re-deriving a narrower one (the sibling ``_BoundPairActuatorPort`` shape).
+        **The exact pin IS the launch's binding context (Redmine #14480).** Current authority
+        is the v4 direct action field joined to the same fresh terminal and generation-v2
+        startup action. Historical v1-v3 side rows remain diagnostic-only and cannot admit
+        this launch; the approved four-store offline rollout is required first.
 
         ``target_provider`` scopes the same-tab postcondition to THIS owed participant. The
         actuator drives exactly ONE participant per launch, so the pair is partial *by
@@ -473,34 +465,22 @@ class LiveRecoveryActuatorPort:
           launched by this recovery is never adopted);
         - fresh AND exact action binding -> :data:`ATTEST_BOUND`.
 
-        **The action binding has two shapes, and reading only the direct field sees one of
-        them (Redmine #14485).** Under a selected v2 store the fresh row carries
-        ``replacement_action_id`` itself; under v1 it CANNOT (#13882 holds the on-disk shape
-        while older installed launchers are live), so the launch writes a normal v1 attestation
-        plus a separate bound side record. This method used to compare only
-        ``record.replacement_action_id``, so a v1 row — whose direct field is empty *by design*
-        — could never match, and a correctly bound v1 replacement was permanently
-        ``attestation_mismatch``. #14484 measured exactly that on installed 0.14.0a4: the old
-        gateway closed, the fresh one launched and attested ``present``, the side record was
-        ``phase=bound`` on the same exact action / name / locator / old locator, and the
-        execute still stopped partial. #14480 fixed this authority model on the LAUNCH side;
-        this is its post-launch half.
+        The historical side-binding shape remains readable only to explain old debt. It
+        cannot satisfy this method: current authority requires the direct v4 action field,
+        exact terminal identity, and the matching generation-v2 startup action.
 
         The judgement itself is NOT re-implemented here — it is
         :func:`...replacement_action_bound_after_identity_join`, the same function the
         bound-pair convergence rail calls. Two post-launch verifications reading one rule is
         the point: a second local copy is how they would drift.
 
-        ``verify_fresh_receiver`` above is the identity join, and it is what supplies the
-        FRESH ``locator`` the v1 side record must agree with — the old pinned locator would
-        match the side record's ``old_locator`` instead, which is precisely what the evaluator
-        refuses. Fail-closed at every unresolved input: an unresolvable workspace identity is
-        passed through as an empty token, which can never equal the record's workspace, so the
-        v1 leg refuses rather than guessing (and the v2 leg, already covered by the join above,
-        is left exactly as it was).
+        ``verify_fresh_receiver`` supplies the fresh locator; the same snapshot supplies the
+        globally unique server-owned terminal identity. v1-v3 rows and side bindings remain
+        diagnostic-only and cannot satisfy this current-authority join.
         """
         from mozyo_bridge.core.state.herdr_identity_attestation import (
             HerdrIdentityAttestationStore,
+            evaluate_attestation,
         )
 
         rec = self.store.get(self.key)
@@ -518,6 +498,8 @@ class LiveRecoveryActuatorPort:
             return ATTEST_PENDING
         if record is None:
             return ATTEST_PENDING
+        if _norm(pin.old_locator) != _norm(self.request.locator):
+            return ATTEST_MISMATCH
         try:
             workspace_id = _norm(repo_scope_workspace_id(self.repo_root))
         except Exception:  # noqa: BLE001 - see the docstring: empty never joins, so v1 refuses
@@ -526,6 +508,8 @@ class LiveRecoveryActuatorPort:
             record,
             action_id=_norm(action_id),
             live_locator=_norm(verification.locator),
+            live_terminal_id=terminal_identity_of_live_slot(
+                self.request.assigned_name, verification.locator, self._rows()),
             workspace_id=workspace_id,
             role=_norm(self.request.role),
             lane=_norm_lane(self.request.lane),
@@ -793,6 +777,10 @@ class LiveStaleWorkerRecoveryOps:
         return _replacement_store_admission(
             key.workspace_id,
             pin.lane_id,
+            repo_root=self.repo_root,
+            env=self.env,
+            runner=self.runner,
+            timeout=self.timeout,
             lifecycle_home=str(self.lifecycle_home) if self.lifecycle_home else "",
             attestation_home=str(self.attestation_home) if self.attestation_home else "",
         )
@@ -921,11 +909,10 @@ class LiveStaleWorkerRecoveryOps:
         worker_provider, _gateway = self._worker_gateway_providers()
         if not worker_provider:
             return False  # unresolved provider binding => fail-closed (never skip the check)
-        fresh_observed_at = self._fresh_attestation_observed_at()
-        if not fresh_observed_at:
+        boundary = self._fresh_attestation_identity()
+        if boundary is None:
             return False  # no fresh attested worker => cannot establish the post-launch boundary
-        fresh_locator = self._fresh_worker_locator()
-        if not fresh_locator or fresh_locator == _norm(self.request.locator):
+        if boundary.locator == _norm(self.request.locator):
             return False  # no distinct fresh worker resolved
         marker = self._redispatch_marker(continuation, worker_provider)
         try:
@@ -944,10 +931,11 @@ class LiveStaleWorkerRecoveryOps:
                 and _norm(rec.provider) in ("", worker_provider)
                 and _norm(rec.backend) == "herdr"
                 and _norm(rec.rail) == "queue_enter_rail"
-                and _norm(rec.target) == fresh_locator
+                and _norm(rec.target) == boundary.locator
                 and _norm(rec.status) == "sent"
                 and _norm(rec.reason) == "ok"  # accepted (marker-observed submit), not queue_enter
-                and _recorded_after(rec.recorded_at, fresh_observed_at)
+                and _recorded_after(rec.recorded_at, boundary.observed_at)
+                and boundary.matches_delivery(rec)
             ):
                 return True
         return False
@@ -966,23 +954,23 @@ class LiveStaleWorkerRecoveryOps:
             return ""
         return _agent_locator(matches[0])
 
-    def _fresh_attestation_observed_at(self) -> str:
+    def _fresh_attestation_identity(self):
         """The fresh worker's startup-attestation ``observed_at`` (the post-launch boundary).
 
         Empty when no attestation exists / is unreadable — the redispatch cannot then be
         distinguished from the initial old-worker delivery, so it is treated as unconfirmed.
         """
-        from mozyo_bridge.core.state.herdr_identity_attestation import (
-            HerdrIdentityAttestationStore,
-        )
-
         try:
-            record = HerdrIdentityAttestationStore(home=self.attestation_home).read(
-                _norm(self.request.assigned_name)
+            from .herdr_live_attestation_time import fresh_attestation_identity
+            rows = self._rows()
+            return fresh_attestation_identity(
+                home=self.attestation_home, rows=rows,
+                assigned_name=self.request.assigned_name,
+                workspace_id=repo_scope_workspace_id(self.repo_root),
+                role=self.request.role, lane=self.request.lane,
             )
-        except Exception:  # noqa: BLE001 - unreadable attestation fails closed
-            return ""
-        return _norm(record.observed_at) if record is not None else ""
+        except Exception:  # noqa: BLE001 - unreadable authority fails closed
+            return None
 
 
 __all__ = (

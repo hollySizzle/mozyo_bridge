@@ -39,6 +39,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     columnar_verdict,
     read_pane_layout,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_managed_column_scope import (  # noqa: E501
+    managed_column_scope,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_adjustment import (  # noqa: E501
     COLUMN_MOVE_LEFT,
     COLUMN_MOVE_RIGHT,
@@ -83,13 +86,15 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     REASON_STALE_PREVIEW,
     column_resize_actuator_key,
     deferred_preview,
-    internal_pair_matches,
     outer_ratio,
     placement_failure_result,
     refused_preview,
     row_by_locator,
     runtime_revision,
     singleton_temporary_tab,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_placement_recovery import (  # noqa: E501
+    ProjectColumnPlacementRecoveryMixin,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_project_column_reflow import (  # noqa: E501
     _move_result,
@@ -104,7 +109,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 GenerationResolver = Callable[[CoordinatorPane], str]
 PlanResolver = Callable[..., ProjectColumnPlan]
 
-class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
+class HerdrProjectColumnPlacement(
+    ProjectColumnPlacementRecoveryMixin,
+    ProjectColumnAdjustmentMixin,
+):
     """Preview and apply configured shared coordinator column placement."""
 
     def __init__(
@@ -144,6 +152,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
             role=pane.role,
             lane_id=pane.lane_id,
             locator=pane.locator,
+            live_terminal_id=pane.terminal_id,
             norm=_norm,
             norm_lane=_norm_lane,
         )
@@ -242,14 +251,21 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
         }
         first_pane = next(iter(pane_ids), "")
         layout = self._read_layout(first_pane)
-        if (
-            layout is None
-            or not layout.tab_id
-            or set(layout.panes) != pane_ids
-        ):
+        scope = (
+            managed_column_scope(
+                layout,
+                tuple(
+                    tuple(pane.locator for pane in members)
+                    for _key, members in sorted(groups.items())
+                ),
+            )
+            if layout is not None
+            else None
+        )
+        if layout is None or scope is None:
             return refused_preview(
                 REASON_LAYOUT_UNAVAILABLE,
-                "the coordinator panes do not resolve to one complete readable tab",
+                "the coordinator panes do not resolve to one isolated managed subtree",
             )
         columnar, _reason = columnar_verdict(layout, groups)
         if not columnar:
@@ -341,6 +357,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
             tuple(columns),
             layout,
             plan,
+            scope,
         )
         ratio_by_key = {target.left_unit: target.ratio for target in plan.ratio_targets}
         ratios_match = all(
@@ -436,6 +453,14 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
         _rows, _groups, fingerprint, reason = self._observe_authority()
         return reason == REASON_OK and fingerprint == opening.authority_fingerprint
 
+    @staticmethod
+    def _same_managed_boundary(opening, current) -> bool:
+        return (
+            current.managed_scope.fingerprint == opening.managed_scope.fingerprint
+            and current.internal_topology_fingerprint
+            == opening.internal_topology_fingerprint
+        )
+
     def _same_source_target(
         self,
         opening: ProjectColumnPlacementEvidence,
@@ -456,111 +481,6 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
             and plan.desired_order == opening.plan.desired_order
             and plan.ratio_targets == opening.plan.ratio_targets
         )
-
-    def _phase_layouts(
-        self,
-        *,
-        main_anchor: str,
-        detached: Mapping[str, str],
-        expected_main: set[str],
-        tab_id: str,
-        top_order: Sequence[str],
-        attached: Optional[Mapping[str, tuple[str, float]]] = None,
-    ) -> bool:
-        main = self._read_layout(main_anchor)
-        if main is None or main.tab_id != tab_id or set(main.panes) != expected_main:
-            return False
-        if (
-            tuple(
-                pane
-                for _x, pane in sorted(
-                    (main.panes[pane].x, pane) for pane in top_order
-                )
-            )
-            != tuple(top_order)
-        ):
-            return False
-        if any(
-            not internal_pair_matches(
-                main,
-                top=top,
-                lower=lower,
-                target_ratio=ratio,
-            )
-            for lower, (top, ratio) in (attached or {}).items()
-        ):
-            return False
-        for pane_id, temp_tab in detached.items():
-            temporary = self._read_layout(pane_id)
-            if (
-                temporary is None
-                or temporary.tab_id != temp_tab
-                or set(temporary.panes) != {pane_id}
-                or temporary.splits
-            ):
-                return False
-        return True
-
-    def _recover(
-        self,
-        opening: ProjectColumnPlacementEvidence,
-        detached: Mapping[str, tuple[str, float, str]],
-    ) -> int:
-        """One best-effort return for each still-proven detached lower pane."""
-
-        stranded = 0
-        for lower, (top, ratio, temp_tab) in detached.items():
-            if not self._same_authority(opening):
-                stranded += 1
-                continue
-            layout = self._read_layout(lower)
-            if layout is None:
-                stranded += 1
-                continue
-            if layout.tab_id == opening.tab_id:
-                if not internal_pair_matches(
-                    layout,
-                    top=top,
-                    lower=lower,
-                    target_ratio=ratio,
-                ):
-                    stranded += 1
-                continue
-            if layout.tab_id != temp_tab or set(layout.panes) != {lower} or layout.splits:
-                stranded += 1
-                continue
-            effect, landed = self._move(
-                (
-                    "pane",
-                    "move",
-                    lower,
-                    "--tab",
-                    opening.tab_id,
-                    "--split",
-                    "down",
-                    "--ratio",
-                    f"{ratio:.9g}",
-                    "--target-pane",
-                    top,
-                    "--no-focus",
-                ),
-                expected_pane=lower,
-                expected_tab=opening.tab_id,
-            )
-            if effect != EFFECT_CHANGED or landed != opening.tab_id:
-                closing = self._read_layout(lower)
-                if (
-                    closing is None
-                    or closing.tab_id != opening.tab_id
-                    or not internal_pair_matches(
-                        closing,
-                        top=top,
-                        lower=lower,
-                        target_ratio=ratio,
-                    )
-                ):
-                    stranded += 1
-        return stranded
 
     def _failure(
         self,
@@ -648,6 +568,8 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
                     expected_main=expected_main,
                     tab_id=opening.tab_id,
                     top_order=top_order,
+                    columns=opening.columns,
+                    managed_scope=opening.managed_scope,
                 )
             ):
                 stranded = self._recover(opening, detached)
@@ -678,6 +600,8 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
                 expected_main=expected_main,
                 tab_id=opening.tab_id,
                 top_order=top_order,
+                columns=opening.columns,
+                managed_scope=opening.managed_scope,
             )
         ):
             stranded = self._recover(opening, detached)
@@ -738,7 +662,9 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
                     expected_main=expected_main,
                     tab_id=opening.tab_id,
                     top_order=top_order,
+                    columns=opening.columns,
                     attached=attached,
+                    managed_scope=opening.managed_scope,
                 )
             ):
                 stranded = self._recover(opening, detached)
@@ -771,6 +697,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
                     or evidence.source_fingerprint != opening.source_fingerprint
                     or evidence.target_fingerprint != opening.target_fingerprint
                     or evidence.current_order != opening.plan.desired_order
+                    or not self._same_managed_boundary(opening, evidence)
                 ):
                     return self._failure(
                         before,
@@ -915,6 +842,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
                     or evidence.source_fingerprint != opening.source_fingerprint
                     or evidence.target_fingerprint != opening.target_fingerprint
                     or evidence.current_order != tuple(working)
+                    or not self._same_managed_boundary(opening, evidence)
                 ):
                     return self._failure(
                         preview,
@@ -945,6 +873,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
             or ordered_evidence.current_order != opening.plan.desired_order
             or ordered_evidence.authority_fingerprint != opening.authority_fingerprint
             or ordered_evidence.target_fingerprint != opening.target_fingerprint
+            or not self._same_managed_boundary(opening, ordered_evidence)
         ):
             return self._failure(
                 preview,
@@ -966,6 +895,7 @@ class HerdrProjectColumnPlacement(ProjectColumnAdjustmentMixin):
             or final_evidence is None
             or final_evidence.authority_fingerprint != opening.authority_fingerprint
             or final_evidence.target_fingerprint != opening.target_fingerprint
+            or not self._same_managed_boundary(opening, final_evidence)
         ):
             return self._failure(
                 preview,

@@ -90,6 +90,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     TmuxTransportRailRequest,
     TmuxTransportRailUseCase,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_queue_enter_rail import (
+    QueueEnterResendGate,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     DeliveryOutcome,
     QueueEnterRetryOutcome,
@@ -112,6 +115,9 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.q_enter 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.transport_binding import (
     TransportBindingError,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_resend_gate import (
+    RESEND_SKIP_BODY_ABSENT,
+)
 
 _MODE_QUEUE_ENTER = "queue-enter"
 _MODE_STANDARD = "standard"
@@ -123,9 +129,21 @@ _MISSING = object()
 
 #: A generation-coherent gateway binding, in the shape the rail persists when the pre-arm and
 #: post-collect generations match.
+_GATEWAY_NAME = "mzb1_ws_codex_lane"
+_GATEWAY_TERMINAL = "terminal-test"
+_GATEWAY_LOCATOR = "%7"
+_GATEWAY_REVISION = "1"
+_GATEWAY_PROCESS_GENERATION = (
+    f"{len(_GATEWAY_NAME)}:{_GATEWAY_NAME}:"
+    f"{len(_GATEWAY_TERMINAL)}:{_GATEWAY_TERMINAL}:"
+    f"{len(_GATEWAY_LOCATOR)}:{_GATEWAY_LOCATOR}:r{_GATEWAY_REVISION}"
+)
 _GATEWAY_BINDING = {
-    "provider": "codex", "assigned_name": "mzb1_ws_codex_lane", "locator": "w4B:p4T",
-    "row_revision": "1", "attestation_observed_at": "2026-07-29T20:10:01+00:00",
+    "provider": "codex",
+    "assigned_name": _GATEWAY_NAME,
+    "locator": _GATEWAY_LOCATOR,
+    "row_revision": _GATEWAY_REVISION,
+    "attestation_observed_at": "2026-07-29T20:10:01+00:00",
     "startup_action_id": "startup-abc",
 }
 
@@ -155,12 +173,13 @@ class _RaisingOps:
     events: List[str] = field(default_factory=list)
     emitted: List[DeliveryOutcome] = field(default_factory=list)
     persisted: List[DeliveryOutcome] = field(default_factory=list)
-    ledgered: List[DeliveryOutcome] = field(default_factory=list)
+    ledgered: List[tuple] = field(default_factory=list)
     enter_presses: int = 0
     injected: List[tuple] = field(default_factory=list)
     rollbacks: int = 0
     guidance: List[str] = field(default_factory=list)
     died: List[str] = field(default_factory=list)
+    live_waits: set[object] = field(default_factory=set)
 
     def _boom(self, primitive: str) -> None:
         raise TransportBindingError(
@@ -208,6 +227,56 @@ class _RaisingOps:
     def observe_queue_enter_turn_start(self, target: str):
         return None
 
+    def observe_queue_enter_runtime_state(self, target: str) -> str:
+        return "turn_ended"
+
+    def observe_queue_enter_gateway_binding(self, target: str) -> dict:
+        assigned_name = "mzb1_ws_codex_lane"
+        terminal_id = "terminal-test"
+        revision = "1"
+        return {
+            "provider": "codex",
+            "assigned_name": assigned_name,
+            "locator": target,
+            "terminal_id": terminal_id,
+            "row_revision": revision,
+            "process_generation": (
+                f"{len(assigned_name)}:{assigned_name}:"
+                f"{len(terminal_id)}:{terminal_id}:"
+                f"{len(target)}:{target}:r{revision}"
+            ),
+            "attestation_observed_at": "2026-08-10T00:00:00+00:00",
+            "startup_action_id": "startup-test",
+        }
+
+    def arm_queue_enter_turn_wait(self, target: str, *, timeout_ms: int):
+        armed = object()
+        self.live_waits.add(armed)
+        return armed
+
+    def collect_queue_enter_turn_wait(self, armed) -> str:
+        self.live_waits.discard(armed)
+        return "timeout"
+
+    def cancel_queue_enter_turn_wait(self, armed) -> None:
+        self.live_waits.discard(armed)
+
+    def queue_enter_turn_wait_pending(self, armed) -> bool:
+        return armed in self.live_waits
+
+    def evaluate_queue_enter_resend(
+        self,
+        target: str,
+        text: str,
+        receiver: str,
+        baseline_binding: Optional[dict],
+    ) -> QueueEnterResendGate:
+        # #15242 replaced the Herdr marker-only retry probe with this strict
+        # gate. Route the old #14232 transport-failure pin through the current
+        # pane-read seam so the containment contract remains exercised.
+        self.capture(target, 200)
+        return QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT)
+
     def emit(
         self,
         outcome: DeliveryOutcome,
@@ -239,10 +308,18 @@ class _RaisingOps:
         self.persisted.append(outcome)
 
     def record_ledger(
-        self, outcome: DeliveryOutcome, *, retry_outcome: Optional[QueueEnterRetryOutcome]
+        self,
+        outcome: DeliveryOutcome,
+        *,
+        retry_outcome: Optional[QueueEnterRetryOutcome],
+        backend: Optional[str] = None,
+        rail: Optional[str] = None,
+        disposition: Optional[str] = None,
     ) -> None:
         self.events.append("ledger")
-        self.ledgered.append(outcome)
+        self.ledgered.append(
+            (outcome, retry_outcome, backend, rail, disposition)
+        )
 
     def restore_previous_active(
         self,
@@ -286,6 +363,8 @@ def _request(mode: str = _MODE_QUEUE_ENTER, **overrides) -> TmuxTransportRailReq
         submit_delivery_id=None,
         persist_delivery=False,
         herdr_send=True,
+        herdr_assigned_name="mzb1_ws_codex_lane",
+        herdr_process_generation=_GATEWAY_PROCESS_GENERATION,
         read_lines=50,
         landing_timeout=8.0,
         submit_delay=None,
@@ -314,6 +393,12 @@ class HerdrTransportExceptionClosesToTypedOutcomeTest(unittest.TestCase):
         self.assertEqual(outcome.status, "blocked")
         self.assertEqual(outcome.reason, "transport_error")
         self.assertTrue(ops.died, "the send must terminate through die(), not a traceback")
+        self.assertEqual(len(ops.ledgered), 1)
+        self.assertEqual(ops.ledgered[0][0], outcome)
+        self.assertEqual(ops.ledgered[0][2:4], ("herdr", "queue_enter_rail"))
+        self.assertEqual(
+            ops.ledgered[0][4], outcome.transport_failure["primitive"]
+        )
         # Secret-safe: the typed outcome carries fixed tokens, never the adapter's raw text.
         self.assertNotIn("herdr command timed out", ops.died[0])
         return outcome
@@ -339,16 +424,16 @@ class HerdrTransportExceptionClosesToTypedOutcomeTest(unittest.TestCase):
         self.assertEqual(outcome.injection_stage["stage"], STAGE_UNCERTAIN_PARTIAL)
         self.assertEqual(ops.enter_presses, 0, "no Enter after a failed injection")
 
-    def test_landing_wait_read_timeout_closes_to_typed_outcome(self):
-        """The landing-marker wait's ``read_pane`` timed out (turn-start read/wait)."""
+    def test_herdr_queue_enter_skips_the_tmux_landing_wait(self):
+        """Herdr arms its causal wait without performing the tmux landing poll."""
         ops = _RaisingOps(raise_on="wait")
         with self.assertRaises(_FakeDie):
             TmuxTransportRailUseCase(ops).execute(_request())
-        self._assert_typed_transport_block(ops)
-        self.assertEqual(ops.enter_presses, 0)
+        self.assertNotIn("wait", ops.events)
+        self.assertEqual(ops.enter_presses, 1)
 
     def test_enter_only_retry_probe_read_timeout_closes_to_typed_outcome(self):
-        """The queue-enter Enter-only retry's marker probe (``capture``) timed out."""
+        """The queue-enter strict resend gate's pane read timed out."""
         ops = _RaisingOps(raise_on="capture", marker_observed=False)
         with self.assertRaises(_FakeDie):
             TmuxTransportRailUseCase(ops).execute(
@@ -589,6 +674,7 @@ class MarkerObservedQueueEnterIsNotAConfirmedSubmissionTest(unittest.TestCase):
             extra = {}
             if event_wait_kind is not None:
                 extra["event_wait_kind"] = event_wait_kind
+                extra["baseline_runtime_state"] = "turn_ended"
             if binding is not _MISSING:
                 extra["gateway_binding"] = binding
             if extra:
@@ -753,6 +839,7 @@ class MalformedGenerationBindingIsNotCausalEvidenceTest(unittest.TestCase):
             "observation_kind": "post_choreography_snapshot",
             "source": "herdr_agent_get", "runtime_state": "busy", "read_ok": True,
             "read_reason": None, "poll_attempts": 3, "event_wait_kind": "changed",
+            "baseline_runtime_state": "turn_ended",
         }
         if binding is not _MISSING:
             observation["gateway_binding"] = binding

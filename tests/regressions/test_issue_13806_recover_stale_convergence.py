@@ -11,8 +11,10 @@ live lane LIFECYCLE revision (``5``, generation ``1``). No single value satisfie
   (pin lifecycle ``0`` != live ``5``);
 
 and the a10 run left a durable transaction pinned to mis-bound evidence, stuck at
-``replacing_nonself`` with the worker still ``close_owed`` (zero close / launch / send) — a
-corrected re-run then tripped the use case's authority-conflict fence.
+``replacing_nonself`` with the worker still ``close_owed`` — a corrected re-run then tripped
+the use case's authority-conflict fence.  Redmine #15227's close-boundary audit later proved
+that this row shape cannot itself prove zero external effect: close happens before the
+``close_owed -> launch_owed`` CAS, so a crash can leave the same row after close succeeded.
 
 This pins the correction:
 
@@ -20,9 +22,9 @@ This pins the correction:
    row) and ``--lane-revision`` / ``--lane-generation`` (preservation, vs the live lifecycle) —
    so the #13811 shape converges to actionable → close → fresh launch → redispatch;
 2. the closed preservation reason(s) + the comparison axis reach the public / durable outcome;
-3. a public ``--supersede`` re-anchors the zero-effect residue to a fresh generation WITHOUT
-   raw DB, and ONLY while it has actuated nothing — after any close / launch / send / a foreign
-   or in-flight row it keeps its immutable fence, zero-write.
+3. a public ``--supersede`` re-anchors a provably pre-effect ``planned`` / ``claimed`` residue
+   to a fresh generation WITHOUT raw DB. ``replacing_nonself`` and every later phase keep an
+   immutable fence because the current schema has no durable close-effect receipt.
 
 All state lives under isolated homes; the live process mutation is faked (non-scope, j#79485).
 The live-composition case wires the REAL adapters against a REAL lane-lifecycle store.
@@ -34,6 +36,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -43,6 +46,7 @@ from mozyo_bridge.core.state.replacement_preservation import (  # noqa: E402
     PreservationObservation,
 )
 from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_launch_authority,
     seed_current_generation,
 )
 from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
@@ -172,7 +176,7 @@ class SupersedeStoreTests(unittest.TestCase):
         return worker
 
     def _drive_to_replacing_nonself(self, *, holder="a10", expiry=FUTURE):
-        """planned -> claimed -> replacing_nonself, worker still close_owed (no actuation)."""
+        """planned -> claimed -> replacing_nonself, worker still durably close_owed."""
         rec = self.store.get(self.key)
         claim = self.store.claim(
             self.key, expected_revision=rec.revision, expected_action_generation=GEN,
@@ -205,30 +209,20 @@ class SupersedeStoreTests(unittest.TestCase):
 
     # -- the happy convergence ----------------------------------------------
 
-    def test_zero_effect_residue_reanchors_to_new_generation(self):
-        # The a10 residue: pinned to lane_revision "0" (mis-bound), stuck at replacing_nonself,
-        # worker still close_owed, lease dead.
+    def test_replacing_nonself_residue_is_ambiguous_and_refused(self):
+        # The a10 residue is durably close_owed, but close may have succeeded before its CAS.
         self._plan_zero_effect(worker=_worker(lane_revision="0"))
         self._drive_to_replacing_nonself()
         self._release_lease()
         stuck = self.store.get(self.key)
         self.assertEqual(stuck.phase, PHASE_REPLACING_NONSELF)
-        self.assertTrue(transaction_has_zero_actuation_effect(stuck))
+        self.assertFalse(transaction_has_zero_actuation_effect(stuck))
 
-        # Supersede to the corrected lifecycle evidence (5, 1) at a higher generation.
         out = self._supersede(gen=GEN + 1, worker=_worker(lane_revision="5", lane_generation="1"))
-        self.assertTrue(out.applied)
-        self.assertEqual(out.reason, CAS_APPLIED)
-
+        self.assertFalse(out.applied)
+        self.assertEqual(out.reason, CAS_UNEXPECTED_STATE)
         after = self.store.get(self.key)
-        self.assertEqual(after.action_generation, GEN + 1)
-        self.assertEqual(after.phase, PHASE_PLANNED)  # reset to drive afresh
-        self.assertEqual(after.lease_holder, "")  # superseded lease never carries forward
-        self.assertGreater(after.revision, stuck.revision)  # CAS revision is monotonic
-        pin = after.find_participant(WK_IDENTITY)
-        self.assertEqual(pin.lane_revision, "5")  # re-anchored to the correct authority
-        self.assertEqual(pin.lane_generation, "1")
-        self.assertEqual(pin.phase, PARTICIPANT_CLOSE_OWED)
+        self.assertEqual(after, stuck)
 
     def test_supersede_resets_created_at_freshness_boundary(self):
         # created_at is the attestation freshness boundary the relaunch verifies the fresh slot
@@ -251,6 +245,25 @@ class SupersedeStoreTests(unittest.TestCase):
         out = self._supersede(worker=_worker(lane_revision="5"))
         self.assertTrue(out.applied)
         self.assertEqual(self.store.get(self.key).find_participant(WK_IDENTITY).lane_revision, "5")
+
+        # An expired/released claimed row is still provably before the first close.
+        self.store = ReplacementTransactionStore(home=Path(tempfile.mkdtemp()))
+        self._plan_zero_effect(worker=_worker(lane_revision="0"))
+        rec = self.store.get(self.key)
+        claimed = self.store.claim(
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="claimed", lease_expires_at=FUTURE, now=FIXED,
+        )
+        self.assertTrue(claimed.applied)
+        rec = self.store.get(self.key)
+        moved = self.store.transition_phase(
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            target=PHASE_CLAIMED, holder="claimed", now=FIXED,
+        )
+        self.assertTrue(moved.applied)
+        self._release_lease(holder="claimed")
+        out = self._supersede(worker=_worker(lane_revision="5"))
+        self.assertTrue(out.applied)
 
     # -- the immutable fences (zero-write) ----------------------------------
 
@@ -306,14 +319,23 @@ class SupersedeStoreTests(unittest.TestCase):
         self.assertFalse(out.applied)
         self.assertEqual(out.reason, CAS_UNEXPECTED_STATE)
 
-    def test_expired_lease_is_still_supersedable(self):
-        # A dead (expired) lease is not an in-flight authority — the residue converges. The
-        # lease is live while the a10 run drove to replacing_nonself (expiry just after FIXED),
-        # then dead by the time the owner supersedes (a later ``now``).
+    def test_expired_claimed_lease_is_still_supersedable(self):
+        # A dead claimed lease is not an in-flight authority and is still pre-close.
         soon = "2026-07-15T12:05:00+00:00"
         later = "2026-07-15T13:00:00+00:00"
         self._plan_zero_effect(worker=_worker(lane_revision="0"))
-        self._drive_to_replacing_nonself(holder="dead", expiry=soon)
+        rec = self.store.get(self.key)
+        claimed = self.store.claim(
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="dead", lease_expires_at=soon, now=FIXED,
+        )
+        self.assertTrue(claimed.applied)
+        rec = self.store.get(self.key)
+        moved = self.store.transition_phase(
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            target=PHASE_CLAIMED, holder="dead", now=FIXED,
+        )
+        self.assertTrue(moved.applied)
         out = self.store.supersede_transaction(
             self.key, new_action_generation=GEN + 1, decision=_decision(),
             continuation=_continuation(), participants=[_worker(lane_revision="5")], now=later,
@@ -554,16 +576,37 @@ class _ConvergenceCase(unittest.TestCase):
         self.port = _FakeActuatorPort()
         # Ruling j#97105: the recovery reads this worker's CURRENT launch-generation row,
         # and this lane is a pre-#14741 one -- stated as a canonical untagged row for the
-        # exact slot rather than left as an absent authority (which now refuses).
+        # exact slot rather than left as an absent authority (which now refuses). Fresh-plan
+        # tests explicitly supersede it with completed v2 authority; pre-existing residue
+        # fixtures intentionally stay on this legacy row.
         seed_current_generation(
             self.home, workspace_id=WS, lane_id=LANE, role=PROVIDER,
             assigned_name=NAME, locator=LOCATOR,
         )
 
+    def _seed_fresh_destructive_authority(self) -> None:
+        """Opt a fresh plan into the complete, inventory-bound current authority."""
+        terminal_id = f"terminal:{LOCATOR}"
+        seed_completed_current_launch_authority(
+            self.home, workspace_id=WS, lane_id=LANE, role=PROVIDER,
+            assigned_name=NAME, locator=LOCATOR, terminal_id=terminal_id,
+            target_workspace="w28", target_tab="w28:t1",
+        )
+        inventory = mock.patch(
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "sublane_herdr_projection.list_herdr_agent_rows",
+            return_value=[{
+                "name": NAME, "pane_id": LOCATOR, "terminal_id": terminal_id,
+            }],
+        )
+        inventory.start()
+        self.addCleanup(inventory.stop)
+
     def _seed_a10_residue(self, *, lane_revision="0"):
         """The durable mis-bound residue the installed a10 left: replacing_nonself, worker
-        close_owed (zero close/launch/send), lease dead, pinned to the WRONG lifecycle
-        evidence."""
+        close_owed, lease dead, pinned to the WRONG lifecycle evidence. This shape is
+        ambiguous after #15227 because close is effect-before-CAS."""
         worker = _worker(lane_revision=lane_revision, lane_generation="1")
         self.store.plan_transaction(
             self.key, action_generation=GEN, decision=_decision(),
@@ -584,6 +627,30 @@ class _ConvergenceCase(unittest.TestCase):
         self.store.release(
             self.key, expected_revision=rec.revision, expected_action_generation=GEN,
             holder="a10", now=FIXED,
+        )
+
+    def _seed_claimed_residue(self, *, lane_revision="0"):
+        """A provably pre-close residue that may safely receive a fresh generation."""
+
+        worker = _worker(lane_revision=lane_revision, lane_generation="1")
+        self.store.plan_transaction(
+            self.key, action_generation=GEN, decision=_decision(),
+            continuation=_continuation(), participants=[worker], now=FIXED,
+        )
+        rec = self.store.get(self.key)
+        self.store.claim(
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="pre-effect", lease_expires_at=FUTURE, now=FIXED,
+        )
+        rec = self.store.get(self.key)
+        self.store.transition_phase(
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            target=PHASE_CLAIMED, holder="pre-effect", now=FIXED,
+        )
+        rec = self.store.get(self.key)
+        self.store.release(
+            self.key, expected_revision=rec.revision, expected_action_generation=GEN,
+            holder="pre-effect", now=FIXED,
         )
 
     def _use_case(self, ops):
@@ -614,8 +681,8 @@ class UseCaseConvergenceTests(_ConvergenceCase):
         self.assertIn("--supersede", outcome.detail)
         self.assertEqual(self.port.closed, [])  # nothing closed
 
-    def test_supersede_converges_residue_to_completed(self):
-        self._seed_a10_residue(lane_revision="0")
+    def test_supersede_converges_claimed_residue_to_completed(self):
+        self._seed_claimed_residue(lane_revision="0")
         ops = _FakeRecoveryOps(_all_clear())
         outcome = self._use_case(ops).run(
             self._request(action_generation=GEN + 1, supersede=True), execute=True
@@ -628,6 +695,18 @@ class UseCaseConvergenceTests(_ConvergenceCase):
         rec = self.store.get(self.key)
         self.assertEqual(rec.action_generation, GEN + 1)
         self.assertEqual(rec.find_participant(WK_IDENTITY).lane_revision, "5")
+
+    def test_supersede_refuses_ambiguous_a10_replacing_residue(self):
+        self._seed_a10_residue(lane_revision="0")
+        before = self.store.get(self.key)
+        outcome = self._use_case(_FakeRecoveryOps(_all_clear())).run(
+            self._request(action_generation=GEN + 1, supersede=True), execute=True
+        )
+        after = self.store.get(self.key)
+        self.assertEqual(outcome.status, RECOVERY_REFUSED)
+        self.assertIn("supersede refused", outcome.detail)
+        self.assertEqual(after, before)
+        self.assertEqual(self.port.closed, [])
 
     def test_supersede_refused_when_residue_already_closed(self):
         # A residue that already closed the old worker (worker at launch_owed) is an immutable
@@ -658,7 +737,7 @@ class UseCaseConvergenceTests(_ConvergenceCase):
 
     def test_supersede_requires_higher_generation(self):
         # --supersede at the SAME generation cannot re-anchor (a monotonic, owner-approved bump).
-        self._seed_a10_residue(lane_revision="0")
+        self._seed_claimed_residue(lane_revision="0")
         outcome = self._use_case(_FakeRecoveryOps(_all_clear())).run(
             self._request(action_generation=GEN, supersede=True), execute=True
         )
@@ -667,6 +746,7 @@ class UseCaseConvergenceTests(_ConvergenceCase):
 
     def test_fresh_key_ignores_supersede_and_drives_normally(self):
         # No residue: --supersede is a no-op; a fresh plan drives straight through.
+        self._seed_fresh_destructive_authority()
         outcome = self._use_case(_FakeRecoveryOps(_all_clear())).run(
             self._request(supersede=True), execute=True
         )
@@ -674,7 +754,7 @@ class UseCaseConvergenceTests(_ConvergenceCase):
         self.assertFalse(outcome.converged_supersede)  # never re-anchored a stuck row
 
     def test_idempotent_replay_after_supersede_does_not_reclose(self):
-        self._seed_a10_residue(lane_revision="0")
+        self._seed_claimed_residue(lane_revision="0")
         req = self._request(action_generation=GEN + 1, supersede=True)
         first = self._use_case(_FakeRecoveryOps(_all_clear())).run(req, execute=True)
         self.assertEqual(first.status, RECOVERY_COMPLETED)
@@ -698,6 +778,7 @@ class PreservationSurfaceTests(_ConvergenceCase):
         # A fresh plan whose close boundary observes a lane-lifecycle identity mismatch: the
         # public outcome must name the CLOSED reason (identity_mismatch) and the comparison axis
         # (never a generic preservation_blocked).
+        self._seed_fresh_destructive_authority()
         self.port.pres[WK_IDENTITY] = PreservationObservation(
             identity_matches=False, attestation_fresh=True,
             detail="lane_lifecycle_revision observed='5' pinned='0'",

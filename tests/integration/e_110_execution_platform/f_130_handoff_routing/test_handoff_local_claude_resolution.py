@@ -34,6 +34,7 @@ import io
 import json
 import os
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -133,6 +134,18 @@ def _outcome_from(stdout: str):
 
 class HandoffLocalClaudeCliTest(unittest.TestCase):
     """`handoff send --to claude` end to end with the #12070 narrowing wired in."""
+
+    def setUp(self) -> None:
+        # The gateway route gate resolves the workflow role binding from MOZYO_REPO,
+        # falling back to the cwd git root — the live checkout's committed operational
+        # config. This fixture hardcodes the DEFAULT binding (codex gateway / claude
+        # worker), so pin MOZYO_REPO to a config-less temp dir: the test must not
+        # depend on the live checkout's .mozyo-bridge/config.yaml (Redmine #15418).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = patch.dict(os.environ, {"MOZYO_REPO": tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
 
     def _run_send(
         self,

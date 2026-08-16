@@ -10,23 +10,19 @@ agents:
       launch_argv:
         default:
         - --model
-        - claude-opus-5
+        - claude-fable-5
         sublane:
         - --model
-        - claude-opus-5
+        - claude-fable-5
     coordination:
-      provider: codex
+      provider: claude
       launch_argv:
         default:
         - --model
-        - gpt-5.6-sol
-        - --config
-        - model_reasoning_effort=xhigh
+        - claude-fable-5
         sublane:
         - --model
-        - gpt-5.6-sol
-        - --config
-        - model_reasoning_effort=high
+        - claude-fable-5
 presentation:
   project_group_presentation: project_group_tmux_window
   project_groups:

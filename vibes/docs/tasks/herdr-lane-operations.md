@@ -39,8 +39,8 @@ PYTHONPATH=src python3 -m mozyo_bridge <args...>
 
 - `MOZYO_HERDR_BINARY`: launch 注入済み agent (lane worker / gateway) は不要。手動起動の coordinator 等で未設定なら `MOZYO_HERDR_BINARY=$(command -v herdr)` を inline 付与。
 - lane の identity (**#13377 shared project workspace model**): sublane の slot は `mzb1_<project-ws>_<role>_<lane_label>` で、mzb1 の workspace segment は project identity のまま。linked worktree は main checkout の registry identity を継承する (#13152)。`sublane create` 時の record (component `lane_metadata`) が `(repo_workspace_id, lane_id)` unit と label/issue の display join を担う。
-- lane の**配置** (**#13380 dedicated sublane host workspace**): lane slot は coordinator pair の project workspace ではなく、**専用 sublane host workspace** に着地する。herdr workspace 数は「project 1 + sublane host 1」の定数 (lane 数に比例しない)。host は最初の lane 作成時に on demand で mint され (operator 可読 label `<main-checkout名>_sublanes`、cosmetic のみ)、lane ゼロで herdr が自動 close する (残骸 husk は生じない)。#13380 以前に作成された coordinator workspace 同居 lane は heal では同居のまま (pair 不分裂優先)、retire で自然 drain する。
-- lane の**細分化** (**#13411 lane=tab / gateway+worker=split**): sublane host workspace 内で、非 default lane ごとに専用 herdr tab を割り当て、gateway + worker を同 tab 内 split pair として並置する。7 lane = 14 loose pane ではなく 7 tab に整理される (owner intent #13377 j#73654 の密度懸念に対応)。tab join は live inventory の `tab_id` のみが authority (label は cosmetic、lane key 由来)。fresh lane は `herdr tab create` で tab を mint、heal / 混在 adopt+launch は生存 slot の `tab_id` を読んで**同一 tab へ復帰** (pair 不分裂)。tab root pane は base pane と同型で全 launch 成功後に reclaim、tab 内最終 pane close で herdr が tab を自動消滅させる。retire は assigned-name の `pane close` のままで tab 配置に非依存 (最終 pane close で tab / host が自動消滅)。identity / route / projection は不変。pre-#13411 に loose pane で起動された legacy lane は heal でも loose のまま、full relaunch で tab へ移行する。owner は display knob (#12391 範疇) としていつでも override 可。
+- lane の**配置** (**#13380 dedicated sublane host workspace**): lane slot は coordinator pair の project workspace ではなく、**専用 sublane host workspace** に着地する。managed lane slot は「project workspace + sublane host workspace」へ集約し、lane 数ごとのworkspaceを作らない。host は最初の lane 作成時に on demand で mint される (operator 可読 label `<main-checkout名>_sublanes`、cosmetic のみ)。lane ゼロでもgeneration-bound private pinを持たないbase rootはcloseせず、cosmetic residueとして保存するため、workspace/tab自動消滅をretireの前提・完了条件にしない。#13380 以前に作成された coordinator workspace 同居 lane は heal では同居のまま (pair 不分裂優先)、retire で自然 drain する。
+- lane の**細分化** (**#13411 lane=tab / gateway+worker=split**): sublane host workspace 内で、非 default lane ごとに専用 herdr tab を割り当て、gateway + worker を同 tab 内 split pair として並置する。7 lane = 14 loose pane ではなく 7 tab に整理される (owner intent #13377 j#73654 の密度懸念に対応)。tab join は live inventory の `tab_id` のみが authority (label は cosmetic、lane key 由来)。fresh lane は `herdr tab create` で tab を mint、heal / 混在 adopt+launch は生存 slot の `tab_id` を読んで**同一 tab へ復帰** (pair 不分裂)。tab root pane は base pane と同型だが、現行Herdrのlocator-only closeではterminal generationを条件化できないため、#15227以後はgeneration-bound private pinが無いrootを **cosmetic residueとして保存しzero-close** とする。retire/releaseはcurrent v4 attestation + completed generation-v2 pinをfresh full snapshotへexact joinできるmanaged slotだけが対象で、root locatorを代用しない。identity / route / projection は不変。pre-#13411 に loose pane で起動された legacy lane は heal でも loose のまま、full relaunch で tab へ移行する。owner は display knob (#12391 範疇) としていつでも override 可。
 - **legacy lane (pre-#13377)**: 旧 model の lane は独自 herdr workspace (`wt_<hash>` segment, default lane) を持つ。読み (list / status / dispatch-worker) と retire は互換対応済み。新規 create は常に shared model。legacy lane への coordinator dispatch は互換対象外 — 生かしたまま運用せず、順次 retire する。
 
 ## `sublane list` の metadata / runtime 読み分け
@@ -71,7 +71,7 @@ dispatch / handoff / retire可否は、Git branch/worktree、metadata record、g
 
 ## 初回 gateway pane 消滅の原因と運用注意 (#13378)
 
-- 原因 (host log 実測、#13378 j#73606): lane 作成〜初回送達の間に host で agent CLI の global update (実例: `npm install --global @openai/codex`) が走ると、**idle かつ session 未確立** の codex TUI が exit 0 で自己終了し pane ごと消える。mozyo の launch 経路 (env / permission mode / adopt pin / root pane reclaim) の欠陥ではない。busy / session 確立後の agent は同じ update を生き延びる。
+- 原因 (host log 実測、#13378 j#73606): lane 作成〜初回送達の間に host で agent CLI の global update (実例: `npm install --global @openai/codex`) が走ると、**idle かつ session 未確立** の codex TUI が exit 0 で自己終了し pane ごと消える。mozyo の launch 経路 (env / permission mode / adopt pin / root pane保存判定) の欠陥ではない。busy / session 確立後の agent は同じ update を生き延びる。
 - 運用注意: **wave 進行中 (lane 作成〜初回送達の window) に agent CLI (codex / claude) の global update を実行しない**。update は wave 間の quiescent 時に行う。
 - 復旧: 標準形の create+dispatch は self-heal で自動復旧する。self-heal 外 (稼働中 lane の途中死・fallback 経路) は下記 relaunch 標準で手動復旧する。
 
@@ -84,7 +84,7 @@ dispatch / handoff / retire可否は、Git branch/worktree、metadata record、g
 
 - `herdr session-start --agent codex --agent claude --repo <lane worktree>` — lane segment は lane metadata record から自動復元される (record が無い場合は `--lane <label>` を明示。無指定 + record 無しは fail-closed)。
 - launch 先 workspace は **lane-aware join** (#13380): 自 lane の生存 slot / adopted slot が最優先で pin (pair 不分裂)、無ければ他 lane slots の sublane host に join (coordinator workspace は除外)、それも無ければ host を再 mint する。旧「claude 単独指定は新 workspace に迷子」(#13360 j#73407) は live-agent join で構造的に解消したが、両 agent 指定の運用は維持してよい。
-- relaunch した worker は「⏵⏵ auto mode on」footer を確認 (permission parity #13360)。旧 pane は先に `herdr pane close`。
+- relaunch した worker は「⏵⏵ auto mode on」footer を確認 (permission parity #13360)。旧paneをraw `herdr pane close`で処理せず、下記のguarded recoveryでfresh v4 attestation + completed generation-v2をexact joinする。legacy/mismatch/unreadableはzero-close。
 - relaunch 後、gateway に worker route の再駆動を指示 (worker の pane id は変わるが解決は assigned name 経由で自動追従)。
 
 ### 消滅したworkerのguarded recovery (`sublane recover-stale`, #13806 / #14663)
@@ -115,7 +115,11 @@ same-lane implementation_gateway が **callback delivery 確認済みの provide
   - ★**`launch_authority_reason` とは独立の軸である**。前者は「lane の ambient authority が今どうか」の**観測**、後者は「launch leg が何に fence されたか」。#14480 の live 事故 (#14479 j#88695) は `launch_authority=ok` のまま launch が 2 回失敗した形であり、authority 軸だけでは原因を名指しできない。
   - ★**空 (`null`) と `launch_error` は別の主張である**。空は「launch fence は起きていない」(成功した / launch leg に到達していない)、`launch_error` は「失敗したが typed reason が無い」。空を「正常」と読み替えて良いのは前者だけ。
   - token は **axis / fence 名のみ**で、path・locator・credential・例外散文を含めない。port が返した値が closed-token の形 (`^[a-z][a-z0-9_]{0,63}$`) を満たさない場合は publish せず `launch_error` に落とす (fail-closed)。
-- ★**v1 attestation store 下では launch は exact participant context を要求する** (#14480)。selected store が v1 の間、action binding は participant を key とする side record なので、`launch_or_resume_v1_replacement` は target の `provider` / `assigned_name` / `old_locator` / workspace / lane を必須とし、欠けると `replacement_binding_context_missing` で **launch 自体が不可能**になる (「generic に launch される」ではない)。recovery port はこの context を **pin から** 取る — pin は close / verify が既に通している単一 authority であり、より狭い派生を別途組み立てない。`target_provider` は同時に same-tab postcondition を **その 1 participant に scope** する: actuator は 1 launch あたり 1 participant しか駆動しないため、この edge では pair は構造上 partial である (recover-gateway = gateway closed / worker live、recover-stale = worker closed / gateway live)。**scope しても live split は fail-closed のまま**で、緩むのは *absent* sibling の場合だけ (後続 leg が収束させる)。生存 sibling は `prepare_session` の adopt-or-launch 冪等性で **adopt** され、relaunch も close もされない。
+- ★**replacement launch は v4 attestation + generation-v2 の exact participant authorityを要求する** (#14480/#15227)。`provider` / `assigned_name` / `old_locator` / workspace / lane / server-owned terminal / startup action の全軸を同じ fresh snapshotへ結合し、不足・不一致・duplicate・malformedは **launch前 zero-effect**。v1-v3 side recordは診断専用で、exactであってもcurrent authorityにはならない。対象providerへのscope後もlive splitはfail-closedで、生存siblingはadoptされrelaunch/closeされない。旧homeは4-store offline rolloutでv4/v2へ移行する。
+- ★**global offline rolloutのstopも同じclose licenseに従う** (#15227 j#104067)。top-level action v1と`offline-rollout-actions-v1`は維持し、private `agents`はrestore identity/provider、destructive pinはclosed-shape `close_authority` v2へ分離する。pinはworkspace/lane/role/assigned-name/locator/`startup_action_id`だけをsealし、raw terminalは保存しない。delegate captureと各close直前にfresh full inventory + v4 attestation + completed generation-v2へexact joinする。旧/tokenless/malformed actionはstatus readのみ可能でrunはfirst effect前にtyped blockし、live stateからbackfillしない。first non-replay absenceは拒否、active-phase replayと各close後は保存generationのterminal-bound positive absenceだけを許可する。legacy live fleetをterminal-only例外で止めてself-migrateしない。
+- ★**absent legacy recoveryはclose authorityではない** (#15227)。`restore_intent identities - plan.agents`のexact setだけをprivate closed `legacy_absence_authority` v1へsealし、old locator + old startup actionを保持するがraw terminalは保持しない。captureはfresh full agent+pane snapshotをcurrent generation-v2 → completed pair action/participant → `pane_bound_v2` terminal → v4 attestationへexact joinし、name/locator/terminalのpositive absence、pairの同一old container、passive root exact 1件を要求する。各effect edgeで再検証し、generation rebuild完了後にexpected restore generationがcurrent rowを置換した場合だけcompleted receiptへfallbackする（row欠落・foreign generationは拒否）。非空authorityはsource launch-generationがrecognized v2のplanだけを許し、rebuild phaseを`already_current`に固定してold pin削除後のuncommitted crash windowを作らない。close executorは`close_authority`だけを読み、legacy absence pinをclose targetに昇格しない。
+- ★**consumer zero以後はphase receiptでなくfresh 3-state rosterをeffect authorityにする** (#15227)。restore前の各backup/migrate/rebuild/install/adopt edgeはfull raw/projection zero + original pin positive absence + supervisor stopped、restore中はcompleted expected actionのexact-current roster + 未restore expected action absent、restore後は全new generation exact rosterを要求する。handler入口だけでなくpreflight後の各mutation直前にも再評価する。private `restore_intent` v1はgroupごとのnonce/expected startup action idをaction作成前にsealし、exact completed-successだけをcrash replayでfoldする。planned/partial/rollback/foreign/missing/extraは追加launch・cleanup 0で停止する。nonceはpublic CLIへ足さず、exact candidate runner内のshared session-start serviceからin-processで渡し、provider envからrunner tokenを除く。restore pathはsealed workspace idをregistry refresh / startup reserve直前と`workspace create --cwd` / `pane split --cwd` invoke直前にexact assertし、legacy recoveryではsealed lifecycle generation + `worktree_identity`もexact-one再joinする。旧plan v3または旧private actionはsealed `status`だけ読め、`run`はport/effect前に拒否する。
+- ★**pane-only rootとconforming session-start競合も閉じる** (#15227)。delegateはfresh full-pane listをagent listへ双方向joinし、shell-only baselineをprivate `passive_pane_intent` v1、各groupのold containerにあるroot exact 1件を`restore_container_intent` v1へclose前sealする。restoreはsealed rootだけをanchorにし、split responseをparticipantへ即時記録して次effectでfresh再joinする。通常startはhome gate shared、offline run全体はexclusiveで保持する。gateはowner-privateな共通namespaceのpath-key（NFD+case-fold）とdevice/inode-keyを同順取得し、home差替え・case/Unicode・bind aliasで別lockへ分岐しない。ただしこのcooperative gateへ参加しないraw Herdr/旧runtimeは残余なのでfull-pane/startup fenceを併用する。startup nonterminalはhome-global zero（実行中selected expected exact 1件のみ）を要求し、generation finalizeがpendingならstartup successを書かず`health_check` residualとして明示回復を要する。
 - 実装正本: `domain/gateway_turn_recovery.py` / `domain/lane_launch_authority.py` (#14475) / `domain/replacement_launch_failure.py` (#14480) / `application/sublane_gateway_recovery*.py` (#14203)。launch context threading は `application/sublane_stale_worker_recovery_live.py` の `LiveRecoveryActuatorPort.launch_action_bound` (recover-gateway / recover-stale 共有 port)。
 
 ## live turn-ended worker の guarded refresh (`sublane refresh-worker`, #14661)
@@ -149,7 +153,9 @@ same-lane implementation_gateway が **callback delivery 確認済みの provide
       - ★**(a) を repo 横断の 1 本にすると、その gate について沈黙している ruling へ全 gate が帰属する** (R6 の実欠陥。#14661 review j#92715)。anchor 文字列は非空なので `is_anchored` は通り、**空 anchor の拒否だけではこの誤帰属を検出できない**。**辿った先がその gate について沈黙している ruling なら、辿れたことにならない**。したがって ruling は role と同じ場所で **gate ごと**に持つ (`contract_ruling_pointer`)。
       - **既存 hibernate-evidence gate (`park_declared` / `review_result` / `required_ci_green` / `integration_disposition` / `dogfood_delegated`) は `redmine:#14219:j#85530:Q3` を維持する**。本 command の追加で既存 evidence の anchor 文字列は 1 文字も変わらない (**re-attribution しない**)。
       - **no-change Review waiver gate `no_change_review_waiver` の ruling は `redmine:#14695:j#93412`** (Design Consultation Answer)。writer role は `coordinator`、provenance 軸は marker の `approval_source=direct_owner` で、両者は連言であり代替関係ではない (#14695 j#93412)。**同一 consultation の先行 Answer j#93406 を pointer にしない** — 両者とも writer を `coordinator` と裁定しており binding 自体は同じだが、hard carve-out と live 測定境界を持つのは j#93412 だけなので、j#93406 を指すと `is_anchored` は通るのに**現行契約を述べていない record** へ読者を送ることになり、(a) が防ぐ誤帰属と同型になる。この gate も (b)(c) の合成規則と fail-closed 条件は既存 gate と同一で、既存 5 gate の anchor 文字列は 1 文字も変わらない。
-      - **global offline rollout gate `herdr_offline_rollout_owner_approval` の ruling は `redmine:#14838:j#97993`**。writer role は `coordinator`、全workspace停止・3-store migration・runtime cutoverを承認した判断のprovenanceはmarkerの `approval_source=direct_owner` で、両者を連言する。full approval manifest + issueのdigestをmarkerへ束縛し、source-system author ID一致はauthorityに使わない。(b)(c) の合成とunanchored refusalは他gateと同じで、既存gateのruling pointerを変更しない。
+      - **global offline rollout gate `herdr_offline_rollout_owner_approval` の ruling は `redmine:#14838:j#97993`**。writer role は `coordinator`、全workspace停止・4-store migration/rebuild・runtime cutoverを承認した判断のprovenanceはmarkerの `approval_source=direct_owner` で、両者を連言する。full approval manifest + issueのdigestをmarkerへ束縛し、source-system author ID一致はauthorityに使わない。(b)(c) の合成とunanchored refusalは他gateと同じで、既存gateのruling pointerを変更しない。
+      - **post-reboot pair recovery gate `restored_pair_recovery_owner_approval` の ruling は `redmine:#15227:j#102879`**。writer role は `coordinator`、owner 判断は marker の `approval_source=direct_owner` と連言する。pair 全体の lifecycle / participant / worktree pin と composer loss の許可を action digest に束縛し、既存 gate の ruling pointer を変更しない。ただしこのgateはconditional-close導入後のために予約されたdormant contractであり、現行read-only診断はmarkerを生成せず、gateを破壊操作へ使わない。
+      - **generation-mismatch disposition gate `generation_mismatch_disposition_owner_approval` の ruling は `redmine:#15193:j#103101`**。writer role は `coordinator`、owner 判断は marker の `approval_source=direct_owner` と連言する。pending composer・receiver・lifecycleのexact operation digestを束縛し、別gateのrulingやjournal pointerだけをauthorityとして流用しない。
       - **ruling を持たない gate は unanchored** となり、本 surface は zero-close で refuse する (fail-closed)。
       - 本節の (a) と既存 gate の維持は **test が code から導出して照合する**ため、runbook と実装のどちらか一方だけを変えると赤化する (前 3 round 連続で docs drift を出したため綴り検査ではなく導出照合にした)。
     - ★**旧実装の「approval journal の author == issue の author」は撤去した** (#14661 review j#92601 F1)。実測で worker / gateway / coordinator の全 role が同一 source-system user id で書いており、この述語は **issue 上の全 journal が満たす**。何も証明していなかった。
@@ -212,7 +218,7 @@ host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit 
 - **state を混同しない (authority matrix, #13520 j#75276)**: Redmine issue/journal = workflow gate と durable anchor / Git worktree・ref・diff = code と dirty state / `registry.sqlite` + repo-local anchor = workspace identity / `state.sqlite` = lane metadata・callback outbox の復元材料 (workflow truth ではない) / herdr assigned-name + live inventory = runtime liveness / launch-time sender env = 再 attest する process-local input (永続 authority にしない)。
 - **composite liveness で false-positive adopt を防ぐ (#13518 j#75329)**: `herdr session-start` の adopt 判定は assigned `name` 一致だけでは不十分。`agent list` row を `classify_named_slot` (`domain/herdr_slot_liveness.py`) で複合判定し、detected agent 不在 + `agent_status=unknown` の **shell residue** は `stale_named_slot` として outcome `stale` で surface する (blind adopt しない / 名前が残っているため launch も上書きしない)。detected agent が名指しされた live slot は従来どおり adopt、liveness signal を一切持たない minimal row も従来どおり adopt (self-heal 不変)。
 - **dirty worktree を never-clobber**: recovery 中に lane worktree を reset / stash / delete / recreate しない。未 commit 成果は保全して同一 durable anchor から resume する (12-file dirty diff を SHA-256 で preflight/post-check して不変を確認した実例: #13518 j#75331/j#75334)。
-- **stale pane の close + same-slot relaunch は destructive** ゆえ **owner-approved recovery gate** を要求する (replayable に journal 記録: #13518 j#75331)。承認後は old pane を `herdr pane close` → 同一 lane/worktree へ `herdr session-start` で relaunch (adopt でなく launched になる)。
+- **stale shell-residue pane の close + same-slot relaunch は destructive** ゆえ **owner-approved recovery gate** を要求する (replayable に journal 記録: #13518 j#75331)。この履歴例は、agent processが無いlogical pane自体のcloseをownerが承認したscopeである。exact terminal generationだけを閉じる #15227 active-sublane recoveryには適用せず、raw `herdr pane close`で代用しない。
 - **projection cache を authority にしない**: `sublane status` の `panes=[]` は stale projection でありうる。live assigned-name inventory と矛盾する場合は同じ reconciler で fail-closed に扱い、runtime 不在と即断しない。
 - **env 欠落に注意**: reboot 後に adopt された既存 process は launch-time `MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID` を欠くことがある (session-start adopt は retroactive 注入しない)。正規 dispatch が `missing_sender_env` で fail-closed した場合、registry/anchor/live assigned-name から検証した値を **その 1 回の** high-level dispatch child process にだけ再注入する (env spoof / 別 role 偽装はしない)。Herdr backend では tmux 専用の `mozyo-bridge init` hint は無効 (`TMUX_PANE is not set`)。
 - **fail-closed 条件**: workspace mismatch / missing・unreadable journal / ambiguous live slot / DB と Redmine・Git の矛盾は停止。implementation/close/integration/publish を自動承認しない。
@@ -220,7 +226,7 @@ host (Mac 等) が再起動されると lane pane の Claude/Codex TUI は exit 
 ## lane retire (guarded close)
 
 1. lane worktree の dirty を確認・復元: `git -C <worktree> checkout -- .claude/settings.local.json` (agent harness が触る唯一の常連 dirt)。**dirty のままだと retire は `dirty_worktree` で fail-closed する** (正常動作、#13331 j#73339 guard)。
-2. `sublane retire --issue <id> --lane-label <label> --worktree <path> --branch <branch> --issue-closed --callbacks-drained --verified --durable-record --target-identity-known --execute --json` → **対象 lane unit の managed slot のみ** close (#13602 Option A: routine green-preflight retirement は coordinator authority。`--owner-approved` flag は無い。`--issue-closed` は「対象 issue が種別ごとの close 契約を満たして closed」を表す — child Task/Test/Bug は `task_close`(owner_close_approval なし)、US / standalone issue は owner_close_approval-backed close (central preset `US-Level Audit Model`)。retire actuation はどの契約でも owner close approval を再収集しない。未解決の owner-approval-waiting は `--callbacks-drained` 側で block する) (#13377: project workspace・coordinator pair・他 lane は閉じない。最終 lane の close で sublane host workspace が herdr により自動消滅するのは無害な付随挙動で、retire の前提・完了条件ではない — #13380)。legacy lane (`wt_<hash>` workspace) は互換 plan で旧 slot も close される。
+2. `sublane retire --issue <id> --lane-label <label> --worktree <path> --branch <branch> --issue-closed --callbacks-drained --verified --durable-record --target-identity-known --execute --json` → **対象 lane unit の managed slot のみ** close (#13602 Option A: routine green-preflight retirement は coordinator authority。`--owner-approved` flag は無い。`--issue-closed` は「対象 issue が種別ごとの close 契約を満たして closed」を表す — child Task/Test/Bug は `task_close`(owner_close_approval なし)、US / standalone issue は owner_close_approval-backed close (central preset `US-Level Audit Model`)。retire actuation はどの契約でも owner close approval を再収集しない。未解決の owner-approval-waiting は `--callbacks-drained` 側で block する) (#13377: project workspace・coordinator pair・他 lane は閉じない。最終laneのmanaged slotを閉じてもgeneration-unbound rootは保存し、workspace/tab消滅を退役の前提・完了条件にしない — #13380 / #15227)。legacy lane (`wt_<hash>` workspace) は互換 plan で旧 slot も close される。
 3. `workflow supervisor --run-once` / `--watch` は callback/backlog delivery後・hibernate前に、同じleaseとpass-wide mutation budget下で一意な終了済み候補を自動的に上記と同じtyped退役処理へ渡す。全evidenceの2回完全一致、exactly-one、close/review/integration/CI/callback/clean/origin条件を満たさない場合はzero-mutation。
 4. worktree / local branch の除去は **統合後のoperator runbook** (`git worktree remove` + `git branch -d`)。自動退役の結果は常にphysical cleanupを`cleanup_blocked`として残す。forceとremote branch削除は禁止する。
 
@@ -289,8 +295,33 @@ mozyo-bridge sublane quarantine-inspect --issue <id> --lane <lane> --role <role>
   `attestation_unreadable` / `known_marker_requires_q_enter` / `not_quarantine_candidate` /
   `workspace_unresolved`。**refusal時はtemplateを出さない** (execute側fenceが拒否するapprovalを貼らせないため)。
 - `known_marker_requires_q_enter` はreceiver replacementではなく、既存delivery railのq-enterで処理する。
+  classifierのprecedenceで`generation_mismatch`が先に確定しても、同時観測したknown marker factを捨てない。
+  同じ観測でpending composerをpositiveに確認したexact 1 markerはq-enterへ残し、複数・ambiguous、または
+  pending不在／不読と矛盾するmarker相関はblockedとする。どれもdisposition templateを生成せず、pending inputの
+  discard authorityにはならない。
 - receiverのrevision / attested generation / locatorが変化したらapprovalは無効である。`--execute` は実状態と
   再照合してfail-closedするので、driftしたapprovalは適用されずに拒否される。inspectを取り直してapprovalを出し直す。
+- generation mismatch と real pending input が同時にある場合だけ、同じ inspection は disposition template を返す。
+  command は mismatch/pending の3 tokenに加え、正の `--approved-lane-generation` と
+  `--approved-lifecycle-revision` を必ず含む。この5 tokenは一組であり、欠落・非正数は
+  `disposition_approval_incomplete` / `lane_lifecycle_pins_invalid` の typed zero-actuation になる。
+- disposition template は一意な `generation_mismatch_disposition_owner_approval` workflow-event markerを含む。
+  executeはexact issue/journalをfresh readし、`approval_source=direct_owner`、anchored coordinator writer、workspace / role /
+  assigned-name / locator / agent revision / attested generation / action id / mismatch axes / pending identity+effect /
+  lane generation / lifecycle revisionのoperation digest完全一致を検証する。journal pointer、散文、引用、重複marker、
+  reader不能、wrong writer/digestはいずれもzero CAS / zero close / zero launchである。
+- 未相関composerのidentityはprovider-owned opaque composer generationだけに束縛する。現行providerのread契約はこの
+  generationを返さないため、取得不能時は`composer_generation_unavailable`でtemplateを生成せずexecuteも拒否する。
+  Herdr row revision、composer本文・hash・lengthを代用authorityにしてはならない。
+- lifecycle authority の不読・row不在は `lane_lifecycle_unreadable` / `lane_lifecycle_absent` でtemplateを出さない。
+  executeは承認時revisionをreplacement generationの起点として、request CAS、owed close、partial launch replay、
+  completion CASの各effect直前にnon-migrating fresh readでlane incarnationと期待revisionを再照合する。
+  `lane_generation_drift` / `lifecycle_revision_drift` では以後のCAS・close・launchを行わない。したがって同じlane名が
+  次incarnationへ再作成されても旧approvalは流用できず、partial replayも承認された同一generationだけを再開する。
+- owed closeはrun冒頭のsnapshotを再利用せず、close port直前にidentity/state/composerをfresh取得し、続けてlifecycleを
+  fresh readする。runtime stateは`awaiting_input`または`turn_ended`だけをsettledとし、busy / blocked / unknown / 空値 /
+  unreadable / novel state、composer generation・identity・revision・attestation・lifecycle driftはclose 0かつ後続CAS/launch 0。
+  exact receiverがpositive absentのpost-close replayだけは再closeせず、既存transactionのcontinuationを処理する。
 
 ### pending composer がpairをpreserveしている場合
 
@@ -397,9 +428,24 @@ forceやpending overrideを加えない。pending generationが本当に破棄�
 - **workflow gate ではない**: channel は watcher の recognized channels と `GATE_BEARING_KINDS` に **入れない**。correlation を説明する record であって workflow event ではない。
 - **判定の正本は `tests/regressions/test_issue_13892_obligation_source_matrix.py`**。covered は「実際に scratch slot が現れ reader が返す」probe で、inapplicable は「**不可能にしている precondition**」を assert する (store の形が変われば落ちる)。prose は腐るので判定を prose に置かない。
 
-- **partial close は replay 可能**: pending attempt に **pinned locators** と closed progress が durable に残るため、re-run の close authority は **`attempt.pinned` − (positively absent | 既 closed)** の **exact locator のみ**。★**assigned name が一致しても locator が違えば `pin_drift` で non-success** — 同名で relaunch された別 pair を旧 attempt の権限で閉じないため (review j#80523 R3-F2)。crash 位置別の replay: `live + pending` → full preflight 再実行後に close resume / `absent + pending` → whole-unit re-measure 後に **completed へ repair** / `absent + completed` → **idempotent success (exit 0)** / `absent + proof 無し` → `retire_evidence_absent`。fence completion write 失敗は non-success (`completion_unproven`) だが **truthful な closed は保持**し、次回 run が pending から repair する。
+- **partial close は v2 generation pin で replay 可能**: pending attempt は role / assigned
+  name / locator / `startup_action_id` と closed progress を durable に保持する。re-run は fresh
+  full inventory の canonical name / locator / private terminal identityを、v4 attestation と
+  completed-success のgeneration-v2 startup participantへexact joinする。閉済pinは同じgenerationの
+  private terminalが全inventoryからpositive absenceのときだけ除外し、残るexact-live subsetだけを閉じる。
+  v1 tokenless pending/partial、legacy/malformed/mismatch、terminalの別name・lane・locatorでの再claimは
+  **zero-close**。crash位置別の replay は `live + pending-v2` → remaining exact generationだけclose、
+  `absent + pending-v2` → terminal-bound positive absence後にcompleted repair、`absent + completed-v2`
+  → 同じproofを毎回再検証したidempotent success。fence completion write失敗はnon-success
+  (`completion_unproven`) だがtruthfulなclosed progressは保持する。
 - **relaunch 誤認の防止**: herdr assigned name は `(workspace, role, lane)` で決まるため同名 pair が再 launch され得る。`completed` の後に新しい live slots が現れたら **新しい attempt (revision+1) を開く**ので、古い completion が稼働中の pair の proof に流用されない。
-- attestation は要求 **しない** (#13892 j#80483): scratch pair は generation / lifecycle row を持たず attestation は構造的に取得不能で、要求すると本 rail が対象とする唯一の shape (live-but-unattested) を恒久 retire 不能にする。identity は assigned-name 一致 + foreign 不在 + duplicate 不在 + locator 一意で証明する。
+- current runtime の destructive close は **v4 attestation + completed generation-v2** を要求する。
+  旧v1 retirement storeは通常runtimeではread-only/non-authoritativeで、通常executeから暗黙migration
+  しない。consumerを止めた明示rail `mozyo-bridge herdr retirement-store migrate --write`だけが、
+  exact-v1 schemaをprivate backup-firstでv2へstampする。verified v1 backupと0700 staging provenanceは
+  crash replay/recovery evidenceとして保持され、primary欠落、backup/pin/security drift、unproven
+  stagingは`recovery_required`相当のdamaged状態となりnormal write/closeを0にする。旧pinのterminalを
+  live inventoryからbackfillしてauthorityへ昇格させない。
 - worktree / branch 除去、process launch / resume、raw herdr / tmux、store 直接 mutation は伴わない。
 
 ## 統合 (integration disposition)
@@ -421,6 +467,50 @@ forceやpending overrideを加えない。pending generationが本当に破棄�
 | logout / `authentication required` / process終了 | `agent_auth_unavailable` | credentialを記録せずre-authまたはfresh agent relaunch | routing bug扱い、blind resend |
 | agentはliveだが実command shellに`MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` / `MOZYO_LANE_ID`が無い/不整合 | `sender_identity_missing_or_conflict` | dispatchを止め、runtime propagation/proxy gapをdurable化 | 手動env注入、raw Herdr send |
 | assigned-name/lane slotが無い、または複数 | `route_runtime_unavailable` | lane metadata + live inventoryを再取得し、standard relaunch/preflightへ | tmux-era candidate空振りだけで断定 |
+
+### 再起動復元後の active sublane pair を診断する (#15227)
+
+`sublane recover-restored-pair` は、active な issue-owned sublane の gateway/worker が
+両方 live だが、再起動復元後の command-shell CWD が lifecycle row の canonical worktree
+と一致しない、または live locator に結び付いた startup self-attestation が non-green な
+場合の公開read-only診断である。default lane と片側だけ存在する pair は本診断の対象外
+である。default coordinator を安全に self-close/relaunch する公開 rail は現時点では未実装
+であり、本コマンドで代用してはならない。片側だけ存在する pair は vanished-slot 用 rail
+を使う。
+
+- 現行で提供する動作は read-only preflight だけである。`--allow-pending-composer-loss` は、
+  eventual replacementで旧 pane の未送信composer textが失われ得るかを診断結果へ含めるための
+  入力であり、close、file破棄、またはowner approvalを実行するflagではない。
+- preflight は lifecycle の issue/lane/revision/generation、canonical worktree token、branch/HEAD、
+  gateway/worker の assigned name/locator/inventory revision、runtime state、CWD、startup
+  attestation を結合する。runtime は両 slot とも明示的な `awaiting_input` または
+  `turn_ended` の場合だけ settled とする。status 欠落、`unknown`、未知値、非文字列、
+  `blocked`、`busy` はいずれも非actionableである。両 slot が healthy、inventory/
+  attestation が読めない、pair が一意でない、worktree/branchが動いた場合も同様である。
+- **現行は診断専用で、破壊操作を持たない**。Herdr 0.8 / protocol 19 の `pane.close` は
+  `pane_id` だけを受け取り、preflightで観測したterminal generationやinventory revisionを
+  close mutationと同じ原子的操作で照合できない。server restartでは同じlogical pane idを
+  復元しつつterminal generationが変わり得るため、inventoryのfresh read直後に
+  `pane close <pane_id>`を呼ぶ二段階処理もexact-generation closeにはならない。
+  `generation_conditional_close_unavailable` は全planに付く技術的blockerであり、
+  `required_approval_marker` は生成しない。public CLIに `--execute` はなく、programmatic CLI
+  呼出しも常にread-onlyである。live replacement portを直接呼んでもreplacement transaction、
+  close、launch、sendを一切行わずtyped refusalを返す。raw Herdr closeや二重readで迂回しては
+  ならない。
+- **先行要件**: Herdr server内の同じclose操作で、少なくとも `pane_id` と期待するterminal
+  generation（必要に応じてassigned name / inventory revisionも）を照合し、
+  `closed | absent | precondition_failed` を区別して返すconditional-close primitiveが必要である。
+  このprimitiveとadapterが実装・検証されるまで、本railはapproval-readyにもdogfood-readyにも
+  ならない。
+- **conditional close導入後に再審査する契約**: 既存のowner approval digest、approval-time
+  health pin、replacement transaction、zero-effect transactionのgeneration再承認CASは将来の
+  候補として残る。ただしread-sideのfresh再確認だけで現行locator-only closeを有効化しては
+  ならない。Herdrのclose mutation自体が承認されたterminal generationを消費し、その返却値を
+  transaction effect receiptへ結合できて初めて、marker生成とclose → same-slot launch →
+  action-bound attestationを有効化する。その時点でpartial replay、healthy化、generation ABA、
+  close成功後CAS前停止を改めて独立reviewする。
+- provider の会話セッション再開は保証しない。保証対象は worktree/branch/file と durable record
+  であり、古い pane の画面内容は必要なら read-only capture して Redmine の状態判断へ反映する。
 
 `sublane create --execute`がlaunch後にdispatchだけfailした場合は、起動済みslot、未配送anchor、失敗理由をjournalに残す。partial laneを成功扱いせず、同じcommandをblind replayしない (Redmine #13613)。
 

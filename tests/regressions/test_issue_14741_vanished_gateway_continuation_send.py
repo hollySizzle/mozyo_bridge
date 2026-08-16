@@ -7,6 +7,7 @@ import sqlite3
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
@@ -41,10 +42,14 @@ from tests.regressions.test_issue_14741_vanished_gateway_continuation import (
     JOIN_LANE,
     JOIN_OLD,
     JOIN_PROVIDER,
+    JOIN_TERMINAL,
     JOIN_WORKSPACE,
     ROOT,
     _join_preparation,
     _live_row,
+)
+from tests.support.current_launch_authority import (
+    seed_completed_current_launch_authority,
 )
 
 OBSERVED = "2026-08-03T01:02:03+00:00"
@@ -90,8 +95,13 @@ class VanishedGatewayContinuationSendTest(unittest.TestCase):
     def setUp(self) -> None:
         self._temp = tempfile.TemporaryDirectory()
         self.home = Path(self._temp.name).resolve()
+        self._home_patch = mock.patch.dict(
+            "os.environ", {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False
+        )
+        self._home_patch.start()
         self.preparation = _join_preparation()
         self.dispatch = _Dispatch()
+        self.startup_action_id = ""
         self.originals = (
             continuation_module.repo_scope_workspace_id,
             continuation_module.resolve_gateway_provider,
@@ -107,6 +117,7 @@ class VanishedGatewayContinuationSendTest(unittest.TestCase):
             continuation_module.resolve_gateway_provider,
             continuation_module.mozyo_bridge_home,
         ) = self.originals
+        self._home_patch.stop()
         self._temp.cleanup()
 
     def _record(self, **changes) -> IdentityAttestationRecord:
@@ -116,6 +127,7 @@ class VanishedGatewayContinuationSendTest(unittest.TestCase):
             role=JOIN_PROVIDER,
             lane_id=JOIN_LANE,
             locator=JOIN_FRESH,
+            terminal_id=JOIN_TERMINAL,
             verdict=VERDICT_PRESENT,
             observed_at=OBSERVED,
             replacement_action_id=self.preparation.action_id,
@@ -124,6 +136,18 @@ class VanishedGatewayContinuationSendTest(unittest.TestCase):
         return IdentityAttestationRecord(**values)
 
     def _seed(self, **changes) -> IdentityAttestationRecord:
+        if not self.startup_action_id:
+            self.startup_action_id = seed_completed_current_launch_authority(
+                self.home,
+                workspace_id=JOIN_WORKSPACE,
+                lane_id=JOIN_LANE,
+                role=JOIN_PROVIDER,
+                assigned_name=self.preparation.participant.assigned_name,
+                locator=changes.get("locator", JOIN_FRESH),
+                terminal_id=changes.get("terminal_id", JOIN_TERMINAL),
+                target_workspace="w4B",
+                target_tab="w4B:t1",
+            )
         return HerdrIdentityAttestationStore(home=self.home).upsert(
             self._record(**changes)
         )
@@ -153,6 +177,7 @@ class VanishedGatewayContinuationSendTest(unittest.TestCase):
             fresh_locator=JOIN_FRESH,
             old_locator=JOIN_OLD,
             observed_at=OBSERVED,
+            startup_action_id=self.startup_action_id,
             revision=0,
         )
         values.update(changes)
@@ -263,7 +288,7 @@ class VanishedGatewayContinuationSendTest(unittest.TestCase):
         self.assertFalse(self._ops(repo_root=Path(".")).context_is_exact())
         self.assertFalse(self._ops(upstream_coordinator=" up ").context_is_exact())
 
-    def test_actual_recognized_v1_side_binding_can_attempt_the_same_send(self):
+    def test_actual_recognized_v1_side_binding_is_diagnostic_only_and_zero_send(self):
         path = herdr_identity_attestation_path(self.home)
         path.parent.mkdir(parents=True, exist_ok=True)
         with sqlite3.connect(path) as conn:
@@ -275,9 +300,25 @@ class VanishedGatewayContinuationSendTest(unittest.TestCase):
                 "verdict TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', "
                 "observed_at TEXT NOT NULL)"
             )
-        record = HerdrIdentityAttestationStore(home=self.home).upsert(
-            self._record(replacement_action_id="")
+            conn.execute(
+                "INSERT INTO herdr_identity_attestations "
+                "(assigned_name, workspace_id, role, lane_id, locator, verdict, "
+                "detail, observed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    self.preparation.participant.assigned_name,
+                    JOIN_WORKSPACE,
+                    JOIN_PROVIDER,
+                    JOIN_LANE,
+                    JOIN_FRESH,
+                    VERDICT_PRESENT,
+                    "",
+                    OBSERVED,
+                ),
+            )
+        record = HerdrIdentityAttestationStore(home=self.home).read(
+            self.preparation.participant.assigned_name
         )
+        self.assertIsNotNone(record)
         side = HerdrIdentityReplacementBindingStore(home=self.home)
         intent = side.reserve(
             action_id=self.preparation.action_id,
@@ -300,8 +341,9 @@ class VanishedGatewayContinuationSendTest(unittest.TestCase):
         )
 
         result = self._ops().send_once(self.preparation)
-        self.assertEqual(result.status, DRAIN_SEND_OK)
-        self.assertEqual(len(self.dispatch.calls), 1)
+        self.assertEqual(result.status, DRAIN_SEND_ZERO)
+        self.assertEqual(result.detail, SEND_AUTHORITY_INVALID)
+        self.assertEqual(self.dispatch.calls, [])
 
     def test_production_composition_builds_the_canonical_herdr_ops(self):
         self._seed()

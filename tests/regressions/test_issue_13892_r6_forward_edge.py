@@ -26,6 +26,7 @@ from mozyo_bridge.core.state.scratch_retirement_fence import (
     ScratchRetirementFence,
     slot_digest,
 )
+from mozyo_bridge.core.state.scratch_retirement_pin import ScratchRetirementPin
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_forward_send import (  # noqa: E501
     execute_herdr_forward,
 )
@@ -63,6 +64,22 @@ class ForwardEdgeRetirementGuardTest(unittest.TestCase):
         claude = encode_assigned_name(WS, "claude", lane_id)
         return RetirementUnit(WS, lane_id, slot_digest([codex, claude]))
 
+    def _pins_for(self, lane_id):
+        return (
+            ScratchRetirementPin(
+                "codex",
+                encode_assigned_name(WS, "codex", lane_id),
+                "%9",
+                "startup:codex:%9",
+            ),
+            ScratchRetirementPin(
+                "claude",
+                encode_assigned_name(WS, "claude", lane_id),
+                "%8",
+                "startup:claude:%8",
+            ),
+        )
+
     def _forward(self, port):
         """The REAL forward entry, with a real fence and a fake send port."""
         from tests.unit.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_herdr_forward_send import (  # noqa: E501
@@ -87,7 +104,7 @@ class ForwardEdgeRetirementGuardTest(unittest.TestCase):
         with self.retirement.transaction(
             self._unit_for(self.gw_lane), live_pair_present=True
         ) as txn:
-            txn.reserve(pinned=(("codex", "%9"), ("claude", "%8")))
+            txn.reserve(pinned=self._pins_for(self.gw_lane))
             result = self._forward(port)
         self.assertEqual(port.calls, [], "sent=0: never forward into a retiring pair")
         self.assertFalse(result.sent)
@@ -105,7 +122,7 @@ class ForwardEdgeRetirementGuardTest(unittest.TestCase):
         with self.retirement.transaction(
             self._unit_for(self.gw_lane), live_pair_present=True
         ) as txn:
-            txn.reserve(pinned=(("codex", "%9"), ("claude", "%8")))
+            txn.reserve(pinned=self._pins_for(self.gw_lane))
         self.retirement.seal_path.write_text("deadbeef")  # identity mismatch
         result = self._forward(port)
         self.assertEqual(port.calls, [], "a send we cannot prove is safe is not sent")

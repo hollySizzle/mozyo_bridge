@@ -217,8 +217,9 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # standard` only for an unadmitted inactive cockpit-grid split);
         # `--no-submit` / `--mode pending` stays an explicit operator/debug
         # fallback, not the standard dispatch path.
-        "その dispatch は **標準 handoff であり、submit を完了しなければならない**",
-        "inactive-split の Claude pane: standard_target_admission が登録済み pane を activate する。`--mode standard` が必要なのは未 admit の pane のみである",
+        "その dispatch は **標準 handoff であり、pending input を意図的に残す経路ではない**",
+        "tmux inactive-split の Claude pane: standard_target_admission が登録済み pane を activate する。",
+        "dispatch outcome と `injection_stage` を記録する。",
         "`--no-submit` / `--mode pending` は標準の dispatch path ではない",
         # Named cockpit groups — grouping vs identity separation
         # (Redmine #11853). A multi-cockpit layout must not become an

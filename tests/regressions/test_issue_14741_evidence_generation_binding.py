@@ -42,6 +42,11 @@ ACTION_NEW = "startup-" + "2" * 64
 LOCATOR = "wA:p1"
 
 
+def _live_rows(assigned="mzb1_wA_codex_lane", terminal=None):
+    return [{"name": assigned, "pane_id": LOCATOR,
+             "terminal_id": terminal or f"terminal:{LOCATOR}"}]
+
+
 def _generation(store, *, assigned, action_id, locator, role="codex"):
     """Reserve and attest one launch generation, the way the launcher does."""
     store.reserve_pending(
@@ -58,6 +63,7 @@ def _generation(store, *, assigned, action_id, locator, role="codex"):
         role=role,
         lane_id="issue_14741",
         locator=locator,
+        terminal_id=f"terminal:{locator}",
         verdict="present",
         observed_at="2026-08-02T00:00:00.000000+00:00",
     )
@@ -69,13 +75,20 @@ class ExactGenerationResolutionTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
         self.generations = HerdrLaunchGenerationStore(home=self.home)
+        self._verified = patch(
+            "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+            side_effect=lambda _home, **kw: kw["assigned_name"] and ACTION_NEW,
+        )
+        self._verified.start()
+        self.addCleanup(self._verified.stop)
 
     def test_the_helper_resolves_the_exact_generation(self) -> None:
         _generation(
             self.generations, assigned="mzb1_wA_codex_lane", action_id=ACTION_NEW,
             locator=LOCATOR,
         )
-        key = resolve_generation_key("codex", LOCATOR, home=self.home)
+        key = resolve_generation_key(
+            "codex", LOCATOR, live_rows=_live_rows(), home=self.home)
         self.assertIsNotNone(key)
         self.assertEqual(key.startup_action_id, ACTION_NEW)
         self.assertEqual(key.assigned_name, "mzb1_wA_codex_lane")
@@ -94,7 +107,8 @@ class ExactGenerationResolutionTest(unittest.TestCase):
             self.generations, assigned="mzb1_wA_codex_lane", action_id=ACTION_NEW,
             locator=LOCATOR,
         )
-        key = resolve_generation_key("codex", LOCATOR, home=self.home)
+        key = resolve_generation_key(
+            "codex", LOCATOR, live_rows=_live_rows(), home=self.home)
         self.assertEqual(key.startup_action_id, ACTION_NEW)
 
     def test_an_unresolvable_locator_is_none_not_a_guess(self) -> None:
@@ -104,14 +118,17 @@ class ExactGenerationResolutionTest(unittest.TestCase):
             ("blank provider", ("", LOCATOR)),
         ):
             with self.subTest(label=label):
-                self.assertIsNone(resolve_generation_key(*args, home=self.home))
+                self.assertIsNone(resolve_generation_key(
+                    *args, live_rows=(), home=self.home))
 
     def test_a_different_provider_at_the_same_pane_does_not_match(self) -> None:
         _generation(
             self.generations, assigned="mzb1_wA_claude_lane", action_id=ACTION_NEW,
             locator=LOCATOR, role="claude",
         )
-        self.assertIsNone(resolve_generation_key("codex", LOCATOR, home=self.home))
+        self.assertIsNone(resolve_generation_key(
+            "codex", LOCATOR,
+            live_rows=_live_rows("mzb1_wA_claude_lane"), home=self.home))
 
     def test_a_pending_generation_is_not_attested_enough_to_bind_to(self) -> None:
         self.generations.reserve_pending(
@@ -121,7 +138,20 @@ class ExactGenerationResolutionTest(unittest.TestCase):
             role="codex",
             lane_id="issue_14741",
         )
-        self.assertIsNone(resolve_generation_key("codex", LOCATOR, home=self.home))
+        self.assertIsNone(resolve_generation_key(
+            "codex", LOCATOR, live_rows=_live_rows(), home=self.home))
+
+    def test_an_attested_row_without_completed_startup_is_not_current(self) -> None:
+        _generation(
+            self.generations, assigned="mzb1_wA_codex_lane", action_id=ACTION_NEW,
+            locator=LOCATOR,
+        )
+        with patch(
+            "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+            return_value="",
+        ):
+            self.assertIsNone(resolve_generation_key(
+                "codex", LOCATOR, live_rows=_live_rows(), home=self.home))
 
 
 class EvidenceProductionTest(unittest.TestCase):
@@ -138,10 +168,19 @@ class EvidenceProductionTest(unittest.TestCase):
         self._patch = patch(
             "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application"
             ".startup_admission_composition.resolve_generation_key",
-            lambda receiver, target, home=None: self.key if target == LOCATOR else None,
+            lambda receiver, target, live_rows=(), home=None: (
+                self.key if target == LOCATOR else None
+            ),
         )
         self._patch.start()
         self.addCleanup(self._patch.stop)
+        self._inventory = patch(
+            "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
+            ".application.sublane_herdr_projection.list_herdr_agent_rows",
+            return_value=_live_rows(),
+        )
+        self._inventory.start()
+        self.addCleanup(self._inventory.stop)
         self._store = patch(
             "mozyo_bridge.core.state.launch_identity_receipt.launch_identity_receipt_path",
             lambda home=None: self.home / "launch-identity-receipt.sqlite",

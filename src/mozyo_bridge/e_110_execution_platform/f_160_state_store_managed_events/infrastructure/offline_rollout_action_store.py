@@ -16,6 +16,7 @@ from mozyo_bridge.e_110_execution_platform.f_160_state_store_managed_events.doma
     canonical_bytes,
     canonical_digest,
     validate_action,
+    validate_action_for_readback,
 )
 
 
@@ -104,7 +105,15 @@ class OfflineRolloutActionStore:
 
     def load(self, action_id: str) -> dict:
         directory = self.action_directory(action_id, create=False)
-        return self._read_path(self._record_path(directory))
+        return self._read_path(self._record_path(directory), validate_action)
+
+    def load_for_status(self, action_id: str) -> dict:
+        """Read a sealed historical record without granting it execution authority."""
+
+        directory = self.action_directory(action_id, create=False)
+        return self._read_path(
+            self._record_path(directory), validate_action_for_readback
+        )
 
     def save_locked(self, directory: Path, action: Mapping[str, object]) -> None:
         """Save while the caller holds :meth:`locked` for this exact directory."""
@@ -117,7 +126,7 @@ class OfflineRolloutActionStore:
         self._write_path(self._record_path(directory), action)
 
     def load_locked(self, directory: Path) -> dict:
-        return self._read_path(self._record_path(directory))
+        return self._read_path(self._record_path(directory), validate_action)
 
     @staticmethod
     def _write_path(path: Path, action: Mapping[str, object]) -> None:
@@ -150,7 +159,9 @@ class OfflineRolloutActionStore:
             raise OfflineRolloutActionStoreError("action_write_failed") from exc
 
     @staticmethod
-    def _read_path(path: Path) -> dict:
+    def _read_sealed_payload(path: Path):
+        """Apply identical filesystem/JSON/seal checks to every decode policy."""
+
         flags = os.O_RDONLY
         if hasattr(os, "O_NOFOLLOW"):
             flags |= os.O_NOFOLLOW
@@ -176,16 +187,26 @@ class OfflineRolloutActionStore:
             envelope = json.loads(raw)
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
             raise OfflineRolloutActionStoreError("action_record_unreadable") from exc
-        if not isinstance(envelope, Mapping):
+        if not isinstance(envelope, Mapping) or set(envelope) != {
+            "payload",
+            "payload_sha256",
+        }:
             raise OfflineRolloutActionStoreError("action_record_invalid")
+        if raw != canonical_bytes(envelope) + b"\n":
+            raise OfflineRolloutActionStoreError("action_record_noncanonical")
         payload = envelope.get("payload")
         digest = envelope.get("payload_sha256")
         if not isinstance(digest, str) or not _SHA256.fullmatch(digest):
             raise OfflineRolloutActionStoreError("action_record_seal_invalid")
         if canonical_digest(payload) != digest:
             raise OfflineRolloutActionStoreError("action_record_seal_mismatch")
+        return payload
+
+    @classmethod
+    def _read_path(cls, path: Path, validator) -> dict:
+        payload = cls._read_sealed_payload(path)
         try:
-            validate_action(payload)
+            validator(payload)
         except OfflineRolloutActionError as exc:
             raise OfflineRolloutActionStoreError(str(exc)) from exc
         return json.loads(canonical_bytes(payload).decode("ascii"))

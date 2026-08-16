@@ -24,7 +24,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Optional, Sequence, Tuple
+from typing import Any, Mapping, Optional, Sequence, Tuple
 
 
 @dataclass(frozen=True)
@@ -80,13 +80,56 @@ def _lifecycle_port(home: Optional[Path]):
     return read
 
 
-def _generation_port(home: Optional[Path]):
+def _generation_port(home: Optional[Path], live_rows, allow_historical_absent: bool):
     def read(assigned_name: str):
         from mozyo_bridge.core.state.herdr_launch_generation import (
-            HerdrLaunchGenerationStore,
+            HerdrLaunchGenerationStore, completed_generation_startup_token,
+            verified_generation_token,
+        )
+        from mozyo_bridge.core.state.herdr_identity_attestation import VERDICT_PRESENT
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            AGENT_KEY_NAME,
+            AGENT_KEY_TERMINAL_ID,
+            _agent_locator,
+            _norm,
+            _norm_lane,
+            terminal_identity_of_row,
+            terminal_identity_of_live_slot,
+            terminal_identity_snapshot_complete,
         )
 
-        return HerdrLaunchGenerationStore(home=home).read(assigned_name)
+        generation = HerdrLaunchGenerationStore(home=home).read(assigned_name)
+        if generation is None:
+            return None
+        terminal_id = terminal_identity_of_live_slot(
+            assigned_name, generation.locator, live_rows
+        )
+        if terminal_id and generation.terminal_id == terminal_id:
+            return generation if verified_generation_token(
+                home, assigned_name=generation.assigned_name,
+                workspace_id=generation.workspace_id, role=generation.role,
+                lane_id=generation.lane_id, locator=generation.locator,
+                live_terminal_id=terminal_id, norm=_norm, norm_lane=_norm_lane,
+            ) == generation.startup_action_id else None
+        if allow_historical_absent and not terminal_identity_snapshot_complete(live_rows):
+            return None
+        claims = [
+            row for row in live_rows
+            if isinstance(row, Mapping)
+            and (
+                row.get(AGENT_KEY_NAME) == assigned_name
+                or _agent_locator(row) == generation.locator
+                or row.get(AGENT_KEY_TERMINAL_ID) == generation.terminal_id
+            )
+        ]
+        return generation if (
+            allow_historical_absent and generation.terminal_id and not claims
+            and generation.verdict == VERDICT_PRESENT
+            and completed_generation_startup_token(
+                home, generation, norm=_norm, norm_lane=_norm_lane
+            )
+            == generation.startup_action_id
+        ) else None
 
     return read
 
@@ -125,7 +168,9 @@ def _update_cause_port():
     return classify
 
 
-def build_evidence_planner(home: Optional[Path]):
+def build_evidence_planner(
+    home: Optional[Path], *, live_rows=(), allow_historical_absent: bool = False
+):
     """The planner, bound to the live authorities under ``home``.
 
     ``None`` means "wherever the stores resolve their own home to" — never ``Path()``,
@@ -137,7 +182,7 @@ def build_evidence_planner(home: Optional[Path]):
     )
 
     return ReplacementEvidencePlanner(
-        generations=_generation_port(home),
+        generations=_generation_port(home, live_rows, allow_historical_absent),
         lifecycle=_lifecycle_port(home),
         evidence=_evidence_port(home),
         update_cause=_update_cause_port(),
@@ -150,6 +195,8 @@ def plan_participants_with_evidence(
     home: Optional[Path],
     workspace_id: str,
     lane_id: str,
+    allow_historical_absent: bool = False,
+    live_rows=None,
 ) -> EvidencePlanning:
     """Plan ``participants``, or return the typed reason this transaction must not proceed.
 
@@ -166,12 +213,24 @@ def plan_participants_with_evidence(
     )
 
     try:
+        import os
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+            list_herdr_agent_rows,
+        )
+
+        live_rows = (
+            tuple(list_herdr_agent_rows(os.environ))
+            if live_rows is None else tuple(live_rows)
+        )
         context = PlanningContext(
             workspace_id=workspace_id,
             lane_id=lane_id,
             expected_update_cause=LAUNCH_CAUSE_UPDATE_RELAUNCH,
         )
-        plan = build_evidence_planner(Path(home) if home is not None else None).plan(
+        plan = build_evidence_planner(
+            Path(home) if home is not None else None, live_rows=live_rows,
+            allow_historical_absent=allow_historical_absent,
+        ).plan(
             participants, context
         )
     except EvidencePlanRefused as refusal:

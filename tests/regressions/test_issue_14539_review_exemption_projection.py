@@ -1983,6 +1983,9 @@ class ReviewJ91896TargetBindingTests(unittest.TestCase):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
             derive_directory_lane_token,
         )
+        from tests.support.current_launch_authority import (
+            seed_completed_current_launch_authority,
+        )
 
         def _row(ws, role, lane, locator):
             return {
@@ -1990,7 +1993,9 @@ class ReviewJ91896TargetBindingTests(unittest.TestCase):
                 "agent_role": role,
                 "lane_id": lane,
                 "locator": locator,
+                "pane_id": locator,
                 "name": f"mzb1_{ws}_{role}_{lane or 'default'}",
+                "terminal_id": f"terminal:{ws}:{lane}:{role}:{locator}",
                 "health": "healthy",
             }
 
@@ -2052,15 +2057,32 @@ class ReviewJ91896TargetBindingTests(unittest.TestCase):
                     _row(ws_id, "codex", self.LANE, "w2:p8"),
                     _row(ws_id, "claude", self.LANE, "w2:p9"),
                 ]
+                for row in rows:
+                    seed_completed_current_launch_authority(
+                        home,
+                        workspace_id=ws_id,
+                        lane_id=self.LANE,
+                        role=row["agent_role"],
+                        assigned_name=row["name"],
+                        locator=row["locator"],
+                        terminal_id=row["terminal_id"],
+                        target_workspace="w1",
+                        target_tab="w1:t1",
+                    )
 
                 def _fake_close(plan, **kw):
                     calls.append(plan)
-                    return retire_mod.HerdrRetireCloseResult(
+                    result = retire_mod.HerdrRetireCloseResult(
                         workspace_id=plan.workspace_id,
                         lane_id=plan.lane_id,
                         closed=plan.close_targets,
                         foreign_names=plan.foreign_names,
                     )
+                    closed_locators = {locator for _role, locator in result.closed}
+                    rows[:] = [
+                        row for row in rows if row["locator"] not in closed_locators
+                    ]
+                    return result
 
                 def _rows_then_advance(*_a, **_kw):
                     """The race: the row moves on between the first attest and the close."""
@@ -3889,6 +3911,12 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "A malformed marker, non-canonical field order, duplicate field, or anything other "
             "than exactly one operation-bound marker for the requested gate authorizes nothing",
         ),
+        f"{_D}/domain/generation_mismatch_disposition.py": (
+            ["*"],
+            "renders the generation-mismatch disposition approval through the shared "
+            "recovery_owner_approval renderer; it does not read durable notes. The shared live "
+            "verifier requires exactly one canonical operation-bound marker for this gate",
+        ),
         "src/mozyo_bridge/e_110_execution_platform/f_160_state_store_managed_events/domain/offline_rollout_action.py": (
             ["*", "*", "*", "*:MARKER_RE"],
             "owns the offline-rollout owner-approval grammar: renders the exact workflow-event "
@@ -3957,6 +3985,33 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "reads (Redmine #14755): the superseded-failure terminal declaration gate, located and "
             "parsed through superseded_failure_correlation's single-scan reader (so the "
             "exactly-one-marker rule is that module's); renders the declaration marker itself",
+        ),
+        f"{_D}/domain/superseded_audit_failure_producer.py": (
+            ["*", "*", "*", "*"],
+            "renders (Redmine #15166): the audit-failure terminal declaration marker, split out of "
+            "the terminal module when the j#102184 typed-refusal wiring pushed it past the "
+            "oversized-module gate. Reads no note; the emitted body is byte-identical to what the "
+            "terminal module's strict reader accepts, by construction",
+        ),
+        f"{_D}/domain/superseded_audit_failure_terminal.py": (
+            ["*", "*", "*"],
+            "reads (Redmine #15166): the audit-failure terminal declaration gate, located and "
+            "parsed through superseded_failure_correlation's single-scan reader (so the "
+            "exactly-one-marker rule is that module's — a second declaration of the gate, or one "
+            "it names but cannot read, poisons the note for the gate rather than yielding the "
+            "readable sibling). The declaration RENDERER now lives in the producer module above "
+            "and is re-exported here. It also RE-EXPORTS the successor "
+            "acknowledgement names from the sibling correlation module below, which is where that "
+            "second gate's grammar now lives",
+        ),
+        f"{_D}/domain/superseded_audit_failure_correlation.py": (
+            ["*", "*", "*", "*"],
+            "reads (Redmine #15166): the successor's audit-supersession acknowledgement gate, "
+            "located and parsed through superseded_failure_correlation's single-scan reader; "
+            "renders that marker through the shared separator guard. Split out of the terminal "
+            "module by review j#101880's hardening, mirroring the #14755 terminal / correlation "
+            "pair. It establishes POINTER INTEGRITY only — one actor can write both this record "
+            "and the declaration that names it, so it is never the authority a terminal rests on",
         ),
         f"{_D}/domain/hibernate_park_record.py": (["handoff", "handoff"], "reads one marker per record"),
         f"{_D}/application/operator_startup_resume_leg.py": (
@@ -4067,6 +4122,24 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "this module treats any non-string as missing — so a record that says two things "
             "yields no claim rather than an arbitrary one, and the caller reports `unknown`",
         ),
+        f"{_D}/application/retire_superseded_audit_failure.py": (
+            ['*'],
+            "inherits via a used import of superseded_audit_failure_terminal (Redmine #15166); "
+            "names no marker token itself and reads no note directly — it measures the live "
+            "histories, both issues' current tracker status, the named audit journal's shape and "
+            "the lane checkout, and delegates every marker question to that module's strict "
+            "grammar",
+        ),
+        f"{_D}/application/sublane_restored_pair_recovery.py": (
+            ['*'],
+            "inherits the recovery owner-approval marker capability through the exact marker "
+            "renderer; it renders the preflight marker but does not parse durable notes",
+        ),
+        f"{_D}/application/sublane_restored_pair_recovery_live.py": (
+            ['*'],
+            "inherits the recovery owner-approval marker capability through the live verifier; "
+            "the shared verifier requires exactly one canonical marker and refuses ambiguity",
+        ),
         f"{_D}/application/coordinator_proxy_send.py": (
             ['workflow-event'],
             "inherits via a used import of coordinator_proxy_decision; names no marker token "
@@ -4123,6 +4196,11 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         f"{_H}/application/handoff_herdr_standard_rail.py": (
             ['handoff'],
             "inherits via a used import of handoff; names no marker token itself",
+        ),
+        f"{_H}/application/handoff_herdr_queue_enter_rail.py": (
+            ['handoff'],
+            "inherits via a used import of handoff for the queue-enter retry policy; "
+            "names no marker token itself, renders none, and reads no durable note",
         ),
         f"{_H}/application/handoff_target_resolution.py": (
             ['handoff'],
@@ -4409,6 +4487,12 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "itself, and reads no note — it plans the refresh and delegates approval "
             "verification to that module's strict parser",
         ),
+        f"{_D}/application/sublane_worker_dispatch_herdr_ops.py": (
+            ['handoff'],
+            "inherits via a used import of handoff to build the exact implementation-request "
+            "delivery marker matched against the durable queue-enter record; it reads no "
+            "journal text and marker multiplicity is resolved by the delivery ledger owner",
+        ),
         f"{_D}/application/recovery_owner_approval_live.py": (
             ['*'],
             "inherits via a used import of recovery_owner_approval; names no marker token itself "
@@ -4486,6 +4570,15 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
         "src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/herdr_send_entry.py": (
             ['handoff'],
             "inherits via a used import of handoff; names no marker token itself",
+        ),
+        "src/mozyo_bridge/e_140_adapter_provider/f_130_terminal_runtime_provider/application/remote_unit_action.py": (
+            ['handoff'],
+            "inherits via a used import of handoff for the canonical `MODES` send-rail "
+            "vocabulary (Redmine #15198 replaced the caller-side `--mode standard` pin with the "
+            "shared default, so the rail offers exactly the modes the gateway has); names no "
+            "marker token itself, renders none, and reads no durable note — it reads only the "
+            "target gateway's own structured delivery outcome, and through the shared "
+            "injection-stage authority rather than by inspecting tokens",
         ),
         "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_application_service.py": (
             ['handoff'],

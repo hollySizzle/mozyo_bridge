@@ -35,6 +35,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     encode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
@@ -55,6 +56,7 @@ def _slot_attestation(
     workspace_id: str,
     lane_id: str,
     locator: str,
+    terminal_id: object,
     store: HerdrIdentityAttestationStore,
 ) -> SlotAttestation:
     """Read + join one slot's self-attestation into a pure :class:`SlotAttestation`.
@@ -80,6 +82,7 @@ def _slot_attestation(
     join = evaluate_attestation(
         record,
         live_locator=locator,
+        live_terminal_id=terminal_id,
         expected_workspace_id=workspace_id,
         expected_role=provider,
         expected_lane=lane_id,
@@ -146,6 +149,10 @@ def observe_lane_pair_attestation(
         workspace_id=workspace_id,
         lane_id=lane_id,
         locator=(slots.get(gateway_provider) or ("", ""))[0],
+        terminal_id=terminal_identity_of_live_slot(
+            encode_assigned_name(workspace_id, gateway_provider, lane_id),
+            (slots.get(gateway_provider) or ("", ""))[0], rows
+        ),
         store=store,
     )
     worker = _slot_attestation(
@@ -154,6 +161,10 @@ def observe_lane_pair_attestation(
         workspace_id=workspace_id,
         lane_id=lane_id,
         locator=(slots.get(worker_provider) or ("", ""))[0],
+        terminal_id=terminal_identity_of_live_slot(
+            encode_assigned_name(workspace_id, worker_provider, lane_id),
+            (slots.get(worker_provider) or ("", ""))[0], rows
+        ),
         store=store,
     )
     return gateway, worker

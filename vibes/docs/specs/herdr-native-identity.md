@@ -57,6 +57,55 @@ sender env** に置き換える。
 - **transient locator** = herdr の `pane_id` (`agent list` row の `pane_id`、alias `pane` /
   `location`)。per-process 再生成される使い捨て値であり、**identity として persist しない**。
   target への「今」の到達には `rebind_by_name` で live snapshot から都度復元する。
+- **server-owned terminal identity** = `agent list` row の `terminal_id`。値は公開JSON・doctor・log・
+  error・dataclass reprへ描画しない内部generation pinであり、durableなlogical identityではない。
+  authority joinは同じfresh full inventory snapshotで assigned name / locator / terminal_id が各exact 1件、
+  かつ全rowがcanonicalであることを要求する。same locator / different terminal、重複、欠落、空白、
+  malformed row混在はいずれもnon-greenである。
+- **global offline rolloutのdestructive pin** (#15227 j#104067) はprivate `close_authority` v2へ
+  workspace/lane/role/assigned-name/locator/`startup_action_id`を保存し、terminal値そのものは保存しない。
+  delegate captureと各close直前に、保存tokenをfresh full inventoryのterminal、v4 attestation、completed
+  generation-v2へexact再joinする。first non-replayでtarget absentならclose 0、active-phase replayと各close後は
+  同じgenerationが指すterminalのpositive absenceだけを許可し、name/locator/terminal reclaimまたはstore不読は
+  後続close 0で拒否する。Herdr 0.8のlocator-only mutationにatomic conditional closeが無い制約は残る。
+- **absent legacy recoveryの非破壊pin** は`close_authority`へ混ぜず、別のprivate closed
+  `legacy_absence_authority` v1へworkspace/lane/provider/name/old locator/old `startup_action_id`を保存する。
+  raw terminalは保存・公開・repr描画しない。captureは同じfresh agent+pane snapshotでcurrent generation-v2、
+  completed pair action、`pane_bound_v2` receipt、v4 attestationへexact joinし、name/locator/terminalのpositive
+  absenceとpairの同一old container + passive root exact 1件を要求する。各effect edgeでも再検証し、明示的な
+  generation rebuild完了後、expected restore generationがcurrent rowを置換した場合だけcompleted startup
+  receiptをold terminalのfallback authorityにする。row欠落やforeign generationはfallbackしない。このpinは
+  restore admission専用であり、close executorのtargetにはならない。非空authorityはplanのsource
+  launch-generation storeがrecognized v2の場合だけ有効なので、同runのrebuild phaseは`already_current`となり
+  old pinを消すv1 rebuild crash windowを作らない。
+- **global offline rolloutのrestore identity** は別のprivate closed `restore_intent` v1である。action作成前に
+  canonical workspace/lane/provider/name groupごとのprivate nonceとexpected startup action idを固定し、
+  terminal値は保存しない。restore前は全original generationのpositive absence、restore中は
+  「completed exact expected actionのnew terminal-bound generation」または「expected action absent」の
+  2 stateだけをcumulative exact rosterとして許可し、それ以外をatomic residualとして追加launchなしで
+  拒否する。restore後は全nameがexpected new action + v4 attestation + completed generation-v2へexact join
+  することを各supervisor/final edgeで再確認する。completed-successのexact groupだけはcrash replayでfoldし、
+  planned / partial / rollback / foreign / missing / extraを自動cleanupやfresh nonceへ畳まない。nonceは
+  public CLI/argv/stdout/provider env/status/reprへ出さず、exact candidate runnerがshared typed session-start
+  serviceへin-processで渡す。repo pathは単独でidentity authorityにせず、sealed groupのworkspace idを
+  application-only equality assertionとして同serviceへ渡す。registry refresh / startup reservation直前に加え、
+  実際にcwdを消費する`workspace create` / `pane split` primitive内のinvoke直前にもpathから解決したidentityとの
+  exact一致を再評価する。legacy recoveryはworkspace idだけでなくsealed lifecycle generation +
+  `worktree_identity`をlocal Git worktree一覧へexact-one joinし、同workspaceのforeign sibling worktreeを拒否する。
+  provider APIがpath identityをatomic consumeしないため、最後のcheck→invoke間の最小raceは保証上限として残る。
+- **pane-only stateもrestore authorityの一部である。** `agent list`とfresh strict full-pane listを同一edgeで
+  読み、agent-bearing paneをrole/locator/terminalへ双方向exact joinする。残るshell-only paneは
+  `passive_pane_intent` v1のlocator/workspace/tab/terminal全軸が不変な場合だけnonconsumer baselineとして許す。
+  groupごとの`restore_container_intent` v1は破壊的close前にold completed participantからpassive root exact 1件を
+  sealし、restoreはそのanchorだけをsplitする。new splitはprovider responseのtyped identityをparticipantへ即時記録し、
+  次effectでfresh full joinする。missing/duplicate/malformed/agent-bearing extra、または任意軸driftはzero-close/
+  zero-launchである。
+- **session-start maintenance gateは補助的なconforming-writer exclusionである。** owner-privateな共通namespaceで、
+  NFD+case-foldしたresolved home path keyとhome device/inode keyの2本の0600 lockを同順取得する。通常startは
+  shared、offline `run`全体はexclusiveで保持し、同process内はmint済みopaque leaseだけを再利用する。これにより
+  rename/recreate、macOSのcase/Unicode alias、bind-mount aliasでlock inodeを分岐させない。raw Herdr、
+  provider wrapper単独、旧runtimeはこのcooperative gateへ参加しないため、terminal/full-pane/startup transactionの
+  fresh fenceを省略してはならない。
 - **workspace_registry は無変更 (#11425)。** herdr anchor に新 schema は足さない。純 herdr
   session の identity anchor は既存の `workspace_id` (registry / `.mozyo-bridge/workspace-anchor.json`)
   + assigned-name scheme で完結する。registry には runtime/pane state を持ち込まない不変条件を維持する。
@@ -105,7 +154,8 @@ resolver はこれを fail-closed に読む。
   read も repair もできない** (修復は relaunch のみ)。したがって triplet が実際に spawn 先へ届いたかを
   観測できるのは **agent 自身の process だけ**である。managed launch は provider を
   `mozyo-bridge herdr agent-attest` で wrap し、agent boot 時に自 `os.environ` を launcher が期待する
-  identity と照合して `present | missing | conflict` を判定し、**live locator に generation-bind した
+  identity と照合して `present | missing | conflict` を判定し、**live locator + server-owned
+  terminal identity に generation-bind した
   durable record** (home-scoped `herdr-identity-attestation.sqlite`、runtime observation projection、
   env 値・secret は保存しない) を書いてから provider を `exec` する。この record は
   (a) adopt が live name-match を採用してよいかの gate (§5) と、(b) doctor が env-less/mismatch managed
@@ -114,9 +164,19 @@ resolver はこれを fail-closed に読む。
   attestation を置換しない**: startup record は TUI process env の boot 時観測であり、tool-exec
   subprocess への伝播を証明しないため、send 直前の `resolve_sender_identity(os.environ, ...)` は hard
   gate のまま残る (env-less shell は依然 `missing_sender_env` で fail-closed)。record 不在/世代不一致
-  (stale)/`missing`/`conflict` の adopt は fail-closed し、**owner 承認の close + same-slot relaunch** を
-  next action として返す (自動 destructive repair を行わない)。真の暗号学的 attestation
+  (stale)/`missing`/`conflict` の adopt は fail-closed する。active issue-owned sublane の
+  gateway/worker pairについては `sublane recover-restored-pair` がCWD/startup-attestation不整合を
+  結合する**公開read-only診断**である。Herdr 0.8 / protocol 19のclose mutationは`pane_id`しか
+  消費せず、観測したterminal generationを原子的に条件化できないため、owner承認close + same-slot
+  relaunchの実行railは未実装である。startup attestation が green でも live inventory の CWD が
+  canonical worktree と違えば診断対象になる。これは startup record が tool-exec subprocess の
+  CWD/env 伝播を証明しないためである。正確なblockerとconditional-close先行要件は
+  `vibes/docs/tasks/herdr-lane-operations.md`
+  「再起動復元後の active sublane pair を診断する」を正本とする。真の暗号学的 attestation
   (nonce / challenge-response) の導入は別 US 判断であり本節の範囲外。
+  reboot診断は各slotについてcanonical CWDと、`MOZYO_WORKSPACE_ID` / `MOZYO_AGENT_ROLE` /
+  `MOZYO_LANE_ID`の**key存在だけ**（値は非表示）を一体観測する。どれか不明・欠落・不一致、または
+  same-pane/different-terminalならsend 0 / close 0で、value-freeなfixed diagnosisを返す。
 
 - **startup attestation は lane epoch へ bind する (Redmine #14756)。** #13637 の record は
   「boot 時に triplet が届いたか」を証明するが、**その boot がどの世代か**は locator (tmux pane-id)
@@ -155,8 +215,11 @@ resolver はこれを fail-closed に読む。
     超過は typed malformed (同 F2)。
   - **既存 fence を弱めない**。epoch は **追加 conjunct** であり、attestation / locator / provider /
     multiplicity / declared-pin / `release_observation` の各 fence は verdict を 1 つも変えない。
-  - **rebuildable cache を流用しない**。`herdr_launch_generation` は `rebuildable_cache` の
-    projection なので load-bearing authority にしない (`### recovery policy vocabulary`)。
+  - **terminal-bound generation v2をcurrent-process conjunctにする**。`herdr_launch_generation` は
+    再launchで再生成可能な `rebuildable_cache` だが、存在するprocessを「current」と主張するread、
+    queue-enter receipt、offline restore/final verifyではterminal-bound attested v2 rowが必須である。
+    v1はlocator-onlyなのでnon-greenであり、4-store offline rolloutがbackup後に削除し、restore launchが
+    v2を再reserve/finalizeする。rebuildableであることはcurrent authorityから省略できる意味ではない。
   - **store 互換性の拒否は effect より前**。`attestation_store_epoch_unsupported` は
     launch preflight (`decide_store_compatibility`) と replacement の pre-effect fence
     (`replacement_store_admission`) の**両方**で、同一の 2 predicate から答える。後者は
@@ -315,9 +378,10 @@ flag には結合しない (別々に選べる) が、純 herdr 運用では両�
      --env KEY=VALUE ... --no-focus
    ```
 
-   `result.type=pane_info`と`result.pane.{pane_id,workspace_id,tab_id}`をexactに検証する。成功直後、
-   `pane_bound_v1` receipt（workspace/tab/native identity）をstartup transactionへ記録し、それ以前に
-   `agent start`を実行しない。
+   `result.type=pane_info`と`result.pane.{pane_id,workspace_id,tab_id,terminal_id}`をexactに検証する。成功直後、
+   `pane_bound_v2` receipt（workspace/tab/native/terminal identity）をstartup transactionへ記録し、それ以前に
+   `agent start`を実行しない。`pane_bound_v1`は既存recordの解析互換だけに残し、新しいlaunch authorityや
+   queue-enterのterminal-generation proofには使わない。
 5. 作成したexact paneへ`pane run`でcanonical provider名のshell functionを定義する。関数は
    action-private shimをabsolute pathで`exec`し、当該paneのshellだけに存在する。これによりlogin-shell
    startup後にもshimを解決でき、global PATH・他pane・provider子processへaliasを漏らさない。その後、
@@ -329,7 +393,9 @@ flag には結合しない (別々に選べる) が、純 herdr 運用では両�
 
    `pane run`の非zeroまたは`agent start`の非zeroはfail-closed。split直後のshell準備中にHerdrがtyped
    `agent_pane_busy`を返した場合だけ、同一pane・同一argvを最大30回、0.1秒間隔で再試行する。他の理由は
-   再試行しない。`result.type=agent_started`、返却pane、tab、native nameを準備済み値と照合する。長い`mzb1`はwrapper
+   再試行しない。`result.type=agent_started`、返却pane、tab、native name、terminal idを準備済み値と照合する。
+   split応答と`agent_started`応答のterminal idが異なる場合は、locatorが同じでもfail-closedとし、v2 receiptは
+   split応答で得たterminal idを保持する。長い`mzb1`はwrapper
    の`--assigned-name`とself-attestation recordへ保持し、Herdrへ直接渡さない。split直後のlogin shell
    準備中だけHerdr 0.8が返すtyped `agent_pane_busy`は、同じexact pane・同じargvに限り0.1秒間隔、
    最大30回で再試行する。他のerror、typed codeを読めない応答、上限到達は即時fail-closedとする。
@@ -340,6 +406,33 @@ flag には結合しない (別々に選べる) が、純 herdr 運用では両�
 
 この移行はHerdr downgradeや旧CLI fallbackを持たない。0.8 surfaceが確認できないruntimeは修復対象で
 あり、別形式へ自動分岐しない。
+
+#### terminal-bound receiptへの更新
+
+候補版へ更新する前から動いているpairの`pane_bound_v1`は解析可能だが、現在のterminalがそのlaunch transactionの
+side effectだという証拠を持たない。そのため、そのpairへのHerdr `queue-enter`は本文入力前に
+`target_unavailable`でfail-closedする。`session-start`をlive pairへ再実行してもexact-name slotをadoptするだけで、
+receiptやlaunch generationは更新されない。DB retryやschema migrationも過去のterminal provenanceを生成できず、
+既存live pairを自動的に強いauthorityへ昇格させない。
+
+lifecycle rowを持たない**非default scratch pair**だけは、exact candidate runtimeを使い、次の公開railでv2へ
+置き換えられる。1行目はread-only preflightであり、green判定とこのpairを閉じる明示承認の後にだけ2行目を実行する。
+positive absence / retired proofを確認してからfresh startへ進む。
+
+```bash
+mozyo-bridge herdr session-retire --lane <lane> --repo <root> --json
+mozyo-bridge herdr session-retire --lane <lane> --repo <root> --execute --json
+mozyo-bridge herdr session-start --agent codex --agent claude --lane <lane> --repo <root> --json
+```
+
+このretireはpairを閉じるがworktree / branch / commitは削除しない。lifecycle row present、default lane、inventory
+unreadable、duplicate / foreign / unlocatable slot、busy agent、未承認pending composer、durable obligationは
+fail-closedする。
+
+**lifecycle-managed active pairとdefault coordinatorには、receiptだけをv1→v2へ安全に更新する汎用public railが
+現時点でない。** `sublane retire`は業務完了後のterminal retirement、hibernate / recoveryはそれぞれの正当な
+前提を持つ別railであり、receipt refreshのために条件を偽装しない。この2 classの一般移行runbookは未成立で、
+専用の外部実行型refresh railまたは明示したcompatibility判断がrelease前に必要である。
 
 flow:
 
@@ -367,8 +460,10 @@ flow:
    無ければ workspace create する (lane slot は operator 可読 `--label` 付き、cosmetic のみ —
    join key は常に live mzb1 inventory)。default lane は自 pin のみ join し host へは決して
    join しない。各段で pin が複数 workspace に split したら fail-closed。lane ゼロの host は
-   herdr が最終 pane close で自動 close する (実測、#13380) ため残骸 husk は構造的に生じず、
-   次の lane が on demand で再 mint する (per-lane workspace は作らない)。同 resolver を
+   managed lane slot がゼロになっても、generation-bound private pinを持たないbase rootは
+   destructive authorityに使わずcosmetic residueとして保存する。workspace/tabの消滅は
+   closeの前提・成功条件にせず、次のlaneはlive inventoryへjoinするかon demandで再mintする
+   (per-lane workspace は作らない)。同 resolver を
    send / retire / projection の resolve 側でも使い、mint と resolve を一致させる。
    **さらに非 default lane は host workspace 内の tab を lane-aware join
    (`_tab_target_for_lane`, Redmine #13411) で決める: (1) 自 lane の live slots が pin する tab
@@ -383,8 +478,8 @@ flow:
    provider 順序は `lane_placement` config で lane class 別に宣言できる (Redmine #13646、下記
    §lane_placement)。**未設定時は product default `--split down` を出す (Redmine #14568)**。
    default lane は `--tab` を出さないままだが `--split` は出す (両者は独立 flag)。tab root pane は
-   #13330 の workspace base pane と同型で全 launch 成功後に reclaim し、tab 内最終 pane close で
-   herdr が tab を自動消滅させる (workspace 自動消滅と対称)。**
+   #13330 の workspace base pane と同型でterminal generationに束縛されないため、全launch成功後も
+   locatorだけではcloseせずcosmetic residueとして保存する。**
 3. mint durable name: `encode_assigned_name(workspace_segment, role, lane)` で mzb1 名を作る。
 4. 要求 agent (`claude` / `codex`) を herdr 管理 agent として **durable 名を start 時に付与**して
    launch する (下記 launch contract)。self-identity (`MOZYO_WORKSPACE_ID` /
@@ -504,7 +599,8 @@ flow:
    ただし adopt は live name-match だけでは足りず、その live locator に **generation-bind した
    `present` startup self-attestation record** (§2 / #13637) が必要である。record 不在 (legacy /
    pre-feature slot) / stale (locator 世代不一致) / `missing` / `conflict` は blind-adopt せず read-only
-   の **`unattested`** として exact reason + owner 承認 close+relaunch next action で surface する
+   の **`unattested`** として exact reasonをsurfaceする。owner承認close+relaunchを実行可能なnext
+   actionとしては返さず、active sublaneではHerdr conditional-close導入待ちを明示する
    (自動 close/relaunch はしない)。slot に別 locator の同名 agent が複数ある (duplicate) → fail-closed。
 6. slot-uniqueness (要求側、#13261 j#72532): 要求された `(provider, lane)` slot が重複する場合は
    **いかなる side effect (binary 解決 / registration / inventory snapshot / launch) より前に**
@@ -544,13 +640,15 @@ herdr agent start <NAME> [--cwd PATH] [--env KEY=VALUE]... [--no-focus] -- <argv
 自動テストは injected runner で argv + JSON parse を検証する (live binary は不使用)。end-to-end
 live smoke は coordinator の post-review step。
 
-### 空 base pane の回収 (cold start、#13330)
+### 空 base pane の保存 (cold start、#13330 / #15227)
 
 herdr workspace は生成時に必ず `root_pane` (agent 無しの空 base shell) を 1 個持つ (実測:
 `workspace create` 応答 = `result.type == "workspace_created"` に `result.workspace.workspace_id`
 + `result.root_pane.pane_id`、`pane_count: 1`)。cold start で初回 `agent start` を `--workspace`
 無しで呼ぶと herdr が workspace を暗黙生成し、この root pane が使われない残骸として agent pane の横に
-残る (dogfood 発見 #12)。回収は次の決定的手順で行う (auditor ruling #13330 j#73225、対処 (a) 採用):
+残る (dogfood 発見 #12)。旧runtimeは作成応答のlocatorだけでこのrootを回収したが、Herdr 0.8の
+`pane close <locator>`はterminal generationを原子的に条件化できない。#15227以後は、このcosmetic
+rootをcurrent generationへ束縛するprivate pinが無い限り **保存してzero-close** とする:
 
 1. 全 slot を launch 前に分類する (adopt / launch / dry-run plan)。
 2. launch する slot があり、かつ adopted agent が既存 workspace を pin していない (pure cold start) 場合は
@@ -558,30 +656,31 @@ herdr workspace は生成時に必ず `root_pane` (agent 無しの空 base shell
    `root_pane.pane_id` を保持する。応答が parse 不能なら fail-closed (推測で pane を閉じない)。
 3. 各launch slot用paneを、保持したrootまたは直前のlive managed paneをanchorに`pane split`で作成し、
    `agent start --pane <pane_id>`で起動する (§5.0)。
-4. **全 launch 成功後に限り** `herdr pane close <root_pane_id>` で、この run が生成した root pane
-   **のみ**を閉じる。
+4. 全launch成功後も、root用のterminal-bound conditional-close authorityが無い現行providerでは
+   `herdr pane close`を呼ばず、`generation_unproven_root_preserved`を記録する。
 
 fail-closed / safety 不変条件:
 
-- 閉じる対象は **この run が `workspace create` で得た `root_pane.pane_id` 一点のみ**。scan で「空
-  shell らしき pane」を探して閉じることは禁止 (user 自身の shell を誤 close しない構造的保証)。
+- 作成応答のlocatorは観測用でありclose authorityではない。scanで「空shellらしきpane」を探すこと、
+  fresh inventoryからhistorical terminalをbackfillすること、locator-only closeへfallbackすることは禁止。
 - **prepared / launched locator は target workspace 内であることを fail-closed 検証する** (#13330
   review j#73231 / #15101)。`pane split`の`pane_info`と`agent start --pane`の
   `result.agent.pane_id`が要求workspace・tab・exact paneと一致しない場合は
-  `HerdrSessionStartError` で raise する。検証は reclaim step より前で発火するため、mislocated launch
+  `HerdrSessionStartError` で raise する。検証はroot保存判定より前で発火するため、mislocated launch
   時は created root pane を close せず、別 workspace 側の残存 base pane を見逃さない。
-- launch 失敗は reclaim より前に raise する (created workspace / root pane は残骸として残し、実装失敗
+- launch 失敗はroot保存判定より前に raise する (created workspace / root pane は残骸として残し、実装失敗
   として扱う。blind close しない)。
-- `pane close` 失敗は **non-fatal** (agent slot は既に live で、空 base pane は cosmetic 残骸)。
-  `SessionStartResult.base_pane_detail` に記録し、session-start 全体を hard-fail しない。
+- 保存は **non-fatal** (agent slot は既にliveで、空base paneはcosmetic残骸)。
+  `SessionStartResult.base_pane_detail` にtyped reasonを記録し、session-start全体をhard-failしない。
 - all-adopt / 既存 workspace への launch は base pane を新規生成しないため byte-invariant。
 - workspace_registry schema は無変更 (§2 invariant 維持)。herdr terminal workspace id は
   `SessionStartResult.herdr_workspace_id` (created / adopted prefix) として観測用に運ぶだけで、mozyo
   registry には持ち込まない。mixed adopt+launch では adopted locator の `wN` prefix から launch target を
   導出し、複数 workspace prefix が混在する場合は fail-closed。
 
-live smoke (cold start bare `mozyo` 後に root pane が残らないこと、adopt 経路が byte-invariant で
-あること) は coordinator の post-review 実機 acceptance で確認する。
+live smokeはcold startでrootへのcloseが0、agent pairがlive、adopt経路がbyte-invariantであることを
+確認する。将来server-side conditional closeを導入する場合だけ、root専用private pinとeffect-edgeの
+exact再joinを新しい契約として設計する。
 
 ## 5.1 lane_placement — pair 配置の設定駆動化 (Redmine #13646 / #14569)
 
@@ -696,11 +795,10 @@ binding を持たない (provider の選択ではなく split の配分である
 - **active-target と first-launch `--focus` (Redmine #13646 R1-F1、実機実測)**: herdr の split は
   **container の active pane** を割る。`agent start` に pane-target flag は無い。全 launch を
   `--no-focus` にすると container の空 root pane が active のままなので、2nd slot の `--split <dir>` は
-  **1st agent ではなく root pane** を割り、その root を reclaim した時点で nested split が畳まれ、1st agent
-  の暗黙 split が作った外側の既定 `right` だけが残る = **設定方向が無言で効かない**。
+  **1st agent ではなく root pane** を割るため、rootを保存する現行契約ではagent pairのdividerを正しく
+  attributeできない。
   → **fresh container では 1st launch を `--focus`** にして split target を 1st agent へ固定し、2nd 以降は
-  `--split <dir> --no-focus` とする。root pane reclaim は従来どおり **全 launch 成功後**
-  (partial-launch safety を壊さない)。
+  `--split <dir> --no-focus` とする。root pane自体はgeneration-unboundなので保存する。
   発火条件は: container occupancy = 0 かつ launch 対象 2 件以上かつ **effective split 方向が非空**。
   **single-provider / heal / mixed adopt では発火しない**。
   なお `--split right` literal (#13411) も同じ理由で本来効いておらず、観測される `right` は herdr 既定
@@ -708,7 +806,7 @@ binding を持たない (provider の選択ではなく split の配分である
   **#14568 の変更点**: 発火条件の第 3 項は「`split`/`order` が **explicit**」から「**effective** split 方向が
   非空」へ移った。product default で全 lane class が `down` を持つ以上、「operator が宣言したか」を
   問うと未宣言 workspace だけが focus を得られず、argv には `--split down` が出るのに実機は
-  reclaim で `right` へ畳まれる — 本 fix が防ぐはずの症状そのものになる。
+  root基準のnested splitになり、agent pairの方向を正しく主張できない。
 - **single-provider request**: `order` は **未要求の peer を暗黙 launch しない**。heal は欠けた provider
   だけを launch する。
 - **heal**: 生存 sibling の隣へ configured `--split <dir>` で launch する。既存 pane は swap / move /
@@ -722,11 +820,16 @@ binding を持たない (provider の選択ではなく split の配分である
 #### ratio actuation (Redmine #14569、実測 j#91140)
 
 herdr 0.7.4 `agent start` は **`--ratio` を持たない** (`pane split` / `pane move` は持つ)。したがって
-`ratio` は launch argv には乗らず、**全 launch 成功 + root pane reclaim の後**に herdr-native
+`ratio` は launch argv には乗らず、**全 launch 成功 + v4 attestation / completed generation-v2確定 + root pane保存判定の後**に herdr-native
 `pane resize --amount` で 1 度だけ actuate し、`pane layout` で **測って** 判定する。正本実装は
-`herdr_pair_split_ratio.finalize_container_geometry` (reclaim と ratio を 1 つの後処理にまとめた
-cohesive sibling。reclaim が先なのは、root pane を閉じると split tree が畳まれ、その前に測った
-geometry が直後に変わるため)。
+`herdr_pair_split_ratio.finalize_container_geometry`。generation-unbound rootは閉じず、後続のcolumn /
+ratioもrootをagent generationとして数えない。rootの存在自体はfailureではない。terminal-bound managed
+pane群がexact tilingする一意なsplit subtreeを構成し、root/外側paneがその矩形と非交差で、各effect直前の
+fresh full layoutでも外側pane+split fingerprintが不変なら、そのmanaged subtreeだけを測定・resizeする。
+subtree分離不能、overlap、非一意tree、外側driftの場合だけ`applied`を主張せずtyped failure/deferとする。
+各resize直前/直後に同じfresh terminal/v4/generation/layout joinを再実行する。ただしHerdr 0.8の
+`pane resize --pane <locator>`はserver-side conditional generationを持たないため、最後のreadとdispatch間の
+same-locator ABAはprovider residualであり、原子的解消にはprovider CASが必要である。
 
 - **actuate するのは「この run が今作った divider」だけ**。判定は
   `launched >= 1 かつ (container の初期 occupancy > 0 または launched >= 2)` — `--split` を出した launch が
@@ -885,7 +988,8 @@ kind 層が参照されるのは **durable な lane_kind が解決でき、か�
   lane の lifecycle row を **launch が返った後**に declare するため、初回 launch 時点に stored kind は
   存在しない。context を渡さないと「pane を実際に作る launch」だけが `lane_class` 幾何になり、以後の
   heal だけ設定どおりになるという逆転が起きる。よって actuator は `prepare_actuator_lane_session`
-  (create / heal / v1 replacement が通る唯一の funnel) へ pre-launch に context を渡す。
+  (create / heal / current v4 replacement が通る唯一の funnel) へ pre-launch に context を渡す。
+  v1-v3 side-binding は診断専用で、この funnel の current launch authorityにはならない。
 - **heal** = lane lifecycle authority row の generation-bound `lane_kind` (schema v7、
   `managed-state-model.md`)。launch chokepoint が **network 無し / display cache 無し**で offline 読解する。
 - **矛盾は fail-closed**: 両方あって不一致なら片方が stale。launch admission (#14242 の
@@ -1225,6 +1329,11 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
 - 列数 `N` はHerdrが表現できる最小ratio `0.1`から最大10とする。11組目以降は最初のpane move前に
   fail-closedする。各resizeは指定paneの最近RIGHT軸ancestorが「現在列からtab右端まで」のrectであることを
   再確認し、command成功ではなく再読したratioのstrict progressと最終幅差で判定する。
+- generation-unbound cosmetic rootはcloseせず、column authorityにも数えない。全managed paneのv4 attestation
+  + completed generation-v2を確定してから、managed paneだけがexact tilingする一意なsplit subtreeを作る。
+  root/外側paneはsubtreeと非交差でなければならず、そのpane rectと外側split fingerprint、managed authority、
+  phaseごとのinternal topologyを各detach/attach/resize直前にfresh readで再照合する。rootが安全に分離できる
+  2/3 projectは従来どおり`applied`、overlap/nonunique/driftだけがzero-effect failureである。
 - **decode できることは coordinator である証明ではない**。assigned name の `role` は provider token
   (`codex` / `claude`) であって workflow role ではないため、decode だけでは project coordinator と、この
   workspace へ誤配置・残留した implementation slot を区別できない (#14996 R2 review j#99885 finding_2 で、
@@ -1410,17 +1519,19 @@ resolver と `coordinator_shared_create_lock` fence をそのまま使う。
   distinct かつ非 nested と証明し (不能なら create 前 fail-closed)、`isolated_smoke_home` が `MOZYO_BRIDGE_HOME` を
   isolated home に向け、operator placement facade (`coordinator-placement.yaml: mode: shared_space`) を isolated home に
   書いて loader で round-trip 検証する。実 operator home / config は変更しない。
-- **clean-slate cleanup-authority (Acceptance 5、herdr 次元)**: `coordinators` label は herdr server global なので、
+- **clean-slate non-ownership guard (Acceptance 5、herdr 次元)**: `coordinators` label は herdr server global なので、
   actuation 前に read-only `workspace list` で **既存 `coordinators` space 不在**を証明する。存在 / labels unreadable は
   create 前 fail-closed (実 operator space を adopt / 汚染しないため)。
-- **observation (Acceptance 4)**: `RecordingHerdrRunner` が command 種別と非秘匿 identity token (`coordinators` label /
-  `mzb1_...` name / `wN:pM` handle) のみ記録し、`--env` 値 / home path / payload 全文は記録しない。evidence 要約は
-  count / bool / closed phase token のみ (durable journal 安全)。
+- **observation (Acceptance 4)**: `RecordingHerdrRunner` は command 種別と actuation receipt を private tape に
+  保持するが、公開 evidence は count / bool / closed phase token のみとする。workspace ID、pane locator、
+  terminal ID、`--env` 値、home path、payload 全文は公開面へ出さない (durable journal 安全)。
 - **project 成功の authority**: `prepare_session` が例外を投げず返ったこと自体は成功ではない。
   `SessionStartResult.ok` が true の場合だけ project を `created` / `adopted` とし、false は
   `failed` (`failure_phase=session_start`) とする。semantic failure でも実際に launch 済みの role / name /
-  pane handle と workspace create receipt は内部 cleanup tape に保持するが、公開 evidence へ identity / raw detail /
-  path を出さない。create count も成功 project 数から逆算せず、recorder の実 create request 数を使う。
+  pane handle と workspace create receipt は内部 tape に保持するが、**cleanup authority は successful
+  `workspace create` receipt の workspace ID だけ**であり、pane handle は observation 専用とする。公開 evidence へ
+  identity / raw detail / path を出さない。create count も成功 project 数から逆算せず、recorder の実 create request
+  数を使う。
 - **concurrent 収束 (Acceptance 3)**: `run_concurrent` が project ごと 1 thread を `threading.Barrier` で同時 release し、
   isolated home 共有で実 `coordinator_shared_create_lock` を競合させる (§5.1.1 create fence と同じ deterministic 手法)。
   **create count 1 / duplicate agent 0** を実測する。#13948 startup-transaction は managed wrapper の write と
@@ -1428,8 +1539,14 @@ resolver と `coordinator_shared_create_lock` fence をそのまま使う。
   execution evidence が別 authority になり、正常 launch も `startup_evidence_unavailable` になるため禁止する。
   同時開始で生じる短い lock 競合だけは、owned smoke 専用 fence が bounded retry する。これは隔離済み診断内の
   非破壊 write に限り、通常 operator command / rollback の fail-fast policy は変更しない。
-- **cleanup + residue (Acceptance 5)**: launch した exact pane handle のみ close し (workspace は最終 pane で auto-vanish、
-  #13380)、`workspace list` / `agent list` を読み返して residue 0 を証明する。generic kill は行わない。
+- **cleanup + residue (Acceptance 5 / #15227)**: generic / non-disposable harness は destructive cleanup capability を
+  持たず、launch locator は terminal generation を bind しないため **`pane close` 0 / `workspace close` 0** とする。
+  disposable driver だけが、server を mint した親 process・owned child 生存・endpoint exact・全 worker exact-handle
+  containment の連言後に、successful `workspace create` receipt の ID 集合へ固定した one-shot capability を mint する。
+  その capability が `workspace close <receipt-id>` を各 ID 最大 1 回送った場合のみ cleanup completed とし、続けて
+  `workspace list` / `agent list` を読み返して residue 0 を証明する。capability 不在、child dead、endpoint drift、
+  worker 未 containment、receipt 不在、non-disposable は workspace-close 0 かつ nonclear / failed。generic kill と
+  locator 由来 close は行わない。
 
 unit / integration は共有 fake (`support.herdr_fake.FakeHerdr`、face H `workspace list` を追加) で駆動し、実 live smoke
 (実 herdr binary + disposable instance) は Review 承認・integration・CI 後に #14185 が同 `SharedSpaceSmokeHarness` を
@@ -1479,6 +1596,15 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     `server stop`)。**mint した process のみ**が、かつ owned child 生存中のみ保持する。
     forked worker は無条件に拒否する。許可される command 集合そのものは下記 allowlist が定義する。
 
+  smoke workspace teardown はこの generic cleanup authority を広げない。`workspace close` は
+  `CLIENT_CALL_SUBCOMMANDS` にも `MINTER_ONLY_SUBCOMMANDS` にも公開せず、別の
+  `OwnedWorkspaceCleanupCapability` だけが呼べる dedicated dispatch とする。この capability は endpoint capability を
+  mint した親で、worker fleet へ入った後に exact process handle がすべて contained と positive に確定し、かつ
+  successful `workspace create` receipt が 1 件以上ある時だけ mint される。target 集合はその receipt ID に固定し、
+  consumer は別 ID を渡せず、dispatch 前に one-shot consume する。child dead / endpoint drift / non-minter /
+  uncontained worker / receipt 不在・不正 / capability 不在は workspace-close request 0、cleanup non-completed とする。
+  graceful `server stop` と exact owned-process fallback の既存契約は変更しない。
+
   分割が必要な理由は fork の非対称性である: forked worker は server の直接 parent ではないため、
   継承した handle への `Popen.poll()` は `waitpid` の `ChildProcessError` 経由で
   **生存中の child を「終了」と誤読する**。共有 gate に `poll()` を足すと健全な worker call が全て
@@ -1525,15 +1651,15 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     失敗分岐の evidence も同時に失われる。`KeyboardInterrupt` / `SystemExit` は捕捉せず伝播させるが、
     その場合も exact-handle reap は `finally` で通る。
   - **受領済み receipt は caller 所有の container へ逐次公開する**。collection 関数の local に
-    溜めると、`output.close()` 等 tail の失敗が **既に届いた receipt ごと巻き戻す**。exact pane
-    locator を失うと receipt-tape 駆動の cleanup が実行できず、観測済み gate counter も失う
+    溜めると、`output.close()` 等 tail の失敗が **既に届いた receipt ごと巻き戻す**。successful workspace-create
+    receipt を失うと receipt-bound cleanup capability を mint できず、観測済み gate counter も失う
     (review j#91687 F3)。例外時に missing placeholder で埋めるのは **未受領 index のみ**とする。
   - **receipt の index は worker の自己申告であり、信頼せず検証する**。範囲外 index は無視され、
     duplicate index は先着を**無言で上書き**して exact locator を落としていた
     (review j#91741 F3 実測)。expected range / unique / project identity を検証し、anomaly は
-    closed token の typed round failure にする。**ただし拒否した receipt が持つ locator も
-    cleanup 用に lossless に保持する** — 拒否は「evidence に採らない」であって「その pane を
-    放置してよい」ではない。
+    closed token の typed round failure にする。**ただし拒否した outer receipt 内の successful workspace-create
+    receipt も cleanup-only tape へ lossless に保持する**。pane locator も private observation として保持するが、
+    terminal generation が bind されないため cleanup target には昇格させない。
   - **index は型についても strict に検証する**。`bool` は `int` の subclass で `True == 1` は
     `1` と同じ hash を持つため、`isinstance(index, int)` だけでは `bool` index が range 検査を
     通過し、`collected` map 上で**別 project になりすます**。実測では malformed receipt が
@@ -1573,9 +1699,9 @@ live capability を持つ process 内で実行した結果、実 operator Herdr 
     前に `config.toml` を書くため、`_process is None` で早期 return すると owned tree が残る。
   - containment 後の反復 shutdown は withhold を**弱めない** (policy は instance state なので
     既定引数で上書きされない)。
-  - `server stop` 自体は containment を**強める**方向 (自 socket を死なせる) なので停止は行う。
-    withhold するのは path の解放のみ。cleanup (`pane close` 等) も fence しない — 実行した方が
-    residue が減り、かつ path 解放を伴わないため。
+  - `server stop` 自体は containment を**強める**方向 (自 socket を死なせる) なので停止は従来どおり行う。
+    withhold するのは path の解放である一方、smoke の destructive workspace cleanup は containment 後に限る。
+    uncontained / unknown の場合は workspace-close 0 とし、generation-unbound pane locator へ fallback しない。
   - load-bearing test は「正常 return の survivor」と「partial-start / queue-close / join-thread
     例外」の双方で **root removal 0** を要求する。
 - **evidence は 2 方向の負証明を持つ。** `operator_endpoint_requests` (実際に dispatch された

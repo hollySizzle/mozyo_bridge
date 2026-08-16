@@ -520,7 +520,8 @@ Table naming:
       pre-epoch build が hibernate した lane を前進させる手順は close-first に固定する
       (`lane_epoch_legacy_recovery_plan.CANONICAL_STEPS`): 旧 pair 両 slot を terminal close →
       attested-live intersection=0 の fresh 確認 → backup-first store migration + strict
-      readback → lifecycle epoch `0→1` adoption → v3/native epoch1 で fresh pair relaunch。
+      readback → launch-generation v1 backup/rebuild → lifecycle epoch `0→1` adoption →
+      v4 self-attestation + generation v2 / native epoch1 で fresh pair relaunch。
       adoption を先に置くと crash 時に `epoch=1` + v1 store + live old pair が残り、上記の
       pre-effect fence が次の close を拒否する **自己 deadlock** になる。
       - ただし **この sequence を実行する rail は置かない**。j#96866 が実環境で計測した
@@ -549,7 +550,7 @@ Table naming:
         不完全な答えで census を狭める)。CLI flag は `--assert-slot` = **assertion 専用**で、
         導出集合と exact 一致しなければ refuse する。供給源にはしない。
       - 全 workspace drain / callback supervisor 停止 / attestation store migration /
-        lifecycle v9→v10 backup-first migration / new runtime install / top coordinator
+        lifecycle v9→v11 backup-first migration / new runtime install / top coordinator
         first relaunch を含む **global rollout は別の durable work unit** であり、fleet の
         外側の非 consumer 主体を必要とする。本 plan はその window の中でだけ有効。
     - **global offline rollout は plan と外部 one-shot execution を分離する**
@@ -559,10 +560,20 @@ Table naming:
       固定した内部actuation面であり、両mutation verbともliteral `--execute` がなければ
       zero-writeで拒否する。TestPyPI publishは本railの責務外で、既に存在するexact artifactだけを
       download/verify/installする。
+      - v4/4-store rolloutを生成・検証できない旧installed binaryでplanを作らない。bootstrapは
+        exact candidate artifactを隔離venvへ展開し、そのabsolute CLI pathとprovenanceをpinして旧homeを
+        read-only capture → fresh owner approval → delegate/runする。旧schema v3 actionはeffect前にtyped
+        refusalし、新candidateでの再planを要求する。ただしaction schema v1 + canonical plan schema v3の
+        既存sealed recordは、共通のpermission/symlink/size/canonical JSON/payload seal検査を通る
+        **status-only readback**では凍結済み15 phaseと3-store targetを読み続ける。strict `load` /
+        `load_locked` / `create` / `save_locked`はcurrent v4専用で、status readをexecution compatibilityや
+        backfillに昇格させない。plan v4でもprivate authorityが旧形なら同じくstatus-onlyである。
+        candidateはold v1 generationを読むが通常launchへは
+        書かず、consumer zero後のbackup/rebuild phaseだけがv2へ前進させる。
       - plan は home registry の **全 workspace id / project name**、global Herdr inventory の
         **全 managed assigned name**、current top identity、両 supervisor の secret-safe status、
-        attestation / lane lifecycle / startup transaction の **3 store schema + logical content
-        digest**（startupはpublic migration primitiveのmigration-plan digestも含む）、各 worktree の
+        attestation / lane lifecycle / launch generation / startup transaction の **4 store schema +
+        logical content digest**（startupはpublic migration primitiveのmigration-plan digestも含む）、各 worktree の
         content-sensitive WIP fingerprint を収集する。絶対 path、credential、pane text、WIP bytes は
         public JSON に含めない。project name が current project と異なる workspace は
         `unrelated_project` と明示し、黙って rollout 対象外にしない。
@@ -573,8 +584,9 @@ Table naming:
         index を materialize しうる既知の bookkeeping 例外を除き、authority row / schema / process /
         worktree を変更しない。
       - canonical plan は top 以外を先に stop、top を最後に stopし、restore は top を最初にする。
-        schema transition は attestation `→v3`、lane lifecycle `→v10`、startup transaction `→v2`
-        を明示する。artifactのsource SHA / `refs/heads/<branch>` / workflow run id / wheel SHA-256 /
+        schema transition は attestation `→v4`、lane lifecycle `→v11`、launch generation `v1→v2`
+        backup/rebuild、startup transaction `→v2`を明示する。artifactのsource SHA /
+        `refs/heads/<branch>` / workflow run id / wheel SHA-256 /
         sdist SHA-256の5者がすべて揃う場合だけ `exact_pin_ready=true` とする。不足pinがあっても
         plan作成は成功するが実行承認には使えず、形式不正なpinはplan無しで拒否する。全pinは
         canonical plan bodyとdigestへ含める。plan body の sorted compact JSON を SHA-256 して
@@ -593,8 +605,17 @@ Table naming:
         canonical writer `coordinator` を、gate固有ruling (`#14838 j#97993`) + committed
         `.mozyo-bridge/config.yaml` blob + exact journal/gate evidenceの3部anchorで解決し、markerの
         direct-owner判断軸と連言する。どちらか一方だけではglobal stopをauthorizeしない。
-      - `delegate --execute` は全workspace pathと全agent locatorをpublic planへ混ぜずprivateに
-        再captureし、planのidentity集合とexact一致させる。`${MOZYO_BRIDGE_HOME}/
+      - `delegate --execute` は全workspace pathをpublic planへ混ぜずprivateに再captureする。
+        restore用 `agents` はworkspace/lane/provider/assigned-name（legacy recoveryではissue pointerも）
+        だけを保持し、破壊的停止のauthorityと兼用しない。停止authorityはprivate
+        `close_authority={version:2,pins:[...]}` のclosed shapeへ分離し、各pinを
+        workspace/lane/role/assigned-name/locator/`startup_action_id`へ束縛する。capture時に
+        同一fresh full canonical inventory、name/locator/terminalのglobal uniqueness、exact target、
+        v4 attestation、completed launch-generation v2を全live plan targetについて連言できない場合は、
+        action作成・runner準備より前にtyped zero-effectで拒否する。raw terminalはactionへ保存せず、
+        fresh join中だけ扱う。legacy attestation v1-v3 / launch-generation v1のlive fleetを本rail自身で
+        停止してmigrationする例外は設けない（意図的zero-close）。必要ならidentity-bearing conditional
+        global-stop primitiveを別Design Consultationで扱う。`${MOZYO_BRIDGE_HOME}/
         offline-rollout-actions-v1/<action-id>/` (0700、record 0600、payload SHA-256 seal、exclusive
         nonblocking lock) にactionをreserveしてから、candidate wheelをexact SHA-256で検証する。
         action idはexact plan digest + approval pointerから決定論的に導出し、同じ承認の並行delegateは
@@ -607,22 +628,33 @@ Table naming:
         env override名・verified absolute alias・symlink解決後のexec targetをprivate actionへ固定する。
         one-shot LaunchAgentはこの固定済みprovider bindingだけを受け取り、欠落・過剰・relative path・
         非実行可能化・symlink retargetをrestore時のambient PATHで補完せずtyped refusalにする。
+        同じaction作成前captureでprivate closed `restore_intent` v1も固定する。canonical restore groupごとに
+        phase、workspace/lane、recovery issue、sorted provider/name identity、private nonceと、そのnonceから
+        決定論的に導出したexpected startup action idをsealする。raw terminalは保持せず、nonce/action idは
+        public plan/status/text/repr/error/logへ出さない。missing / old / malformed intentはaction作成前、または
+        runのport構築前にtyped refusalし、live stateから補完しない。
       - `run --execute` はLaunchAgentが注入したexact action tokenを持ち、かつ
         `MOZYO_AGENT_ROLE` / `MOZYO_WORKSPACE_ID`を持たないconsumer外processだけをadmitする。
+        top-level action schema/store root/action-idはv1のまま維持し、旧sealed actionの`status` / readbackを
+        継続する。一方runは最初のsupervisor停止effectより前にprivate `close_authority` v2をstrict decodeし、
+        private `restore_intent` v1とcompleted restore receiptもstrict decodeする。いずれかが
+        missing / old / tokenless / malformedならtyped blockする。live inventoryから旧actionへ
+        `startup_action_id`をbackfillせず、fresh executionにはfresh approval pointerで新actionを作る。
         expected launchd labelを副作用前にprivate actionへ固定し、run時に同labelのlive jobを
         readbackする。同一OS user内での暗号的identity分離ではないため、sealed action / exact token /
         managed-consumer不在 / launchd bindingの連言をこの境界の保証上限とする。
         actionのphase prefixと各readback receiptを1 phaseごとにatomic保存し、crash/retryは未完
         phaseから前進する。effect前にactive intentが既にdurableだった場合だけreplayと分類し、同じ
         runの最初の `mark_phase_started` はreplay authorityにしない。phase順はplanの
-        `supervisor stop → non-top stop → top stop → zero → backup → 3 migration → exact install →
+        `supervisor stop → non-top stop → top stop → zero → backup → attestation/lifecycle/startup migration
+        → launch-generation v1 rebuild → exact install →
         legacy epoch adoption → top first → remaining → supervisor pair → final verify`から変更しない。
       - pre-v10 hibernateでepoch未発行のlaneをこのwindowで復帰する場合は、plan/delegateの双方へ
         repeatableな `--legacy-recovery ISSUE:JOURNAL` を同一順で指定する。issueはlifecycle authority上の
         **exact 1 row**へ解決し、`hibernated + released + settled replacement + canonical epoch 0`を
         #14756のpure adoption predicateで満たす場合だけplanへ入る。history上の全hibernated rowを
         暗黙採用・復帰しない。target、expected revision、decision pointer、fresh codex/claude assigned
-        namesをplan digestとowner approval manifestへ含める。global consumer=0とv10 migration、exact
+        namesをplan digestとowner approval manifestへ含める。global consumer=0とv11 migration、exact
         runtime installの後にepoch `0→1`をCASし、その後の`session-start`がepoch 1を自己attestする
         fresh pairだけを復帰として認める。phase receipt前crashはstored revision/epoch/decision pointerの
         exact一致時だけreplay成功へ畳み、別writerのepoch 1をlaunderしない。lane固有Git worktreeは
@@ -633,19 +665,73 @@ Table naming:
         patch、Git index、untracked path/archiveをprivate directoryへ保存し、planの
         content-sensitive WIP digestを再照合する。non-top phaseがまだliveなtop workspaceのsnapshotを
         先取りしない。workspace idはpath componentに使わずhashしたprivate directoryへ格納する。
-        stash/reset/checkoutは行わない。closeはplan時のassigned-name + locatorの
-        exact generationだけを対象とし、同名different locator、foreign/unmanaged row、inventory
-        unreadableはzero-progress refusal。既にabsentなexact planned nameはcrash replayとしてのみ
-        goal stateへ畳み、consumer=0をfresh raw/projection countの連言で確認する。
-      - backupはattestation/state container/startup seal+DBをSQLite logical snapshotとreadbackで
+        stash/reset/checkoutは行わない。各close直前にfresh full snapshotを取り、sealed pinの
+        assigned-name + locator + `startup_action_id`を全live rowのworkspace/lane/provider、in-memoryの
+        server-owned terminal、v4 attestation、completed generation-v2へ再joinする。duplicate・malformed・
+        unexpected row、token mismatch、store不読は当該close前にzero-closeで拒否する。ただしHerdr 0.8のmutationは
+        locatorしか受け取らずatomic compare-and-closeを持たないため、fresh checkから`pane close`までの
+        same-locator restore raceはprovider制約として残り、terminal値をpublic planへ出して補えない。
+        first non-replayでtarget absentは拒否する。durable active phaseのreplayだけは、保存tokenが指す
+        v4/generation-v2のterminalをfresh full inventoryのname/locator/terminal全軸からpositive absenceと
+        証明できるtargetを再closeせずgoal stateへ畳む。各close後も同じpositive absenceを必須とし、
+        terminal reclaim / unreadable / mismatchは後続close・launch・migration 0で停止する。
+        consumer=0はfresh raw/projection countの連言で確認する。さらにconsumer-zero receiptを再利用せず、
+        **各後続effect edge**で3-state fenceをfreshに評価する。(1) restore前のbackup/migration/rebuild/install/
+        adoptionはfull raw/projection zero + 全original close pinのterminal-bound positive absence + schedulerの
+        positive stopped readback、(2) restore中はcompleted groupのexact current v4/generation-v2 rosterと
+        未restore groupのexpected action absent + original pin absence、(3) restore後のsupervisor/final phaseは
+        全new generationのexact rosterを要求する。unmanaged/extra/malformed row、store/scheduler不読、name/
+        locator/terminal reclaimはそのedge以降のeffectを0にする。phase handler入口だけでなく、store/hash等の
+        preflight後、各mutation primitiveを呼ぶ直前にも同じfenceを再評価する。
+      - agent inventoryだけではshell-only paneを観測できないため、delegateは同じfresh strict full-pane
+        snapshotもcaptureする。agent rowとはname/role/locator/terminalを双方向exact joinし、agentの無い
+        canonical paneだけをprivate `passive_pane_intent` v1へlocator/workspace/tab/terminal全軸でsealする。
+        各restore groupはold completed participantが属したcontainer内のpassive root exact 1件を
+        `restore_container_intent` v1へ破壊的close前にsealし、ambient label searchで別rootを選ばない。
+        既存rootは触らずsplit anchorとして再利用する。split responseのtyped full identityだけは同processの
+        provisional allowanceとし、追加read/fenceを挟まずparticipantへ直ちにdurable記録してから、次の
+        pane-run/start edgeでfull snapshotへ再joinする。crashで記録に至らないpaneは次回residualでありadoptしない。
+      - conforming session-startとの競合は、owner-privateな共通namespaceに置く2本の0600 `flock` gateで直列化する。
+        一方はNFD+case-foldしたresolved home path、他方はhomeのdevice/inodeをfull digest化し、同じbyte順で取得する。
+        これによりpathのrename/recreate、macOSのcase/Unicode alias、bind-mount aliasのいずれでもlock inodeを分岐させない。
+        通常のnon-dry public/direct
+        startはfirst effectからcompletionまでshared lease、offline `run`はprivate schema admission後かつ最初の
+        supervisor/close effect前からfinal verifyまでexclusive leaseを保持し、inner restoreへopaque leaseを渡す。
+        action lock → session gate →既存store lockの順序を固定し、crashではkernelがleaseを解放する。このgateは
+        cooperativeなcurrent processだけを覆い、raw Herdr、provider wrapper単独、旧installed runtimeによる
+        launchを排除しないため、full-pane/startup/consumer fenceの代替ではない。
+      - backupはattestation/state container/launch-generation/startup seal+DBをSQLite logical snapshotとreadbackで
         検証する。同じverified-backup phaseでattestation/lifecycleのprivate cloneをtarget schemaへ
         migrationし、deterministic logical post-digestをphase receiptへ固定する。live migration後の
         readbackとcrash replayはこのpost-digestとのexact一致を必須にし、`active_phase`だけではtarget
         versionを受理しない。migrationは既存public primitiveをcomposeし、startup v2 replayはprivate actionの
         typed completion receipt + recovery artifact再検証を必須にする。installはprivateに保持した
         exact wheelをpipxへ渡し、通常PATH executableのversionをreadbackする。restoreはtop unitを
-        先に`herdr session-start`し、各nameをfresh inventory locator + v3 self-attestationでjoinして
-        からremaining unitへ進む。supervisorはpair install/statusの両方で2 agent loaded、home pin、
+        先に進めるが、public CLI/argv/stdin/stdoutをnonce transportにしない。exact candidate runner内で
+        CLIと共通のtyped session-start serviceをin-process呼出しし、private nonceを直接渡す。provider
+        wrapperだけはsealed production `target_cli`を`MOZYO_BRIDGE_LAUNCHER`へ固定し、runner action tokenと
+        caller identity envをprovider envから除去する。candidate venv/module/wheel/version provenanceが
+        exactに証明できなければfallbackせずlaunch前に拒否する。sealed repo selectorから解決したpathは
+        session-start内部へexpected workspace idも渡し、registry refresh / startup action reserveの直前と、
+        `workspace create --cwd` / `pane split --cwd`の各provider invoke直前にpath-derived identityとの
+        exact一致を再評価する。legacy recoveryは同じworkspace idを継承するsibling worktreeを区別するため、
+        sealed lifecycle generation + `worktree_identity`をfresh local `git worktree list`へexact-one joinし、
+        実際に`--cwd`へ渡すpathとの一致も要求する。pathだけをauthorityにして返却action idで事後検知する
+        形にはしない。providerがpath fd/identityをatomic consumeするAPIは無いため、最後のidentity checkから
+        provider invokeまでの最小raceはcloseのlocator-only制約と同様に残る。
+        各groupのlaunch直前にexpected action absenceとcumulative partitionを再確認し、返却action id、
+        completed-success transactionのunit/participants/pane-bound terminal receipt、fresh inventory、v4
+        self-attestation、finalized generation-v2 tokenをexpected actionへexact joinしてから次groupへ進む。
+        offline window内のstartup transaction nonterminalはhome-globalにexact 0件、restore group実行中だけは
+        selected expected action exact 1件を許し、別workspace/lane/providerのplanned/rollback actionもforeign
+        residualとして拒否する。health確認後も全participantのgeneration-v2 finalize readbackをterminal phase
+        write直前に要求し、pending/unreadableならactionを`health_check`に残してsuccessを書かない。このstateは
+        同じoffline action内で自動resumeせず、明示的なrollback/recoveryとfresh approval actionを要する。
+        crash後はこのcompleted exact stateだけを**folded**として再launchせず畳む。planned / health-check中 /
+        rollback owed / foreign action / missing・extra participantまたはlive slotはatomic residualであり、
+        cleanup・replacement nonce mint・追加launchをせずtyped blockする。restore phase receiptはclosed v1で
+        group action idsとcumulative namesを記録し、保存時とresume時の双方でintentとの完全一致を検証する。
+        supervisorはpair install/statusの両方で2 agent loaded、home pin、
         executable、credential readinessを確認する。
       - `status` はaction/plan/phase/reason/timestampだけを返し、workspace path、locator、WIP bytes、
         backup path、credentialを公開しない。status read成功は途中/blockedでもcommand successで、
@@ -1092,8 +1178,8 @@ Table naming:
       fence は lifecycle row の mutation しか捕捉せず、**process launch は同 row を触らない**
       （`declare_active`(existing)=`already_declared` zero-write、`declare_lane`=idempotent、実測）
       ため、live-zero read → terminal CAS の間に pair が起動すると live のまま `retired` になりえた。
-      新 schema / durable claim は導入せず、**#13882 three-boundary lock を再利用**して解決する:
-      全 managed launch（ordinary create/heal、v1 replacement binding、quarantine `heal_receiver`、
+      新 schema / durable claim は導入せず、既存の attestation-store exclusion lock を再利用して解決する:
+      全 managed launch（ordinary create/heal、current v4 replacement、quarantine `heal_receiver`、
       lane identity を持たない bare / scratch / shared-space session start）は既に home の
       attestation-store lock を **shared 非 blocking** で「最初の attestation read 前から最後の
       actuation まで」保持するので、terminalizer が同 lock を **exclusive 非 blocking** で
@@ -1394,6 +1480,9 @@ Table naming:
         再実行した run」が前の run の record を継承し、rollback が **自分が起動していない pane** を閉じうる。
       - **participants** = provider / assigned-name / launch locator / launch receipt。各 fresh launch の**直後**に記録する
         (最後にまとめて記録すると、2 つの start の間で死んだ run — まさに partial pair — の第 1 agent が誰の物か分からなくなる)。
+        現行のpane-bound receiptはsplit応答のterminal idを含む`pane_bound_v2`であり、`agent_started`のterminal idと
+        exact一致して初めてlaunch-generation finalizeへ進む。旧`pane_bound_v1`は解析互換のみで、terminal generation
+        authorityには昇格しない。正本は`vibes/docs/specs/herdr-native-identity.md`のHerdr 0.8 launch contractを参照。
       - **phases** = `planned` → `launching` → `health_check` → `rollback_owed` | `success_owed` → `completed_rolled_back` |
         `completed_success`。terminal は write-once で、replay は record から答える (再 close しない)。
       - **reserve は bootstrap 可 / rollback は不可** (意図的な非対称): reserve は *新しい* identity を作るので何も忘れない。
@@ -1406,8 +1495,8 @@ Table naming:
         `startup_health_unconfirmed` として post-append inventory read-back / pair attestation / readiness / dispatch の前で
         zero-send にし、同 action の public rollback command を pointer として示すだけで auto rollback / auto close しない。
         `None` は startup result を持たない legacy non-Herdr adapter の互換値に限り、Herdr 成功の代用にしない。
-        **nested caller** (`sublane prepare-bound-pair --execute` の #13933 v1 replacement-binding 収束、#13948 R3) も同契約に従う:
-        fresh replacement participant が bounded startup health に達しないと v1 adapter は `replacement_binding_launch_unhealthy` で
+        **nested caller** (`sublane prepare-bound-pair --execute` の current v4 replacement 収束、#13948 R3) も同契約に従う:
+        fresh replacement participant が bounded startup health に達しないと adapter は `replacement_binding_launch_unhealthy` で
         fail-closed し、その **inner `SessionStartResult`** を catch site (`heal_lane_column`) で locator-free な startup observation
         (同一 startup `action_id` / role health / rollback debt) へ projection して outer の public `prepare-bound-pair` outcome まで
         **losslessly** 伝播する。outcome は同 action の pointer `mozyo-bridge herdr session-rollback --action-id <id>` (`--execute` なし)
@@ -1416,6 +1505,16 @@ Table naming:
         (rolled-back でない replay は startup debt で fail-closed のまま)。rollback debt は **fresh_launched participant** に限り、
         adopted / surfaced sibling は zero-close (pointer も出さない)。
         adopted / foreign / newer / identity drift / duplicate / obligation-present / busy / unreadable は zero-close。
+        normal participant の destructive close は、close 直前に 1 回取得した full inventory の全 row が
+        canonical name / locator / terminal identity を持ち各軸 global unique であり、同一 snapshot の exact
+        name+locator+terminal が v4 attestation と finalized generation-v2 の **同じ rollback startup action**
+        に一致し、provider がその native/terminal generation を server-side で条件付き close できる場合だけ許可する。
+        `pane_bound_v2` prepared shell も receipt の exact native/terminal、full pane inventory の terminal global
+        uniqueness、empty-input positive fact、同じ conditional-close capability の連言が必要。structured
+        `pane_bound_v1` は recorded locator の positive absenceだけを zero-close settle できる。legacy unstructured /
+        unbound / mismatch は常に zero-close。現 Herdr は conditional-close capability を公開しないため present
+        normal/prepared participant は保存される。将来 capability が提供されても post-close で agent/pane 双方の
+        full inventory と private terminal global absenceを再確認してからだけ durable completionへ進む。
         composer は 3 値を保つ: 捨てられるのは **transaction 自身が生んだ startup UI** (認識済み provider startup blocker で、
         誰も打鍵していないもの) だけで、LLM / operator が投入した composer body は **owner approval の有無に関わらず preserve**
         する。generic pending-composer discard authority (#13918 / #13933 の `direct_owner`) は**拡張しない**。
@@ -1628,8 +1727,8 @@ generic backfill / `repair-pins` / standard dispatch の緩和では直さない
 `sublane reconcile-recovered-pair-pins` は、exact issue/lane/worktree、active revision、lane generation、
 lifecycle decision、old pair、`recover-pair` source revisionから再構成した action id、fresh pair の
 live/settled/attested/action-bound generation、および exact structured owner authorizationを連言した場合
-だけ、`declared_slots + revision + updated_at` を bounded CAS で更新する。side-binding v1 では各 old
-locator も exact 照合する。disposition、lane generation、decision pointer、issue/worktree binding、
+だけ、`declared_slots + revision + updated_at` を bounded CAS で更新する。current v4 direct action と
+generation-v2 の各 old locator も exact 照合する。legacy side-binding は診断専用である。disposition、lane generation、decision pointer、issue/worktree binding、
 release/replacement axes、process、worktree、branch、message delivery は変更しない。byte-equal new snapshot
 の replay だけを idempotent success とし、expected-old / expected-new のどちらでもない snapshot、
 revision/generation/decision/action drift は zero-write である。
@@ -1725,53 +1824,29 @@ guard raised, the best-effort writer swallowed it (an agent boot must never be b
 both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability preflight could not see any of it: it joins the launcher's
 *advertised* schema against the *source runtime's required* schema — both **code** — and never opens the store on disk.
 
-- **Reads never migrate, and project older shapes up.** Identical to #13844: `readonly_compatible_select` emits the current column
-  vocabulary, padding a column an older shape lacks with its migration-default literal, inside **one explicit read transaction**
-  begun before the first schema query (the R9 torn-snapshot discipline). A v1 row's empty `replacement_action_id` is not a guess:
-  its writer predates the replacement transaction (#13806) entirely, so `''` is that row's **true** value. Padding it is a proven
-  backward-compatible projection; the field-drop hazard the pre-#13882 comment feared lives on the *write* side, and is refused there.
-- **Writes never migrate either — the deliberate divergence.** In `lane_lifecycle`, every mutation migrates through one write gate,
-  which is safe because all its readers ship in this build. Here, forward-migrating the shared home on a launch would leave every
-  **older installed launcher** hitting its own exact-version guard, silently dropping its attestation and booting live-but-unattested:
-  the identical defect, merely inverted onto the old runtimes. So a recognized older store is written in **its own shape**
-  (`writable_projection`) and left at its own version. Forward migration is an **explicit operator command only**, never a launch
-  side effect.
-- **v3 adds `lane_epoch` (#14756) under the same contract.** A v1/v2 row truthfully carries an EMPTY epoch (its
-writer was never handed one), so the read projection pads `''` — never a number, which would be a threshold claim the row
-never made. The write side gains the second instance of the refusal below: an **epoch-bearing** launch onto a v1/v2 store
-raises (`write_drops_lane_epoch`) rather than landing a row with the epoch dropped, because such a pair would be live,
-correctly launched, and permanently unresumable. An **epoch-less** launch still writes the older shape, so the
-mixed-runtime home keeps working exactly as #13882 requires. The operator rail is the same explicit
-`mozyo-bridge herdr attestation-store migrate --write`.
-- **The one write refusal is the field that cannot be dropped.** A **normal** launch (empty `replacement_action_id`) writes the v1
-  shape losing nothing. A **replacement** launch (non-empty `action_id`) is refused there and raises
-  (`write_drops_replacement_action_id`), because a dropped binding would leave a fresh worker a replacement recovery matches on
-  exactly (`sublane_stale_worker_recovery_live`) permanently unverifiable. The best-effort writer still never raises into a boot —
-  the refusal is surfaced by the **preflight, before the launch**, not by crashing the child.
-- **The bounded-pair v1 recovery exception does not drop that field** (#13933 R12). General replacement launches remain refused on
-  v1. The reviewed hibernated bound-pair convergence rail instead reserves a separate home-scoped action-binding row **before** its
-  launch, writes the fresh process's ordinary v1 self-attestation, then binds only after the startup transaction proves one exact
-  successful participant receipt. The immutable join is action + assigned name + workspace + role + lane + old locator + startup
-  nonce/action, and the bound join additionally pins the fresh locator and attestation timestamp. A retry resumes that same durable
-  startup receipt; an already-live slot with no prior reservation is foreign and is never adopted or retroactively bound.
-  Publication is an atomic private `0600` SQLite v1 side store with strict shape validation and compare-and-set writes; it never
-  migrates or repairs an unknown shape. The main-store shared generation lock spans v1 selection, reserve, launch/self-attestation,
-  receipt read, and bind, so explicit maintenance cannot overtake the action. Readers accept the side binding only while the selected
-  main store is still recognized v1 and every identity/generation field matches. Native v2 continues to carry
-  `replacement_action_id` directly; migration, a different action/generation, unreadable authority, unsafe permissions, or a torn
-  schema all fail closed. This is therefore a two-record exact binding, not an implicit migration or a silent field drop.
+- **Reads never migrate and older shapes are diagnostic-only.** `readonly_compatible_select` may
+  project v1-v3 rows into the current vocabulary for status, rollback-debt diagnosis, and
+  explicit offline migration planning. Missing `terminal_id` is never synthesized; those
+  rows are non-green and cannot authorize adopt, recovery, send, resume, or replacement.
+- **Managed writes are v4-only.** A normal, replacement, or epoch-bearing managed launch
+  refuses every recognized v1-v3 store before registry/startup/generation/Herdr effects.
+  `writable_projection` describes historical column shapes only; it is not launch admission.
+- **Legacy side bindings are not current authority.** The #13933 side store remains readable
+  only to diagnose historical rollback debt. Exact side rows cannot compensate for the
+  missing server-owned terminal identity and never make a live process current.
+- **Migration is one approved four-store offline action.** Attestation v1-v3 is rebuilt to v4
+  and launch-generation v1 is backup-first rebuilt to v2 while consumers are zero; startup
+  transaction and lifecycle stores are migrated in the same approval-bound plan. Old and new
+  runtimes refuse mixed shapes rather than writing conservatively into them.
 - **Admission joins the launcher against the REAL store, before any actuation.** `probe_store_schema` (read-only; creates nothing;
   an unopenable file is `store_unreadable`, never folded into "absent") + `decide_store_compatibility` run at the #13748/#13847
   preflight boundary in `prepare_session`, i.e. before the first herdr `workspace` / `tab` / `agent` write, so an incompatible store
-  aborts with zero herdr side effect. Admitted: absent store; exact-version store; older store + normal launch + a launcher that can
-  prove it writes that shape. Refused: unreadable; unsupported (naming *upgrade* vs *corrupt* honestly from `reader_upgrade_required`);
-  replacement launch onto a pre-`replacement_action_id` shape; a launcher that cannot prove it writes the store's shape.
+  aborts with zero registry/startup/generation/Herdr effect. Admitted: absent store or exact v4. Refused: unreadable,
+  unsupported, or any recognized older shape; all require the approved offline rollout.
 - **The launcher advertises the writable SET, not just its native schema.** The #13847 token (`mozyo_attest_capability_schema=`)
-  carries one exact version, which **cannot distinguish** a pre-#13882 build (writes v2 only) from a #13882 build (writes v1
-  conservatively) — both advertise `2`, yet only the second is safe against a v1 home. So `agent-attest --help` additionally
-  advertises `mozyo_attest_capability_stores=1_2` (underscore-separated: argparse help wrapping breaks on hyphens and width). A
-  launcher advertising no set is credited with its **native schema only** — fail-closed, because that is precisely the build whose
-  write guard is an exact match.
+  carries the native schema. `agent-attest --help` separately advertises the writable set;
+  current managed launch authority is exactly `{4}`. Readable `{1,2,3,4}` is a distinct
+  diagnostic/migration contract and never expands that writable set.
 - **Migration / rebuild is public, backup-first, and consumer-gated.** `mozyo-bridge herdr attestation-store {status,migrate,rebuild}`
   is the only supported rail (raw SQLite editing is a #13882 non-goal). Read-only plan by default; `--write` acts. `migrate` is
   additive and idempotent; `rebuild` rotates an **unreadable / unsupported** store into `backups/` and is refused for a recognized

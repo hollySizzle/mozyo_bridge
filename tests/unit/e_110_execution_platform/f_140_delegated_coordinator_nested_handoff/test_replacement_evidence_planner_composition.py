@@ -32,6 +32,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_launch_composition import (  # noqa: E402,E501
     LAUNCH_CAUSE_UPDATE_RELAUNCH,
 )
+from tests.support.current_launch_authority import seed_completed_current_generation
 
 WORKSPACE = "ws"
 LANE = "issue_14741"
@@ -63,12 +64,13 @@ class CompositionTest(unittest.TestCase):
             home=self.home,
             workspace_id=WORKSPACE,
             lane_id=LANE,
+            live_rows=(),
         )
 
     def test_the_expected_cause_is_the_registry_token(self) -> None:
         """Not re-spelled in e_110: the same object the provider registry exports."""
         self.assertEqual(LAUNCH_CAUSE_UPDATE_RELAUNCH, "update_relaunch")
-        planner = build_evidence_planner(self.home)
+        planner = build_evidence_planner(self.home, live_rows=())
         self.assertEqual(
             planner._update_cause("codex", "update_prompt_available"),
             LAUNCH_CAUSE_UPDATE_RELAUNCH,
@@ -76,7 +78,7 @@ class CompositionTest(unittest.TestCase):
 
     def test_a_non_update_blocker_is_not_a_cause(self) -> None:
         """A trust or login screen is not an update, and neither is an unknown provider."""
-        planner = build_evidence_planner(self.home)
+        planner = build_evidence_planner(self.home, live_rows=())
         for provider, blocker in (
             ("codex", "trust_prompt"),
             ("codex", ""),
@@ -87,19 +89,17 @@ class CompositionTest(unittest.TestCase):
 
     def test_the_ports_read_the_temp_home_and_not_the_shared_one(self) -> None:
         """The generation port is bound to THIS home: seeding it changes the answer."""
-        planner = build_evidence_planner(self.home)
+        live = [{"name": ASSIGNED, "pane_id": "ws:p1",
+                 "terminal_id": "terminal:ws:p1"}]
+        planner = build_evidence_planner(self.home, live_rows=live)
         self.assertIsNone(planner._generations(ASSIGNED))
-        store = HerdrLaunchGenerationStore(home=self.home)
-        store.reserve_pending(
-            assigned_name=ASSIGNED,
-            startup_action_id=LEGACY_ACTION,
-            workspace_id=WORKSPACE,
-            role="gateway",
-            lane_id=LANE,
+        action = seed_completed_current_generation(
+            self.home, assigned_name=ASSIGNED, workspace_id=WORKSPACE,
+            lane_id=LANE, role="gateway", locator="ws:p1",
         )
         found = planner._generations(ASSIGNED)
         self.assertIsNotNone(found)
-        self.assertEqual(found.startup_action_id, LEGACY_ACTION)
+        self.assertEqual(found.startup_action_id, action)
 
     def test_an_unreadable_authority_is_a_typed_reason_not_an_exception(self) -> None:
         """A caller about to close a live pane must never receive a raw store error."""

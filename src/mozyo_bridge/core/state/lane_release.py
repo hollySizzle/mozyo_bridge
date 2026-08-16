@@ -55,6 +55,7 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     LaneLifecycleRecord,
     ReleasePin,
     ReleasePinError,
+    decode_release_pin_projection,
     decode_release_pins,
     encode_release_pins,
     norm,
@@ -87,6 +88,9 @@ OBSERVATION_UNREADABLE = "release_observation_unreadable"
 #: The stored release pins do not describe exactly the recorded observation (missing, extra, or
 #: different). A row whose two fields disagree is never usable as proof.
 OBSERVATION_PIN_MISMATCH = "release_observation_pin_mismatch"
+#: A nonempty legacy observation remains readable for diagnosis but carries no terminal-bound
+#: process-generation authority. The only legacy positive is explicit complete-empty absence.
+OBSERVATION_LEGACY_NON_AUTHORITATIVE = "release_observation_legacy_non_authoritative"
 #: The observation belongs to the CURRENT generation, but that generation has not COMPLETED
 #: (``requested`` / ``partial``). Only a completed generation establishes what it closed: a
 #: partial run may still close more slots, so its observation is not yet a survivor proof.
@@ -170,8 +174,10 @@ def open_release_generation(
     # A complete-empty observation legitimately opens a generation with zero pins;
     # ``validate_release_pins`` refuses empty by design (it guards AMBIGUOUS sets), so the
     # empty case skips it. A non-empty set still goes through the R1-F4 duplicate guard.
+    if observation.version != 2:
+        raise ReleaseObservationError("legacy release observations are read-only")
     pinned = validate_release_pins(observation.slots) if observation.slots else ()
-    encoded_pins = encode_release_pins(pinned) if pinned else ""
+    encoded_pins = encode_release_pins(pinned)
     encoded_observation = encode_release_observation(observation)
     # Writer gate (j#94582 item 3): what we are about to store must decode back to EXACTLY the
     # observation. A mismatch here is a programming error, refused before it becomes durable.
@@ -297,10 +303,18 @@ def verify_release_observation(
     if release != RELEASE_RELEASED:  # unreachable today; see _CLASSIFIED_RELEASE_STATES
         return None, OBSERVATION_RELEASE_STATE_UNKNOWN
     try:
-        stored_pins = decode_release_pins(record.release_pins)
+        projection = decode_release_pin_projection(record.release_pins)
     except ReleasePinError:
         return None, OBSERVATION_UNREADABLE
-    if not observation_matches_pins(observation, stored_pins):
+    if observation.version == 1:
+        if observation.slots or projection.version != 0 or projection.pins:
+            return None, OBSERVATION_LEGACY_NON_AUTHORITATIVE
+    elif observation.version == 2:
+        if not projection.current_authority:
+            return None, OBSERVATION_PIN_MISMATCH
+    else:  # decoder currently refuses this; keep the authority branch total.
+        return None, OBSERVATION_UNREADABLE
+    if not observation_matches_pins(observation, projection.pins):
         return None, OBSERVATION_PIN_MISMATCH
     return observation, OBSERVATION_OK
 
@@ -310,6 +324,7 @@ __all__ = (
     "OBSERVATION_ABSENT",
     "OBSERVATION_UNREADABLE",
     "OBSERVATION_PIN_MISMATCH",
+    "OBSERVATION_LEGACY_NON_AUTHORITATIVE",
     "OBSERVATION_GENERATION_NOT_COMPLETED",
     "OBSERVATION_STALE_AFTER_RESET",
     "OBSERVATION_RELEASE_STATE_UNKNOWN",

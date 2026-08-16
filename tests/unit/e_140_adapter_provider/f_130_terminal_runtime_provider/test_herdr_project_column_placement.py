@@ -315,6 +315,60 @@ class ProjectColumnPlacementTest(unittest.TestCase):
         self.assertTrue(herdr.resizes)
         self.assertEqual(1, len(herdr.tabs))
 
+    def test_untouched_unit_ratio_drift_stops_before_the_next_effect(self):
+        herdr = PaneTreeHerdr("w1")
+        tab = herdr.new_tab()
+        key_c = UnitColumnKey("project-c", DEFAULT_LANE)
+        herdr.seed_columns(
+            tab,
+            [
+                [_name("project-a", "codex"), _name("project-a", "claude")],
+                [_name("project-b", "codex"), _name("project-b", "claude")],
+                [_name("project-c", "codex"), _name("project-c", "claude")],
+            ],
+        )
+
+        def drift_after_first_detach(argv, **kwargs):
+            completed = herdr(argv, **kwargs)
+            tail = list(argv[1:])
+            if tail[:2] == ["pane", "move"] and "--new-tab" in tail and herdr._moves == 1:
+                root = tab.root
+                self.assertIsInstance(root, Split)
+                self.assertIsInstance(root.second, Split)
+                self.assertIsInstance(root.second.second, Split)
+                root.second.second.ratio = 0.7
+            return completed
+
+        service = HerdrProjectColumnPlacement(
+            home=Path("/unused"),
+            target_workspace="w1",
+            top_workspace_id="",
+            binary="herdr",
+            runner=drift_after_first_detach,
+            timeout=1.0,
+            authority=_Authority(),
+            generation_resolver=lambda pane: f"generation:{pane.assigned_name}",
+            plan_resolver=_plan(
+                (self.key_b, self.key_a, key_c),
+                ((self.key_b, 1 / 3), (self.key_a, 0.5)),
+            ),
+        )
+
+        result = service.converge()
+
+        self.assertEqual(PLACEMENT_PARTIAL, result.status)
+        self.assertFalse(herdr.swaps)
+        self.assertEqual(
+            1,
+            len(
+                [
+                    call
+                    for call in herdr.calls
+                    if call[:2] == ["pane", "move"] and "--new-tab" in call
+                ]
+            ),
+        )
+
     def test_public_payload_never_contains_runtime_handles_or_generations(self):
         service = self.service(
             _plan((self.key_b, self.key_a), ((self.key_b, 0.5),))

@@ -11,16 +11,13 @@ from __future__ import annotations
 import json
 import os
 import subprocess
-from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
-from mozyo_bridge.core.state.herdr_identity_attestation import VERDICT_PRESENT
 from mozyo_bridge.core.state.herdr_launch_generation import (
-    GENERATION_ATTESTED,
-    HerdrLaunchGenerationError,
     HerdrLaunchGenerationStore,
+    verified_generation_token,
 )
 from mozyo_bridge.core.state.lane_kind import LANE_KIND_COORDINATOR
 from mozyo_bridge.core.state.lane_lifecycle import (
@@ -31,9 +28,6 @@ from mozyo_bridge.core.state.lane_lifecycle import (
 from mozyo_bridge.core.state.lane_lifecycle_readonly import LaneLifecycleReader
 from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
 from mozyo_bridge.core.state.workspace_registry import WorkspaceRecord, load_workspace_by_id
-from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.herdr_unit_board import (
-    safe_text,
-)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (
     MAX_RESIZE_PASSES,
     RATIO_APPLIED,
@@ -41,8 +35,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     RATIO_MATCHED,
     RESIZE_CHANGED,
     RESIZE_UNCHANGED,
-    PaneRect,
-    SplitInfo,
     _read_layout,
     _resize,
     find_pair_split,
@@ -66,13 +58,52 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_topology import (
     HerdrSessionStartError,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_managed_column_scope import (
+    managed_column_scope,
+    managed_external_boundary_matches,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_live_pair_placement_model import (  # noqa: E501
+    APPLY_APPLIED,
+    APPLY_FAILED,
+    APPLY_MATCHED,
+    APPLY_PARTIAL,
+    APPLY_REFUSED,
+    MOVE_CHANGED,
+    MOVE_UNCHANGED,
+    MOVE_UNKNOWN,
+    PLAN_MATCHED,
+    PLAN_READY,
+    PLAN_REFUSED,
+    REASON_COMMAND_FAILED,
+    REASON_CONFIG_INVALID,
+    REASON_GENERATION_UNVERIFIED,
+    REASON_GEOMETRY_UNSUPPORTED,
+    REASON_INVENTORY_UNAVAILABLE,
+    REASON_LAYOUT_UNAVAILABLE,
+    REASON_NOT_DEDICATED_PAIR,
+    REASON_OK,
+    REASON_PAIR_INVALID,
+    REASON_POSTCONDITION_FAILED,
+    REASON_STALE,
+    REASON_WORKSPACE_UNKNOWN,
+    LiveSlot,
+    PairEvidence,
+    PlacementApplyResult,
+    PlacementPlan,
+    PlacementTarget,
+    decide_plan as _decide_plan,
+    refused_plan as _refused,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_LOCATOR,
     AGENT_KEY_LOCATOR_ALIAS,
     AGENT_KEY_LOCATOR_ALIAS_2,
+    _norm,
+    _norm_lane,
     decode_assigned_name,
     encode_assigned_name,
     rebind_by_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (
     SLOT_LIVE,
@@ -90,190 +121,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     resolve_herdr_binary,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
-
-
-PLAN_READY = "ready"
-PLAN_MATCHED = "matched"
-PLAN_REFUSED = "refused"
-
-APPLY_APPLIED = "applied"
-APPLY_MATCHED = "matched"
-APPLY_REFUSED = "refused"
-APPLY_FAILED = "failed"
-APPLY_PARTIAL = "partial_failure"
-
-REASON_OK = "ok"
-REASON_INVENTORY_UNAVAILABLE = "inventory_unavailable"
-REASON_WORKSPACE_UNKNOWN = "workspace_unknown"
-REASON_CONFIG_INVALID = "config_invalid"
-REASON_PAIR_INVALID = "pair_invalid"
-REASON_GENERATION_UNVERIFIED = "generation_unverified"
-REASON_LAYOUT_UNAVAILABLE = "layout_unavailable"
-REASON_NOT_DEDICATED_PAIR = "not_dedicated_pair"
-REASON_GEOMETRY_UNSUPPORTED = "geometry_unsupported"
-REASON_STALE = "stale_before_apply"
-REASON_COMMAND_FAILED = "herdr_command_failed"
-REASON_POSTCONDITION_FAILED = "postcondition_failed"
-
-MOVE_CHANGED = "changed"
-MOVE_UNCHANGED = "unchanged"
-MOVE_UNKNOWN = "unknown"
-
-
-@dataclass(frozen=True)
-class PlacementTarget:
-    split: str
-    order: tuple[str, str]
-    ratio: float
-    declared_pins: tuple[ProcessGenerationPin, ...] = field(
-        default=(), repr=False
-    )
-
-    def as_payload(self) -> dict[str, object]:
-        return {
-            "split": safe_text(self.split),
-            "order": [safe_text(provider) for provider in self.order],
-            "ratio": self.ratio,
-        }
-
-
-@dataclass(frozen=True)
-class LiveSlot:
-    provider: str
-    assigned_name: str = field(repr=False)
-    pane_id: str = field(repr=False)
-    generation: str = field(repr=False)
-    runtime_revision: str = field(default="", repr=False)
-
-    @property
-    def fingerprint(self) -> tuple[str, str, str, str, str]:
-        return (
-            self.provider,
-            self.assigned_name,
-            self.pane_id,
-            self.generation,
-            self.runtime_revision,
-        )
-
-
-@dataclass(frozen=True)
-class PairEvidence:
-    workspace_id: str
-    lane_id: str
-    tab_id: str = field(repr=False)
-    slots: tuple[LiveSlot, LiveSlot] = field(repr=False)
-    split: SplitInfo = field(repr=False)
-    rects: tuple[tuple[str, PaneRect], tuple[str, PaneRect]] = field(
-        repr=False
-    )
-    current_order: tuple[str, str]
-
-    @property
-    def by_provider(self) -> Mapping[str, LiveSlot]:
-        return {slot.provider: slot for slot in self.slots}
-
-    @property
-    def fingerprint(self) -> tuple[object, ...]:
-        rect = self.split.rect
-        return (
-            self.workspace_id,
-            self.lane_id,
-            self.tab_id,
-            tuple(slot.fingerprint for slot in self.slots),
-            self.split.direction,
-            self.split.ratio,
-            (rect.x, rect.y, rect.width, rect.height),
-            tuple(
-                (provider, pane.x, pane.y, pane.width, pane.height)
-                for provider, pane in self.rects
-            ),
-            self.current_order,
-        )
-
-    @property
-    def authority_fingerprint(self) -> tuple[object, ...]:
-        return (
-            self.workspace_id,
-            self.lane_id,
-            self.tab_id,
-            tuple(slot.fingerprint for slot in self.slots),
-        )
-
-    @property
-    def rect_by_provider(self) -> Mapping[str, PaneRect]:
-        return dict(self.rects)
-
-
-@dataclass(frozen=True)
-class PlacementPlan:
-    status: str
-    reason: str
-    detail: str
-    workspace_id: str
-    lane_id: str
-    target: Optional[PlacementTarget] = None
-    current_split: str = ""
-    current_order: tuple[str, ...] = ()
-    current_ratio: Optional[float] = None
-    operations: tuple[str, ...] = ()
-    evidence: Optional[PairEvidence] = field(default=None, repr=False, compare=False)
-
-    @property
-    def ok(self) -> bool:
-        return self.status in {PLAN_READY, PLAN_MATCHED}
-
-    @property
-    def can_apply(self) -> bool:
-        return self.status == PLAN_READY
-
-    def as_payload(self) -> dict[str, object]:
-        return {
-            "ok": self.ok,
-            "status": safe_text(self.status),
-            "reason": safe_text(self.reason),
-            "detail": safe_text(self.detail),
-            "unit": {
-                "workspace_id": safe_text(self.workspace_id),
-                "lane_id": safe_text(self.lane_id),
-            },
-            "current": {
-                "split": safe_text(self.current_split) if self.current_split else None,
-                "order": [safe_text(provider) for provider in self.current_order],
-                "ratio": self.current_ratio,
-            },
-            "target": self.target.as_payload() if self.target else None,
-            "operations": list(self.operations),
-        }
-
-
-@dataclass(frozen=True)
-class PlacementApplyResult:
-    status: str
-    reason: str
-    detail: str
-    before: PlacementPlan
-    after: PlacementPlan
-    recovery: str = ""
-
-    @property
-    def ok(self) -> bool:
-        return self.status in {APPLY_APPLIED, APPLY_MATCHED}
-
-    def as_payload(self) -> dict[str, object]:
-        return {
-            "ok": self.ok,
-            "status": safe_text(self.status),
-            "reason": safe_text(self.reason),
-            "detail": safe_text(self.detail),
-            "recovery": safe_text(self.recovery) if self.recovery else None,
-            "retryable": self.status == APPLY_FAILED,
-            "before": self.before.as_payload(),
-            "after": self.after.as_payload(),
-        }
-
-
-def _refused(workspace_id: str, lane_id: str, reason: str, detail: str) -> PlacementPlan:
-    return PlacementPlan(PLAN_REFUSED, reason, detail, workspace_id, lane_id)
 
 
 def _target_for(record: WorkspaceRecord, lane_id: str) -> PlacementTarget:
@@ -328,8 +175,9 @@ def _target_for(record: WorkspaceRecord, lane_id: str) -> PlacementTarget:
 
 
 def _current_split(layout, pane_to_provider: Mapping[str, str]):
-    if len(layout.splits) != 1:
-        return None
+    # The managed pair may sit beside a preserved generation-unbound cosmetic
+    # root.  ``managed_column_scope`` has already proved that the pair itself owns
+    # exactly one isolated subtree, so an outer split is not pair ambiguity.
     pane_ids = tuple(pane_to_provider)
     candidates = []
     for direction in ("down", "right"):
@@ -366,28 +214,13 @@ def decide_plan(
     target: PlacementTarget,
     evidence: PairEvidence,
 ) -> PlacementPlan:
-    operations: list[str] = []
-    if evidence.split.direction != target.split:
-        operations.append("change_split")
-    elif evidence.current_order != target.order:
-        operations.append("swap_order")
-    first_rect = evidence.rect_by_provider[evidence.current_order[0]]
-    matches_ratio, _ = ratio_verdict(evidence.split, first_rect, target.ratio)
-    if not matches_ratio:
-        operations.append("resize_ratio")
-    status = PLAN_READY if operations else PLAN_MATCHED
-    return PlacementPlan(
-        status=status,
-        reason=REASON_OK,
-        detail=("placement changes are ready" if operations else "live placement already matches"),
+    """Preserve the facade's patchable ratio-verdict dependency."""
+    return _decide_plan(
         workspace_id=workspace_id,
         lane_id=lane_id,
         target=target,
-        current_split=evidence.split.direction,
-        current_order=evidence.current_order,
-        current_ratio=evidence.split.ratio,
-        operations=tuple(operations),
         evidence=evidence,
+        ratio_evaluator=ratio_verdict,
     )
 
 
@@ -402,6 +235,7 @@ class HerdrLivePairPlacement:
         timeout: float = COMMAND_TIMEOUT_SECONDS,
         lister: Optional[HerdrCliAgentLister] = None,
         generation_store: Optional[HerdrLaunchGenerationStore] = None,
+        generation_verifier: Optional[Callable[..., str]] = None,
         workspace_loader: Callable[[str], Optional[WorkspaceRecord]] = (
             load_workspace_by_id
         ),
@@ -412,6 +246,7 @@ class HerdrLivePairPlacement:
         self.timeout = timeout
         self.lister = lister or HerdrCliAgentLister(binary, runner=self.runner, timeout=timeout)
         self.generations = generation_store or HerdrLaunchGenerationStore()
+        self.generation_verifier = generation_verifier or verified_generation_token
         self.workspace_loader = workspace_loader
         self.workspace_of = workspace_resolver or IdentityWorkspaceResolver(
             mozyo_bridge_home()
@@ -517,7 +352,6 @@ class HerdrLivePairPlacement:
                         REASON_PAIR_INVALID,
                         "a managed provider does not match its declared generation",
                     )
-
             if row.get("agent") != provider or classify_named_slot(row) != SLOT_LIVE:
                 return (
                     None,
@@ -560,20 +394,13 @@ class HerdrLivePairPlacement:
                         "a managed provider foreground process resolves to another workspace",
                     )
 
-            try:
-                generation = self.generations.read(name)
-            except (HerdrLaunchGenerationError, OSError, ValueError):
-                generation = None
-            if (
-                generation is None
-                or generation.phase != GENERATION_ATTESTED
-                or generation.verdict != VERDICT_PRESENT
-                or generation.workspace_id != workspace_id
-                or generation.lane_id != lane_id
-                or generation.role != provider
-                or generation.locator != rebound.locator
-                or not generation.startup_action_id
-            ):
+            terminal_id = terminal_identity_of_live_slot(name, rebound.locator, rows)
+            generation_token = self.generation_verifier(
+                None, assigned_name=name, workspace_id=workspace_id, role=provider,
+                lane_id=lane_id, locator=rebound.locator,
+                live_terminal_id=terminal_id, norm=_norm, norm_lane=_norm_lane,
+            )
+            if not generation_token:
                 return (
                     None,
                     REASON_GENERATION_UNVERIFIED,
@@ -581,10 +408,9 @@ class HerdrLivePairPlacement:
                 )
             slots.append(
                 LiveSlot(
-                    provider,
-                    name,
+                    provider, name,
                     rebound.locator,
-                    generation.startup_action_id,
+                    generation_token,
                     runtime_revision,
                 )
             )
@@ -616,7 +442,8 @@ class HerdrLivePairPlacement:
         if layout is None or not valid_target(layout.tab_id):
             return _refused(workspace_id, lane_id, REASON_LAYOUT_UNAVAILABLE, "the live pane layout could not be read")
         expected_panes = {slot.pane_id for slot in slots}
-        if set(layout.panes) != expected_panes:
+        scope = managed_column_scope(layout, (tuple(sorted(expected_panes)),))
+        if scope is None:
             return _refused(workspace_id, lane_id, REASON_NOT_DEDICATED_PAIR, "the unit does not exclusively occupy a two-pane tab")
         pane_to_provider = {slot.pane_id: slot.provider for slot in slots}
         current = _current_split(layout, pane_to_provider)
@@ -634,6 +461,7 @@ class HerdrLivePairPlacement:
             split,
             rects,
             (first_provider, second_provider),
+            scope,
         )
         return decide_plan(
             workspace_id=workspace_id,
@@ -751,17 +579,23 @@ class HerdrLivePairPlacement:
             and temporary is not None
             and original.tab_id == evidence.tab_id
             and temporary.tab_id == temp_tab
-            and set(original.panes) == {staying.pane_id}
-            and set(temporary.panes) == {moving.pane_id}
-            and not original.splits
-            and not temporary.splits
+            and managed_external_boundary_matches(
+                original,
+                evidence.managed_scope,
+                present_managed_ids=(staying.pane_id,),
+            )
+            and managed_column_scope(temporary, ((moving.pane_id,),)) is not None
         )
 
     @staticmethod
     def _same_opening_authority(
         opening: PairEvidence, current: PairEvidence
     ) -> bool:
-        return current.authority_fingerprint == opening.authority_fingerprint
+        return (
+            current.authority_fingerprint == opening.authority_fingerprint
+            and current.managed_scope.fingerprint
+            == opening.managed_scope.fingerprint
+        )
 
     def _apply_ratio_guarded(
         self,

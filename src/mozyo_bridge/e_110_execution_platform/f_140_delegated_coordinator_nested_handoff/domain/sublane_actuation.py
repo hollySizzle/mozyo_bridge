@@ -226,6 +226,14 @@ DISPATCH_GATEWAY_NOTIFIED = "gateway_notified"
 #: :attr:`SublaneActuationOutcome.worker_dispatch_confirmed` signal use it to
 #: distinguish "gateway notified" from "worker dispatched".
 DISPATCH_WORKER_DISPATCHED = "worker_dispatched"
+#: A gateway dispatch completed with structured proof that no body or Enter reached
+#: the receiver.  Unlike ``not_attempted``, the send rail did run; the same durable
+#: anchor is safe to retry after the named pre-injection refusal is corrected.
+DISPATCH_DELIVERY_NOT_SENT = "delivery_not_sent"
+#: The gateway dispatch ran, but body and/or Enter may have reached the receiver and
+#: submission was not confirmed.  Blind replay is prohibited because it can duplicate
+#: the implementation request.
+DISPATCH_DELIVERY_UNCERTAIN = "delivery_uncertain"
 #: Dispatch was intentionally skipped (``--no-dispatch``).
 DISPATCH_SKIPPED = "skipped"
 #: Dispatch was not reached (dry-run, or actuation blocked before the dispatch step).
@@ -235,6 +243,8 @@ DISPATCH_RESULTS = frozenset(
     {
         DISPATCH_GATEWAY_NOTIFIED,
         DISPATCH_WORKER_DISPATCHED,
+        DISPATCH_DELIVERY_NOT_SENT,
+        DISPATCH_DELIVERY_UNCERTAIN,
         DISPATCH_SKIPPED,
         DISPATCH_NOT_ATTEMPTED,
     }
@@ -342,6 +352,11 @@ class SublaneActuationOutcome:
     worker_pane: Optional[str] = None
     dispatch_target: Optional[str] = None
     dispatch_result: str = DISPATCH_NOT_ATTEMPTED
+    # Present only after a typed gateway send ran.  Keeping the shared injection
+    # stage beside the public result prevents an uncertain partial delivery from
+    # being flattened to ``not_attempted`` by the outer sublane surface (#15242).
+    dispatch_injection_stage: Optional[str] = None
+    dispatch_blind_retry_prohibited: bool = False
     durable_anchor: Optional[str] = None
     adopted: bool = False
     steps: Tuple[ActuationStep, ...] = ()
@@ -355,9 +370,8 @@ class SublaneActuationOutcome:
     # #13293 gateway readiness wait: whether the freshly-launched gateway TUI was
     # observed ready (codex foreground process + rendered pane) before the dispatch.
     # ``True`` = confirmed ready and dispatched into a ready composer; ``False`` = the
-    # bounded wait elapsed unconfirmed and the dispatch proceeded anyway (the queue-
-    # enter rail never hard-blocks — the handoff Enter-only retry is the landing safety
-    # net, and the coordinator watches for a no-progress lane); ``None`` = not probed
+    # bounded readiness probe elapsed unconfirmed before the governed send independently
+    # confirmed or failed closed; ``None`` = not probed
     # (dry-run, ``--no-dispatch``, wait disabled, or actuation blocked before dispatch).
     gateway_ready: Optional[bool] = None
 
@@ -403,6 +417,11 @@ class SublaneActuationOutcome:
             "fill_override_reason": self.fill_override_reason,
             "gateway_ready": self.gateway_ready,
         }
+        if self.dispatch_injection_stage is not None:
+            payload["dispatch_injection_stage"] = self.dispatch_injection_stage
+            payload["dispatch_blind_retry_prohibited"] = bool(
+                self.dispatch_blind_retry_prohibited
+            )
         if self.startup is not None:
             payload["startup"] = self.startup.as_payload()
         if self.is_blocked and "sender_attestation" in self.blocked_reasons:
@@ -460,6 +479,14 @@ def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
         f"- worker_dispatch_confirmed: {str(outcome.worker_dispatch_confirmed).lower()}",
         f"- durable_anchor: {outcome.durable_anchor or '-'}",
     ]
+    if outcome.dispatch_injection_stage is not None:
+        lines.extend(
+            (
+                f"- dispatch_injection_stage: {outcome.dispatch_injection_stage}",
+                "- dispatch_blind_retry_prohibited: "
+                f"{str(outcome.dispatch_blind_retry_prohibited).lower()}",
+            )
+        )
     # #13290: record the consulted fill decision and any explicit override so the
     # durable record carries the admission decision (reason + anchor) that let a
     # stop-classified dispatch proceed. Emitted only when the gate was armed, so the
@@ -562,6 +589,8 @@ __all__ = (
     "BLOCKED_REASONS",
     "DISPATCH_GATEWAY_NOTIFIED",
     "DISPATCH_WORKER_DISPATCHED",
+    "DISPATCH_DELIVERY_NOT_SENT",
+    "DISPATCH_DELIVERY_UNCERTAIN",
     "DISPATCH_SKIPPED",
     "DISPATCH_NOT_ATTEMPTED",
     "DISPATCH_RESULTS",

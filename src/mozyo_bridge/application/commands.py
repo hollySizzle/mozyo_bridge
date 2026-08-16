@@ -1990,14 +1990,8 @@ def run_handoff_orchestration(
             emit=_emit,
         )
 
-    # Redmine #13729 tranche 4: the common tmux transport rail slice owns its own control flow
-    # (every path returns / dies without falling through). It is carved into the typed
-    # ``handoff_tmux_transport_rail`` use case — the facade only assembles the typed request (the
-    # resolved envelope value objects + terminal outcome context + the raw landing / submit /
-    # retry scalars + the pre-resolved focus-restore activation) and hands it the per-call
-    # publishing emitter. The inject / marker gate / C-u rollback / Enter-only retry / standard
-    # turn-start confirmation / final sent assembly choreography, the emit / persist / ledger /
-    # restore side effects, and both ``die`` messages are unchanged.
+    # #13729: the typed transport use case owns control flow and side effects; this
+    # facade only assembles the resolved request and per-call publishing emitter.
     return run_tmux_transport_rail(
         TmuxTransportRailRequest(
             target=target,
@@ -2022,6 +2016,12 @@ def run_handoff_orchestration(
             submit_delivery_id=inp.submit_delivery_id,
             persist_delivery=bool(inp.persist_delivery),
             herdr_send=herdr_send,
+            herdr_assigned_name=(
+                str(target_info.get("herdr_assigned_name") or "") or None
+            ),
+            herdr_process_generation=(
+                str(target_info.get("herdr_process_generation") or "") or None
+            ),
             read_lines=read_lines,
             landing_timeout=inp.landing_timeout,
             submit_delay=inp.submit_delay,

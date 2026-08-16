@@ -41,6 +41,14 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops import (  # noqa: E501
     HerdrSublaneActuatorOps,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (  # noqa: E501
+    SublaneDispatchAttempt,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (  # noqa: E501
+    STAGE_NOT_SENT,
+    STAGE_SUBMITTED_CONFIRMED,
+    STAGE_UNCERTAIN_PARTIAL,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_runtime_fence import (  # noqa: E501
     HEAL_REASON_PAIR_INCOMPLETE,
     HEAL_REASON_PAIR_SPLIT,
@@ -249,6 +257,8 @@ class _StatefulHerdr:
                                 "pane_id": pane_id,
                                 "workspace_id": wid,
                                 "tab_id": tab_id or f"{wid}:t1",
+                                "terminal_id": f"terminal-{pane_id}",
+                                "revision": 0,
                             },
                         }
                     }
@@ -320,6 +330,7 @@ class _StatefulHerdr:
                 "name": logical_name,
                 "native_name": native_name,
                 "pane_id": pane_id,
+                "terminal_id": f"terminal-{pane_id}",
             }
             if tab_id:
                 row["tab_id"] = tab_id
@@ -332,6 +343,7 @@ class _StatefulHerdr:
                         role=launch_env.get("MOZYO_AGENT_ROLE", ""),
                         lane_id=launch_env.get("MOZYO_LANE_ID", ""),
                         locator=pane_id,
+                        terminal_id=f"terminal-{pane_id}",
                         verdict=VERDICT_PRESENT,
                         observed_at="2026-07-18T00:00:00+00:00",
                     ),
@@ -343,6 +355,7 @@ class _StatefulHerdr:
                 action_id = launch_env.get("MOZYO_STARTUP_ACTION_ID", "")
                 if action_id:
                     from mozyo_bridge.core.state.startup_execution_events import (
+                        STAGE_ATTESTATION_WRITE_SUCCEEDED,
                         STAGE_PROVIDER_EXEC_CALL_REACHED,
                         STAGE_WRAPPER_ENTERED,
                         append_execution_event,
@@ -354,6 +367,7 @@ class _StatefulHerdr:
                     events_fence = StartupTransactionFence(home=Path(self.attest_home))
                     for stage in (
                         STAGE_WRAPPER_ENTERED,
+                        STAGE_ATTESTATION_WRITE_SUCCEEDED,
                         STAGE_PROVIDER_EXEC_CALL_REACHED,
                     ):
                         append_execution_event(
@@ -372,6 +386,8 @@ class _StatefulHerdr:
                                 # #13411: echo the requested tab so the landing guard
                                 # (returned tab_id == --tab) passes on the happy path.
                                 "tab_id": tab_id,
+                                "terminal_id": f"terminal-{pane_id}",
+                                "revision": 0,
                             },
                             "type": "agent_started",
                         }
@@ -660,6 +676,68 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertTrue(view.worker_pane and view.worker_pane.startswith("wL:"))
         self.assertNotEqual(view.gateway_pane, view.worker_pane)
         self.assertEqual(view.state, SUBLANE_STATE_ACTIVE)
+
+    def test_append_holds_one_shared_gate_through_metadata_finalization(self) -> None:
+        from mozyo_bridge.core.state.herdr_session_start_gate import (
+            SessionStartGateError,
+            acquire_session_start_gate,
+            release_session_start_gate,
+            require_session_start_gate,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_actuator_herdr_ops as module,
+        )
+
+        herdr = _StatefulHerdr()
+        with tempfile.TemporaryDirectory() as tmp:
+            ops, home = self._ops(tmp, herdr)
+            worktree = Path(tmp) / "lane-wt"
+            worktree.mkdir()
+            real_prepare = module.prepare_actuator_lane_session
+            real_metadata = ops._record_lane_metadata  # noqa: SLF001
+            observed_leases = []
+            metadata_fenced = []
+
+            def prepare(**kwargs):
+                lease = kwargs.get("session_gate_lease")
+                observed_leases.append(lease)
+                require_session_start_gate(
+                    lease, home=home, exclusive=False
+                )
+                return real_prepare(**kwargs)
+
+            def record_metadata(path):
+                with self.assertRaisesRegex(
+                    SessionStartGateError, "session_start_gate_busy"
+                ):
+                    acquire_session_start_gate(home, exclusive=True)
+                metadata_fenced.append(True)
+                return real_metadata(path)
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"MOZYO_BRIDGE_HOME": str(home)},
+                    clear=False,
+                ),
+                patch.object(
+                    module,
+                    "prepare_actuator_lane_session",
+                    side_effect=prepare,
+                ),
+                patch.object(
+                    ops,
+                    "_record_lane_metadata",
+                    side_effect=record_metadata,
+                ),
+            ):
+                startup = ops.append_lane_column(str(worktree))
+
+            self.assertTrue(startup.ok)
+            self.assertEqual(len(observed_leases), 1)
+            self.assertEqual(metadata_fenced, [True])
+            exclusive = acquire_session_start_gate(home, exclusive=True)
+            release_session_start_gate(exclusive)
 
     def test_append_launches_claude_worker_in_auto_permission_mode(self) -> None:
         # Redmine #13360: lane creation is a managed-pane chokepoint, so the lane's
@@ -1509,6 +1587,81 @@ class HerdrSublaneOpsTest(unittest.TestCase):
         self.assertEqual(argv[argv.index("--role-profile") + 1], "implementation_gateway")
         self.assertIn("lane=issue_13331_x", argv)
         self.assertIn("upstream_coordinator=w2:p2", argv)
+
+    def test_dispatch_contains_system_exit_and_retains_typed_stage(self) -> None:
+        ops = HerdrSublaneActuatorOps(
+            repo_root=Path("/repo"), lane_label="lane", issue="15242"
+        )
+
+        for stage, expected in (
+            (STAGE_NOT_SENT, STAGE_NOT_SENT),
+            (STAGE_UNCERTAIN_PARTIAL, STAGE_UNCERTAIN_PARTIAL),
+            # A nonzero exit withdraws a contradictory confirmation.
+            (STAGE_SUBMITTED_CONFIRMED, STAGE_UNCERTAIN_PARTIAL),
+        ):
+            with self.subTest(stage=stage):
+                args = argparse.Namespace(
+                    delivery_outcome=argparse.Namespace(
+                        injection_stage={"stage": stage}
+                    )
+                )
+
+                def die(_args):
+                    raise SystemExit(2)
+
+                args.func = die
+                with patch(
+                    "mozyo_bridge.application.cli.build_parser"
+                ) as parser, patch(
+                    "mozyo_bridge.application.cli.normalize_paths",
+                    side_effect=lambda value: value,
+                ):
+                    parser.return_value.parse_args.return_value = args
+                    result = ops._drive_cli_result(["handoff", "send"])
+
+                self.assertEqual(result.exit_code, 2)
+                self.assertEqual(result.injection_stage, expected)
+                self.assertEqual(result.retry_safe, expected == STAGE_NOT_SENT)
+
+    def test_dispatch_attempt_exit_stage_truth_matrix(self) -> None:
+        cases = (
+            (0, STAGE_SUBMITTED_CONFIRMED, True, False, STAGE_SUBMITTED_CONFIRMED),
+            (0, STAGE_NOT_SENT, False, True, STAGE_NOT_SENT),
+            (0, STAGE_UNCERTAIN_PARTIAL, False, False, STAGE_UNCERTAIN_PARTIAL),
+            (2, STAGE_SUBMITTED_CONFIRMED, False, False, STAGE_UNCERTAIN_PARTIAL),
+            (2, STAGE_NOT_SENT, False, True, STAGE_NOT_SENT),
+            (2, STAGE_UNCERTAIN_PARTIAL, False, False, STAGE_UNCERTAIN_PARTIAL),
+        )
+        for exit_code, stage, confirmed, retry_safe, expected_stage in cases:
+            with self.subTest(exit_code=exit_code, stage=stage):
+                result = SublaneDispatchAttempt.typed(exit_code, stage)
+
+                self.assertEqual(result.confirmed, confirmed)
+                self.assertEqual(result.retry_safe, retry_safe)
+                self.assertEqual(result.injection_stage, expected_stage)
+                self.assertEqual(
+                    result.blind_retry_prohibited,
+                    expected_stage != STAGE_NOT_SENT,
+                )
+
+    def test_dispatch_without_captured_outcome_is_uncertain_and_legacy_int_returns(self):
+        ops = HerdrSublaneActuatorOps(
+            repo_root=Path("/repo"), lane_label="lane", issue="15242"
+        )
+        args = argparse.Namespace()
+        args.func = lambda _args: (_ for _ in ()).throw(SystemExit(3))
+
+        with patch("mozyo_bridge.application.cli.build_parser") as parser, patch(
+            "mozyo_bridge.application.cli.normalize_paths",
+            side_effect=lambda value: value,
+        ):
+            parser.return_value.parse_args.return_value = args
+            result = ops._drive_cli_result(["handoff", "send"])
+            legacy_rc = ops._drive_cli(["handoff", "send"])
+
+        self.assertEqual(result.injection_stage, STAGE_UNCERTAIN_PARTIAL)
+        self.assertTrue(result.blind_retry_prohibited)
+        self.assertEqual(legacy_rc, 3)
 
 
 class BackendSelectorTest(unittest.TestCase):

@@ -78,6 +78,7 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                     role="codex",
                     runtime_state="working",
                     raw_status="working",
+                    terminal_id="terminal:top",
                 ),
                 HerdrObservedAgent(
                     name=self.peer_name,
@@ -87,6 +88,7 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                     role="claude",
                     runtime_state="idle",
                     raw_status="idle",
+                    terminal_id="terminal:peer",
                 ),
             ),
             raw_row_count=2,
@@ -125,6 +127,9 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                     "lane_lifecycle", "recognized", 9, content_digest="2" * 64
                 ),
                 StoreSnapshot(
+                    "launch_generation", "recognized", 1, content_digest="5" * 64
+                ),
+                StoreSnapshot(
                     "startup_transaction",
                     "recognized",
                     1,
@@ -133,6 +138,7 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                 ),
             ),
             "supervisor_reader": lambda *, mozyo_home: {
+                "backend": "launchd",
                 "agents": [
                     {
                         "label": "org.mozyo-bridge.callback-supervisor",
@@ -142,16 +148,12 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                         "home_pin": "ok",
                         "executable_matches": True,
                         "credential_readiness": "ready",
+                        "legacy_drain": "owned",
                     },
-                    {
-                        "label": "org.mozyo-bridge.callback-supervisor.drain",
-                        "installed": True,
-                        "loaded": True,
-                        "pid": 43,
-                        "home_pin": "ok",
-                        "executable_matches": True,
-                        "credential_readiness": "ready",
-                    },
+                    # The `--drain-only` agent was retired by #15192: each host now owns exactly ONE
+                    # registration, and the backend this reader stands in for returns a one-row
+                    # roster. A capture still showing two agents comes from an un-migrated host and
+                    # is refused as an invalid supervisor set (review j#102151 Finding 2).
                 ]
             },
         }
@@ -161,6 +163,9 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
         result = build_offline_rollout_plan(captured)
 
         self.assertTrue(result.ok)
+        self.assertEqual(result.plan["schema_version"], 4)
+        self.assertEqual(result.plan["supervisors"][0]["backend"], "launchd")
+        self.assertEqual(result.plan["supervisors"][0]["legacy_drain"], "owned")
         self.assertEqual(len(result.plan["workspaces"]), 2)
         self.assertEqual(result.plan["workspaces"][1]["scope"], "unrelated_project")
         payload = str(result.as_payload())
@@ -189,6 +194,36 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
         self.assertEqual(result.reason, "snapshot_drift")
         self.assertIsNone(result.plan)
 
+    def test_legacy_drain_drift_between_capture_reads_refuses_without_a_plan(self) -> None:
+        calls = []
+
+        def drifting_supervisor(*, mozyo_home):
+            calls.append(1)
+            return {
+                "backend": "launchd",
+                "agents": [
+                    {
+                        "label": "org.mozyo-bridge.callback-supervisor",
+                        "installed": True,
+                        "loaded": True,
+                        "pid": 42,
+                        "home_pin": "ok",
+                        "executable_matches": True,
+                        "credential_readiness": "ready",
+                        "legacy_drain": "owned" if len(calls) == 1 else "absent",
+                    }
+                ],
+            }
+
+        kwargs = self._kwargs()
+        kwargs["supervisor_reader"] = drifting_supervisor
+
+        result = capture_offline_rollout_snapshot(**kwargs)
+
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, "snapshot_drift")
+        self.assertIsNone(result.plan)
+
     def test_store_content_drift_with_same_versions_refuses(self) -> None:
         calls = []
 
@@ -201,6 +236,9 @@ class OfflineRolloutSnapshotRegressionTests(unittest.TestCase):
                 ),
                 StoreSnapshot(
                     "lane_lifecycle", "recognized", 9, content_digest="2" * 64
+                ),
+                StoreSnapshot(
+                    "launch_generation", "recognized", 1, content_digest="5" * 64
                 ),
                 StoreSnapshot(
                     "startup_transaction",

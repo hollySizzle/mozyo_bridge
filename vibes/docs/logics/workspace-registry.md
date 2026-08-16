@@ -110,6 +110,193 @@ CREATE TABLE workspace_activity (       -- cache。identity と分離
 
 canonical session / defaults 解決そのものが目的の command (`session name`、smart `init` の adoption など) は既定 (`derive_unregistered=True`) のまま、フル derivation を使う。`session_inventory.collect_runtime_inventory(..., derive_unregistered=False)` も同じ degrading 契約 (lightweight inventory、#12032) を共有する。
 
+## Nested workspace の launch routing (Redmine #15190)
+
+同一 Git repository 内に canonical repo root workspace と nested application root
+workspace の両 anchor が実在しうる (観測事例: repo root が default coordinator pair を
+持ち、その配下 `Source/rails` が独自 scaffold/anchor を持つ)。通常の cwd 解決は
+Git-root-first (#13641) なので `cd <nested>` は repo root を adopt する。穴は**明示 root**
+側にある: `resolve_repo_root()` は `--repo` / `MOZYO_REPO` を canonicalization の**前**に
+short-circuit するため、nested anchor が独立 workspace として解決し、1 repository に
+2 組目の default Codex/Claude pair を `planned` にできる。
+
+`workspace retire` は missing-path registry row 専用で、実在する nested path には使えない。
+そこで **workspace-local な宣言 file** を rail として追加する。
+
+```yaml
+declaration:
+  path: "<nested-workspace>/.mozyo-bridge/workspace-alias.json"
+  schema_version: 1
+  modes:
+    alias:    canonical parent workspace へ解決する
+    disabled: fixed typed reason で zero-launch する
+  writer: "mozyo-bridge workspace alias set / disable / clear"
+  reader: "mozyo-bridge workspace alias show" と launch chokepoint
+```
+
+- **格納先が workspace-local である理由**: registry 喪失・復旧を跨いで宣言が生き残る必要が
+  ある。`registry.sqlite` の row は、その宣言が耐えるべき復旧手順そのもので消える。identity
+  store への schema 追加も不要になる。
+- **anchor と分離する理由**: anchor は identity recovery record (#11429) であり意味を 1 つに
+  保つ。本 file は launch authority routing の宣言で、identity provenance に触れずに
+  追加・削除できる。
+- **chokepoint は 2 箇所**であり、これは意図的な重複である (#15190 / review j#102107 F4):
+  - `herdr_session_start.prepare_session` の最初 — public entry。request validation・
+    home lock・binary 解決・capability probe より**前**に評価するので、拒否は zero-launch
+    かつ zero-side-effect になる。
+  - `herdr_session_start._prepare_session_locked` の最初 — **実際に全 current launch が到達する
+    境界**。replacement actuator (`sublane_actuator_herdr_ops`) は
+    `prepare_actuator_lane_session(admission_lock_held=True)` 経由で public wrapper を
+    通さず本 entry を直接呼ぶため、public entry だけに rail を置くと live replacement 経路が
+    素通りする。旧 v1-v3 side-binding driver は diagnostic-only で launch authorityを持たない。
+  再適用は idempotent (canonical root は宣言を持たないので、既に畳まれた root は自分自身へ
+  解決する)。後続の読者が「重複」と見なして 2 つ目を削除すると bypass が復活するため、
+  docstring と本節の双方に理由を残す。`--dry-run` と live action-time は同一 rail。
+- **`resolve_repo_root()` を書き換えない理由**: 同 resolver は約 57 箇所から呼ばれ、release
+  tooling・doctor・discovery・config load を含む。nested root を *それ自体として* 報告するのが
+  仕事の read-only surface (`workspace inspect` / `docs resolve` / `scaffold status`) まで
+  巻き込むと、nested tree を code/docs 作業 root として使えるという受入条件を壊す。#15190 は
+  default coordinator pair の *launch* が repository 単位で重複しないことだけを要求する。
+- **fail-closed 条件** (いずれも typed reason 付き zero-launch。nested root への degrade は
+  しない — その degrade が除去対象の欠陥そのもの):
+  `alias_target_missing` / `alias_target_not_directory` / `alias_target_is_self` /
+  `alias_target_not_ancestor` / `alias_target_identity_unresolved` /
+  `alias_target_identity_mismatch` / `alias_target_cross_repository` /
+  `alias_target_git_binding_unavailable` /
+  `alias_target_declares_alias` / `declaration_unreadable` / `declaration_invalid` /
+  `declaration_unsupported_schema` / `declaration_not_regular_file`。
+- **未知 field は拒否する** (`declaration_invalid`)。schema v1 が mode ごとに定義する key
+  集合は exact であり、余剰 key を無視して部分解釈しない。将来の schema 拡張は
+  `schema_version` の bump で表現する。無版の余剰 key を旧 reader が黙って落とすと、
+  「起動を gate する」という宣言の目的そのものが部分適用になる (review j#102104 F3)。
+
+### 宣言 file の filesystem 安全性 (review j#102104 F1 / F2)
+
+宣言 file は repository が内容を支配する path にあるため、writer / reader は path 解決を
+follow-through helper に任せない。`.mozyo-bridge` を `O_NOFOLLOW` で開いた **directory file
+descriptor** に固定し、判定は全て `lstat` で行う。
+
+- **書き込みは symlink を辿らない**。`Path.write_text` は symlink を辿るため、
+  workspace 外を指す `workspace-alias.json` symlink があると `workspace alias disable` が
+  workspace 外の file を上書きできた。現在は「既存 entry が通常 file でない」「hard link が
+  複数」「親が実 directory でない (symlink 含む)」をいずれも zero-mutation で拒否する
+  (`declaration_not_regular_file` / `declaration_multiple_links` /
+  `declaration_parent_unsafe`)。
+- **書き込みは同一 directory 内の private temp file → `os.replace` → readback 照合**で行う。
+  途中のどの失敗でも既存宣言は変化しない (`declaration_write_failed` /
+  `declaration_readback_failed`)。
+- **「不在」と「存在するが通常 file でない」を分離する**。`is_file()` は directory / FIFO /
+  dangling symlink でも false になるため、破損・すり替えられた宣言が「宣言なし」と読まれ
+  nested root の起動を許していた。現在は不在のみ `no_declaration`、非通常 entry・stat/read
+  失敗は typed zero-launch。
+- **`clear` は「存在するが削除不能」を成功と報告しない** (`declaration_remove_failed`)。
+  symlink の `clear` は link だけを外し、その target には触れない。
+- alias cycle 判定は「読める宣言」ではなく **entry の存在**で行うので、target 側の宣言が
+  壊れている場合も fail closed する。
+- **pin した dirfd は「見えている directory」と同じとは限らない** (review j#102140 F1)。
+  dirfd は directory の rename を跨いで生き残るため、これを検証しないと書き込みが
+  *detached* な directory に着地したまま成功を返し、workspace から見える path には宣言が
+  存在しない、という状態になる。そこで全 mutation は (1) root から見える `.mozyo-bridge` が
+  pin した inode と同一であることを replace の前後で再検証し、(2) 完了判定を **fresh な
+  path 経由の read-back** (= effective state) で行う。drift は `declaration_parent_drift` で
+  zero-effective-mutation。`clear` も同様に effective state を確認する。
+- **検証失敗は既存宣言を壊さない** (review j#102140 F2)。`os.replace` は read-back が
+  失敗する時点で既に着地しているため、直前の内容を同一 directory 内へ stage しておき、
+  失敗時に戻す (元が無ければ新 entry を削除する)。`WorkspaceAliasStoreError` は `mutated`
+  を持ち、CLI は「何も書かれていない」と決め打ちせず実際の effective state を報告する。
+- **read は raise せず、block もしない** (review j#102140 F3 / j#102710 r6f3)。reader は
+  writer と同じ `.workspace-alias.json.lock` を create せず安全に開き、`fstat` で
+  single-linked regular file と確認し、visible inode を再照合してから
+  `LOCK_SH | LOCK_NB` を取得する。shared lock は宣言の parse 完了まで保持する。writer の
+  `LOCK_EX` と競合した場合は待機も `None` 返却もせず
+  `declaration_mutation_in_progress` の typed refusal とする。lock の open / stat / flock が
+  安全に成立しない場合は `declaration_lock_failed` で fail closed。lock entry がまだ無い
+  workspace では、宣言 entry の不在を確認した後に lock の不在を再確認し、2 回目の lock
+  `ENOENT` を linearization point とする。真に不在なら read-only side effect なしで `None`、
+  途中で writer の lock が現れたら通常の shared-lock 判定へ入り、宣言が存在するのに lock が
+  無ければ未協調 read を拒否する。`declaration_exists()` も同じ reader を使い、mutation中の
+  refusal を「存在」として cycle 判定を fail closed にする。さらに宣言本体も
+  `O_NONBLOCK` で開いた上で `fstat` により同一 object が regular file であることを再確認する
+  ので、`lstat` と `open` の間に regular file が FIFO へ差し替えられても reader が無限に
+  停止しない。writer が `LOCK_EX` を保持中に行う effective readback は、public reader の
+  shared lock を再取得せず、caller-held lock fd と fresh path から見える lock inode を
+  read 前後に照合する private read を使う。fresh parent の消失・置換は absent ではなく
+  parent/lock drift の typed refusal となり、write/clear の成功にはならない。
+- **restore できない mutation を「変更なし」と報告しない** (review j#102230 F1)。
+  既存 entry を snapshot できない場合は replace の**前**に `declaration_snapshot_failed` で
+  拒否する (snapshot 無しで進むと、後段の検証失敗時に rollback が新 entry を消すだけとなり、
+  旧宣言が失われたまま no-op として報告される)。`clear` も削除前に entry を捕捉し、
+  削除後の effective 確認が失敗したら復元する。復元できたときだけ `mutated=false`。
+- **宣言の読み取りは常に bounded** (review j#102230 F2)。`MAX_DECLARATION_BYTES` (64 KiB) を
+  `fstat` で allocation 前に enforce し、読み出し自体も chunk 単位で上限を超えたら
+  `declaration_too_large` にする。`st_size` は単独では信頼できない (sparse file は実体を
+  持たずに巨大 size を宣言でき、read 中に成長もしうる) ため、両方を課す。旧実装の
+  `os.read(fd, st_size + 1)` は 512 MiB の sparse 宣言だけで reader を raw `MemoryError` に
+  追い込めた。`MemoryError` も typed refusal へ変換する。
+- **全 supported mutation は single-writer で直列化する** (review j#102259 F1)。
+  `.mozyo-bridge/.workspace-alias.json.lock` の排他 lock を snapshot → replace →
+  verify → rollback の全区間で保持する。replace 直前の precheck だけでは
+  check→replace race が残り、その間に成功した別 mutation を失敗側の rollback が
+  無言で上書きしうる (実測: 失敗した write が concurrent 宣言を旧内容へ戻し、しかも
+  `mutated=false` と報告した)。加えて snapshot した entry の generation
+  (dev/ino/mtime_ns/size) を束縛し、snapshot 直後と replace 直前に照合する
+  (`declaration_concurrent_change`)。lock を通らない外部 writer への防御であり、
+  「読んでいない宣言を上書きしない」ことを保証する。
+- **mutation は check-then-act ではなく atomic take-ownership で行う** (review j#102710 r6f2)。
+  fence 照合と `os.replace` / `os.unlink` は別 syscall であり、その間に lock を通らない
+  writer が着地しうる。そこで既存 entry を先に `rename` で私有名へ退避して**所有権を原子的に
+  獲得**し、獲得した inode の digest を fence と照合してから install / 削除する。不一致なら
+  退避を戻して `declaration_concurrent_change` (zero mutation)。宣言が不在の場合は
+  `os.link` (存在すれば EEXIST) で「不在時のみ作成」を原子化する。非通常 entry
+  (symlink / directory) は content を持たないため従来どおり直接 unlink する。
+- **alias が承認した identity は public entry から private entry へ引き渡す**
+  (review j#102710 r6f1)。canonical root 自身は宣言を持たないため、private entry で
+  再解決すると binding が空になる。public wrapper が承認 id を call へ載せ、private entry は
+  caller 由来の binding を優先する。
+- **`.mozyo-bridge` を新規作成した場合は repo root directory も fsync する**
+  (review j#102710 r6f4)。宣言と `.mozyo-bridge` を sync しても、その directory を指す
+  entry は repo root にあり、未 sync なら crash で宣言ごと失われる。
+- **fence は content-bound で、clear にも適用する** (review j#102641 F2)。metadata
+  (dev/ino/mtime_ns/size) だけでは、同一 inode・同 size・mtime 復元の in-place 更新を
+  検出できない。snapshot した bytes の digest を fence に含め、replace / unlink の直前に
+  照合する。`clear` も write と同じ fence を通し、snapshot と unlink の間に着地した宣言を
+  「読んだもの」として削除しない (`declaration_concurrent_change`)。
+- **alias が承認した identity を launch actuation まで束縛する** (review j#102641 F1)。
+  alias 決定は canonical の特定 `workspace_id` に対して下される。決定と登録の間に canonical
+  path の anchor が差し替わると、承認されていない workspace 向けに名前が mint されうる。
+  そのため登録後の identity を承認 id と exact 照合し、drift は typed zero-launch にする。
+- **durability failure の typed reason は全 mutation で統一する** (review j#102641 F3)。
+  write / clear / rollback / restore のいずれでも `declaration_durability_failed` を返す。
+- **directory durability を成功条件に含める** (review j#102259 F2)。final replace /
+  clear の unlink / すべての rollback・restore の後に parent directory を `fsync` し、
+  失敗を握り潰さない (`declaration_durability_failed`)。unsynced な rename/unlink は
+  power loss で失われるため、process 内 readback が一致しても durable な宣言とは
+  言えない。rollback も durable に完了できない場合は `mutated=true` 相当として
+  manual inspection を要求する。
+- **schema の型検査は exact** (review j#102140 F4)。Python では `True == 1` / `1.0 == 1` が
+  成立し、`bool` は `int` の subclass なので、値比較だけでは bool / float が整数 1 として
+  通ってしまう。`schema_version` は `type(v) is int` を要求し、optional な文字列 field は
+  正規化の**前**に型を検査する (旧実装の `raw.get(k) or ""` は `false` / `0` / `None` を
+  黙って `""` に潰していた)。
+- **cross-repository 判定は `git_common_dir` の一致**で行う。linked worktree は main checkout と
+  共通なので同一 repository (sublane worktree は従来どおり launch 可能)、**submodule** は
+  親の tree 内に物理的に存在しても別 repository として拒否する。観測事例の
+  `projects/nihonidenshi` が submodule であるため、path 包含だけでは不十分。
+  両者とも**positively non-git**の場合のみ包含関係が binding を担う (#11301 の非 git
+  scaffolded workspace)。この判定は workspace-alias 専用のlossless probeを使い、Gitが実際に
+  起動してlocale固定のnon-repository結果を返し、discovery path上に `.git` entryが無い場合だけ
+  `not_measurable` とする。missing executable / timeout / unexpected non-zero / malformed output /
+  marker stat failureは `alias_target_git_binding_unavailable` のtyped zero-launchであり、
+  `workspace alias set`も宣言を一切書かない。shared workspace-registryのbest-effort helperが
+  failureを `None` に畳む後方互換contractを、authority-bearing alias判定へ流用しない。
+- **identity binding**: 宣言は canonical の `workspace_id` を記録する。同一 path で identity が
+  再発行・復元された場合は `alias_target_identity_mismatch` で fail closed し、alias が別
+  workspace へ黙って向き直ることを防ぐ。
+- alias chain は 1 hop に固定 (`alias_target_declares_alias`) するので cycle は成立しない。
+- canonical 側の role binding / workspace id / live attestation は本 rail では一切変更しない。
+  `clear` は宣言 file だけを削除し、anchor・registry row・nested の tracked scaffold /
+  catalog / skills には触れない。
+
 ## 検証
 
 - registry tests: `tests/integration/e_110_execution_platform/f_110_workspace_session_identity/test_workspace_registry.py` と `test_workspace_retirement_store.py`、`tests/unit/e_110_execution_platform/f_110_workspace_session_identity/test_workspace_retirement.py`。

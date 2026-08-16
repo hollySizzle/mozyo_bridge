@@ -12,6 +12,7 @@ from time import strftime
 import yaml
 
 from mozyo_bridge import __version__
+from mozyo_bridge.scaffold.rules_manifest import install_rule_store
 from mozyo_bridge.shared.errors import die
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
@@ -370,17 +371,15 @@ def install_rules(
     store: RulesStore | None = None,
 ) -> list[Path]:
     resolved = _coerce_store(store, home)
-    written: list[Path] = []
-    for preset in PRESETS:
-        target_dir = installed_preset_dir(preset, store=resolved)
-        target_dir.mkdir(parents=True, exist_ok=True)
-        for filename in ("VERSION", "agent-workflow.md"):
-            content = package_text(preset, filename)
-            target = target_dir / filename
-            if not target.exists() or target.read_text(encoding="utf-8") != content:
-                target.write_text(content, encoding="utf-8")
-                written.append(target)
-    return written
+    return install_rule_store(
+        resolved,
+        presets=PRESETS,
+        preset_dir=lambda preset: installed_preset_dir(preset, store=resolved),
+        package_text=package_text,
+        manifest_relative_path=MANIFEST_RELATIVE_PATH,
+        central_mode=CENTRAL_MODE,
+        repo_local_mode=REPO_LOCAL_MODE,
+    )
 
 
 def rules_status(

@@ -286,7 +286,10 @@ def _shard_env(repo_root: Path, shard_home: Path) -> dict[str, str]:
         if role.startswith("xdg_")
     }
     for directory in (home, tmp, mozyo, *xdg.values()):
-        directory.mkdir(parents=True, exist_ok=True)
+        # 0700 like the single-run fence roots: shard-private, and a group-writable tmp
+        # would fail the session-start gate's entry-stability rule (#15227 R-correction).
+        directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        directory.chmod(0o700)
     env["HOME"] = str(home)
     env["TMPDIR"] = str(tmp)
     env["TMP"] = str(tmp)

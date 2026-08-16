@@ -138,8 +138,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OLD_SLOT_PRESENT,
     OLD_SLOT_RECYCLED,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_epoch import (  # noqa: E501
-    replacement_store_admission,
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_replacement_launch_admission import (  # noqa: E501
+    replacement_managed_launch_admission,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (
     herdr_workspace_segment,
@@ -148,6 +148,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_NAME,
     _agent_locator,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 
 
@@ -156,13 +157,14 @@ def _action_bound_after_identity_join(
     *,
     action_id: str,
     live_locator: str,
+    live_terminal_id: object,
     workspace_id: str,
     role: str,
     lane: str,
     assigned_name: str,
     old_locator: str,
 ) -> bool:
-    """Accept native-v2 directly, or the exact v1 side binding after identity join.
+    """Accept only the exact terminal-bound v4 direct action after identity join.
 
     Redmine #14485 made the rule shared rather than local, the same way #14480 did for
     ``_launch_detail``: the recovery port that ``recover-stale`` / ``recover-gateway`` share
@@ -175,6 +177,7 @@ def _action_bound_after_identity_join(
         record,
         action_id=norm(action_id),
         live_locator=live_locator,
+        live_terminal_id=live_terminal_id,
         workspace_id=workspace_id,
         role=role,
         lane=lane,
@@ -340,6 +343,10 @@ class _BoundPairActuatorPort(ExactGenerationActuatorPort):
         # (Redmine #13933 R11 j#81429 #3).  A fenced launch records its stable, typed reason
         # (no path / credential) so the public outcome surfaces WHY (j#81429 #2), instead of a
         # bare swallowed exception under ``effect_failed / launch``.
+        if self.verify_attestation(action_id, pin) == ATTEST_BOUND:
+            self.launch_failure_reason = ""
+            self.launch_startup_health = None
+            return LAUNCH_DONE
         try:
             HerdrSublaneActuatorOps(
                 repo_root=self.owner.repo_root,
@@ -390,6 +397,9 @@ class _BoundPairActuatorPort(ExactGenerationActuatorPort):
         join = evaluate_attestation(
             record,
             live_locator=locator,
+            live_terminal_id=terminal_identity_of_live_slot(
+                pin.assigned_name, locator, rows
+            ),
             expected_workspace_id=self.live.workspace_id(),
             expected_role=pin.provider,
             expected_lane=self.request.lane,
@@ -402,6 +412,9 @@ class _BoundPairActuatorPort(ExactGenerationActuatorPort):
                 record,
                 action_id=norm(action_id),
                 live_locator=locator,
+                live_terminal_id=terminal_identity_of_live_slot(
+                    pin.assigned_name, locator, rows
+                ),
                 workspace_id=self.live.workspace_id(),
                 role=pin.provider,
                 lane=self.request.lane,
@@ -420,7 +433,7 @@ class LiveBoundPairConvergenceOps:
     transaction_store: ReplacementTransactionStore = field(default_factory=ReplacementTransactionStore)
     pin_store: LanePinRepairStore = field(default_factory=LanePinRepairStore)
 
-    def store_admission(self, key, pin) -> str | None:
+    def store_admission(self, key, pin, *, repo_root: Path | None = None) -> str | None:
         """The pre-effect epoch/store verdict for one participant (Redmine #14756 j#96848).
 
         Injected into every :class:`ReplacementActuatorUseCase` this ops object builds, so the
@@ -438,8 +451,15 @@ class LiveBoundPairConvergenceOps:
         confident verdict about a store the action has nothing to do with.
         """
         home = str(self.lifecycle_store.path.parent)
-        return replacement_store_admission(
-            key.workspace_id, pin.lane_id, lifecycle_home=home, attestation_home=home
+        return replacement_managed_launch_admission(
+            key.workspace_id,
+            pin.lane_id,
+            repo_root=repo_root or self.repo_root,
+            env=self.env,
+            runner=None,
+            timeout=30.0,
+            lifecycle_home=home,
+            attestation_home=home,
         )
 
     def _worktree(self, request: ConvergeBoundPairRequest) -> tuple[Path | None, str, str]:
@@ -516,7 +536,10 @@ class LiveBoundPairConvergenceOps:
         except Exception:  # noqa: BLE001
             return None
 
-    def observe(self, request: ConvergeBoundPairRequest, *, action_id: str = "") -> BoundPairObservation:
+    def observe(
+        self, request: ConvergeBoundPairRequest, *, action_id: str = "",
+        _snapshot_rows: Sequence[Mapping[str, object]] | None = None,
+    ) -> BoundPairObservation:
         worktree, workspace, identity = self._worktree(request)
         if worktree is None or not workspace or not identity:
             return BoundPairObservation(detail="worktree/workspace identity unresolved")
@@ -541,7 +564,10 @@ class LiveBoundPairConvergenceOps:
         faults = self._bound_signature_faults(request, record, identity)
         exact = not faults
         try:
-            rows = tuple(list_herdr_agent_rows(self.env))
+            rows = tuple(
+                list_herdr_agent_rows(self.env)
+                if _snapshot_rows is None else _snapshot_rows
+            )
             inventory_readable = True
         except Exception as exc:  # noqa: BLE001
             return BoundPairObservation(
@@ -766,7 +792,9 @@ class LiveBoundPairConvergenceOps:
             self.transaction_store,
             port,
             preservation_policy=assess_preservation,
-            store_admission=self.store_admission,
+            store_admission=lambda key, pin: self.store_admission(
+                key, pin, repo_root=Path(request.worktree)
+            ),
             evidence_completion=build_update_evidence_completion(
                 self.transaction_store.path.parent
             ),
@@ -784,7 +812,15 @@ class LiveBoundPairConvergenceOps:
     def final_pins(
         self, request: ConvergeBoundPairRequest, *, action_id: str
     ) -> tuple[BoundPairObservation, tuple[ProcessGenerationPin, ...]]:
-        observation = self.observe(request, action_id=action_id)
+        try:
+            rows = tuple(list_herdr_agent_rows(self.env))
+        except Exception as exc:  # noqa: BLE001
+            return BoundPairObservation(
+                detail=f"inventory unreadable ({type(exc).__name__})"
+            ), ()
+        observation = self.observe(
+            request, action_id=action_id, _snapshot_rows=rows
+        )
         transaction = self._transaction(observation.workspace_id, action_id)
         pins: list[ProcessGenerationPin] = []
         for slot in observation.slots:
@@ -794,9 +830,13 @@ class LiveBoundPairConvergenceOps:
                 attestation = HerdrIdentityAttestationStore().read(slot.assigned_name)
             except Exception:  # noqa: BLE001
                 return observation, ()
+            live_terminal_id = terminal_identity_of_live_slot(
+                slot.assigned_name, slot.locator, rows
+            )
             join = evaluate_attestation(
                 attestation,
                 live_locator=slot.locator,
+                live_terminal_id=live_terminal_id,
                 expected_workspace_id=observation.workspace_id,
                 expected_role=slot.provider,
                 expected_lane=request.lane,
@@ -815,6 +855,7 @@ class LiveBoundPairConvergenceOps:
                 attestation,
                 action_id=norm(action_id),
                 live_locator=slot.locator,
+                live_terminal_id=live_terminal_id,
                 workspace_id=observation.workspace_id,
                 role=slot.provider,
                 lane=request.lane,

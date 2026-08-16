@@ -132,9 +132,12 @@ class SameIssueRouteSelectionTest(_StoreCase):
     def test_auditor_action_selects_gateway_not_worker_route(self):
         # j#68908 finding 1: persisting a worker(claude) route then a gateway(codex) route
         # for the same issue must NOT make an auditor action point at the worker route.
+        # `--repo` points at the config-less temp dir so the default role->provider
+        # binding applies (see PersistResumeLoopTest note on the committed rebind).
         rc, _ = _run(
             [
                 "workflow", "runtime",
+                "--repo", self._tmp.name,
                 "--event", "12671:review_request,id=12671:68864,commit=1",
                 "--persist", "--store-path", self.store_path,
                 "--route-identity",
@@ -145,7 +148,10 @@ class SameIssueRouteSelectionTest(_StoreCase):
             ]
         )
         self.assertEqual(rc, 0)
-        rc2, text = _run(["workflow", "resume", "--store-path", self.store_path, "--json"])
+        rc2, text = _run(
+            ["workflow", "resume", "--repo", self._tmp.name,
+             "--store-path", self.store_path, "--json"]
+        )
         self.assertEqual(rc2, 0)
         na = json.loads(text)["workflow"]["next_action"]
         self.assertEqual(na["action"], "perform_review")

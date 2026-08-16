@@ -46,6 +46,7 @@ import subprocess
 import tempfile
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any, Mapping, NamedTuple, Optional
 from unittest import mock
 
@@ -318,8 +319,9 @@ class InstalledFaultHarness:
 
         # A readable-but-EMPTY composer read (a rendered prompt line ``> `` with no body): a
         # fresh idle launch has nothing typed, so a rollback's "pending input cannot be ruled
-        # out" guard clears (a blank read would instead read as *unreadable*) and the fresh pane
-        # is closeable.
+        # out" guard clears (a blank read would instead read as *unreadable*). The fixture still
+        # exercises the live public ops, which preserve this present pane when the selected Herdr
+        # runtime has no server-side conditional close for its observed generation.
         self.fake = FakeHerdr(read_text="idle\n> ")
         self._ws = self.fake.seed_workspace(cwd=str(self.repo_root))
         self._runner = _HerdrRunner(self.fake, self.herdr_bin, subprocess.run, subprocess.Popen)
@@ -596,36 +598,108 @@ class InstalledFaultHarness:
         """Reserve a startup action + record a fresh unhealthy launch that owes a rollback.
 
         Returns ``(action_id, {role: locator})``. Each recorded participant is also placed live
-        in the fake inventory so the public ``herdr session-rollback`` preflight finds it as a
-        closeable fresh launch of THIS action. ``busy=True`` seeds the fresh slot as an in-flight
-        turn instead (a rollback must refuse to interrupt it). This is the safe isolated fixture
-        rail: the home-scoped :class:`StartupTransactionFence` public API — the same store the
-        public rollback command reads — never a raw fence mutation.
+        in the fake inventory so the public ``herdr session-rollback`` preflight finds the exact
+        fresh launch of THIS action and exercises its identity/content fences. Current live Herdr
+        ops then report ``conditional_close_unavailable`` and preserve the pane because the
+        runtime cannot atomically close that observed generation. ``busy=True`` seeds the fresh
+        slot as an in-flight turn instead (a rollback must refuse to interrupt it). This is the
+        safe isolated fixture rail: the home-scoped :class:`StartupTransactionFence` public API —
+        the same store the public rollback command reads — never a raw fence mutation.
         """
         from mozyo_bridge.core.state.startup_transaction_fence import (
+            PHASE_HEALTH_CHECK,
+            PHASE_ROLLBACK_OWED,
             Participant,
             StartupTransactionFence,
             StartupUnit,
+        )
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            IdentityAttestationRecord,
+            VERDICT_PRESENT,
+        )
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            HerdrLaunchGenerationStore,
+        )
+        from mozyo_bridge.core.state.herdr_native_identity_binding import (
+            HerdrNativeIdentityBindingStore,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+            pane_bound_receipt,
         )
 
         fence = StartupTransactionFence(home=self.home)
         unit = StartupUnit(workspace_id=self.workspace_id, lane_id=lane_id, providers=providers)
         action = fence.reserve(unit, nonce)
-        # A fresh launch that did NOT come up healthy sits idle (never attested), the closeable
-        # rollback candidate; a busy slot is an in-flight turn a rollback always refuses.
+        generations = HerdrLaunchGenerationStore(home=self.home)
+        attestations = HerdrIdentityAttestationStore(home=self.home)
+        # A fresh launch came up far enough to publish its terminal-bound authority, but its
+        # bounded health decision failed and left this same action in rollback_owed. The live
+        # public adapter still preserves a present pane without conditional-close capability; a
+        # busy slot is always refused too.
         status = STATUS_WORKING if busy else DEFAULT_START_STATUS
         locators: dict[str, str] = {}
         for role in providers:
             name = encode_assigned_name(self.workspace_id, role, lane_id)
+            binding = HerdrNativeIdentityBindingStore(home=self.home).bind(name)
             locator = self.fake.seed_agent(
-                name, workspace_id=self._ws, provider=role, status=status
+                binding.native_name,
+                workspace_id=self._ws,
+                logical_name=name,
+                provider=role,
+                status=status,
+                detected_agent=role,
             )
             fence.record_participant(
                 action.action_id,
-                Participant(role=role, assigned_name=name, locator=locator, receipt=locator),
+                Participant(
+                    role=role,
+                    assigned_name=name,
+                    locator=locator,
+                    receipt=pane_bound_receipt(
+                        target_workspace=self._ws,
+                        target_tab=f"{self._ws}:t1",
+                        native_name=binding.native_name,
+                        terminal_id=self.fake.terminal_id_of(locator),
+                    ),
+                ),
+            )
+            terminal_id = self.fake.terminal_id_of(locator)
+            generations.reserve_pending(
+                assigned_name=name,
+                startup_action_id=action.action_id,
+                workspace_id=self.workspace_id,
+                role=role,
+                lane_id=lane_id,
+            )
+            generations.finalize(
+                assigned_name=name,
+                startup_action_id=action.action_id,
+                workspace_id=self.workspace_id,
+                role=role,
+                lane_id=lane_id,
+                locator=locator,
+                terminal_id=terminal_id,
+                verdict=VERDICT_PRESENT,
+                observed_at="2026-01-01T00:00:00+00:00",
+            )
+            attestations.upsert(
+                IdentityAttestationRecord(
+                    assigned_name=name,
+                    workspace_id=self.workspace_id,
+                    role=role,
+                    lane_id=lane_id,
+                    locator=locator,
+                    terminal_id=terminal_id,
+                    verdict=VERDICT_PRESENT,
+                    observed_at="2026-01-01T00:00:00+00:00",
+                    replacement_action_id=action.action_id,
+                )
             )
             locators[role] = locator
             self._locators[name] = locator
+        fence.set_phase(action.action_id, PHASE_HEALTH_CHECK)
+        fence.set_phase(action.action_id, PHASE_ROLLBACK_OWED)
         return action.action_id, locators
 
     # -- stale-worker recovery driving (#13806) -------------------------------
@@ -731,8 +805,14 @@ class InstalledFaultHarness:
         rec = store.get(key)
         store.request_release(
             key, expected_revision=rec.revision, action_id="rel-1",
-            observation=build_release_observation([ReleasePin("gateway", "codex-mzb1", "w1:p1"),
-                  ReleasePin("worker", "claude-mzb1", "w1:p2")]),
+            observation=build_release_observation([
+                ReleasePin(
+                    "gateway", "codex-mzb1", "w1:p1", "startup-action-current"
+                ),
+                ReleasePin(
+                    "worker", "claude-mzb1", "w1:p2", "startup-action-current"
+                ),
+            ]),
         )
         rec = store.get(key)
         from mozyo_bridge.core.state.lane_lifecycle import RELEASE_RELEASED
@@ -896,15 +976,37 @@ class InstalledFaultHarness:
         from mozyo_bridge.core.state.herdr_launch_generation import (
             HerdrLaunchGenerationStore,
         )
+        from mozyo_bridge.core.state.herdr_identity_attestation import (
+            HerdrIdentityAttestationStore,
+            IdentityAttestationRecord,
+            VERDICT_PRESENT,
+        )
         from mozyo_bridge.core.state.startup_transaction_fence import (
+            PHASE_COMPLETED_SUCCESS,
+            PHASE_HEALTH_CHECK,
+            Participant,
+            StartupTransactionFence,
             StartupUnit,
-            startup_action_id,
         )
 
-        legacy_action_id = startup_action_id(
+        startup_fence = StartupTransactionFence(home=self.home)
+        startup_action = startup_fence.reserve(
             StartupUnit(workspace_id=ws_id, lane_id=lane_id, providers=("claude",)),
             "installed-fault-harness-legacy-generation",
         )
+        legacy_action_id = startup_action.action_id
+        terminal_id = self.fake.terminal_id_of(locator)
+        startup_fence.record_participant(
+            legacy_action_id,
+            Participant(
+                role="claude",
+                assigned_name=name,
+                locator=locator,
+                receipt=f"workspace={lane_ws}",
+            ),
+        )
+        startup_fence.set_phase(legacy_action_id, PHASE_HEALTH_CHECK)
+        startup_fence.set_phase(legacy_action_id, PHASE_COMPLETED_SUCCESS)
         generations = HerdrLaunchGenerationStore(home=self.home)
         generations.reserve_pending(
             assigned_name=name,
@@ -920,8 +1022,21 @@ class InstalledFaultHarness:
             role="claude",
             lane_id=lane_id,
             locator=locator,
-            verdict="present",
+            terminal_id=terminal_id,
+            verdict=VERDICT_PRESENT,
             observed_at="2026-01-01T00:00:00.000000+00:00",
+        )
+        HerdrIdentityAttestationStore(home=self.home).upsert(
+            IdentityAttestationRecord(
+                assigned_name=name,
+                workspace_id=ws_id,
+                role="claude",
+                lane_id=lane_id,
+                locator=locator,
+                terminal_id=terminal_id,
+                verdict=VERDICT_PRESENT,
+                observed_at="2026-01-01T00:00:00.000000+00:00",
+            )
         )
         # The surviving same-lane codex gateway the heal adopts + pins the tab on (a heal never
         # splits the pair; without a live gateway the fresh worker launch has nothing to adopt).
@@ -1022,17 +1137,64 @@ class InstalledFaultHarness:
     def _seed_fresh_attestation(
         self, ctx: _RecoverStaleContext, locator: str, *, observed_at: str
     ) -> None:
-        """Seed the fresh receiver's startup identity attestation (the relaunch came online)."""
+        """Seed the fresh receiver's complete managed-launch authority."""
         from mozyo_bridge.core.state.herdr_identity_attestation import (
             HerdrIdentityAttestationStore, IdentityAttestationRecord, VERDICT_PRESENT,
         )
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            GENERATION_PENDING,
+            HerdrLaunchGenerationStore,
+        )
+        from mozyo_bridge.core.state.startup_execution_events import (
+            STAGE_ATTESTATION_WRITE_SUCCEEDED,
+            append_execution_event,
+        )
+        from mozyo_bridge.core.state.startup_transaction_fence import (
+            PHASE_COMPLETED_SUCCESS,
+            StartupTransactionFence,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
+            finalize_launch_generations,
+        )
 
-        HerdrIdentityAttestationStore(home=self.home).upsert(
+        attestations = HerdrIdentityAttestationStore(home=self.home)
+        attestations.upsert(
             IdentityAttestationRecord(
                 assigned_name=ctx.worker_name, workspace_id=ctx.workspace_id, role="claude",
                 lane_id=ctx.lane_id, locator=locator, verdict=VERDICT_PRESENT,
                 observed_at=observed_at, replacement_action_id=ctx.action_id,
+                terminal_id=self.fake.terminal_id_of(locator),
             )
+        )
+        generations = HerdrLaunchGenerationStore(home=self.home)
+        generation = generations.read(ctx.worker_name)
+        if generation is None or generation.phase != GENERATION_PENDING:
+            return
+        fence = StartupTransactionFence(home=self.home)
+        action = fence.read(generation.startup_action_id)
+        if action is None:
+            return
+        append_execution_event(
+            fence,
+            generation.startup_action_id,
+            STAGE_ATTESTATION_WRITE_SUCCEEDED,
+            participant=ctx.worker_name,
+        )
+        if not action.terminal:
+            fence.set_phase(generation.startup_action_id, PHASE_COMPLETED_SUCCESS)
+        slot = SimpleNamespace(
+            assigned_name=ctx.worker_name,
+            provider="claude",
+            locator=locator,
+            launch_terminal_id=self.fake.terminal_id_of(locator),
+        )
+        finalize_launch_generations(
+            store_home=self.home,
+            startup_action_id=generation.startup_action_id,
+            slots=[slot],
+            workspace_id=ctx.workspace_id,
+            lane_id=ctx.lane_id,
+            attestation_read=attestations.read,
         )
 
     def _agent_identity_set(self) -> frozenset:

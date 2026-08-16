@@ -33,6 +33,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatcher import (
     cmd_sublane_dispatch_worker,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_audit_failure_terminal_decision import (  # noqa: E501
+    register_audit_failure_terminal_decision,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_sublane_retire import (
     register_sublane_retire,
 )
@@ -71,6 +74,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard import register_sublane_prepare_bound_pair_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_reboot_audit import register_sublane_reboot_audit_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_residue_close import register_sublane_close_residue_parser  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_recovery_cli import register_sublane_recover_restored_pair_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
@@ -444,17 +448,19 @@ def register_sublane_group(
     # #13293: bounded pre-dispatch gateway readiness wait. Before the --execute
     # queue-enter dispatch, poll the freshly-launched gateway TUI until it is booted +
     # rendered (so the input lands on a live composer, not a still-booting one — the
-    # j#72677 / 5-example dispatch-loss failure mode). Never hard-blocks the queue-enter
-    # rail: an unconfirmed readiness within the window degrades to gateway_ready=false
-    # and dispatches anyway. 0 disables the wait (back-compat immediate dispatch).
+    # j#72677 / 5-example dispatch-loss failure mode). The readiness observation itself
+    # is advisory: an unconfirmed probe records gateway_ready=false and proceeds to the
+    # governed send. That send still returns its own typed outcome — confirmed, not_sent,
+    # or uncertain — and may fail closed. 0 disables the wait (back-compat immediate send).
     sublane_create.add_argument(
         "--gateway-ready-timeout",
         dest="gateway_ready_timeout",
         type=float,
         default=10.0,
         help="Seconds to wait for the gateway TUI to become ready before the --execute "
-        "dispatch (default: 10.0; 0 disables the wait). Never hard-blocks — an "
-        "unconfirmed readiness dispatches anyway and records gateway_ready=false.",
+        "dispatch (default: 10.0; 0 disables the wait). This probe is advisory: an "
+        "unconfirmed readiness records gateway_ready=false and continues to the governed "
+        "send, which can still confirm submission or fail closed.",
     )
     _add_dispatch_admission_flags(sublane_create)
     add_repo_option(sublane_create)
@@ -476,7 +482,7 @@ def register_sublane_group(
         help=(
             "Drive the same-lane gateway -> worker implementation_request "
             "forward and record the measured worker-dispatch delivery ACK "
-            "(Redmine #12988): only a submit-complete send yields "
+            "(Redmine #12988): only a causally confirmed submission yields "
             "`worker_dispatched` / worker_dispatch_confirmed=true; a failed or "
             "unresolved drive fails closed and the lane's recorded state stays "
             "`gateway_notified`. Default is a dry-run preview; --execute sends. "
@@ -521,17 +527,17 @@ def register_sublane_group(
     # queue-enter forward, poll the freshly-launched same-lane worker TUI until it is
     # booted + rendered (so the anchored implementation_request lands on a live
     # composer, not a still-booting one — the worker-side analog of the #13293 gateway
-    # dispatch-loss failure mode; 3/4 lanes in the 2026-07-06 second wave). Never
-    # hard-blocks: an unconfirmed readiness forwards anyway and records
-    # worker_ready=false. 0 disables the wait (back-compat immediate forward).
+    # dispatch-loss failure mode; 3/4 lanes in the 2026-07-06 second wave). Readiness is
+    # an action-time gate: an unconfirmed worker records worker_ready=false and blocks
+    # before injection (zero-send). 0 disables the wait (back-compat immediate forward).
     sublane_dispatch_worker.add_argument(
         "--worker-ready-timeout",
         dest="worker_ready_timeout",
         type=float,
         default=10.0,
         help="Seconds to wait for the same-lane worker TUI to become ready before the "
-        "--execute forward (default: 10.0; 0 disables the wait). Never hard-blocks — an "
-        "unconfirmed readiness forwards anyway and records worker_ready=false.",
+        "--execute forward (default: 10.0; 0 disables the wait). An unconfirmed readiness "
+        "records worker_ready=false and blocks before injection (zero-send).",
     )
     # #13301: thread the explicit --allow-direct-worker gateway-route exception
     # (#12918) into the same-lane worker send so a drive from a pane whose lane Unit
@@ -591,6 +597,11 @@ def register_sublane_group(
         add_repo_option=add_repo_option,
         add_lifecycle_json=add_lifecycle_json,
     )
+
+    # Redmine #15166: the coordinator decision the audit-failure terminal requires, registered by
+    # the same convention. Recording a decision retires nothing; it is the writer half of a route
+    # whose reader is `sublane retire --superseded-audit-failure-terminal`.
+    register_audit_failure_terminal_decision(sublane_sub, add_repo_option=add_repo_option)
 
     sublane_supersede = sublane_sub.add_parser(
         "supersede",
@@ -677,3 +688,4 @@ def register_sublane_group(
     # and the lane-scoped shell-residue close it recommends.
     register_sublane_reboot_audit_parser(sublane_sub)
     register_sublane_close_residue_parser(sublane_sub)
+    register_sublane_recover_restored_pair_parser(sublane_sub)

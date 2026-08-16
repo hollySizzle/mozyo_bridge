@@ -64,6 +64,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     sublane_herdr_projection as projection,
     sublane_herdr_retire as herdr_retire,
     sublane_lifecycle_command,
+    # Import before the per-test retire actuator patch starts. The lifecycle command loads
+    # this consumer lazily; importing it while the source function is mocked would leave its
+    # module-level alias bound to a dead fixture closure after cleanup.
+    sublane_quarantine as _quarantine_import_fence,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E402,E501
     declared_lane_root_identity,
@@ -79,6 +83,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     derive_directory_lane_token,
     derive_lane_workspace_token,
     encode_assigned_name,
+)
+from tests.support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_launch_authority,
 )
 
 _WORKSPACE_ID = "a14715c0d1e2f3a4"
@@ -272,12 +279,40 @@ class _RetireCommandFixture(_RealRootsFixture):
         self.addCleanup(backend.stop)
 
         self.rows: list[dict] = [
-            {"name": encode_assigned_name(_WORKSPACE_ID, "codex", _LANE), "pane_id": "w1:p3"},
-            {"name": encode_assigned_name(_WORKSPACE_ID, "claude", _LANE), "pane_id": "w1:p4"},
+            {
+                "name": encode_assigned_name(_WORKSPACE_ID, "codex", _LANE),
+                "pane_id": "w1:p3",
+                "terminal_id": "terminal:w1:p3",
+            },
+            {
+                "name": encode_assigned_name(_WORKSPACE_ID, "claude", _LANE),
+                "pane_id": "w1:p4",
+                "terminal_id": "terminal:w1:p4",
+            },
             # never a close target: the project's default-lane coordinator pair
-            {"name": encode_assigned_name(_WORKSPACE_ID, "codex", ""), "pane_id": "w1:p1"},
-            {"name": encode_assigned_name(_WORKSPACE_ID, "claude", ""), "pane_id": "w1:p2"},
+            {
+                "name": encode_assigned_name(_WORKSPACE_ID, "codex", ""),
+                "pane_id": "w1:p1",
+                "terminal_id": "terminal:w1:p1",
+            },
+            {
+                "name": encode_assigned_name(_WORKSPACE_ID, "claude", ""),
+                "pane_id": "w1:p2",
+                "terminal_id": "terminal:w1:p2",
+            },
         ]
+        for role, row in zip(("codex", "claude"), self.rows[:2]):
+            seed_completed_current_launch_authority(
+                self.home,
+                workspace_id=_WORKSPACE_ID,
+                lane_id=_LANE,
+                role=role,
+                assigned_name=row["name"],
+                locator=row["pane_id"],
+                terminal_id=row["terminal_id"],
+                target_workspace="w1",
+                target_tab="w1:t1",
+            )
         self._pristine_rows = list(self.rows)
         rows_patch = mock.patch.object(
             projection, "list_herdr_agent_rows",

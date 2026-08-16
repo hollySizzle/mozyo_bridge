@@ -4,6 +4,7 @@ import argparse
 import contextlib
 import io
 import json
+import os
 import sys
 import tempfile
 import time
@@ -37,6 +38,18 @@ class CrossWorkspaceHandoffGateTest(unittest.TestCase):
     `--to codex`. The optional `--target-repo` flag adds a repo-mismatch
     fail-closed check on top.
     """
+
+    def setUp(self) -> None:
+        # The gateway route gate resolves the workflow role binding from MOZYO_REPO,
+        # falling back to the cwd git root — the live checkout's committed operational
+        # config. This fixture hardcodes the DEFAULT binding (codex gateway / claude
+        # worker), so pin MOZYO_REPO to a config-less temp dir: the test must not
+        # depend on the live checkout's .mozyo-bridge/config.yaml (Redmine #15418).
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        env = patch.dict(os.environ, {"MOZYO_REPO": tmp.name})
+        env.start()
+        self.addCleanup(env.stop)
 
     def run_handoff(self, argv, pane, sender_session="local"):
         parser = build_parser()

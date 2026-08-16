@@ -30,12 +30,19 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
+from tests.support.current_launch_authority import (
+    seed_completed_current_launch_authority,
+)
 
 HERDR_ENV = "MOZYO_HERDR_BINARY"
 
 
 def _row(ws, role, lane, locator):
-    return {"name": encode_assigned_name(ws, role, lane), "pane_id": locator}
+    return {
+        "name": encode_assigned_name(ws, role, lane),
+        "pane_id": locator,
+        "terminal_id": f"terminal:{locator}",
+    }
 
 
 class PlanHerdrRetireCloseTest(unittest.TestCase):
@@ -388,6 +395,20 @@ class NonGitRetireCloseTest(unittest.TestCase):
                     _row(project_ws, "codex", lane_label, "w2:p8"),  # lane gateway
                     _row(project_ws, "claude", lane_label, "w2:p9"),  # lane worker
                 ]
+                for role, locator in (("codex", "w2:p8"), ("claude", "w2:p9")):
+                    seed_completed_current_launch_authority(
+                        home,
+                        workspace_id=project_ws,
+                        lane_id=lane_label,
+                        role=role,
+                        assigned_name=encode_assigned_name(
+                            project_ws, role, lane_label
+                        ),
+                        locator=locator,
+                        terminal_id=f"terminal:{locator}",
+                        target_workspace="w2",
+                        target_tab="w2:t1",
+                    )
                 captured: dict = {}
 
                 def _fake_execute(plan, **kw):
@@ -403,7 +424,9 @@ class NonGitRetireCloseTest(unittest.TestCase):
                     worktree=str(root), lane_label=lane_label, issue="13392"
                 )
                 with patch.object(
-                    proj, "list_herdr_agent_rows", return_value=rows
+                    proj,
+                    "list_herdr_agent_rows",
+                    side_effect=(rows, rows, rows[:2]),
                 ), patch.object(
                     retire_mod, "execute_herdr_retire_close", side_effect=_fake_execute
                 ):

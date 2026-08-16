@@ -256,7 +256,10 @@ class Argv0WrapperExecTest(unittest.TestCase):
         def _fake_run(argv, **kwargs):
             return argparse.Namespace(
                 returncode=0,
-                stdout='[{"name": "' + NAME + '", "pane_id": "wY:p2"}]',
+                stdout=(
+                    '[{"name": "' + NAME
+                    + '", "pane_id": "wY:p2", "terminal_id": "terminal-wY:p2"}]'
+                ),
             )
 
         envd = {
@@ -389,7 +392,10 @@ class PreExecListerHygieneTest(unittest.TestCase):
             list_calls.append({"argv": list(argv), "kwargs": kwargs})
             return argparse.Namespace(
                 returncode=0,
-                stdout='[{"name": "' + NAME + '", "pane_id": "wY:p2"}]',
+                stdout=(
+                    '[{"name": "' + NAME
+                    + '", "pane_id": "wY:p2", "terminal_id": "terminal-wY:p2"}]'
+                ),
             )
 
         with tempfile.TemporaryDirectory() as tmp, patch.dict(
@@ -425,7 +431,10 @@ class AttestationRecordedBeforeExecTest(unittest.TestCase):
         def _fake_run(argv, **kwargs):
             return argparse.Namespace(
                 returncode=0,
-                stdout='[{"name": "' + NAME + '", "pane_id": "wY:p2"}]',
+                stdout=(
+                    '[{"name": "' + NAME
+                    + '", "pane_id": "wY:p2", "terminal_id": "terminal-wY:p2"}]'
+                ),
             )
 
         envd = {
@@ -475,6 +484,7 @@ class AttestationRecordedBeforeExecTest(unittest.TestCase):
                     self.assertIsNotNone(record)
                     self.assertEqual(record.verdict, VERDICT_PRESENT)
                     self.assertEqual(record.locator, "wY:p2")
+                    self.assertEqual(record.terminal_id, "terminal-wY:p2")
 
 
 if __name__ == "__main__":

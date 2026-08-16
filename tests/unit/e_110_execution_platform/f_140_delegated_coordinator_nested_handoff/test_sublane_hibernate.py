@@ -88,14 +88,19 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_boundary import (  # noqa: E501
     LaneActivityObservation,
+    fresh_release_disposition,
     read_live_lane_activity,
     read_live_worktree_fingerprint,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernate_cli import (  # noqa: E501
     cmd_sublane_hibernate,
+    format_hibernate_text,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
+)
+from tests.support.current_launch_authority import (
+    seed_completed_current_launch_authority,
 )
 
 WS = "wProj"
@@ -104,8 +109,53 @@ LANE = "issue_13441_provider"
 JOURNAL = "77485"
 
 
+def _terminal(role: str, lane: str, locator: str) -> str:
+    return f"terminal:{lane}:{role}:{locator}"
+
+
 def _row(role: str, lane: str, locator: str) -> dict:
-    return {"name": encode_assigned_name(WS, role, lane), "pane_id": locator}
+    return {
+        "name": encode_assigned_name(WS, role, lane),
+        "pane_id": locator,
+        "terminal_id": _terminal(role, lane, locator),
+    }
+
+
+def _seed_current_pair(
+    home: Path,
+    lane: str,
+    *,
+    gateway_locator: str,
+    worker_locator: str,
+) -> None:
+    """Seed the exact current launch authority a destructive close must rejoin."""
+    for role, locator in (
+        ("codex", gateway_locator),
+        ("claude", worker_locator),
+    ):
+        seed_completed_current_launch_authority(
+            home,
+            workspace_id=WS,
+            lane_id=lane,
+            role=role,
+            assigned_name=encode_assigned_name(WS, role, lane),
+            locator=locator,
+            terminal_id=_terminal(role, lane, locator),
+            target_workspace=WS,
+            target_tab=f"{WS}:t1",
+        )
+
+
+def _declare_issue_lane(store: LaneLifecycleStore) -> None:
+    store.declare_active(
+        LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
+    )
+    _seed_current_pair(
+        store.path.parent,
+        LANE,
+        gateway_locator=f"{WS}:p2",
+        worker_locator=f"{WS}:p3",
+    )
 
 
 def _all_gates(**overrides) -> HibernateAssertions:
@@ -182,6 +232,9 @@ class _FakeOps:
             return self._inventory_sequence.pop(0), self._readable
         return list(self._rows), self._readable
 
+    def live_rows(self):
+        return list(self._rows)
+
     def read_attestation(self, assigned_name):
         return self._attestations.get(assigned_name)
 
@@ -202,15 +255,25 @@ class _FakeOps:
 
     def execute_close(self, plan):
         self.close_calls.append(plan)
-        if self._close_result is not None:
-            return self._close_result
-        return HerdrRetireCloseResult(
+        result = self._close_result or HerdrRetireCloseResult(
             workspace_id=plan.workspace_id,
             lane_id=plan.lane_id,
             closed=tuple(plan.close_targets),
             failed=(),
             foreign_names=plan.foreign_names,
         )
+        closed = set(result.closed)
+        self._rows = [
+            row
+            for row in self._rows
+            if not any(
+                row.get("name")
+                == encode_assigned_name(WS, role, plan.lane_id)
+                and row.get("pane_id") == locator
+                for role, locator in closed
+            )
+        ]
+        return result
 
 
 def _decision() -> DecisionPointer:
@@ -233,9 +296,7 @@ class SublaneHibernateTest(unittest.TestCase):
         return LaneLifecycleStore(home=Path(tmp))
 
     def _declare(self, store) -> None:
-        store.declare_active(
-            LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-        )
+        _declare_issue_lane(store)
 
     def _live_ops(self, **kw) -> _FakeOps:
         rows = [
@@ -538,6 +599,8 @@ class SublaneHibernateTest(unittest.TestCase):
             self.assertEqual(retry.release.process_release, "weird_unknown_token")
             self.assertIn("release_state_unknown", retry.release.detail)
             self.assertEqual(ops.close_calls, [], "an unclassified state closes nothing")
+            self.assertFalse(retry.success_withheld)
+            self.assertIn("release state unclassified", retry.detail)
             self.assertFalse(
                 retry.is_success,
                 "a synthetic released with zero actuation must never read as a clean success",
@@ -664,11 +727,9 @@ class SublaneHibernateTest(unittest.TestCase):
             # live" from "a survivor existed and nothing was written".
             self.assertEqual(outcome.release.process_release, RELEASE_RELEASED)
             # ZERO close actuation is the point (j#94596 item 3): the generation runs, but
-            # with an empty plan, so no pane is ever touched. Asserting the plan's emptiness
-            # is stronger than asserting the driver skipped the call — it pins that the
-            # release completed AND closed nothing.
-            self.assertEqual(len(ops.close_calls), 1)
-            self.assertEqual(ops.close_calls[0].close_targets, ())
+            # with an empty plan, so the guarded close adapter is never invoked and no pane
+            # is ever touched. The durable release observation still records completion.
+            self.assertEqual(ops.close_calls, [])
             self.assertEqual(outcome.release.closed, ())
             self.assertIn("0 close actuation", outcome.release.detail)
 
@@ -754,9 +815,7 @@ class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
         # the lane active, and closes nothing.
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
-            store.declare_active(
-                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-            )
+            _declare_issue_lane(store)
             ops = LiveSublaneHibernateOps(repo_root=Path(tmp))
             with mock.patch(_WORKSPACE_SEGMENT, return_value=WS), mock.patch(
                 _PROJECTION, side_effect=RuntimeError("herdr inventory down")
@@ -778,9 +837,7 @@ class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
         # CLI exit: a blocked (unreadable-inventory) hibernate must exit non-zero.
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
-            store.declare_active(
-                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-            )
+            _declare_issue_lane(store)
             args = argparse.Namespace(
                 repo=None,
                 issue=ISSUE,
@@ -857,9 +914,7 @@ class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
-            store.declare_active(
-                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-            )
+            _declare_issue_lane(store)
             # A canonical, fully-actuated hibernate exits 0.
             self.assertEqual(_run(store, _args()), 0)
 
@@ -883,9 +938,7 @@ class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
-            store.declare_active(
-                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-            )
+            _declare_issue_lane(store)
             # Preflight-only keeps its exit-0 contract (it never actuated).
             self.assertEqual(_run(store, _args(execute=False)), 0)
 
@@ -895,9 +948,7 @@ class LiveHibernateAdapterBoundaryTest(unittest.TestCase):
         # the recovery / boundary-record path.
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
-            store.declare_active(
-                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-            )
+            _declare_issue_lane(store)
             args = argparse.Namespace(
                 repo=None,
                 issue=ISSUE,
@@ -978,9 +1029,7 @@ class SublaneEarlyHibernateTest(unittest.TestCase):
         return LaneLifecycleStore(home=Path(tmp))
 
     def _declare(self, store) -> None:
-        store.declare_active(
-            LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-        )
+        _declare_issue_lane(store)
 
     def _live_ops(self, **kw) -> _FakeOps:
         rows = [
@@ -1121,6 +1170,7 @@ def _pg_attestations(gw_loc=PG_GW_LOC, wk_loc=PG_WK_LOC):
             role="codex",
             lane_id=PG_LANE,
             locator=gw_loc,
+            terminal_id=_terminal("codex", PG_LANE, gw_loc),
             verdict=VERDICT_PRESENT,
             observed_at="2026-07-20T00:00:00Z",
         ),
@@ -1130,6 +1180,7 @@ def _pg_attestations(gw_loc=PG_GW_LOC, wk_loc=PG_WK_LOC):
             role="claude",
             lane_id=PG_LANE,
             locator=wk_loc,
+            terminal_id=_terminal("claude", PG_LANE, wk_loc),
             verdict=VERDICT_PRESENT,
             observed_at="2026-07-20T00:00:00Z",
         ),
@@ -1164,11 +1215,17 @@ class SublaneProjectGatewayHibernateTest(unittest.TestCase):
                 ),
             ),
         )
+        _seed_current_pair(
+            Path(tmp),
+            PG_LANE,
+            gateway_locator=PG_GW_LOC,
+            worker_locator=PG_WK_LOC,
+        )
 
     def _rows(self, gw_loc=PG_GW_LOC, wk_loc=PG_WK_LOC, **gw_extra):
-        gw = {"name": PG_GW_NAME, "pane_id": gw_loc}
+        gw = _row("codex", PG_LANE, gw_loc)
         gw.update(gw_extra)
-        return [gw, {"name": PG_WK_NAME, "pane_id": wk_loc}]
+        return [gw, _row("claude", PG_LANE, wk_loc)]
 
     def _ops(self, *, rows=None, attestations=None, readable=True):
         return _FakeOps(
@@ -1340,6 +1397,12 @@ class SublaneProjectGatewayHibernateTest(unittest.TestCase):
                         locator=PG_WK_LOC,
                     ),
                 ),
+            )
+            _seed_current_pair(
+                Path(tmp),
+                PG_LANE,
+                gateway_locator=PG_GW_LOC,
+                worker_locator=PG_WK_LOC,
             )
             outcome = SublaneHibernateUseCase(ops=self._ops(), store=store).run(
                 self._request(), execute=True
@@ -1578,9 +1641,7 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
         return LaneLifecycleStore(home=Path(tmp))
 
     def _declare(self, store) -> None:
-        store.declare_active(
-            LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-        )
+        _declare_issue_lane(store)
 
     def _rows(self):
         return [_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")]
@@ -1623,7 +1684,12 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
             store = self._store(tmp)
             self._declare(store)
             running = LaneActivityObservation(readable=True, worker_busy=True)
-            ops = _FakeOps(rows=self._rows(), activities=[running])
+            # Redmine #15193: the preflight now takes its OWN T0 activity observation, so the
+            # script leads with a quiescent one. That keeps this test on the TOCTOU case it
+            # is for — quiescent at T0, non-quiescent at T1 — rather than a condition that
+            # was already true before the release began (covered separately by the preflight
+            # parity tests).
+            ops = _FakeOps(rows=self._rows(), activities=[_QUIESCENT_ACTIVITY, running])
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
             )
@@ -1638,7 +1704,11 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
                 store.get(LaneLifecycleKey(WS, LANE)).lane_disposition,
                 DISPOSITION_ACTIVE,
             )
-            self.assertEqual(ops.activity_reads, 1)  # the fence actually observed activity
+            # Redmine #15193: two activity reads, and BOTH are load-bearing — the T0
+            # preflight parity probe and the T1 boundary re-read. The boundary's must stay
+            # FRESH (an input appearing during the release window is exactly what the #13843
+            # fence catches), so it can never be collapsed into the preflight's.
+            self.assertEqual(ops.activity_reads, 2)
 
     def test_boundary_pending_composer_blocks(self) -> None:
         # F2: a live pending composer observed at the boundary blocks with zero mutation.
@@ -1646,7 +1716,9 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
             store = self._store(tmp)
             self._declare(store)
             composer = LaneActivityObservation(readable=True, composer_pending=True)
-            ops = _FakeOps(rows=self._rows(), activities=[composer])
+            # Quiescent at T0 (see the worker-busy sibling): this is the TOCTOU case, where
+            # the input appears DURING the release window.
+            ops = _FakeOps(rows=self._rows(), activities=[_QUIESCENT_ACTIVITY, composer])
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
             )
@@ -1668,7 +1740,7 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
             ghost = LaneActivityObservation(
                 readable=True, composer_pending=False, composer_ghost_observed=True
             )
-            ops = _FakeOps(rows=self._rows(), activities=[ghost])
+            ops = _FakeOps(rows=self._rows(), activities=[_QUIESCENT_ACTIVITY, ghost])
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
             )
@@ -1684,7 +1756,9 @@ class SublaneHibernateToctouFenceTest(unittest.TestCase):
             self._declare(store)
             ops = _FakeOps(
                 rows=self._rows(),
-                activities=[LaneActivityObservation(readable=False)],
+                # Readable at T0 (so the preflight's own probe passes and does not shadow
+                # this), unreadable at T1 — the boundary is what must fail closed here.
+                activities=[_QUIESCENT_ACTIVITY, LaneActivityObservation(readable=False)],
             )
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
@@ -1942,13 +2016,11 @@ class ReleaseBoundaryNextActionsTest(unittest.TestCase):
     def test_outcome_next_actions_property_reflects_boundary_reasons(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
-            store.declare_active(
-                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-            )
+            _declare_issue_lane(store)
             running = LaneActivityObservation(readable=True, worker_busy=True)
             ops = _FakeOps(
                 rows=[_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")],
-                activities=[running],
+                activities=[_QUIESCENT_ACTIVITY, running],
             )
             outcome = SublaneHibernateUseCase(ops=ops, store=store).run(
                 _request(), execute=True
@@ -2323,6 +2395,9 @@ _TRANSPORT = (
     ".herdr_transport.HerdrCliTransport"
 )
 _OBSERVE = (
+    # The hibernate boundary resolves this by a CALL-TIME
+    # `from ...sublane_quarantine import observe_composer_text`, so the re-exported alias
+    # there is the correct seam — unchanged by the Redmine #15193 split.
     "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff"
     ".application.sublane_quarantine.observe_composer_text"
 )
@@ -2444,7 +2519,7 @@ class RevalidateBoundaryReReadTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
             key = LaneLifecycleKey(WS, LANE)
-            store.declare_active(key, decision=_decision(), issue_id=ISSUE)
+            _declare_issue_lane(store)
             rec0 = store.get(key)
             # Another process advances the lane's authority (revision bump) after preflight.
             store.transition_disposition(
@@ -2471,7 +2546,7 @@ class RevalidateBoundaryReReadTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
             key = LaneLifecycleKey(WS, LANE)
-            store.declare_active(key, decision=_decision(), issue_id=ISSUE)
+            _declare_issue_lane(store)
             rec0 = store.get(key)
             ops = _FakeOps(rows=self._rows())
             _rows1, _fp, reasons, _ghost = revalidate_boundary(
@@ -2509,8 +2584,10 @@ class RevalidateBoundaryReReadTest(unittest.TestCase):
                 ),
             )
             rec0 = store.get(key)
-            rows = [{"name": PG_GW_NAME, "pane_id": PG_GW_LOC},
-                    {"name": PG_WK_NAME, "pane_id": PG_WK_LOC}]
+            rows = [
+                _row("codex", PG_LANE, PG_GW_LOC),
+                _row("claude", PG_LANE, PG_WK_LOC),
+            ]
             # Worker attested, gateway NOT -> boundary attestation fence fires.
             atts = _pg_attestations()
             del atts[PG_GW_NAME]
@@ -2534,12 +2611,29 @@ class PartialReleaseSuccessTest(unittest.TestCase):
     def _rows(self):
         return [_row("codex", LANE, f"{WS}:p2"), _row("claude", LANE, f"{WS}:p3")]
 
+    def test_admission_block_uses_revision_recovery_not_residue_recovery(self) -> None:
+        withheld, recovery, detail = fresh_release_disposition(
+            mock.Mock(admission_blocked=True),
+            mock.Mock(recovery_detail="", residue_detected=False),
+        )
+        self.assertTrue(withheld)
+        self.assertIn("revision drift", recovery)
+        self.assertIn("revision drift", detail)
+        self.assertNotIn("worktree residue", recovery)
+
+    def test_unknown_fresh_release_state_is_not_laundered_as_incomplete(self) -> None:
+        withheld, recovery, detail = fresh_release_disposition(
+            mock.Mock(admission_blocked=False, process_release="future_state"),
+            mock.Mock(recovery_detail="", residue_detected=False),
+        )
+        self.assertFalse(withheld)
+        self.assertEqual(recovery, "")
+        self.assertIn("release state unclassified", detail)
+
     def test_partial_release_is_not_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
-            store.declare_active(
-                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-            )
+            _declare_issue_lane(store)
             partial = HerdrRetireCloseResult(
                 workspace_id=WS, lane_id=LANE,
                 closed=(("claude", f"{WS}:p3"),),
@@ -2549,17 +2643,123 @@ class PartialReleaseSuccessTest(unittest.TestCase):
                 ops=_FakeOps(rows=self._rows(), close_result=partial), store=store
             ).run(_request(), execute=True)
             self.assertEqual(outcome.release.process_release, RELEASE_PARTIAL)
-            # Executed and not blocked / withheld, but NOT a clean success (re-drive needed).
+            # The lane transition landed, but incomplete process release withholds success until
+            # a current-authority re-drive converges the remaining close debt.
             self.assertFalse(outcome.is_blocked)
-            self.assertFalse(outcome.success_withheld)
+            self.assertTrue(outcome.success_withheld)
             self.assertFalse(outcome.is_success)
+            self.assertIn("process release incomplete", outcome.recovery_detail)
+            text = format_hibernate_text(outcome)
+            self.assertIn("process release incomplete", text)
+            self.assertNotIn("post-release worktree residue", text)
+
+    def test_partial_redrive_remains_withheld_until_close_debt_converges(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            _declare_issue_lane(store)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            SublaneHibernateUseCase(
+                ops=_FakeOps(rows=self._rows(), close_result=partial), store=store
+            ).run(_request(), execute=True)
+            still_partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE, closed=(),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            retry = SublaneHibernateUseCase(
+                ops=_FakeOps(
+                    rows=[_row("codex", LANE, f"{WS}:p2")],
+                    close_result=still_partial,
+                ),
+                store=store,
+            ).run(_request(), execute=True)
+            self.assertTrue(retry.already_hibernated)
+            self.assertEqual(retry.release.process_release, RELEASE_PARTIAL)
+            self.assertTrue(retry.success_withheld)
+            self.assertFalse(retry.is_success)
+            self.assertIn("process release incomplete", retry.recovery_detail)
+            self.assertNotIn("worktree residue", format_hibernate_text(retry))
+
+    def test_partial_redrive_preflight_does_not_claim_a_withheld_effect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            _declare_issue_lane(store)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            SublaneHibernateUseCase(
+                ops=_FakeOps(rows=self._rows(), close_result=partial), store=store
+            ).run(_request(), execute=True)
+            preflight = SublaneHibernateUseCase(
+                ops=_FakeOps(rows=[_row("codex", LANE, f"{WS}:p2")]),
+                store=store,
+            ).run(_request(), execute=False)
+            self.assertTrue(preflight.already_hibernated)
+            self.assertFalse(preflight.executed)
+            self.assertIsNone(preflight.release)
+            self.assertFalse(preflight.success_withheld)
+            self.assertIn("preflight only", preflight.detail)
+            self.assertNotIn("resumed release", preflight.detail)
+
+    def test_partial_release_with_post_residue_prioritizes_boundary_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            _declare_issue_lane(store)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            outcome = SublaneHibernateUseCase(
+                ops=_FakeOps(
+                    rows=self._rows(), close_result=partial,
+                    fingerprints=[_CLEAN_FP, _CLEAN_FP, _dirty_fp("post-residue")],
+                ),
+                store=store,
+            ).run(_request(), execute=True)
+            self.assertEqual(outcome.release.process_release, RELEASE_PARTIAL)
+            self.assertTrue(outcome.success_withheld)
+            self.assertIn("post-release worktree residue", outcome.recovery_detail)
+            self.assertIn("boundary-record", outcome.detail)
+
+    def test_partial_redrive_with_post_residue_prioritizes_boundary_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = LaneLifecycleStore(home=Path(tmp))
+            _declare_issue_lane(store)
+            partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE,
+                closed=(("claude", f"{WS}:p3"),),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            SublaneHibernateUseCase(
+                ops=_FakeOps(rows=self._rows(), close_result=partial), store=store
+            ).run(_request(), execute=True)
+            still_partial = HerdrRetireCloseResult(
+                workspace_id=WS, lane_id=LANE, closed=(),
+                failed=(("codex", f"{WS}:p2", "close_failed"),),
+            )
+            retry = SublaneHibernateUseCase(
+                ops=_FakeOps(
+                    rows=[_row("codex", LANE, f"{WS}:p2")],
+                    close_result=still_partial,
+                    fingerprints=[_CLEAN_FP, _CLEAN_FP, _dirty_fp("post-residue")],
+                ),
+                store=store,
+            ).run(_request(), execute=True)
+            self.assertEqual(retry.release.process_release, RELEASE_PARTIAL)
+            self.assertTrue(retry.success_withheld)
+            self.assertIn("post-release worktree residue", retry.recovery_detail)
+            self.assertIn("boundary-record", retry.detail)
 
     def test_released_is_success(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
-            store.declare_active(
-                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-            )
+            _declare_issue_lane(store)
             outcome = SublaneHibernateUseCase(
                 ops=_FakeOps(rows=self._rows()), store=store
             ).run(_request(), execute=True)
@@ -2569,9 +2769,7 @@ class PartialReleaseSuccessTest(unittest.TestCase):
     def test_cmd_returns_nonzero_on_partial_release(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = LaneLifecycleStore(home=Path(tmp))
-            store.declare_active(
-                LaneLifecycleKey(WS, LANE), decision=_decision(), issue_id=ISSUE
-            )
+            _declare_issue_lane(store)
             partial = HerdrRetireCloseResult(
                 workspace_id=WS, lane_id=LANE,
                 closed=(("claude", f"{WS}:p3"),),
@@ -2607,7 +2805,7 @@ class DriveReleaseExpectedRevisionTest(unittest.TestCase):
     def _hibernated_store(self, tmp):
         store = LaneLifecycleStore(home=Path(tmp))
         key = LaneLifecycleKey(WS, LANE)
-        store.declare_active(key, decision=_decision(), issue_id=ISSUE)
+        _declare_issue_lane(store)
         store.transition_disposition(
             key, expected_disposition=DISPOSITION_ACTIVE, expected_revision=1,
             target=DISPOSITION_HIBERNATED, decision=_decision(),
@@ -2687,7 +2885,7 @@ class RedriveRevisionRaceTest(unittest.TestCase):
             # Seed a hibernated lane with an OPEN partial release (so the redrive resumes it).
             store = LaneLifecycleStore(home=Path(tmp))
             key = LaneLifecycleKey(WS, LANE)
-            store.declare_active(key, decision=_decision(), issue_id=ISSUE)
+            _declare_issue_lane(store)
             partial = HerdrRetireCloseResult(
                 workspace_id=WS, lane_id=LANE,
                 closed=(("claude", f"{WS}:p3"),),

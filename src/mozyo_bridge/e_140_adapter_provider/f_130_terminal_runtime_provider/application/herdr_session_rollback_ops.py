@@ -34,6 +34,16 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     PREPARED_PANE_UNREADABLE,
     PreparedPaneObservation,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback_contract import (  # noqa: E501
+    StartupRollbackAgentTarget,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_inventory import (  # noqa: E501
+    strict_pane_rows as _strict_pane_rows,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_rollback import (  # noqa: E501
+    ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE,
+    ROLLBACK_DETAIL,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (  # noqa: E501
     valid_target,
 )
@@ -62,14 +72,61 @@ class LiveStartupRollbackOps:
     def open_obligations(self, workspace_id: str, assigned_names: Sequence[str]):
         return self._retire_ops.open_obligations(workspace_id, assigned_names)
 
-    def close(self, workspace_id: str, lane_id: str, targets):
-        return self._retire_ops.close(workspace_id, lane_id, targets)
+    def supports_conditional_close(self) -> bool:
+        """Herdr's locator close has no server-side generation predicate."""
+        return False
+
+    def close_agent_participant(
+        self,
+        *,
+        workspace_id: str,
+        lane_id: str,
+        target: StartupRollbackAgentTarget,
+    ) -> tuple[bool, str]:
+        return False, ROLLBACK_DETAIL[ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE]
+
+    def close_prepared_pane(
+        self,
+        *,
+        locator: str,
+        workspace_id: str,
+        tab_id: str,
+        expected_terminal_id: str = "",
+    ) -> tuple[bool, str]:
+        return False, ROLLBACK_DETAIL[ROLLBACK_CONDITIONAL_CLOSE_UNAVAILABLE]
+
+    def current_generation_targets_absent(self, action, targets, *, store_home) -> bool:
+        """Use one fresh full snapshot to prove every durable target terminal absent."""
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_rollback import (  # noqa: E501
+            _terminal_bound_action_target_absent,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            terminal_identity_snapshot_complete,
+        )
+
+        participants = {participant.role: participant for participant in action.participants}
+        try:
+            rows = tuple(self.agent_rows())
+            return bool(
+                terminal_identity_snapshot_complete(rows)
+                and all(
+                    role in participants
+                    and participants[role].locator == locator
+                    and _terminal_bound_action_target_absent(
+                        Path(store_home), action, participants[role], rows
+                    )
+                    for role, locator in targets
+                )
+            )
+        except Exception:  # noqa: BLE001 - absence is a positive proof
+            return False
 
     def _environ(self) -> Mapping[str, str]:
         return self._env if self._env is not None else os.environ
 
     def prepared_pane(
-        self, *, locator: str, workspace_id: str, tab_id: str
+        self, *, locator: str, workspace_id: str, tab_id: str,
+        expected_terminal_id: str = "",
     ) -> PreparedPaneObservation:
         """Read the exact Herdr 0.8 pane facts; never infer an empty input buffer."""
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
@@ -105,8 +162,20 @@ class LiveStartupRollbackOps:
                 detail="the complete Herdr pane inventory could not be read",
             )
         matches = [row for row in rows if row["pane_id"] == locator]
+        terminal_reclaimed = (
+            any(
+                row["pane_id"] != locator
+                and row.get("terminal_id") == expected_terminal_id
+                for row in rows
+            )
+            if expected_terminal_id
+            else None
+        )
         if not matches:
-            return PreparedPaneObservation(state=PREPARED_PANE_ABSENT)
+            return PreparedPaneObservation(
+                state=PREPARED_PANE_ABSENT,
+                terminal_reclaimed=terminal_reclaimed,
+            )
         if len(matches) != 1:
             return PreparedPaneObservation(
                 state=PREPARED_PANE_UNREADABLE,
@@ -115,12 +184,19 @@ class LiveStartupRollbackOps:
         row = matches[0]
         row_workspace = row["workspace_id"]
         row_tab = row["tab_id"]
+        terminal_id = (
+            row.get("terminal_id")
+            if type(row.get("terminal_id")) is str
+            else ""
+        )
         if row_workspace != workspace_id or row_tab != tab_id:
             return PreparedPaneObservation(
                 state=PREPARED_PANE_PRESENT,
                 locator=locator,
                 workspace_id=row_workspace,
                 tab_id=row_tab,
+                terminal_id=terminal_id,
+                terminal_reclaimed=terminal_reclaimed,
                 detail="the recorded container does not match the live pane inventory",
             )
         agent_absent = "agent" not in row
@@ -130,6 +206,8 @@ class LiveStartupRollbackOps:
                 locator=locator,
                 workspace_id=row_workspace,
                 tab_id=row_tab,
+                terminal_id=terminal_id,
+                terminal_reclaimed=terminal_reclaimed,
                 detail="the prepared pane now contains an agent",
             )
         shell_only = _read_shell_only(
@@ -143,6 +221,8 @@ class LiveStartupRollbackOps:
                 locator=locator,
                 workspace_id=row_workspace,
                 tab_id=row_tab,
+                terminal_id=terminal_id,
+                terminal_reclaimed=terminal_reclaimed,
                 agent_absent=True,
                 shell_only=False,
                 detail="the prepared pane could not be proven to contain only its shell",
@@ -155,6 +235,8 @@ class LiveStartupRollbackOps:
             locator=locator,
             workspace_id=row_workspace,
             tab_id=row_tab,
+            terminal_id=terminal_id,
+            terminal_reclaimed=terminal_reclaimed,
             agent_absent=True,
             shell_only=True,
             input_empty=None,
@@ -162,38 +244,6 @@ class LiveStartupRollbackOps:
                 "Herdr 0.8 does not expose an authoritative empty-input fact for a "
                 "shell pane; refusing to infer one from rendered prompt text"
             ),
-        )
-
-    def close_prepared_pane(
-        self, *, locator: str, workspace_id: str, tab_id: str
-    ) -> tuple[bool, str]:
-        """Recheck every positive fact immediately before an exact pane close."""
-        observation = self.prepared_pane(
-            locator=locator, workspace_id=workspace_id, tab_id=tab_id
-        )
-        if not (
-            observation.state == PREPARED_PANE_PRESENT
-            and observation.locator == locator
-            and observation.workspace_id == workspace_id
-            and observation.tab_id == tab_id
-            and observation.agent_absent is True
-            and observation.shell_only is True
-            and observation.input_empty is True
-        ):
-            return False, observation.detail or "prepared pane close proof changed"
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (  # noqa: E501
-            _close_base_pane,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
-            COMMAND_TIMEOUT_SECONDS,
-        )
-
-        return _close_base_pane(
-            self._retire_ops._binary(),
-            locator,
-            subprocess.run,
-            COMMAND_TIMEOUT_SECONDS,
-            self._environ(),
         )
 
     def startup_blocker(self, provider: str, locator: str) -> str:
@@ -227,38 +277,6 @@ class LiveStartupRollbackOps:
             provider_id=provider, read_visible=lambda: reader(locator)
         )
         return admission.blocker_id if admission.outcome == ADMISSION_BLOCKED else ""
-
-
-def _strict_pane_rows(stdout: object) -> tuple[Mapping[str, object], ...]:
-    """Parse only Herdr 0.8's canonical complete ``pane list`` envelope."""
-    if not isinstance(stdout, str):
-        raise ValueError("pane list did not return text")
-    payload = json.loads(stdout)
-    if not isinstance(payload, Mapping):
-        raise ValueError("pane list did not return an object")
-    result = payload.get("result")
-    if not isinstance(result, Mapping) or result.get("type") != "pane_list":
-        raise ValueError("pane list result type is not pane_list")
-    rows = result.get("panes")
-    if not isinstance(rows, list) or any(not isinstance(row, Mapping) for row in rows):
-        raise ValueError("pane list does not contain a complete pane array")
-    pane_ids: set[str] = set()
-    for row in rows:
-        pane_id = row.get("pane_id")
-        workspace_id = row.get("workspace_id")
-        tab_id = row.get("tab_id")
-        if (
-            not valid_target(pane_id)
-            or not valid_target(workspace_id)
-            or not valid_target(tab_id)
-            or _workspace_prefix(pane_id) != workspace_id
-            or not tab_id.startswith(f"{workspace_id}:t")
-            or tab_id == f"{workspace_id}:t"
-            or pane_id in pane_ids
-        ):
-            raise ValueError("pane list contains a malformed or duplicate identity")
-        pane_ids.add(pane_id)
-    return tuple(rows)
 
 
 def _read_shell_only(

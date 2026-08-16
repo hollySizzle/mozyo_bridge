@@ -15,7 +15,7 @@ delivering something the transaction never agreed to.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -62,6 +62,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     AGENT_KEY_LOCATOR,
     AGENT_KEY_NAME,
     decode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
     SLOT_LIVE,
@@ -136,6 +137,7 @@ class VanishedGatewayInventoryJoin:
     assigned_name: str = ""
     fresh_locator: str = ""
     old_locator: str = ""
+    terminal_id: str = field(default="", repr=False)
 
     @property
     def joined(self) -> bool:
@@ -398,6 +400,7 @@ def resolve_vanished_gateway_inventory(
         assigned_name=assigned_name,
         fresh_locator=locator,
         old_locator=pin.old_locator,
+        terminal_id=terminal_identity_of_live_slot(assigned_name, locator, rows) or "",
     )
 
 
@@ -410,8 +413,8 @@ def verify_vanished_gateway_attestation_evidence(
     """Verify the joined live generation's canonical startup/action attestation.
 
     Reads the selected main identity-attestation exactly once from the canonical mozyo
-    home, then delegates native-current / recognized-v1-side action binding to the shared
-    replacement-binding authority. It performs no write, send, ledger read, CAS, or
+    home, then delegates current v4 direct-action binding to the shared authority. Legacy
+    v1-v3 side records are diagnostic-only. It performs no write, send, ledger read, CAS, or
     completion transition. The typed evidence exposes only the exact record's timestamp;
     the general proof wrapper below exposes neither the stored record nor that timestamp.
     """
@@ -542,6 +545,9 @@ def verify_vanished_gateway_attestation_evidence(
         join_values != expected_values
         or not join_values[5]
         or join_values[5] == join_values[6]
+        or type(inventory_join.terminal_id) is not str
+        or not inventory_join.terminal_id
+        or inventory_join.terminal_id.strip() != inventory_join.terminal_id
     ):
         return _attestation_evidence_stopped(
             STOPPED_ATTESTATION_INVALID,
@@ -588,6 +594,7 @@ def verify_vanished_gateway_attestation_evidence(
         joined = evaluate_attestation(
             record,
             live_locator=inventory_join.fresh_locator,
+            live_terminal_id=inventory_join.terminal_id,
             expected_workspace_id=workspace_id,
             expected_role=provider,
             expected_lane=pin.lane_id,
@@ -596,6 +603,7 @@ def verify_vanished_gateway_attestation_evidence(
             record,
             action_id=action_id,
             live_locator=inventory_join.fresh_locator,
+            live_terminal_id=inventory_join.terminal_id,
             workspace_id=workspace_id,
             role=provider,
             lane=pin.lane_id,

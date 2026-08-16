@@ -29,6 +29,7 @@ import json
 import os
 import shutil
 import stat
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -43,9 +44,14 @@ from support.herdr_fake import (  # noqa: E402
     HERDR_SPLIT_EXTENT,
     FakeHerdr,
     apply_resize_amount,
+    attest_capability_epilog,
     render_pane_layout,
 )
 from support.herdr_pane_tree import PaneTreeHerdr  # noqa: E402
+from support.current_launch_authority import (  # noqa: E402
+    seed_completed_current_generation,
+    seed_completed_current_launch_authority,
+)
 from support.agent_provider_binaries import (  # noqa: E402
     FakeAgentBinaries,
     neutralized_overrides,
@@ -79,6 +85,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     PaneRect,
     PairPanes,
     _apply_ratio,
+    _pair_geometry,
     find_pair_split,
     governing_split,
     order_pair,
@@ -102,12 +109,23 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.startup_health import (  # noqa: E402,E501
     HEALTH_HEALTHY,
 )
-from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
-    IdentityAttestationRecord,
-    VERDICT_PRESENT,
-)
 from mozyo_bridge.core.state.workspace_registry import register_workspace  # noqa: E402
+from mozyo_bridge.core.state.herdr_identity_attestation import (  # noqa: E402
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+)
+from mozyo_bridge.core.state.herdr_native_identity_binding import (  # noqa: E402
+    HerdrNativeIdentityBindingStore,
+    native_name_for,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_generation_authority import (  # noqa: E402,E501
+    pair_generation_fingerprint,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E402,E501
+    pane_bound_receipt,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E402,E501
+    encode_assigned_name,
     decode_assigned_name,
 )
 
@@ -118,34 +136,6 @@ PROVIDER_BINS = FakeAgentBinaries(Path(tempfile.mkdtemp(prefix="mzb14569-provide
 atexit.register(shutil.rmtree, PROVIDER_BINS.bin_dir.parent, True)
 #: The post-launch health probe with no real sleeping (the fake settles instantly).
 _FAST_PROBE = StartupProbe(polls=3, interval=0.0, sleeper=lambda _seconds: None)
-
-
-def _attesting_reader(herdr):
-    """An attestation reader that vouches for whatever the fake has live.
-
-    The #13637 adopt gate only ADOPTS a live name-match whose startup self-attestation is
-    bound to its current locator; the shared fake models herdr, not the wrapper that writes
-    that record. Injecting it here is what lets these tests exercise the adopt / heal
-    shapes at all — the axis under test is the pair's geometry, and a run whose slots all
-    came back ``unattested`` would never reach it.
-    """
-
-    def read(name):
-        agent = herdr.agent_named(name)
-        decoded = decode_assigned_name(name)
-        if agent is None or not decoded.ok or decoded.identity is None:
-            return None
-        return IdentityAttestationRecord(
-            assigned_name=name,
-            workspace_id=decoded.identity.workspace_id,
-            role=decoded.identity.role,
-            lane_id=decoded.identity.lane_id,
-            locator=agent["pane_id"],
-            verdict=VERDICT_PRESENT,
-            observed_at="2026-07-28T00:00:00+00:00",
-        )
-
-    return read
 
 
 class RatioSchemaTest(unittest.TestCase):
@@ -310,6 +300,28 @@ class PaneGeometryDecisionTest(unittest.TestCase):
         )
         self.assertIsNotNone(snapshot)
         return snapshot
+
+    def _nested_pair_payload(self, *, root_id="root", overlap=False):
+        root_rect = {"x": 25 if overlap else 50, "y": 0, "width": 50, "height": 40}
+        return {
+            "result": {
+                "type": "pane_layout",
+                "layout": {
+                    "tab_id": "tab",
+                    "panes": [
+                        {"pane_id": "p1", "rect": {"x": 0, "y": 0, "width": 50, "height": 20}},
+                        {"pane_id": "p2", "rect": {"x": 0, "y": 20, "width": 50, "height": 20}},
+                        {"pane_id": root_id, "rect": root_rect},
+                    ],
+                    "splits": [
+                        {"id": "pair", "direction": "down", "ratio": 0.5,
+                         "rect": {"x": 0, "y": 0, "width": 50, "height": 40}},
+                        {"id": "outer", "direction": "right", "ratio": 0.5,
+                         "rect": {"x": 0, "y": 0, "width": 100, "height": 40}},
+                    ],
+                },
+            }
+        }
 
     def test_parses_the_live_0_7_4_layout_envelope(self) -> None:
         # The exact payload shape measured in j#91140, transcribed rather than paraphrased.
@@ -545,6 +557,104 @@ class PaneGeometryDecisionTest(unittest.TestCase):
         self.assertAlmostEqual(0.5, outer.ratio)
         self.assertAlmostEqual(0.4, nested.ratio)
 
+    def test_terminal_generation_drift_after_resize_withholds_applied(self) -> None:
+        herdr = PaneTreeHerdr("w1")
+        tab = herdr.new_tab()
+        (a,), (b,) = herdr.seed_columns(tab, [["a"], ["b"]])
+        opening = parse_pane_layout(json.dumps(tab.layout_payload()))
+        self.assertIsNotNone(opening)
+        pair = PairPanes(a, b)
+        split = find_pair_split(opening, opening.panes[a], opening.panes[b], "right")
+        checks = iter((True, False))
+
+        outcome, detail = _apply_ratio(
+            pair, split, opening.panes[a], direction="right", target=0.7,
+            binary="herdr", runner=herdr, timeout=1.0, env=None,
+            authority_check=lambda: next(checks),
+        )
+
+        self.assertEqual(RATIO_FAILED, outcome, detail)
+        self.assertIn("terminal generation changed after resize", detail)
+        self.assertEqual(1, len(herdr.resizes))
+
+    def test_overlapping_foreign_pane_refuses_opening_scope_without_resize(self) -> None:
+        payload = self._nested_pair_payload(overlap=True)
+        opening = parse_pane_layout(json.dumps(payload))
+        self.assertIsNotNone(opening)
+        pair = PairPanes("p1", "p2")
+        split = find_pair_split(opening, opening.panes["p1"], opening.panes["p2"], "down")
+        calls = []
+
+        def runner(argv, **_kwargs):
+            calls.append(list(argv[1:]))
+            if list(argv[1:3]) == ["pane", "layout"]:
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(payload), stderr="")
+            raise AssertionError(f"unexpected effect: {argv!r}")
+
+        outcome, detail = _apply_ratio(
+            pair, split, opening.panes["p1"], direction="down", target=0.7,
+            binary="herdr", runner=runner, timeout=1.0, env=None,
+        )
+        self.assertEqual(RATIO_FAILED, outcome, detail)
+        self.assertFalse(any(call[:2] == ["pane", "resize"] for call in calls))
+
+    def test_external_boundary_drift_before_resize_is_zero_effect(self) -> None:
+        opening_payload = self._nested_pair_payload()
+        drifted_payload = self._nested_pair_payload(root_id="replacement-root")
+        opening = parse_pane_layout(json.dumps(opening_payload))
+        self.assertIsNotNone(opening)
+        pair = PairPanes("p1", "p2")
+        split = find_pair_split(opening, opening.panes["p1"], opening.panes["p2"], "down")
+        layouts = iter((opening_payload, drifted_payload))
+        calls = []
+
+        def runner(argv, **_kwargs):
+            calls.append(list(argv[1:]))
+            if list(argv[1:3]) == ["pane", "layout"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=json.dumps(next(layouts)), stderr=""
+                )
+            raise AssertionError(f"unexpected effect: {argv!r}")
+
+        outcome, detail = _apply_ratio(
+            pair, split, opening.panes["p1"], direction="down", target=0.7,
+            binary="herdr", runner=runner, timeout=1.0, env=None,
+        )
+        self.assertEqual(RATIO_FAILED, outcome, detail)
+        self.assertIn("layout changed before resize", detail)
+        self.assertFalse(any(call[:2] == ["pane", "resize"] for call in calls))
+
+    def test_external_boundary_drift_after_resize_withholds_applied(self) -> None:
+        opening_payload = self._nested_pair_payload()
+        drifted_payload = self._nested_pair_payload(root_id="replacement-root")
+        opening = parse_pane_layout(json.dumps(opening_payload))
+        self.assertIsNotNone(opening)
+        pair = PairPanes("p1", "p2")
+        split = find_pair_split(opening, opening.panes["p1"], opening.panes["p2"], "down")
+        layouts = iter((opening_payload, opening_payload, drifted_payload))
+        calls = []
+
+        def runner(argv, **_kwargs):
+            call = list(argv[1:])
+            calls.append(call)
+            if call[:2] == ["pane", "layout"]:
+                return subprocess.CompletedProcess(
+                    argv, 0, stdout=json.dumps(next(layouts)), stderr=""
+                )
+            if call[:2] == ["pane", "resize"]:
+                body = {"result": {"type": "pane_resize", "resize": {"changed": True}}}
+                return subprocess.CompletedProcess(argv, 0, stdout=json.dumps(body), stderr="")
+            raise AssertionError(f"unexpected call: {argv!r}")
+
+        outcome, detail = _apply_ratio(
+            pair, split, opening.panes["p1"], direction="down", target=0.7,
+            binary="herdr", runner=runner, timeout=1.0, env=None,
+        )
+        self.assertEqual(RATIO_FAILED, outcome, detail)
+        self.assertIn("layout changed after resize", detail)
+        self.assertEqual(1, sum(call[:2] == ["pane", "resize"] for call in calls))
+
+
     def test_ratio_is_always_the_first_child_share_on_both_axes(self) -> None:
         for direction in ("down", "right"):
             with self.subTest(direction=direction):
@@ -583,13 +693,255 @@ class PaneGeometryDecisionTest(unittest.TestCase):
             self.assertGreaterEqual(resize_step(0.9, 0.1, direction)[1], 0.0)
 
 
+class PairGenerationAuthorityTest(unittest.TestCase):
+    """Pair geometry joins one home and every terminal/provider axis exactly."""
+
+    def _seed(self, home, roles=("codex", "claude")):
+        rows = []
+        names = []
+        actions = []
+        for index, role in enumerate(roles, 1):
+            name = encode_assigned_name("workspace", role, "lane")
+            locator = f"w1:p{index}"
+            terminal = f"terminal:{index}"
+            actions.append(seed_completed_current_launch_authority(
+                Path(home), workspace_id="workspace", lane_id="lane", role=role,
+                assigned_name=name, locator=locator, terminal_id=terminal,
+                target_workspace="w1", target_tab="w1:t1",
+            ))
+            names.append(name)
+            rows.append({"name": name, "pane_id": locator, "terminal_id": terminal})
+        return tuple(names), rows, tuple(actions)
+
+    @staticmethod
+    def _runner(rows):
+        def run(argv, **_kwargs):
+            return subprocess.CompletedProcess(
+                argv, 0, stdout=json.dumps(rows), stderr=""
+            )
+        return run
+
+    def _fingerprint(
+        self,
+        home,
+        rows,
+        *,
+        action_id,
+        expected_anchor_name=None,
+        expected_anchor_provider=None,
+        expected_anchor_terminal_id=None,
+    ):
+        anchor = rows[-1]
+        decoded = decode_assigned_name(expected_anchor_name or anchor["name"])
+        provider = (
+            expected_anchor_provider
+            or (decoded.identity.role if decoded.ok and decoded.identity is not None else "")
+        )
+        return pair_generation_fingerprint(
+            tuple(row["pane_id"] for row in rows),
+            expected_workspace_id="workspace",
+            expected_lane_id="lane",
+            expected_anchor_assigned_name=expected_anchor_name or anchor["name"],
+            expected_anchor_provider=provider,
+            expected_anchor_locator=anchor["pane_id"],
+            expected_anchor_terminal_id=(
+                expected_anchor_terminal_id or anchor["terminal_id"]
+            ),
+            expected_anchor_action_id=action_id,
+            home=Path(home), binary="herdr",
+            runner=self._runner(rows), timeout=1.0,
+        )
+
+    def test_exact_current_pair_is_authoritative(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, rows, actions = self._seed(tmp)
+            self.assertIsNotNone(self._fingerprint(tmp, rows, action_id=actions[-1]))
+
+    def test_same_locator_different_terminal_is_not_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, rows, actions = self._seed(tmp)
+            rows[0] = {**rows[0], "terminal_id": "terminal:replacement"}
+            self.assertIsNone(self._fingerprint(tmp, rows, action_id=actions[-1]))
+
+    def test_unknown_fully_attested_provider_pair_is_not_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            _, rows, actions = self._seed(tmp, roles=("codex", "reviewer"))
+            self.assertIsNone(self._fingerprint(tmp, rows, action_id=actions[-1]))
+
+    def test_noncanonical_trimmed_role_name_is_not_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            alternate = "mzb1_workspace_Z20codexZ20_lane"
+            canonical = encode_assigned_name("workspace", "claude", "lane")
+            rows = []
+            actions = []
+            for index, (role, name) in enumerate(
+                (("codex", alternate), ("claude", canonical)), 1
+            ):
+                locator, terminal = f"w1:p{index}", f"terminal:{index}"
+                actions.append(seed_completed_current_launch_authority(
+                    home, workspace_id="workspace", lane_id="lane", role=role,
+                    assigned_name=name, locator=locator, terminal_id=terminal,
+                    target_workspace="w1", target_tab="w1:t1",
+                ))
+                rows.append(
+                    {"name": name, "pane_id": locator, "terminal_id": terminal}
+                )
+            self.assertNotEqual(
+                alternate, encode_assigned_name("workspace", "codex", "lane")
+            )
+            self.assertIsNone(
+                self._fingerprint(home, rows, action_id=actions[-1])
+            )
+
+    def test_native_binding_must_come_from_the_explicit_authority_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            authority_home = Path(tmp) / "authority"
+            ambient_home = Path(tmp) / "ambient"
+            names, logical_rows, actions = self._seed(authority_home)
+            HerdrNativeIdentityBindingStore(home=ambient_home).bind_many(names)
+            native_rows = [
+                {**row, "name": native_name_for(row["name"])} for row in logical_rows
+            ]
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(ambient_home)}, clear=False
+            ):
+                self.assertIsNone(
+                    self._fingerprint(
+                        authority_home,
+                        native_rows,
+                        action_id=actions[-1],
+                        expected_anchor_name=names[-1],
+                        expected_anchor_provider="claude",
+                    )
+                )
+                HerdrNativeIdentityBindingStore(home=authority_home).bind_many(names)
+                self.assertIsNotNone(
+                    self._fingerprint(
+                        authority_home,
+                        native_rows,
+                        action_id=actions[-1],
+                        expected_anchor_name=names[-1],
+                        expected_anchor_provider="claude",
+                    )
+                )
+
+    def test_attestation_must_come_from_the_explicit_authority_home(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            authority_home = Path(tmp) / "authority"
+            ambient_home = Path(tmp) / "ambient"
+            rows = []
+            actions = []
+            for index, role in enumerate(("codex", "claude"), 1):
+                name = encode_assigned_name("workspace", role, "lane")
+                locator, terminal = f"w1:p{index}", f"terminal:{index}"
+                receipt = pane_bound_receipt(
+                    target_workspace="w1", target_tab="w1:t1",
+                    native_name=native_name_for(name), terminal_id=terminal,
+                )
+                actions.append(seed_completed_current_generation(
+                    authority_home, workspace_id="workspace", lane_id="lane",
+                    role=role, assigned_name=name, locator=locator,
+                    terminal_id=terminal, receipt=receipt,
+                ))
+                HerdrIdentityAttestationStore(home=ambient_home).upsert(
+                    IdentityAttestationRecord(
+                        assigned_name=name, workspace_id="workspace", role=role,
+                        lane_id="lane", locator=locator, terminal_id=terminal,
+                        verdict="present", observed_at="2026-08-11T00:00:00+00:00",
+                    )
+                )
+                rows.append({"name": name, "pane_id": locator, "terminal_id": terminal})
+            with patch.dict(
+                os.environ, {"MOZYO_BRIDGE_HOME": str(ambient_home)}, clear=False
+            ):
+                self.assertIsNone(
+                    self._fingerprint(
+                        authority_home, rows, action_id=actions[-1]
+                    )
+                )
+
+    def test_unattested_legacy_shaped_pair_is_not_authority(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            rows = [
+                {"name": encode_assigned_name("workspace", role, "lane"),
+                 "pane_id": f"w1:p{index}", "terminal_id": f"terminal:{index}"}
+                for index, role in enumerate(("codex", "claude"), 1)
+            ]
+            self.assertIsNone(
+                self._fingerprint(tmp, rows, action_id="missing-current-action")
+            )
+
+    def test_opening_pair_must_match_this_runs_terminal_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            names, rows, _actions = self._seed(home)
+            layout = render_pane_layout(
+                pane_ids=[row["pane_id"] for row in rows],
+                direction="down",
+                ratio=0.5,
+            )
+            calls = []
+
+            def runner(argv, **_kwargs):
+                call = list(argv[1:])
+                calls.append(call)
+                if call[:2] == ["pane", "layout"]:
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout=json.dumps(layout), stderr=""
+                    )
+                if call[:2] == ["agent", "list"]:
+                    return subprocess.CompletedProcess(
+                        argv, 0, stdout=json.dumps(rows), stderr=""
+                    )
+                raise AssertionError(f"unexpected effect: {argv!r}")
+
+            result = SessionStartResult(
+                workspace_id="workspace",
+                lane_id="lane",
+                action_id="startup-ir1-" + "a" * 64,
+                slots=[
+                    SlotResult(
+                        provider="claude",
+                        assigned_name=names[-1],
+                        outcome="launched",
+                        locator=rows[-1]["pane_id"],
+                        health=HEALTH_HEALTHY,
+                        launch_terminal_id="terminal:this-run",
+                    )
+                ],
+            )
+
+            outcome, detail = _pair_geometry(
+                result,
+                config_split="down",
+                config_order=("codex", "claude"),
+                pair_order=None,
+                requested=("claude",),
+                config_ratio=0.7,
+                launched=1,
+                initial_occupancy=1,
+                dry_run=False,
+                binary="herdr",
+                runner=runner,
+                timeout=1.0,
+                env=None,
+                store_home=home,
+            )
+
+            self.assertEqual(RATIO_FAILED, outcome, detail)
+            self.assertIn("current-generation authority", detail)
+            self.assertFalse(any(call[:2] == ["pane", "resize"] for call in calls))
+
+
 class LaunchRatioTest(unittest.TestCase):
     """Close conditions 3 / 4 / 7 / 8: what a real launch does with the declared ratio.
 
     Driven through the shared stateful fake herdr at the subprocess ``Runner`` boundary, so
     ``prepare_session`` runs for real end to end: the divider is created by a Herdr 0.8
-    ``pane split --direction``, the root pane is reclaimed, and only then does the ratio rail
-    read and move herdr's own layout. The fake's ``pane resize`` reproduces herdr's measured
+    ``pane split --direction`` while the generation-unbound root is preserved outside the
+    managed pair, and only then does the ratio rail read and move the pair's own divider.
+    The fake's ``pane resize`` reproduces herdr's measured
     arithmetic (0.5 amount cap, 0.1..0.9 clamp), so a pass here means the code converged
     against the real clamps rather than against a compliant stub.
     """
@@ -605,9 +957,22 @@ class LaunchRatioTest(unittest.TestCase):
         binpath.chmod(binpath.stat().st_mode | stat.S_IEXEC | stat.S_IXGRP | stat.S_IXOTH)
         env = {
             HERDR_ENV: str(binpath),
+            "MOZYO_BRIDGE_LAUNCHER": str(binpath),
             "PATH": str(PROVIDER_BINS.bin_dir),
             **neutralized_overrides(),
         }
+
+        def launcher_runner(argv, **_kwargs):
+            if list(argv[1:]) != ["herdr", "agent-attest", "--help"]:
+                raise AssertionError(f"unexpected launcher probe: {list(argv)!r}")
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                stdout="usage: agent-attest [--assigned-name NAME]\n"
+                + attest_capability_epilog(),
+                stderr="",
+            )
+
         with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
             if dry_run:
                 # A dry run refuses to register a workspace (it has no side effect), so the
@@ -620,10 +985,10 @@ class LaunchRatioTest(unittest.TestCase):
                 lane_id=lane,
                 env=env,
                 runner=herdr.run,
+                launcher_runner=launcher_runner,
                 dry_run=dry_run,
                 lane_placement=lane_placement,
                 pair_order=pair_order,
-                attestation_reader=_attesting_reader(herdr),
                 probe=_FAST_PROBE,
             )
 
@@ -801,7 +1166,14 @@ class LaunchRatioTest(unittest.TestCase):
             capture_output=True, text=True,
         )
         snapshot = parse_pane_layout(out.stdout)
-        first_pane = min(snapshot.panes.items(), key=lambda kv: kv[1].y)[0]
+        managed_ids = {a["pane_id"] for a in herdr.agents}
+        first_pane = min(
+            (
+                item for item in snapshot.panes.items()
+                if item[0] in managed_ids
+            ),
+            key=lambda kv: (kv[1].y, kv[1].x),
+        )[0]
         name = next(a["name"] for a in herdr.agents if a["pane_id"] == first_pane)
         return decode_assigned_name(name).identity.role
 
@@ -972,10 +1344,6 @@ class LaunchRatioTest(unittest.TestCase):
         # Ordering, not just absence: a malformed argument must lose to nothing — including
         # a busy store. If validation ran after acquisition, a contended lock would decide
         # the error instead, and the caller would be told to retry a call that can never work.
-        from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
-            AttestationStoreLockBusy,
-        )
-
         config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
         herdr = FakeHerdr()
         with tempfile.TemporaryDirectory() as tmp:
@@ -992,12 +1360,18 @@ class LaunchRatioTest(unittest.TestCase):
             }
 
             def busy(*_args, **_kwargs):
-                raise AttestationStoreLockBusy("probe: the store is held exclusively")
+                raise AssertionError("invalid arguments must be rejected before locks")
 
             module = "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             with patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(home)}, clear=False):
                 with patch(
-                    module + "application.herdr_session_start.attestation_store_lock", busy
+                    module
+                    + "application.herdr_session_start_entry.attestation_store_lock",
+                    busy,
+                ), patch(
+                    module
+                    + "application.herdr_session_start_entry.acquire_session_start_gate",
+                    busy,
                 ):
                     with self.assertRaises(HerdrSessionStartError):
                         prepare_session(
@@ -1102,6 +1476,27 @@ class LaunchRatioTest(unittest.TestCase):
             result = self._prepare(tmp, herdr=herdr, lane_placement=config)
         self.assertEqual(result.ratio_outcome, RATIO_FAILED)
         self.assertIn("refused", result.ratio_detail)
+
+    def test_generation_drift_immediately_before_resize_is_zero_effect(self) -> None:
+        """The layout preview cannot lend authority to a recycled terminal."""
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
+            herdr_pair_generation_authority as generation_authority,
+        )
+
+        herdr = FakeHerdr()
+        config = LanePlacementConfig.from_record({"sublane": {"ratio": 0.8}})
+        opening = (("workspace", "lane", "codex", "name", "pane", "token"),)
+        with patch.object(
+            generation_authority,
+            "pair_generation_fingerprint",
+            side_effect=(opening, None),
+        ):
+            with tempfile.TemporaryDirectory() as tmp:
+                result = self._prepare(tmp, herdr=herdr, lane_placement=config)
+
+        self.assertEqual(result.ratio_outcome, RATIO_FAILED)
+        self.assertIn("terminal generation changed before resize", result.ratio_detail)
+        self.assertEqual(self._resize_calls(herdr), [])
         self.assertFalse(result.ratio_ok)
 
     def test_a_layout_payload_the_parser_refuses_is_a_failure(self) -> None:

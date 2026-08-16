@@ -63,7 +63,7 @@ class _SlotPlan:
     """A per-provider decision (adopt / launch / dry-run plan) made before any launch.
 
     Classifying every slot up front lets the run pick a single launch-target
-    workspace (and decide whether to create+reclaim a base pane) before it starts
+    workspace (and decide whether to create and preserve a base pane) before it starts
     launching, so Herdr 0.8 can split and prepare an exact pane before ``agent start``.
     """
 
@@ -103,6 +103,10 @@ class SlotResult:
     compensation: str = COMPENSATION_NOT_NEEDED
     #: A fixed operator sentence for ``health`` (never observed pane content).
     health_detail: str = ""
+    #: Per-process terminal identity from this slot's own ``agent_started`` receipt.
+    #: Internal launch-generation evidence only: it is intentionally omitted from
+    #: :meth:`as_payload` and never becomes durable route identity.
+    launch_terminal_id: str = field(default="", repr=False)
 
     @property
     def disposition(self) -> str:
@@ -140,20 +144,20 @@ class SessionStartResult:
     """The aggregate outcome of a session-start run.
 
     ``workspace_id`` / ``lane_id`` are the *mozyo* identities (registry anchor +
-    requested lane). The base-pane fields (Redmine #13330) record the empty herdr
-    root pane this run created and reclaimed on a pure cold start:
+    requested lane). The base-pane fields (Redmine #13330 / #15227) record the empty
+    herdr root pane this run created and, absent conditional generation authority,
+    preserved on a pure cold start:
 
     - ``herdr_workspace_id`` — the herdr *terminal* workspace the launched agents
       live in (the one this run created, or the single workspace its adopted
       agents already occupy). Blank when nothing was launched.
     - ``base_pane_id`` — the ``root_pane.pane_id`` of the workspace this run
       **created** (blank when no workspace was created: all-adopt, dry-run, or a
-      launch into an already-existing workspace). Only this exact pane is ever a
-      reclaim target — never a scanned-for shell (fail-closed against closing a
-      user's own shell).
-    - ``base_pane_reclaimed`` — True iff that created root pane was closed.
-    - ``base_pane_detail`` — a non-fatal ``pane close`` failure detail, if any
-      (a failed reclaim leaves harmless cosmetic residue, never a hard failure).
+      launch into an already-existing workspace). It is observation, not locator-only
+      close authority; a scanned-for shell is never substituted.
+    - ``base_pane_reclaimed`` — historical observation; current unbound roots remain False.
+    - ``base_pane_detail`` — the typed preservation reason (normally
+      ``generation_unproven_root_preserved``), never provider stderr.
 
     The tab fields (Redmine #13411) are the lane=tab analogue: a non-default lane
     lands in its OWN dedicated herdr tab inside the sublane host workspace, its
@@ -165,9 +169,9 @@ class SessionStartResult:
       the default lane / all-adopt / nothing launched.
     - ``tab_pane_id`` — the ``root_pane.pane_id`` of the tab this run **created**
       (blank when no tab was created: default lane, all-adopt, or a heal that
-      rejoined an existing tab). Only this exact pane is ever a reclaim target.
-    - ``tab_pane_reclaimed`` — True iff that created tab root pane was closed.
-    - ``tab_pane_detail`` — a non-fatal tab root ``pane close`` failure detail.
+      rejoined an existing tab). It is likewise observation, not close authority.
+    - ``tab_pane_reclaimed`` — historical observation; current unbound roots remain False.
+    - ``tab_pane_detail`` — the typed preservation reason, never provider stderr.
     """
 
     workspace_id: str

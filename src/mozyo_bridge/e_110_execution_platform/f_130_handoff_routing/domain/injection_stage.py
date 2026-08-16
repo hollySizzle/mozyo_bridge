@@ -226,9 +226,10 @@ TRANSPORT_ERROR_NARRATIVE: str = (
     "transport primitive raised at or after the single body injection, so the rail could not "
     "drive the send to a confirmed disposition. The failure is reported as this typed outcome "
     "instead of an uncaught traceback: the sender gets a structured status / reason / "
-    "next_action and can classify the delivery. No C-u rollback and no re-send were issued — "
-    "the marker+body was typed at most once. Partial reach of the body and/or Enter cannot be "
-    "excluded, so this is an uncertain delivery, never an optimistic one."
+    "next_action and can classify the delivery. No C-u rollback or body re-send was issued; "
+    "depending on the failure point, Enter may have been pressed zero or more times, while "
+    "the marker+body was typed at most once. Partial reach of the body and/or Enter cannot "
+    "be excluded, so this is an uncertain delivery, never an optimistic one."
 )
 
 #: ``DeliveryOutcome`` receiver-side contract line for a ``transport_error`` outcome.
@@ -267,16 +268,34 @@ _BINDING_FIELDS: tuple[str, ...] = (
     "startup_action_id",
 )
 
-#: The producer's ONE optional-empty field: ``row_revision`` is ``_norm(str(revision))`` and
-#: collapses to ``""`` for a bool row value, so an empty string is a legitimate canonical
-#: binding. Every other field is guaranteed non-empty at the producer — it returns ``None``
-#: outright when the attestation timestamp or the launch-generation token is missing, and the
-#: remaining three are built from an identity that already decoded and matched the target.
-#:
-#: Only the *literal* empty string qualifies: ``" "`` is not a canonical value at all, because
-#: ``_norm`` would have stripped it to ``""`` (review j#95881). The normalized-form check above
-#: rejects it before this exemption is ever consulted.
-_BINDING_OPTIONAL_EMPTY: frozenset[str] = frozenset({"row_revision"})
+#: The current terminal-aware producer requires every field to be non-empty.
+_BINDING_OPTIONAL_EMPTY: frozenset[str] = frozenset()
+
+_QUEUE_ENTER_CAUSAL_BASELINE_STATES: frozenset[str] = frozenset(
+    ("awaiting_input", "turn_ended")
+)
+
+
+def canonical_queue_enter_generation_binding(binding: object) -> bool:
+    """Whether ``binding`` is the redaction-safe public producer shape."""
+    if not isinstance(binding, dict):
+        return False
+    if not set(_BINDING_FIELDS).issubset(binding):
+        return False
+    if {"terminal_id", "process_generation"}.intersection(binding):
+        return False
+    for field in _BINDING_FIELDS:
+        value = binding.get(field)
+        if not isinstance(value, str) or value != value.strip():
+            return False
+        if not value and field not in _BINDING_OPTIONAL_EMPTY:
+            return False
+    revision = binding["row_revision"]
+    if any(char not in "0123456789" for char in revision):
+        return False
+    if len(revision) > 1 and revision.startswith("0"):
+        return False
+    return True
 
 
 def canonical_v2_generation_binding(observation: object) -> bool:
@@ -317,23 +336,9 @@ def canonical_v2_generation_binding(observation: object) -> bool:
     # by coincidence (`True == 2` merely happens to be false).
     if type(version) is not int or version != _OBSERVATION_VERSION_V2:
         return False
-    binding = observation.get("gateway_binding")
-    if not isinstance(binding, dict):
-        return False
-    for field in _BINDING_FIELDS:
-        value = binding.get(field)
-        if not isinstance(value, str):
-            return False
-        # The producer routes every field through `herdr_identity._norm`, which is
-        # `str(value).strip()` — so a canonical value is ALWAYS already stripped. Requiring the
-        # normalized form (rather than merely a non-empty one) is what rejects the tokens the
-        # producer cannot emit: whitespace-only values such as `" "` / `"\t"` / `"\n"` (which a
-        # bare non-empty check accepts), and unnormalized values such as `" w4B:p4T "`.
-        if value != value.strip():
-            return False
-        if not value and field not in _BINDING_OPTIONAL_EMPTY:
-            return False
-    return True
+    return canonical_queue_enter_generation_binding(
+        observation.get("gateway_binding")
+    )
 
 
 def turn_start_positively_observed(
@@ -346,22 +351,24 @@ def turn_start_positively_observed(
     was set up **before** this send's Enter and then fired, so the start it saw belongs to
     THIS send. Exactly two such signals exist:
 
-    - the herdr **event** rail's armed ``wait agent-status --status working`` transition
+    - the herdr **event** rail's armed
+      ``agent wait TARGET --until working --timeout MS`` transition
       (``turn_start_outcome.outcome == "started"``), used by ``--mode standard``;
     - the queue-enter rail's own armed working-transition wait (Redmine #14203), surfaced on
       the v2 observation as ``event_wait_kind == "changed"`` **together with** a
-      ``gateway_binding``. The rail writes those two fields only when the pre-arm and
-      post-collect gateway generations are present and exactly equal
-      (``handoff_tmux_transport_rail`` — "a None / mismatched pair drops BOTH"), so their
-      presence *is* the generation-coherence guarantee: the receiver process did not change
-      across the observation window, and an old process's start can never pair with a new
-      process's binding.
+      ``gateway_binding`` from a positively idle ``baseline_runtime_state``. The rail
+      writes those fields only when the pre-arm and post-collect bindings carry the
+      same assigned name, locator, provider, terminal id, and verified
+      ``pane_bound_v2`` launch token. Mutable ``terminal.revision`` may advance after
+      body rendering and is deliberately not the post-body identity fence. A missing
+      or mismatched stable field drops the causal event, so an old terminal's start
+      cannot pair with a replacement terminal's binding.
 
     **The post-choreography ``runtime_state`` snapshot is NOT evidence of a start**, in either
     direction of this predicate. Review j#95601 established that reading ``busy`` as a
     confirmation violates the source contract of the field itself
     (``DeliveryOutcome.queue_enter_turn_start_observation``: *"a post-hoc snapshot does not
-    prove causality the way an armed ``wait agent-status`` transition does, so it must not be
+    prove causality the way an armed ``agent wait --until`` transition does, so it must not be
     read as an event-observed turn start"*). A post-hoc poll cannot attribute what it sees to
     this send: the queue-enter rail runs no idle precondition gate, so a receiver that was
     already busy before the send — or a recycled process running someone else's turn — reads
@@ -387,11 +394,20 @@ def turn_start_positively_observed(
         armed_wait_fired = (
             str(observation.get("event_wait_kind") or "") == _WAIT_KIND_CHANGED
         )
+        baseline_state = observation.get("baseline_runtime_state")
+        baseline_is_injectable_idle = (
+            type(baseline_state) is str
+            and baseline_state in _QUEUE_ENTER_CAUSAL_BASELINE_STATES
+        )
         # Required alongside it, not implied: the rail writes the two together only under a
         # coherent generation, so a record carrying one without the other did not come from
         # that gate and must not be trusted as if it had. And the binding must be the
         # canonical v2 shape — its mere presence is NOT a generation authority (#14203 j#87418).
-        if armed_wait_fired and canonical_v2_generation_binding(observation):
+        if (
+            armed_wait_fired
+            and baseline_is_injectable_idle
+            and canonical_v2_generation_binding(observation)
+        ):
             return True
     return False
 
@@ -424,10 +440,10 @@ def injection_stage_for(
     - on ``--mode standard`` the rail *verified a turn start* before resolving to ``ok`` (the
       capture-based observation, or the herdr event rail's ``started``), so it is a genuine
       confirmed submission;
-    - on the daily-default ``queue-enter`` rail ``ok`` only means **the landing marker was
-      observed and Enter was pressed** — that rail deliberately runs no turn-start gate
-      (its snapshot is additive telemetry). A receiver whose composer took the text but whose
-      Enter was absorbed reports exactly this outcome.
+    - on the tmux ``queue-enter`` rail ``ok`` only means **the landing marker was observed and
+      Enter was pressed**; tmux has no causal turn-start gate. The Herdr ``queue-enter`` rail
+      now requires causal turn-start evidence and otherwise fails closed. Older or synthetic
+      outcomes without that evidence remain unconfirmed.
 
     Reading ``ok`` as confirmed on queue-enter was therefore the same optimistic
     delivered-ization the issue's Non-goals prohibit, in a second place: it claimed a
@@ -596,6 +612,7 @@ __all__: Iterable[str] = (
     "ANCHOR_AUTHORITY_NARRATIVE",
     "ANCHOR_AUTHORITY_NEXT_ACTION",
     "ANCHOR_AUTHORITY_REASONS",
+    "canonical_queue_enter_generation_binding",
     "canonical_v2_generation_binding",
     "INJECT_FAILED_NARRATIVE",
     "INJECT_FAILED_NEXT_ACTION",

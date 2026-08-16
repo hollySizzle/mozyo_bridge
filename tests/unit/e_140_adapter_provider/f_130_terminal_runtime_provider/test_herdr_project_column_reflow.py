@@ -28,7 +28,14 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pair_split_ratio import (  # noqa: E402,E501
+    LayoutSnapshot,
+    PaneRect,
+    SplitInfo,
     parse_pane_layout,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_managed_column_scope import (  # noqa: E402,E501
+    managed_column_scope,
+    managed_column_scope_matches,
 )
 from mozyo_bridge.core.state.lane_kind import (  # noqa: E402
     LANE_KIND_DELEGATED_COORDINATOR,
@@ -476,6 +483,66 @@ class ColumnarVerdictTest(unittest.TestCase):
         )
         columnar, _reason = columnar_verdict(_snapshot(tab), self._groups())
         self.assertFalse(columnar)
+
+    def test_cosmetic_root_outside_managed_subtree_does_not_defeat_columns(self):
+        tab = Tab(tab_id="w1:t1", workspace_id="w1", bounds=Rect(0, 0, 80, 24))
+        tab.root = Split(
+            "right", 0.25, Leaf("root"),
+            Split(
+                "right", 0.5,
+                Split("down", 0.5, Leaf("w1:p2"), Leaf("w1:p3")),
+                Split("down", 0.5, Leaf("w1:p4"), Leaf("w1:p5")),
+            ),
+        )
+        layout = _snapshot(tab)
+        scope = managed_column_scope(
+            layout,
+            (("w1:p2", "w1:p3"), ("w1:p4", "w1:p5")),
+        )
+        self.assertIsNotNone(scope)
+        columnar, reason = columnar_verdict(layout, self._groups())
+        self.assertTrue(columnar, reason)
+        self.assertEqual(layout.panes["root"], PaneRect(0, 0, 20, 24))
+
+    def test_overlap_and_non_tree_split_are_refused(self):
+        panes = {
+            "a": PaneRect(20, 0, 20, 20),
+            "b": PaneRect(20, 20, 20, 20),
+            "c": PaneRect(40, 0, 20, 20),
+            "d": PaneRect(40, 20, 20, 20),
+            "root": PaneRect(0, 0, 20, 40),
+        }
+        valid = (
+            SplitInfo("managed", "right", 0.5, PaneRect(20, 0, 40, 40)),
+            SplitInfo("left", "down", 0.5, PaneRect(20, 0, 20, 40)),
+            SplitInfo("right", "down", 0.5, PaneRect(40, 0, 20, 40)),
+            SplitInfo("outside", "right", 0.25, PaneRect(0, 0, 60, 40)),
+        )
+        groups = (("a", "b"), ("c", "d"))
+        baseline = managed_column_scope(LayoutSnapshot("tab", panes, valid), groups)
+        self.assertIsNotNone(baseline)
+        overlap = dict(panes)
+        overlap["c"] = PaneRect(35, 0, 25, 20)
+        self.assertIsNone(
+            managed_column_scope(LayoutSnapshot("tab", overlap, valid), groups)
+        )
+        bogus = (
+            valid[0],
+            SplitInfo("partial", "down", 0.5, PaneRect(30, 0, 20, 40)),
+            valid[2],
+            valid[3],
+        )
+        self.assertEqual(len(bogus), len(valid))
+        self.assertIsNone(
+            managed_column_scope(LayoutSnapshot("tab", panes, bogus), groups)
+        )
+        drifted = dict(panes)
+        drifted["root"] = PaneRect(0, 0, 19, 40)
+        self.assertFalse(
+            managed_column_scope_matches(
+                LayoutSnapshot("tab", drifted, valid), baseline
+            )
+        )
 
 
 class ColumnPlanTest(unittest.TestCase):

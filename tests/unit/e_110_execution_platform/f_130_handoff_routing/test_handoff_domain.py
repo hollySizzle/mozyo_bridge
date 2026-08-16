@@ -430,6 +430,18 @@ class QueueEnterRetryPolicyTest(unittest.TestCase):
         self.assertFalse(resolve_queue_enter_retry_policy(-5, 2).enabled)
         self.assertEqual(0, resolve_queue_enter_retry_policy(-5, 2).max_retries)
 
+    def test_generic_policy_keeps_legacy_tmux_values_above_herdr_bound(self) -> None:
+        policy = resolve_queue_enter_retry_policy(3601, 2)
+        self.assertEqual(1800, policy.max_retries)
+
+    def test_generic_policy_keeps_legacy_tmux_sub_millisecond_values(self) -> None:
+        # Herdr cannot express sub-millisecond wait budgets, but this shared
+        # arithmetic also drives tmux's float-based marker rail.  The Herdr-only
+        # minimum therefore must not silently disable tmux retries here.
+        policy = resolve_queue_enter_retry_policy(0.002, 0.0005)
+        self.assertEqual(4, policy.max_retries)
+        self.assertTrue(policy.enabled)
+
     def test_zero_window_or_interval_disables_retry(self) -> None:
         self.assertEqual(0, resolve_queue_enter_retry_policy(0, 2).max_retries)
         self.assertEqual(0, resolve_queue_enter_retry_policy(30, 0).max_retries)

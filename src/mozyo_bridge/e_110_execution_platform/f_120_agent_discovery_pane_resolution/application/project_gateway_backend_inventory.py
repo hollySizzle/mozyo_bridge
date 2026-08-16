@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import argparse
 from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Optional, Protocol
 
@@ -31,9 +31,8 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_role_authority_source import (
     load_parsed_role_bindings,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
-    ROLE_COORDINATOR as PROVIDER_ROLE_COORDINATOR,
-    ROLE_PROJECT_GATEWAY as PROVIDER_ROLE_PROJECT_GATEWAY,
+from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_route_binding import (
+    GATEWAY_AUTHORITY_ROLES,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (
     DEFAULT_LANE,
@@ -77,6 +76,7 @@ class ProjectGatewayBackendSupport(Protocol):
     """Adapter operations required by the core inventory use case."""
 
     agent_name_key: str
+    terminal_id_key: str
     locator_keys: tuple[str, ...]
 
     def normalize(self, value: object) -> str: ...
@@ -88,6 +88,10 @@ class ProjectGatewayBackendSupport(Protocol):
     def slot_is_live(self, row: object) -> bool: ...
 
     def valid_target(self, value: object) -> bool: ...
+
+    def terminal_identity(
+        self, assigned_name: object, locator: object, rows: object
+    ) -> object: ...
 
     def workspace_segment(self, repo_root: Path) -> str: ...
 
@@ -101,6 +105,11 @@ class ProjectGatewayBackendSupport(Protocol):
         provider: str,
         lane_id: str,
         locator: str,
+        terminal_id: str,
+    ) -> str: ...
+
+    def process_generation(
+        self, locator: str, rows: Sequence[Mapping[str, object]]
     ) -> str: ...
 
     def build_project_gateway_capability(self, observation: object) -> object: ...
@@ -236,6 +245,8 @@ class HerdrTargetObservation:
     project_scope: str
     assigned_name: str
     locator: str
+    terminal_id: str = field(repr=False)
+    process_generation: str = field(repr=False)
     generation_token: str
     target_cwd: str
     target_repo_root: str
@@ -322,6 +333,7 @@ class LiveProjectGatewayInventoryOps:
         provider: str,
         lane_id: str,
         locator: str,
+        terminal_id: str,
     ) -> str:
         return _require_backend_support().generation_token(
             assigned_name=assigned_name,
@@ -329,6 +341,7 @@ class LiveProjectGatewayInventoryOps:
             provider=provider,
             lane_id=lane_id,
             locator=locator,
+            terminal_id=terminal_id,
         )
 
     def project_path(
@@ -393,6 +406,29 @@ class ProjectGatewayBackendInventoryUseCase:
     @staticmethod
     def _error(reason: str, detail: str, backend: str = BACKEND_HERDR):
         raise ProjectGatewayInventoryError(reason, detail, backend=backend)
+
+    # The scope's durable binding resolution lives in the sibling
+    # `project_gateway_route_binding` module (Redmine #15414): the CLI family
+    # derives its requested receiver from the SAME resolution this gate
+    # verifies, so the two cannot drift apart. Imported lazily — that module
+    # reads this module's typed refusal / selector vocabulary back.
+    def _parsed_role_bindings(self, repo_root: Path, *, backend: str):
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_route_binding import (  # noqa: E501
+            parsed_scope_role_bindings,
+        )
+
+        return parsed_scope_role_bindings(self._ops, repo_root, backend=backend)
+
+    def _scope_route_providers(
+        self, repo_root: Path, scope: str, *, parsed, backend: str, selector: str
+    ):
+        from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.application.project_gateway_route_binding import (  # noqa: E501
+            scope_route_providers,
+        )
+
+        return scope_route_providers(
+            self._ops, repo_root, scope, parsed=parsed, backend=backend, selector=selector
+        )
 
     def discover(
         self, request: ProjectGatewayInventoryRequest
@@ -462,62 +498,10 @@ class ProjectGatewayBackendInventoryUseCase:
                 candidates=(),
             )
 
-        try:
-            parsed = self._ops.parsed_role_bindings(repo_root)
-        except Exception as exc:  # noqa: BLE001 - durable authority unavailable
-            raise ProjectGatewayInventoryError(
-                "workflow_role_binding_unavailable",
-                "the durable workflow-role binding could not be read",
-                backend=backend,
-            ) from exc
-        if not getattr(parsed, "ok", False):
-            self._error(
-                "workflow_role_binding_invalid",
-                "the durable workflow-role binding is malformed",
-            )
-
-        gateway_roles = frozenset({ROLE_PROJECT_GATEWAY, ROLE_COORDINATOR})
-        authority_matches = [
-            binding
-            for binding in parsed.bindings
-            if binding.role in gateway_roles and binding.project_scope == scope
-        ]
-        if len(authority_matches) != 1:
-            self._error(
-                "project_scope_binding_ambiguous"
-                if authority_matches
-                else "project_scope_binding_missing",
-                "the project scope must have exactly one durable coordinator/project-gateway binding",
-            )
-        authority = authority_matches[0]
-
-        try:
-            role_binding = self._ops.provider_binding(repo_root)
-        except Exception as exc:  # noqa: BLE001 - provider authority unavailable
-            raise ProjectGatewayInventoryError(
-                "provider_binding_unavailable",
-                "the workflow provider binding could not be read",
-                backend=backend,
-            ) from exc
-        gateway_provider_key = (
-            PROVIDER_ROLE_COORDINATOR
-            if authority.role == ROLE_COORDINATOR
-            else PROVIDER_ROLE_PROJECT_GATEWAY
+        parsed = self._parsed_role_bindings(repo_root, backend=backend)
+        authority, gateway_provider, child_provider = self._scope_route_providers(
+            repo_root, scope, parsed=parsed, backend=backend, selector=request.selector
         )
-        gateway_provider = _norm(role_binding.provider_for(gateway_provider_key))
-        child_provider = _norm(role_binding.provider_for(PROVIDER_ROLE_COORDINATOR))
-        required_providers = (
-            (gateway_provider,)
-            if request.selector == SELECT_GATEWAY
-            else (child_provider,)
-            if request.selector == SELECT_CHILD_ROUTE
-            else (gateway_provider, child_provider)
-        )
-        if any(not item for item in required_providers):
-            self._error(
-                "provider_binding_unresolved",
-                "provider_binding resolves no provider for the requested project-gateway route",
-            )
         target_provider = (
             gateway_provider
             if request.selector == SELECT_GATEWAY
@@ -555,7 +539,7 @@ class ProjectGatewayBackendInventoryUseCase:
         gateway_lane_ids = {
             _norm_lane(binding.lane_id)
             for binding in parsed.bindings
-            if binding.role in gateway_roles
+            if binding.role in GATEWAY_AUTHORITY_ROLES
         }
         gateway_lane_ids.add(_norm_lane(authority.lane_id))
         selected_rows: list[tuple[Mapping[str, object], object, str, str]] = []
@@ -663,6 +647,28 @@ class ProjectGatewayBackendInventoryUseCase:
                     "herdr_locator_ambiguous",
                     "the matching Herdr locator is aliased by multiple live inventory rows",
                 )
+            row_terminal_id = row.get(_require_backend_support().terminal_id_key)
+            terminal_id = _require_backend_support().terminal_identity(
+                assigned_name, locator, rows
+            )
+            if (
+                type(terminal_id) is not str
+                or not terminal_id
+                or terminal_id.strip() != terminal_id
+                or terminal_id != row_terminal_id
+            ):
+                self._error(
+                    "herdr_terminal_identity_unavailable",
+                    "a matching live Herdr row has no exact terminal identity",
+                )
+            process_generation = _require_backend_support().process_generation(
+                locator, rows
+            )
+            if not process_generation:
+                self._error(
+                    "herdr_process_generation_unavailable",
+                    "a matching live Herdr row has no unambiguous process generation",
+                )
             try:
                 generation = self._ops.generation_token(
                     assigned_name=assigned_name,
@@ -670,6 +676,7 @@ class ProjectGatewayBackendInventoryUseCase:
                     provider=identity.role,
                     lane_id=lane,
                     locator=locator,
+                    terminal_id=terminal_id,
                 )
             except Exception as exc:  # noqa: BLE001 - attestation source is an IO boundary
                 raise ProjectGatewayInventoryError(
@@ -738,6 +745,8 @@ class ProjectGatewayBackendInventoryUseCase:
                 project_scope=scope,
                 assigned_name=assigned_name,
                 locator=locator,
+                terminal_id=terminal_id,
+                process_generation=process_generation,
                 generation_token=generation,
                 target_cwd=target_cwd,
                 target_repo_root=target_root,

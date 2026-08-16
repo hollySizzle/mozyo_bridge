@@ -1,7 +1,7 @@
 """Herdr CLI-event wake adapter for the callback background runtime (Redmine #13520 / #13518).
 
 Design answer j#75098 Q1: the callback watcher wakes on the **stable Herdr CLI event surface**
-(``wait agent-status`` — never the raw control socket, and never exposed to an LLM role), but a
+(``agent wait --until`` — never the raw control socket, and never exposed to an LLM role), but a
 Herdr event is a **wake / liveness hint, not workflow authority**. On any wake outcome — a
 state change, a bounded timeout, or a wait-primitive restart / error — the background runtime
 re-reads the **exact Redmine journal** (the authority) and runs the outbox
@@ -24,6 +24,10 @@ import subprocess  # noqa: S404 - the sanctioned herdr CLI wait boundary (inject
 from dataclasses import dataclass
 from typing import Callable, Optional
 
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_wait import (  # noqa: E501
+    build_herdr_agent_wait_argv,
+)
+
 #: The runner seam for the production wait: given an argv, returns ``(returncode, stderr)``.
 #: Injectable so tests never spawn a real ``herdr`` process.
 HerdrWaitRunner = Callable[[list], "tuple[int, str]"]
@@ -31,7 +35,7 @@ HerdrWaitRunner = Callable[[list], "tuple[int, str]"]
 #: The herdr runtime status the watcher waits for a *change into* (a scheduling hint; the
 #: watcher re-reads Redmine regardless, so the exact status only affects wake latency).
 DEFAULT_WAKE_STATUS = "working"
-#: The default bounded ``wait agent-status --timeout`` window (ms). Homes the 45-55s watcher
+#: The default bounded ``agent wait --timeout`` window (ms). Homes the 45-55s watcher
 #: cadence in the background runtime (NOT an LLM turn); an operator may override it.
 DEFAULT_WAKE_TIMEOUT_MS = 50_000
 
@@ -63,7 +67,7 @@ class WakeSignal:
 def resolve_wake(wait_fn: Callable[[], object], *, detail: str = "") -> WakeSignal:
     """Run one bounded Herdr-event wait and normalize it to a fail-safe :class:`WakeSignal`.
 
-    ``wait_fn`` is the injected stable Herdr wait primitive (``wait agent-status``); it returns a
+    ``wait_fn`` is the injected stable Herdr wait primitive (``agent wait``); it returns a
     truthy value when a runtime state change was observed and a falsy value on a bounded timeout,
     or raises when the background CLI event stream fails / restarts. In **every** case this
     returns a :class:`WakeSignal` with ``should_reread=True`` — the caller re-reads the exact
@@ -123,10 +127,10 @@ def build_herdr_event_wait(
     timeout_ms: int = DEFAULT_WAKE_TIMEOUT_MS,
     runner: Optional[HerdrWaitRunner] = None,
 ) -> Callable[[], object]:
-    """Build the production ``wait_fn``: a bounded, blocking ``herdr wait agent-status`` (#13520 F1b).
+    """Build the production ``wait_fn``: a bounded, blocking ``herdr agent wait`` (#13520 F1b).
 
     Returns a zero-arg callable suitable for :func:`resolve_wake`. Each call blocks on
-    ``herdr wait agent-status <target> --status <status> --timeout <ms>`` (a *change into* the
+    ``herdr agent wait <target> --until <status> --timeout <ms>`` (a *change into* the
     status) and returns **truthy** when herdr observed the change (rc 0), **falsy** on herdr's own
     bounded ``--timeout`` elapse (a benign timeout hint), and **raises** :class:`HerdrWaitError` on a
     non-timeout non-zero exit — so :func:`resolve_wake` distinguishes a bounded timeout
@@ -141,10 +145,12 @@ def build_herdr_event_wait(
     """
     outer_timeout = int(timeout_ms) / 1000.0 + WAKE_OUTER_TIMEOUT_MARGIN_SECONDS
     run: HerdrWaitRunner = runner if runner is not None else _make_default_wait_runner(outer_timeout)
-    argv = [
-        str(binary), "wait", "agent-status", str(target),
-        "--status", str(status), "--timeout", str(int(timeout_ms)),
-    ]
+    argv = build_herdr_agent_wait_argv(
+        binary,
+        target,
+        until=status,
+        timeout_ms=int(timeout_ms),
+    )
 
     def _wait() -> object:
         rc, stderr = run(list(argv))

@@ -56,6 +56,20 @@ def _args(repo):
     return ns
 
 
+def _process_generation(
+    assigned_name: str,
+    *,
+    locator: str = "wT:pT",
+    terminal_id: str = "terminal-target",
+    revision: int = 5,
+) -> str:
+    return (
+        f"{len(assigned_name)}:{assigned_name}:"
+        f"{len(terminal_id)}:{terminal_id}:"
+        f"{len(locator)}:{locator}:r{revision}"
+    )
+
+
 # Redmine #13729: the herdr send helpers are now Namespace-free; these thin
 # adapters derive the same scalars the facade passes (repo root + raw target
 # fields) from an ``args`` fixture, so the fixtures stay unchanged.
@@ -196,7 +210,12 @@ class ResolveHerdrSendTargetTest(unittest.TestCase):
             ctx = _Ctx(
                 tmp,
                 rows=lambda ws: [
-                    {"name": encode_assigned_name(ws, "claude", "lane-1"), "pane_id": "wT:pT"}
+                    {
+                        "name": encode_assigned_name(ws, "claude", "lane-1"),
+                        "pane_id": "wT:pT",
+                        "terminal_id": "terminal-target",
+                        "revision": 3,
+                    }
                 ],
             )
             pane = self._resolve(ctx)
@@ -204,6 +223,11 @@ class ResolveHerdrSendTargetTest(unittest.TestCase):
         self.assertEqual(pane["window_name"], "claude")
         self.assertEqual(pane["agent_role"], "")  # no @mozyo_agent_role -> not cockpit
         self.assertEqual(pane["workspace_id"], ctx.workspace_id)
+        assigned_name = encode_assigned_name(ctx.workspace_id, "claude", "lane-1")
+        self.assertEqual(
+            pane["herdr_process_generation"],
+            f"{len(assigned_name)}:{assigned_name}:15:terminal-target:5:wT:pT:r3",
+        )
         # The projection binds the receiver and stays a normal_window (main-lane
         # cockpit guard therefore inactive) — the tmux-only cockpit semantics are an
         # explicit no-op under herdr.
@@ -325,6 +349,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                     {
                         "name": encode_assigned_name(ws, "codex", "default"),
                         "pane_id": "wT:pT",
+                        "terminal_id": "terminal-target",
+                        "revision": 4,
                     }
                 ],
             )
@@ -340,6 +366,11 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
         self.assertEqual(pane["id"], "wT:pT")
         self.assertEqual(pane["workspace_id"], ctx.workspace_id)
         self.assertEqual(pane["lane_id"], "default")
+        assigned_name = encode_assigned_name(ctx.workspace_id, "codex", "default")
+        self.assertEqual(
+            pane["herdr_process_generation"],
+            f"{len(assigned_name)}:{assigned_name}:15:terminal-target:5:wT:pT:r4",
+        )
         # The proxy is not rewritten into a fictional lane sender.
         self.assertEqual(pane["herdr_sender_workspace_id"], "")
         self.assertEqual(pane["herdr_sender_lane_id"], "")
@@ -401,6 +432,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                     {
                         "name": encode_assigned_name(ws, "codex", "default"),
                         "pane_id": "wT:pT",
+                        "terminal_id": "terminal-target",
+                        "revision": 5,
                         "agent": "codex",
                         "cwd": str(Path(tmp) / "repo"),
                     }
@@ -414,6 +447,10 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                 locator="wT:pT",
                 purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
                 generation_token="generation-1",
+                terminal_id="terminal-target",
+                process_generation=_process_generation(
+                    encode_assigned_name(ctx.workspace_id, "codex", "default")
+                ),
                 project_scope="infra-platform",
                 target_repo_root=str(ctx.repo),
                 target_cwd=str(ctx.repo),
@@ -422,7 +459,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
             with patch("subprocess.run", ctx.run), patch.dict(
                 os.environ, self._foreign_env(ctx), clear=True
             ), patch(
-                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_send_entry.verified_terminal_generation_token",
                 return_value="generation-1",
             ) as generation:
                 pane = _resolve_from_args(
@@ -446,6 +484,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                         ctx.workspace_id, "codex", "default"
                     ),
                     "pane_id": "wT:pT",
+                    "terminal_id": "terminal-target",
+                    "revision": 5,
                     "agent": "codex",
                     "cwd": str(nested),
                 }
@@ -460,6 +500,10 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                 locator="wT:pT",
                 purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
                 generation_token="generation-1",
+                terminal_id="terminal-target",
+                process_generation=_process_generation(
+                    encode_assigned_name(ctx.workspace_id, "codex", "default")
+                ),
                 project_scope="infra-platform",
                 target_repo_root=str(ctx.repo),
                 target_cwd=str(nested),
@@ -468,7 +512,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
             with patch("subprocess.run", ctx.run), patch.dict(
                 os.environ, self._foreign_env(ctx), clear=True
             ), patch(
-                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_send_entry.verified_terminal_generation_token",
                 return_value="generation-1",
             ):
                 pane = _resolve_from_args(
@@ -503,6 +548,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                 locator="wT:pT",
                 purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
                 generation_token="generation-1",
+                terminal_id="terminal-target",
+                process_generation="pinned-process-generation",
                 project_scope="infra-platform",
                 target_repo_root=str(ctx.repo),
                 target_cwd=str(ctx.repo),
@@ -540,6 +587,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                     {
                         "name": encode_assigned_name(ws, "codex", "default"),
                         "pane_id": "wT:pT",
+                        "terminal_id": "terminal-target",
+                        "revision": 5,
                         "agent": "codex",
                         "cwd": str(Path(tmp) / "repo"),
                     }
@@ -553,6 +602,10 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                 locator="wT:pT",
                 purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
                 generation_token="generation-1",
+                terminal_id="terminal-target",
+                process_generation=_process_generation(
+                    encode_assigned_name(ctx.workspace_id, "codex", "default")
+                ),
                 project_scope="infra-platform",
                 target_repo_root=str(ctx.repo),
                 target_cwd=str(ctx.repo),
@@ -561,7 +614,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
             with patch("subprocess.run", ctx.run), patch.dict(
                 os.environ, self._foreign_env(ctx), clear=True
             ), patch(
-                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_send_entry.verified_terminal_generation_token",
                 return_value="generation-2",
             ):
                 with self.assertRaises(HerdrSendEntryError) as caught:
@@ -582,6 +636,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                     {
                         "name": encode_assigned_name(ws, "codex", "default"),
                         "pane_id": "wT:pT",
+                        "terminal_id": "terminal-target",
+                        "revision": 5,
                         "agent": "codex",
                         "cwd": str(Path(tmp) / "repo"),
                     }
@@ -597,6 +653,10 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                 locator="wT:pT",
                 purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
                 generation_token="generation-1",
+                terminal_id="terminal-target",
+                process_generation=_process_generation(
+                    encode_assigned_name(ctx.workspace_id, "codex", "default")
+                ),
                 project_scope="infra-platform",
                 target_repo_root=str(ctx.repo),
                 target_cwd=str(ctx.repo),
@@ -605,7 +665,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
             with patch("subprocess.run", ctx.run), patch.dict(
                 os.environ, self._foreign_env(ctx), clear=True
             ), patch(
-                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_send_entry.verified_terminal_generation_token",
                 return_value="generation-1",
             ) as generation:
                 _resolve_from_args(
@@ -623,6 +684,60 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
         self.assertIn("generation changed", str(caught.exception))
         self.assertEqual(generation.call_count, 2)
 
+    def test_project_gateway_effect_guard_refuses_replacement_terminal(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = _Ctx(
+                tmp,
+                rows=lambda ws: [
+                    {
+                        "name": encode_assigned_name(ws, "codex", "default"),
+                        "pane_id": "wT:pT",
+                        "terminal_id": "terminal-target",
+                        "revision": 5,
+                        "agent": "codex",
+                        "cwd": str(Path(tmp) / "repo"),
+                    }
+                ],
+            )
+            assigned_name = encode_assigned_name(
+                ctx.workspace_id, "codex", "default"
+            )
+            capability = ResolvedHerdrTargetCapability(
+                workspace_id=ctx.workspace_id,
+                lane_id="default",
+                provider="codex",
+                assigned_name=assigned_name,
+                locator="wT:pT",
+                purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
+                generation_token="generation-1",
+                terminal_id="terminal-target",
+                process_generation=_process_generation(assigned_name),
+                project_scope="infra-platform",
+                target_repo_root=str(ctx.repo),
+                target_cwd=str(ctx.repo),
+                project_path=".",
+            )
+            with patch("subprocess.run", ctx.run), patch.dict(
+                os.environ, self._foreign_env(ctx), clear=True
+            ), patch(
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_send_entry.verified_terminal_generation_token",
+                return_value="generation-1",
+            ):
+                _resolve_from_args(
+                    self._args(ctx),
+                    receiver="codex",
+                    resolved_target_capability=capability,
+                )
+                ctx.rows[0]["terminal_id"] = "replacement-terminal"
+                with self.assertRaises(HerdrSendEntryError) as caught:
+                    verify_project_gateway_target_effect(
+                        capability, repo_root=ctx.repo
+                    )
+
+        self.assertEqual(caught.exception.reason, RESOLVED_TARGET_CAPABILITY_MISMATCH)
+        self.assertIn("terminal changed", str(caught.exception))
+
     def test_project_gateway_effect_guard_rechecks_detected_provider(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = _Ctx(
@@ -631,6 +746,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                     {
                         "name": encode_assigned_name(ws, "codex", "default"),
                         "pane_id": "wT:pT",
+                        "terminal_id": "terminal-target",
+                        "revision": 5,
                         "agent": "codex",
                         "cwd": str(Path(tmp) / "repo"),
                     }
@@ -646,6 +763,10 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                 locator="wT:pT",
                 purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
                 generation_token="generation-1",
+                terminal_id="terminal-target",
+                process_generation=_process_generation(
+                    encode_assigned_name(ctx.workspace_id, "codex", "default")
+                ),
                 project_scope="infra-platform",
                 target_repo_root=str(ctx.repo),
                 target_cwd=str(ctx.repo),
@@ -654,7 +775,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
             with patch("subprocess.run", ctx.run), patch.dict(
                 os.environ, self._foreign_env(ctx), clear=True
             ), patch(
-                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_send_entry.verified_terminal_generation_token",
                 return_value="generation-1",
             ):
                 _resolve_from_args(
@@ -680,6 +802,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
             base_row = {
                 "name": assigned_name,
                 "pane_id": "wT:pT",
+                "terminal_id": "terminal-target",
+                "revision": 5,
                 "agent": "codex",
                 "cwd": str(ctx.repo),
             }
@@ -691,6 +815,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                 locator="wT:pT",
                 purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
                 generation_token="generation-1",
+                terminal_id="terminal-target",
+                process_generation=_process_generation(assigned_name),
                 project_scope="infra-platform",
                 target_repo_root=str(ctx.repo),
                 target_cwd=str(ctx.repo),
@@ -722,7 +848,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
             with patch("subprocess.run", ctx.run), patch.dict(
                 os.environ, self._foreign_env(ctx), clear=True
             ), patch(
-                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_send_entry.verified_terminal_generation_token",
                 return_value="generation-1",
             ):
                 for label, rows in contradictions.items():
@@ -747,6 +874,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                         target_workspace, "codex", "default"
                     ),
                     "pane_id": "wT:pT",
+                    "terminal_id": "terminal-target",
+                    "revision": 5,
                     "agent": "codex",
                     "cwd": str(target),
                 }
@@ -763,6 +892,10 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                 locator="wT:pT",
                 purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
                 generation_token="generation-1",
+                terminal_id="terminal-target",
+                process_generation=_process_generation(
+                    encode_assigned_name(target_workspace, "codex", "default")
+                ),
                 project_scope="infra-platform",
                 target_repo_root=str(target),
                 target_cwd=str(target),
@@ -771,7 +904,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
             with patch("subprocess.run", ctx.run), patch.dict(
                 os.environ, self._foreign_env(ctx), clear=True
             ), patch(
-                "mozyo_bridge.core.state.herdr_launch_generation.verified_generation_token",
+                "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+                "application.herdr_send_entry.verified_terminal_generation_token",
                 return_value="generation-1",
             ):
                 pane = _resolve_from_args(
@@ -799,6 +933,8 @@ class ResolvedTargetCapabilityTest(unittest.TestCase):
                 locator="wT:pT",
                 purpose=PROJECT_GATEWAY_TARGET_CAPABILITY_PURPOSE,
                 generation_token="generation-1",
+                terminal_id="terminal-target",
+                process_generation="pinned-process-generation",
                 project_scope="infra-platform",
                 target_repo_root=str(target),
                 target_cwd=str(target),

@@ -22,6 +22,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
@@ -37,6 +38,7 @@ from mozyo_bridge.core.state.herdr_launch_generation import (  # noqa: E402
 )
 from tests.support.current_launch_authority import (  # noqa: E402
     RECEIPT_CAPABLE_ACTION_ID,
+    seed_completed_current_launch_authority,
     seed_current_generation,
 )
 from mozyo_bridge.core.state.replacement_transaction import (  # noqa: E402
@@ -122,6 +124,7 @@ WORKER = dict(
     lane_id="l", role="worker", provider="claude", assigned_name="wk", old_locator="w:2"
 )
 ACTION_ID = "recover:l:worker:claude:wk:w:2"
+WORKER_TERMINAL = "terminal:w:2"
 
 
 def _all_clear(**overrides) -> RecoveryObservation:
@@ -243,17 +246,38 @@ class _RecoveryCase(unittest.TestCase):
         self.port = FakeActuatorPort()
         # Ruling j#97105: the recovery reads this worker's CURRENT launch-generation row.
         # A home without one is a lane whose current authority is missing, which refuses --
-        # so the pre-#14741 path is seeded explicitly as a canonical untagged action id.
+        # so the pre-#14741 receipt-capability path is seeded explicitly with the current
+        # terminal-bound v4 attestation + completed generation-v2 authority.
         self._seed_current_authority()
+        # `TestCase.enterContext` is Python 3.11+, and the supported matrix
+        # (`requires-python = ">=3.10"`) still includes 3.10, where it raises
+        # AttributeError in setUp — every test in this class errors, and the
+        # #14741 site-wiring test that drives this fixture fails with it. The
+        # start()/addCleanup(stop) form is the 3.10-compatible equivalent.
+        rows_patcher = patch(
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "sublane_herdr_projection.list_herdr_agent_rows",
+            return_value=[
+                {
+                    "name": WORKER["assigned_name"],
+                    "pane_id": WORKER["old_locator"],
+                    "terminal_id": WORKER_TERMINAL,
+                }
+            ],
+        )
+        rows_patcher.start()
+        self.addCleanup(rows_patcher.stop)
 
     def _seed_current_authority(self, **overrides):
         base = dict(
             workspace_id=self.workspace_id, lane_id=WORKER["lane_id"],
             role=WORKER["provider"], assigned_name=WORKER["assigned_name"],
-            locator=WORKER["old_locator"],
+            locator=WORKER["old_locator"], terminal_id=WORKER_TERMINAL,
+            target_workspace="w1", target_tab="w1:t1",
         )
         base.update(overrides)
-        seed_current_generation(self.home, **base)
+        seed_completed_current_launch_authority(self.home, **base)
 
     def _request(self, **overrides) -> RecoveryRequest:
         base = dict(
@@ -309,8 +333,8 @@ class CurrentLaunchAuthorityTests(_RecoveryCase):
         self.assertEqual(self.port.closed, [])
         self.assertEqual(self.port.launched, [])
 
-    def test_a_canonical_legacy_current_row_recovers_byte_invariantly(self):
-        """The positive control: the pre-#14741 path, now stated rather than assumed."""
+    def test_a_terminal_bound_legacy_capability_recovers_byte_invariantly(self):
+        """The pre-#14741 receipt path is safe only with current v4/v2 identity proof."""
         outcome = self._use_case(FakeRecoveryOps(_all_clear())).run(
             self._request(), execute=True
         )
@@ -324,7 +348,22 @@ class CurrentLaunchAuthorityTests(_RecoveryCase):
                 stored.evidence_cause,
             ),
             ("", "", ""),
-            "a legacy participant carries no evidence, and none was invented for it",
+            "a legacy-capability participant carries no update receipt evidence",
+        )
+
+    def test_an_unbound_legacy_current_row_is_a_typed_zero_effect_refusal(self):
+        self._fresh_home()
+        seed_current_generation(
+            self.home,
+            workspace_id=self.workspace_id,
+            lane_id=WORKER["lane_id"],
+            role=WORKER["provider"],
+            assigned_name=WORKER["assigned_name"],
+            locator=WORKER["old_locator"],
+            terminal_id=WORKER_TERMINAL,
+        )
+        self._assert_zero_effect(
+            self._use_case(FakeRecoveryOps(_all_clear())).run(self._request(), execute=True)
         )
 
     def test_an_absent_current_row_is_a_typed_zero_effect_refusal(self):
@@ -351,7 +390,16 @@ class CurrentLaunchAuthorityTests(_RecoveryCase):
     def test_a_receipt_capable_current_row_without_receipts_refuses(self):
         """Capability lives in the action id, so a tagged row cannot fall back to legacy."""
         self._fresh_home()
-        self._seed_current_authority(action_id=RECEIPT_CAPABLE_ACTION_ID)
+        seed_current_generation(
+            self.home,
+            workspace_id=self.workspace_id,
+            lane_id=WORKER["lane_id"],
+            role=WORKER["provider"],
+            assigned_name=WORKER["assigned_name"],
+            locator=WORKER["old_locator"],
+            terminal_id=WORKER_TERMINAL,
+            action_id=RECEIPT_CAPABLE_ACTION_ID,
+        )
         self._assert_zero_effect(
             self._use_case(FakeRecoveryOps(_all_clear())).run(self._request(), execute=True)
         )

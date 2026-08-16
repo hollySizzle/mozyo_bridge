@@ -50,6 +50,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _agent_locator,
     _norm,
     encode_assigned_name,
+    terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrastructure.herdr_transport import (  # noqa: E501
     Runner,
@@ -72,6 +73,7 @@ def prepare_actuator_lane_session(
     launch_context: object = None,
     pair_order: object = None,
     launch_cause: str = LAUNCH_CAUSE_GENERIC_FRESH,
+    session_gate_lease: object = None,
 ) -> SessionStartResult:
     """Compose one actuator launch, optionally beneath its caller-held store lock.
 
@@ -132,6 +134,7 @@ def prepare_actuator_lane_session(
         coordinator_placement_mode=coordinator_placement.mode,
         coordinator_top_workspace_id=coordinator_placement.top_workspace_id,
         launch_cause=launch_cause,
+        _session_gate_lease=session_gate_lease,
     )
     if not admission_lock_held:
         return prepare_session(**call)
@@ -228,7 +231,7 @@ def _binding_identity_matches(
 
 
 def _is_exact_normal_v1_row(
-    home: Path, intent: ReplacementActionBinding, live_locator: str
+    home: Path, intent: ReplacementActionBinding, live_locator: str, live_terminal_id: object
 ) -> bool:
     """True iff the live locator carries an exact, unbound normal-v1 attestation row.
 
@@ -245,6 +248,7 @@ def _is_exact_normal_v1_row(
     join = evaluate_attestation(
         record,
         live_locator=live_locator,
+        live_terminal_id=live_terminal_id,
         expected_workspace_id=intent.workspace_id,
         expected_role=intent.role,
         expected_lane=intent.lane_id,
@@ -259,6 +263,7 @@ def _bind_startup_receipt(
     startup_fence: StartupTransactionFence,
     intent: ReplacementActionBinding,
     live_locator: str,
+    live_terminal_id: object,
     startup_providers: tuple[str, ...],
 ) -> None:
     """Finish or replay one exact reserve -> startup receipt -> v1-row binding."""
@@ -276,6 +281,7 @@ def _bind_startup_receipt(
             record,
             action_id=intent.action_id,
             live_locator=live_locator,
+            live_terminal_id=live_terminal_id,
             expected_workspace_id=intent.workspace_id,
             expected_role=intent.role,
             expected_lane=intent.lane_id,
@@ -320,7 +326,7 @@ def _bind_startup_receipt(
             and owed.assigned_name == intent.assigned_name
             and owed.locator == live_locator
             and owed.receipt
-            and _is_exact_normal_v1_row(home, intent, live_locator)
+            and _is_exact_normal_v1_row(home, intent, live_locator, live_terminal_id)
         ):
             _stop(
                 V1_BINDING_STARTUP_ROLLBACK_REQUIRED,
@@ -354,6 +360,7 @@ def _bind_startup_receipt(
     join = evaluate_attestation(
         record,
         live_locator=live_locator,
+        live_terminal_id=live_terminal_id,
         expected_workspace_id=intent.workspace_id,
         expected_role=intent.role,
         expected_lane=intent.lane_id,
@@ -434,6 +441,9 @@ def launch_or_resume_v1_replacement(
             "the replacement assigned name is duplicated in live inventory",
         )
     live_locator = existing.get(provider, ("", ""))[0]
+    live_terminal_id = terminal_identity_of_live_slot(
+        assigned_name, live_locator, rows
+    )
     if named_rows and _agent_locator(named_rows[0]) != live_locator:
         _stop(
             V1_BINDING_AUTHORITY_CONFLICT,
@@ -476,6 +486,7 @@ def launch_or_resume_v1_replacement(
             startup_fence=startup_fence,
             intent=intent,
             live_locator=live_locator,
+            live_terminal_id=live_terminal_id,
             startup_providers=startup_providers,
         )
         return
@@ -564,5 +575,9 @@ def launch_or_resume_v1_replacement(
         startup_fence=startup_fence,
         intent=intent,
         live_locator=launched[0].locator,
+        # A managed v4 runtime refuses a v1 store before launch.  If an injected or
+        # legacy callback nevertheless reports a fresh launch, no post-launch inventory
+        # identity is available at this seam, so binding must fail closed.
+        live_terminal_id=None,
         startup_providers=startup_providers,
     )

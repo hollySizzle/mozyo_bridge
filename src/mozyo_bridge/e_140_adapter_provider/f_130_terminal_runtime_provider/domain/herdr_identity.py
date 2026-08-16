@@ -6,8 +6,9 @@ addresses a herdr target by a **handle**, and the #13175 herdr PoC
 (``vibes/docs/logics/herdr-poc-13175-experiment-log.md``) proved *which* handle is
 durable: experiment **E10** showed that a herdr **assigned name** (given by
 ``agent rename``, e.g. ``poc_claude``) survives a full ``server stop`` / restart,
-while ``pane_id`` and ``terminal_id`` are regenerated per process and are
-therefore disposable. The PoC learning was explicit: "mozyo-bridge の lane/Redmine
+while ``terminal_id`` is regenerated per process and ``pane_id`` is only a
+transient logical location that may be restored with the same text. Neither is
+a durable process-generation identity. The PoC learning was explicit: "mozyo-bridge の lane/Redmine
 紐付けに使う handle は herdr 付与名一択".
 
 This module is the **staged seam** that turns that learning into a contract: a
@@ -386,6 +387,8 @@ AGENT_KEY_NAME: str = "name"
 AGENT_KEY_LOCATOR: str = "pane_id"  # real herdr `agent list` row key (PoC #13175 E10 実測)
 AGENT_KEY_LOCATOR_ALIAS: str = "pane"
 AGENT_KEY_LOCATOR_ALIAS_2: str = "location"
+AGENT_KEY_TERMINAL_ID: str = "terminal_id"
+AGENT_KEY_REVISION: str = "revision"
 
 
 class HerdrIdentityError(ValueError):
@@ -604,8 +607,9 @@ class HerdrAgentIdentity:
     The stable components are ``(workspace_id, lane_id, role)`` — the same slot the
     route-identity ledger uses — and the durable handle is :attr:`assigned_name`,
     the restart-surviving herdr name (PoC E10). This type deliberately carries
-    **no** ``pane_id`` / ``terminal_id`` field: those are per-process, disposable
-    locators, so a caller structurally cannot persist one as identity. The live
+    **no** ``pane_id`` / ``terminal_id`` field: ``terminal_id`` is per-process,
+    while ``pane_id`` is a transient logical locator whose text may be restored or
+    reused for a new terminal generation. Neither is durable identity. The live
     locator is recovered on demand by :func:`rebind_by_name` and is transient.
 
     Construction normalises the components (trim; empty lane -> :data:`DEFAULT_LANE`)
@@ -710,9 +714,10 @@ def rebind_by_name(
     Signature: ``rebind_by_name(name, agents) -> HerdrRebindResult``.
 
     This is the restart-recovery procedure the PoC prescribes: after a herdr
-    ``server`` restart the ``pane_id`` / ``terminal_id`` are regenerated, but the
-    assigned name persists, so the live target is re-discovered by **matching the
-    name** in the ``agent list`` snapshot — never by trusting a cached locator.
+    ``server`` restart regenerates ``terminal_id`` while the same ``pane_id`` text
+    may be restored for a new terminal generation. The assigned name persists, so
+    the live target is re-discovered by **matching the name** in the ``agent list``
+    snapshot — never by treating a cached locator as process-generation identity.
     ``agents`` is the read-only row shape herdr's ``agent list`` emits; each row's
     name rides on :data:`AGENT_KEY_NAME` and its transient locator on
     :data:`AGENT_KEY_LOCATOR` (alias :data:`AGENT_KEY_LOCATOR_ALIAS`).
@@ -783,6 +788,112 @@ def rebind_by_name(
     )
 
 
+def occupant_of_locator(
+    locator: object, agents: Sequence[Mapping[str, object]]
+) -> Optional[str]:
+    """The durable assigned name currently holding ``locator``, or ``None`` (pure).
+
+    The inverse direction of :func:`rebind_by_name`: that one answers "where is this
+    agent now", this one answers "who is at this pane now". It is the identity
+    revalidation the turn-start rail's WAIT_ERROR Enter-resend needs (Redmine #15202,
+    audit j#102755 finding 3) — a locator is *transient*, so a pane that was killed and
+    had its id reused, or a lane relaunched inside the 8–15s wait window, addresses a
+    different agent than the one the send was authorised against. Comparing this token
+    before injection and again before the extra Enter is what makes that detectable.
+
+    Pure and fail-closed: it reads a caller-supplied ``agent list`` snapshot and never
+    lists on its own (the caller owns freshness — a memoised snapshot would make the
+    comparison vacuous). ``None`` whenever the answer is not unambiguous: a blank
+    locator, no matching row, a row with a blank name, or **more than one** row claiming
+    the same locator (a herdr uniqueness violation — refuse to guess, exactly as
+    :data:`REBIND_AMBIGUOUS` does).
+    """
+    wanted = _norm(locator)
+    if not wanted:
+        return None
+    names = [
+        _norm(agent.get(AGENT_KEY_NAME))
+        for agent in agents
+        if isinstance(agent, Mapping) and _agent_locator(agent) == wanted
+    ]
+    if len(names) != 1 or not names[0]:
+        return None
+    return names[0]
+
+
+def process_generation_of_locator(
+    locator: object, agents: Sequence[Mapping[str, object]]
+) -> Optional[str]:
+    """An opaque, conservative token for the live Herdr target, or ``None``.
+
+    The WAIT_ERROR Enter-only resend must distinguish more than the durable assigned
+    name and transient pane locator. Herdr 0.8 ``AgentInfo.terminal_id`` is the opaque
+    identity of the server-owned terminal and is regenerated for a replacement
+    terminal; it therefore separates different terminals even when a pane id and row
+    revision happen to be reused. ``AgentInfo.revision`` is *not* a process-generation
+    id: it mirrors ``terminal.revision`` and can advance for presentation changes such
+    as title or metadata updates. The revision remains in this short-window token only
+    as a conservative mutation fence, not as identity proof.
+
+    A successful token is an injective length-prefixed encoding of
+    ``(assigned_name, terminal_id, locator, row_revision)``. It is private, opaque
+    action-time evidence: public telemetry, logs, errors, and dataclass reprs must not
+    persist or render it. Consumers must not parse it or treat it as durable process
+    identity. Missing or malformed terminal-
+    id or revision evidence fails closed. A terminal id must be an exact, non-blank JSON
+    string with no surrounding whitespace. Herdr exposes revision as a non-negative
+    JSON integer, so strings, booleans, floats, and negative integers are rejected
+    rather than normalised into fabricated evidence.
+
+    Exactly one row must claim the locator and it must carry a non-blank name, matching
+    :func:`occupant_of_locator`'s ambiguity rules. Consequently, stable name + terminal
+    id + locator + revision compares equal when only the separately reported runtime
+    status changes. A different terminal id or revision compares different, even if
+    name and locator are unchanged; revision-only drift may conservatively withhold an
+    otherwise safe resend, which is preferable to sending on incomplete evidence.
+    """
+    if type(locator) is not str or not locator or locator.strip() != locator:
+        return None
+    wanted = locator
+    agents = tuple(agents)
+    if not terminal_identity_snapshot_complete(agents):
+        return None
+    matches = [
+        agent
+        for agent in agents
+        if isinstance(agent, Mapping) and _agent_locator(agent) == wanted
+    ]
+    if len(matches) != 1:
+        return None
+    row = matches[0]
+    assigned_name = _norm(row.get(AGENT_KEY_NAME))
+    terminal_id = row.get(AGENT_KEY_TERMINAL_ID)
+    revision = row.get(AGENT_KEY_REVISION)
+    if (
+        not assigned_name
+        or type(terminal_id) is not str
+        or not terminal_id
+        or terminal_id.strip() != terminal_id
+        or not isinstance(revision, int)
+        or isinstance(revision, bool)
+        or revision < 0
+    ):
+        return None
+    terminal_claims = [
+        agent
+        for agent in agents
+        if isinstance(agent, Mapping)
+        and agent.get(AGENT_KEY_TERMINAL_ID) == terminal_id
+    ]
+    if len(terminal_claims) != 1:
+        return None
+    return (
+        f"{len(assigned_name)}:{assigned_name}:"
+        f"{len(terminal_id)}:{terminal_id}:"
+        f"{len(wanted)}:{wanted}:r{revision}"
+    )
+
+
 def _agent_locator(agent: Mapping[str, object]) -> str:
     """Read the transient pane locator from an ``agent list`` row (fail-soft)."""
     locator = _norm(agent.get(AGENT_KEY_LOCATOR))
@@ -793,11 +904,23 @@ def _agent_locator(agent: Mapping[str, object]) -> str:
     return locator
 
 
+# Compatibility re-export: authority callers keep the established import path while
+# the terminal-identity policy lives in a focused module below the health ceiling.
+from .herdr_terminal_identity import (  # noqa: E402
+    terminal_identity_of_live_slot,
+    terminal_identity_of_locator,
+    terminal_identity_of_row,
+    terminal_identity_snapshot_complete,
+)
+
+
 __all__ = (
     "AGENT_KEY_LOCATOR",
     "AGENT_KEY_LOCATOR_ALIAS",
     "AGENT_KEY_LOCATOR_ALIAS_2",
     "AGENT_KEY_NAME",
+    "AGENT_KEY_REVISION",
+    "AGENT_KEY_TERMINAL_ID",
     "DECODE_FAILURE_REASONS",
     "DEFAULT_LANE",
     "LANE_WORKSPACE_TOKEN_PREFIX",
@@ -828,5 +951,11 @@ __all__ = (
     "decode_assigned_name",
     "encode_assigned_name",
     "encode_field",
+    "occupant_of_locator",
+    "process_generation_of_locator",
+    "terminal_identity_of_locator",
+    "terminal_identity_of_live_slot",
+    "terminal_identity_of_row",
+    "terminal_identity_snapshot_complete",
     "rebind_by_name",
 )

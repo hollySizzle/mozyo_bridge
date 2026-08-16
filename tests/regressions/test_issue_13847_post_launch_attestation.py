@@ -183,6 +183,10 @@ class CreateStartGate(unittest.TestCase):
 class LiveObservationHelper(unittest.TestCase):
     """`observe_lane_pair_attestation` joins each slot's record against the live locator."""
 
+    @staticmethod
+    def _terminal(provider):
+        return f"terminal:13847:{provider}"
+
     def _store(self, tmp):
         return HerdrIdentityAttestationStore(path=Path(tmp) / "attest.sqlite")
 
@@ -194,6 +198,7 @@ class LiveObservationHelper(unittest.TestCase):
                 role=provider,
                 lane_id=lane,
                 locator=locator,
+                terminal_id=self._terminal(provider),
                 verdict=VERDICT_PRESENT,
             )
         )
@@ -215,7 +220,10 @@ class LiveObservationHelper(unittest.TestCase):
                 worktree_path="/wt",
                 gateway_provider="codex",
                 worker_provider="claude",
-                list_rows=lambda: [],
+                list_rows=lambda: [
+                    {"name": encode_assigned_name(ws, "codex", lane), "pane_id": "wZ:p2", "terminal_id": self._terminal("codex")},
+                    {"name": encode_assigned_name(ws, "claude", lane), "pane_id": "wZ:p3", "terminal_id": self._terminal("claude")},
+                ],
                 resolve_slots=self._resolver(ws, lane, slots),
                 attestation_store=store,
             )
@@ -236,7 +244,10 @@ class LiveObservationHelper(unittest.TestCase):
                 worktree_path="/wt",
                 gateway_provider="codex",
                 worker_provider="claude",
-                list_rows=lambda: [],
+                list_rows=lambda: [
+                    {"name": encode_assigned_name(ws, "codex", lane), "pane_id": "wZ:p2", "terminal_id": self._terminal("codex")},
+                    {"name": encode_assigned_name(ws, "claude", lane), "pane_id": "wZ:p3", "terminal_id": self._terminal("claude")},
+                ],
                 resolve_slots=self._resolver(ws, lane, slots),
                 attestation_store=store,
             )
@@ -255,7 +266,9 @@ class LiveObservationHelper(unittest.TestCase):
                 worktree_path="/wt",
                 gateway_provider="codex",
                 worker_provider="claude",
-                list_rows=lambda: [],
+                list_rows=lambda: [
+                    {"name": encode_assigned_name(ws, "codex", lane), "pane_id": "wZ:p2", "terminal_id": self._terminal("codex")},
+                ],
                 resolve_slots=self._resolver(ws, lane, slots),
                 attestation_store=store,
             )

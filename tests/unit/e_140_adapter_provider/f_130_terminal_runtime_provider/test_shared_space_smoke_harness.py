@@ -55,7 +55,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 
 
 class ProveSmokeIsolationTests(unittest.TestCase):
-    """The pre-actuation cleanup-authority gate (Acceptance 5)."""
+    """The pre-actuation isolation/non-ownership guard (Acceptance 5)."""
 
     def test_distinct_home_is_accepted(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -256,23 +256,30 @@ class ObservationAggregateTests(unittest.TestCase):
         complete = (self._obs("0", "created"), self._obs("1", "adopted"))
         unverified = SharedSpaceSmokeObservation(
             projects=complete, requested_projects=2,
-            cleanup_attempted=True, residue_verified=False,
+            cleanup_attempted=True, cleanup_completed=True, residue_verified=False,
             residue_workspaces=0, residue_agents=0,
         )
         self.assertFalse(unverified.residue_clear)
         verified = SharedSpaceSmokeObservation(
             projects=complete, requested_projects=2,
-            cleanup_attempted=True, residue_verified=True,
+            cleanup_attempted=True, cleanup_completed=True, residue_verified=True,
             residue_workspaces=0, residue_agents=0,
         )
         self.assertTrue(verified.residue_clear)
+        incomplete = SharedSpaceSmokeObservation(
+            projects=complete, requested_projects=2,
+            cleanup_attempted=True, cleanup_completed=False, residue_verified=True,
+            residue_workspaces=0, residue_agents=0,
+        )
+        self.assertFalse(incomplete.residue_clear)
 
     def test_residue_clear_false_when_a_project_failed(self) -> None:
         # review j#83905 F2: even a receipt-driven residue-0 read is not "clear" while a
         # project failed (its actuation-identity coverage may be incomplete).
         failed = SharedSpaceSmokeObservation(
             projects=(self._obs("0", "created"), self._obs("1", "failed")),
-            requested_projects=2, cleanup_attempted=True, residue_verified=True,
+            requested_projects=2, cleanup_attempted=True, cleanup_completed=True,
+            residue_verified=True,
             residue_workspaces=0, residue_agents=0,
         )
         self.assertFalse(failed.residue_clear)

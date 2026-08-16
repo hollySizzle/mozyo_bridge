@@ -254,6 +254,195 @@ def cmd_workspace_register(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_workspace_alias(args: argparse.Namespace) -> int:
+    """Declare / inspect / clear a nested workspace's launch routing (#15190).
+
+    The supported rail for the case where one Git repository legitimately holds
+    two workspace anchors — a canonical repo root and a nested application root
+    — and only the canonical one may own the default coordinator pair. It writes
+    a single workspace-local declaration file and never touches the identity
+    anchor, the home registry, or the nested workspace's tracked scaffold /
+    catalog / skills content.
+    """
+    import json as _json
+
+    from mozyo_bridge.core.state.workspace_registry import resolve_canonical_session
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.workspace_alias import (  # noqa: E501
+        observe_target,
+        resolve_launch_root,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.workspace_alias import (  # noqa: E501
+        MODE_ALIAS,
+        MODE_DISABLED,
+        STATE_ALIASED,
+        AliasResolution,
+        WorkspaceAliasDeclaration,
+        build_alias_resolution,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.infrastructure.workspace_alias_store import (  # noqa: E501
+        CLEAR_REMOVED,
+        WorkspaceAliasStoreError,
+        alias_path,
+        clear_declaration,
+        read_declaration,
+        write_declaration,
+    )
+
+    action = getattr(args, "alias_command", "show")
+    repo_root = repo_root_from_args(args)
+    as_json = bool(getattr(args, "as_json", False))
+
+    def _store_refusal(exc: WorkspaceAliasStoreError, root) -> dict:
+        """Render a store refusal saying what the effective state actually is.
+
+        The wording is driven by ``exc.mutated``, not hardcoded: a rolled-back
+        failure genuinely left nothing behind, but a failed rollback did not, and
+        telling the operator "nothing was written" in that case is a false report
+        about durable state (review j#102140 Finding 2).
+        """
+        if exc.mutated:
+            tail = (
+                " — the declaration could NOT be restored; inspect "
+                f"{alias_path(root)} by hand before relying on this workspace."
+            )
+        else:
+            tail = " — the effective declaration is unchanged."
+        return {
+            "state": "refused",
+            "reason": exc.reason,
+            "detail": f"{exc.detail}{tail}",
+            "mutated": exc.mutated,
+            "repo_root": str(root),
+            "declaration_path": str(alias_path(root)),
+        }
+
+    def _emit(payload: dict, ok: bool) -> int:
+        if as_json:
+            print(_json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True))
+            return 0 if ok else 1
+        for key in ("state", "reason", "detail", "declaration_path", "launch_root"):
+            value = payload.get(key)
+            if value:
+                print(f"{key}: {value}")
+        declaration = payload.get("declaration")
+        if isinstance(declaration, dict):
+            for key in ("mode", "canonical_path", "canonical_workspace_id", "reason"):
+                if declaration.get(key):
+                    print(f"declaration.{key}: {declaration[key]}")
+        return 0 if ok else 1
+
+    if action == "show":
+        resolution = resolve_launch_root(repo_root)
+        payload = resolution.as_payload()
+        payload["repo_root"] = str(repo_root)
+        payload["declaration_path"] = str(alias_path(repo_root))
+        return _emit(payload, resolution.ok)
+
+    if action == "clear":
+        # A present-but-unremovable declaration must never be reported as
+        # "nothing was declared" (review j#102104 Finding 2): that would tell the
+        # operator this workspace launches independently again when it does not.
+        try:
+            outcome = clear_declaration(repo_root)
+        except WorkspaceAliasStoreError as exc:
+            return _emit(_store_refusal(exc, repo_root), False)
+        removed = outcome == CLEAR_REMOVED
+        return _emit(
+            {
+                "state": "cleared" if removed else "no_declaration",
+                "repo_root": str(repo_root),
+                "declaration_path": str(alias_path(repo_root)),
+                "detail": (
+                    "declaration removed; this workspace launches independently again"
+                    if removed
+                    else "no declaration file was present"
+                ),
+            },
+            True,
+        )
+
+    if action == "disable":
+        declaration = WorkspaceAliasDeclaration(
+            mode=MODE_DISABLED,
+            reason=getattr(args, "reason", "") or "",
+        )
+        try:
+            written = write_declaration(repo_root, declaration)
+        except WorkspaceAliasStoreError as exc:
+            return _emit(_store_refusal(exc, repo_root), False)
+        return _emit(
+            {
+                "state": "declared",
+                "repo_root": str(repo_root),
+                "declaration_path": str(written),
+                "declaration": declaration.as_payload(),
+                "detail": "launch-disabled; session-start will fail closed here",
+            },
+            True,
+        )
+
+    # action == "set": verify BEFORE writing. A declaration that would fail at
+    # launch time must not be persisted — the operator learns now, at the surface
+    # they are using, instead of at the next launch.
+    target_raw = getattr(args, "to", None)
+    if not target_raw:
+        return _emit(
+            {"state": "refused", "reason": "alias_target_not_declared",
+             "detail": "--to <canonical-root> is required"},
+            False,
+        )
+    from pathlib import Path as _Path
+
+    source = _Path(repo_root).expanduser().resolve()
+    target_path = _Path(target_raw).expanduser().resolve()
+    identity = resolve_canonical_session(target_path, derive_unregistered=False)
+    declaration = WorkspaceAliasDeclaration(
+        mode=MODE_ALIAS,
+        canonical_path=str(target_path),
+        canonical_workspace_id=identity.workspace_id or "",
+        reason=getattr(args, "reason", "") or "",
+    )
+    if not declaration.canonical_workspace_id:
+        return _emit(
+            {
+                "state": "refused",
+                "reason": "alias_target_identity_unresolved",
+                "detail": (
+                    f"{target_path} has no durable workspace identity; run "
+                    f"`mozyo-bridge workspace register --repo {target_path}` first"
+                ),
+            },
+            False,
+        )
+    observation = observe_target(source, declaration.canonical_path)
+    verdict = build_alias_resolution(
+        source_root=str(source),
+        declaration=declaration,
+        target=observation,
+    )
+    if verdict.state != STATE_ALIASED:
+        payload = verdict.as_payload()
+        payload["repo_root"] = str(source)
+        payload["detail"] = (
+            f"{payload.get('detail', '')} — nothing was written."
+        ).strip(" —")
+        return _emit(payload, False)
+
+    try:
+        written = write_declaration(source, declaration)
+    except WorkspaceAliasStoreError as exc:
+        return _emit(_store_refusal(exc, source), False)
+    readback = resolve_launch_root(source)
+    payload: dict = readback.as_payload()
+    payload["repo_root"] = str(source)
+    payload["declaration_path"] = str(written)
+    if not isinstance(readback, AliasResolution) or not readback.redirected:
+        payload["state"] = "refused"
+        payload["reason"] = "declaration_readback_failed"
+        return _emit(payload, False)
+    return _emit(payload, True)
+
+
 def cmd_workspace_retire(args: argparse.Namespace) -> int:
     """Plan or execute one exact, backup-first stale registry retirement."""
     import json as _json

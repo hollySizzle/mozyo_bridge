@@ -131,21 +131,27 @@ class ChildIntakeRoute:
         }
 
 
-def _child_identity(repo_root: str, project_scope: str) -> GatewayLaneIdentity:
+def _child_identity(
+    repo_root: str, project_scope: str, *, role: str = AGENT_KIND_CODEX
+) -> GatewayLaneIdentity:
     """The coordinator-class identity for the child (#12699 shared-kind note).
 
     Live discovery cannot distinguish a delegated coordinator from a project
-    gateway — both are a strong project-scoped Codex — so the child is resolved by
-    the same :data:`TARGET_KIND_PROJECT_GATEWAY` coordinator-class identity over
-    the same ``repo_root`` + ``project_scope``. The same-lane guard, not a separate
-    kind marker, is what keeps the child distinct from the parent.
+    gateway — both are a strong project-scoped coordinator on the provider the
+    scope's provider_binding resolves (historically codex; Redmine #15414) — so
+    the child is resolved by the same :data:`TARGET_KIND_PROJECT_GATEWAY`
+    coordinator-class identity over the same ``repo_root`` + ``project_scope``.
+    ``role`` is that bound provider, supplied by the caller that fetched the
+    candidates with it; the default keeps the historical codex contract. The
+    same-lane guard, not a separate kind marker, is what keeps the child
+    distinct from the parent.
     """
     return GatewayLaneIdentity(
         project_scope=project_scope,
         project_label=project_scope,
         project_path="",
         repo_root=repo_root,
-        role=AGENT_KIND_CODEX,
+        role=role,
         target_kind=TARGET_KIND_PROJECT_GATEWAY,
     )
 
@@ -157,6 +163,7 @@ def resolve_child_intake_route(
     project_scope: str,
     caller_pane: str,
     session: Optional[str] = None,
+    provider: Optional[str] = None,
 ) -> ChildIntakeRoute:
     """Resolve the parent -> child intake route with the same-lane guard (pure, #12748).
 
@@ -175,6 +182,11 @@ def resolve_child_intake_route(
 
     Fails closed via :class:`ChildIntakeRouteError` when ``caller_pane`` is empty
     (the same-lane guard cannot run without the caller's own lane identity).
+
+    ``provider`` is the scope's provider_binding resolution for the child route
+    (Redmine #15414 finding_childidentity): pass the same provider the
+    ``candidates`` were fetched with, or omit it to keep the historical codex
+    contract.
     """
     caller_pane = (caller_pane or "").strip()
     if not caller_pane:
@@ -185,7 +197,9 @@ def resolve_child_intake_route(
         )
 
     candidates = list(candidates)
-    identity = _child_identity(repo_root, project_scope)
+    identity = _child_identity(
+        repo_root, project_scope, role=provider or AGENT_KIND_CODEX
+    )
 
     # Does the caller's own lane match the coordinator-class identity? Resolved over
     # the caller's pane alone, so an ADOPT means the parent itself is the gateway

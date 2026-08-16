@@ -72,6 +72,24 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.workspace_registry import read_anchor, register_workspace
+from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationStore,
+    IdentityAttestationRecord,
+    VERDICT_PRESENT,
+)
+from mozyo_bridge.core.state.herdr_launch_generation import (
+    HerdrLaunchGenerationStore,
+)
+from mozyo_bridge.core.state.startup_transaction_fence import (
+    PHASE_COMPLETED_SUCCESS,
+    Participant,
+    StartupTransactionFence,
+    StartupUnit,
+)
+from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
+from mozyo_bridge.core.state.herdr_native_identity_binding import (
+    HerdrNativeIdentityBindingStore,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_worker_dispatch_herdr_ops import (  # noqa: E501
     HerdrWorkerDispatchOps,
 )
@@ -82,11 +100,15 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (  # noqa: E501
     herdr_effective_backend_selected,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
+    pane_bound_receipt,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
     encode_assigned_name,
 )
 
 from tests.support.herdr_fake import FakeHerdr
+from tests.support.herdr_fake import STATUS_WORKING
 from tests.support.redmine_anchor_authority import matching_redmine_anchor_source_patch
 
 
@@ -134,11 +156,10 @@ class _ScenarioRunner:
         self.fake = fake
         self.herdr_bin = herdr_bin
         #: The per-target composer text accumulated from ``pane send-text`` injections,
-        #: served back on ``agent read`` so the queue-enter landing observation
-        #: (``wait_for_text`` over the herdr ``capture_pane``) sees the marker it just
-        #: typed — exactly as a live composer echoes it (instant), instead of polling a
-        #: fixed fake read to its wall-clock deadline. Scenario-level fidelity; the US-A
-        #: shared fake stays a fixed-text read model.
+        #: served back on ``agent read`` so the Herdr queue-enter body/screen gates see
+        #: the exact text they just typed instead of polling a fixed fake read to the
+        #: wall-clock deadline. Scenario-level fidelity; the US-A shared fake stays a
+        #: fixed-text read model.
         self._composer: dict = {}
 
     def run(self, argv, **kwargs):
@@ -172,10 +193,9 @@ class _ScenarioRunner:
         raise AssertionError(f"unexpected subprocess call in scenario: {list(argv)!r}")
 
     def popen(self, argv, **kwargs):
-        # The queue-enter worker-dispatch rail is submit-complete with no event wait
-        # (design §3.2 ACK hop), so a ``wait`` popen is not expected. Delegate to the
-        # fake (which models ``wait agent-status``) so a stray wait surfaces its
-        # change-semantics outcome rather than a fabricated success.
+        # Herdr queue-enter arms an event wait before each admitted Enter.  Delegate to
+        # the fake's ``wait agent-status`` model so this scenario exercises the real
+        # causal turn-start rail rather than fabricating success from a marker echo.
         return self.fake.popen(argv, **kwargs)
 
 
@@ -238,12 +258,81 @@ class _Finding1World:
             workspace_id=ws,
             provider="codex",
         )
-        self.worker_locator = self.fake.seed_agent(
-            encode_assigned_name(self.workspace_id, "claude", LANE),
-            workspace_id=ws,
-            provider="claude",
+        worker_name = encode_assigned_name(self.workspace_id, "claude", LANE)
+        worker_binding = HerdrNativeIdentityBindingStore(home=self.home).bind(
+            worker_name
         )
+        self.worker_locator = self.fake.seed_agent(
+            worker_binding.native_name,
+            workspace_id=ws,
+            logical_name=worker_name,
+            provider="claude",
+            detected_agent="claude",
+        )
+        self._seed_worker_launch_authority()
         self.runner = _ScenarioRunner(self.fake, self.herdr_bin)
+
+    def _seed_worker_launch_authority(self) -> None:
+        """Represent the worker as one completed, attested managed generation."""
+        name = encode_assigned_name(self.workspace_id, "claude", LANE)
+        observed_at = "2026-08-10T00:00:00+00:00"
+        terminal_id = self.fake.terminal_id_of(self.worker_locator)
+        HerdrIdentityAttestationStore(home=self.home).upsert(
+            IdentityAttestationRecord(
+                assigned_name=name,
+                workspace_id=self.workspace_id,
+                role="claude",
+                lane_id=LANE,
+                locator=self.worker_locator,
+                terminal_id=terminal_id,
+                verdict=VERDICT_PRESENT,
+                observed_at=observed_at,
+            )
+        )
+        fence = StartupTransactionFence(home=self.home)
+        action = fence.reserve(
+            StartupUnit(
+                workspace_id=self.workspace_id,
+                lane_id=LANE,
+                providers=("claude",),
+            ),
+            "scenario-managed-worker-generation",
+        )
+        target_workspace = self.worker_locator.split(":", 1)[0]
+        fence.record_participant(
+            action.action_id,
+            Participant(
+                role="claude",
+                assigned_name=name,
+                locator=self.worker_locator,
+                receipt=pane_bound_receipt(
+                    target_workspace=target_workspace,
+                    target_tab=f"{target_workspace}:t1",
+                    native_name=native_name_for(name),
+                    terminal_id=terminal_id,
+                ),
+            ),
+        )
+        fence.set_phase(action.action_id, PHASE_COMPLETED_SUCCESS)
+        generations = HerdrLaunchGenerationStore(home=self.home)
+        generations.reserve_pending(
+            assigned_name=name,
+            startup_action_id=action.action_id,
+            workspace_id=self.workspace_id,
+            role="claude",
+            lane_id=LANE,
+        )
+        generations.finalize(
+            assigned_name=name,
+            startup_action_id=action.action_id,
+            workspace_id=self.workspace_id,
+            role="claude",
+            lane_id=LANE,
+            locator=self.worker_locator,
+            terminal_id=terminal_id,
+            verdict=VERDICT_PRESENT,
+            observed_at=observed_at,
+        )
 
     # -- environment / argv -----------------------------------------------
 
@@ -324,6 +413,8 @@ class _Finding1World:
     def drive_inner_send(self, *, pin: bool):
         """Drive the real ``_drive_worker_send_argv`` composition; return (rc, out, err)."""
         env = self.sender_env()
+        if pin:
+            self.fake.arm_transition(self.worker_locator, STATUS_WORKING)
         with self._driving_context(env):
             out = io.StringIO()
             err = io.StringIO()
@@ -346,6 +437,7 @@ class _Finding1World:
             runner=self.runner.run,
         )
         env = self.sender_env()
+        self.fake.arm_transition(self.worker_locator, STATUS_WORKING)
         with self._driving_context(env):
             out = io.StringIO()
             err = io.StringIO()
