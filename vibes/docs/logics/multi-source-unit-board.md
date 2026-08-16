@@ -275,7 +275,7 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   `blocked` / `turn_start_unconfirmed` に閉じる。causal turn start 未確認時だけ、同一
   target identity、collision-free launch generation、現在の composer tail にある full marker+body
   （hard-wrap whitespace のみ正規化）、startup / modal / trust / login / selection screen の非該当、runtime
-  read 成功を **各回 fresh に**再確認し、各 Enter より先に working-transition wait を arm する。timeout-only
+  read 成功を **各回 fresh に**再確認し、idle / turn-ended 系列では各 Enter より先に working-transition wait を arm する (busy 系列は #15537 の wait 非依存 full effect fence)。timeout-only
   系列は policy の回数上限と absolute deadline まで Enter-only retry を反復できる。wait error は次の Enter を
   許可せず即時停止し、それ以前の timeout-authorised retries は telemetry に残す。`busy` は queue semantics 上この厳格 gate の候補になれるが、
   busy baseline / snapshot / event だけでは delivery confirmation にならない。tmux host の既存 marker-based
@@ -311,8 +311,10 @@ mozyo-bridge herdr unit-board action --unit <unit_id> \
   composer に置いただけの `pending_input` や Herdr causal turn start 未確認の delivery は **confirmed ではない**が
   **zero-send でもない**。Herdr gateway は未確認を legacy `sent` / exit 0 に倒さず、precise `blocked` reason /
   non-zero で返す。landing marker 観測や post-hoc `busy` snapshot だけでも confirmed にしない。Herdr
-  queue-enter で confirmation に使えるのは、`awaiting_input` / `turn_ended` の readable baseline より先に arm
+  queue-enter で causal confirmation に使えるのは、`awaiting_input` / `turn_ended` の readable baseline より先に arm
   した working-transition event と coherent な target / collision-free launch generation が揃う場合だけである。
+  busy baseline は #15537 により、full effect fence を通した Enter 後の composer clear を証拠に非 causal な
+  `sent` / `queue_enter` (queued submission、`submitted_confirmed` にはしない) を返せる。
   wait absent は `turn_start_absent`、fresh gate の runtime blocked は `receiver_blocked`、timeout/error/unarmed/
   drift/body-screen-state proof failure は `turn_start_unconfirmed`、raised transport failure は `transport_error`。
   正本は `delivery_outcome_gate` / `injection_stage`

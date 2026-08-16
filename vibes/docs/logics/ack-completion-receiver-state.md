@@ -164,8 +164,10 @@ idle だけを許す standard `drive_turn_start` を流用しない。
   landing-marker wait を行わない。pinned generation を再確認し、Herdr 0.8 の
   `agent wait TARGET --until working --timeout MS` を arm でき、absolute deadline 内にある場合だけ
   first Enter を発行する。失敗時は
-  `enter_attempts=0` のまま `blocked` / `turn_start_unconfirmed` に閉じる。実際に発行する first / extra Enter は
-  すべて事前に wait を arm する。causal start が未確認なら、同一 target identity、collision-free launch
+  `enter_attempts=0` のまま `blocked` / `turn_start_unconfirmed` に閉じる。idle / turn-ended 系列で実際に発行する first / extra Enter は
+  すべて事前に wait を arm する。busy 系列 (#15537) は wait を attribution に使えないため arm を要求せず、
+  wait 非依存の full effect fence を通した Enter と composer clear を証拠に非 causal な
+  `sent` / `queue_enter` (queued submission、`uncertain_partial` のまま) を返せる。causal start が未確認なら、同一 target identity、collision-free launch
   generation、現在の composer tail にある full marker+body（hard-wrap whitespace のみ正規化）、startup /
   modal / trust / login / selection screen の非該当、runtime state の read 成功を **各回の送信直前に fresh に**
   再確認する。timeout-only 系列は policy 回数上限と absolute deadline まで Enter-only retry を反復できる。

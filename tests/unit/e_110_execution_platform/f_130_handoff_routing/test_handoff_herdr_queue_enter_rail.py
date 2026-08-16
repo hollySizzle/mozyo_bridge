@@ -1437,33 +1437,152 @@ class BusyReceiverQueuedSubmissionTest(unittest.TestCase):
         self.assertNotIn("event_wait_kind", observation)
 
 
-class StaleCausalOnlyClaimGuardTest(unittest.TestCase):
-    """No contract surface may reintroduce the pre-ADR-0002 unconditional claims
-    (review j#106470 finding_busycontractsync).
+class BusyContractSurfaceGuardTest(unittest.TestCase):
+    """Positive contract guard (review j#106474 finding_busycontractsync).
 
-    Before #15537, the distributed contracts said every actually-issued Enter must
-    have a wait armed first and only a causal turn start could yield exit 0 —
-    claims the busy queued-submission path now contradicts. This guard scans the
-    current contract surfaces for the exact unconditional phrasings so they cannot
-    quietly return; the conditional (idle/turn-ended-scoped) forms remain legal.
+    A phrase blacklist proved false-green: causal-only claims survived in
+    paraphrased forms the exact strings missed. This guard is POSITIVE instead —
+    every enumerated canonical/normative surface that describes the herdr
+    queue-enter promise must state the busy exception itself: the noncausal
+    ``queue_enter`` outcome, the busy trigger, and the #15537 decision anchor.
+    A surface rewritten back to causal-only — in any wording, English or
+    Japanese — loses those tokens and goes red. A small blacklist of the known
+    unconditional sentences remains as a belt over the suspenders.
     """
 
+    #: Every current/normative surface that states the herdr queue-enter promise.
+    #: Each must carry the busy exception: the noncausal outcome token, the busy
+    #: trigger, and the decision anchor.
+    SURFACES = (
+        "README.md",
+        "vibes/docs/logics/tmux-send-safety-contract.md",
+        "vibes/docs/logics/multi-source-unit-board.md",
+        "vibes/docs/logics/ack-completion-receiver-state.md",
+        "vibes/docs/logics/plugin-ready-adapter-boundary.md",
+        "skills/mozyo-bridge-agent/references/safety.md",
+        "skills/mozyo-bridge-agent/references/workflow.md",
+        "plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/references/safety.md",
+        "plugins/mozyo-bridge-agent/skills/mozyo-bridge-agent/references/workflow.md",
+        ".claude/skills/mozyo-bridge-agent/references/safety.md",
+        ".claude/skills/mozyo-bridge-agent/references/workflow.md",
+        "src/mozyo_bridge/scaffold/presets/redmine/agent-workflow.md",
+        "src/mozyo_bridge/scaffold/presets/asana/agent-workflow.md",
+        ".mozyo-bridge/rules/presets/redmine/agent-workflow.md",
+        ".mozyo-bridge/rules/presets/asana/agent-workflow.md",
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "application/handoff_tmux_transport_rail.py",
+        "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/"
+        "application/cli_handoff.py",
+    )
+
+    #: Required on every surface: the noncausal outcome, the busy trigger, and
+    #: the decision anchor. Token presence, not phrasing, so paraphrases of the
+    #: exception stay legal while its REMOVAL (the causal-only regression) fails.
+    REQUIRED_TOKENS = ("queue_enter", "busy", "15537")
+
+    #: Belt: the exact unconditional sentences the R1/R2 sweeps removed.
     FORBIDDEN = (
-        # unconditional "arm before every issued Enter"
         "実際に発行する first / extra Enter はすべて先に wait を arm する。",
         "各 Enter の前に working-transition wait を arm する。",
         "- first Enter と各 extra Enter より先に working-transition wait を arm する",
         "実際に発行する各 Enter より先に wait を arm する。",
+        "実際に発行する first / extra Enter はすべて事前に wait を arm する。",
         "arms a causal wait before every Enter",
-        # unconditional "only causal start exits 0 / confirms"
+        "every issued Enter is preceded by an armed causal wait, and only a "
+        "same-generation causal turn-start returns",
         "causal turn-start を確認した場合だけ `submitted_confirmed` / exit 0 を返す。",
         "busy自体を成功証拠にはしない。",
     )
 
-    def test_no_surface_reintroduces_the_unconditional_causal_only_claims(self) -> None:
+    def _root(self):
         import pathlib
 
-        root = pathlib.Path(__file__).resolve().parents[4]
+        return pathlib.Path(__file__).resolve().parents[4]
+
+    def test_every_promise_surface_states_the_busy_exception(self) -> None:
+        root = self._root()
+        missing = []
+        for rel in self.SURFACES:
+            path = root / rel
+            try:
+                text = path.read_text(encoding="utf-8").lower()
+            except OSError:
+                missing.append(f"{rel}: unreadable")
+                continue
+            for token in self.REQUIRED_TOKENS:
+                if token.lower() not in text:
+                    missing.append(f"{rel}: missing {token!r}")
+        self.assertEqual(
+            [],
+            missing,
+            "a herdr queue-enter promise surface no longer states the busy "
+            "queued-submission exception (#15537 / ADR-0002):\n" + "\n".join(missing),
+        )
+
+    #: Section-scoped layer: large docs restate the queue-enter promise inside
+    #: specific sections, where file-wide token presence is too coarse (another
+    #: section may legally carry the tokens). Each listed section — matched by a
+    #: stable heading substring — must itself state the busy exception. This is
+    #: what makes a paraphrased causal-only rewrite of the promise section red
+    #: even though the tokens survive elsewhere in the same file.
+    SECTION_CONTRACTS = (
+        ("vibes/docs/logics/multi-source-unit-board.md", "Remote Unit action"),
+        (
+            "vibes/docs/logics/ack-completion-receiver-state.md",
+            "Herdr queue-enter の causal turn-start",
+        ),
+        (
+            "vibes/docs/logics/plugin-ready-adapter-boundary.md",
+            "Herdr queue-enter causal resend seam",
+        ),
+        ("vibes/docs/logics/tmux-send-safety-contract.md", "handoff send"),
+        ("vibes/docs/logics/tmux-send-safety-contract.md", "herdr queue-enter (causal"),
+        ("vibes/docs/logics/tmux-send-safety-contract.md", "短い結論"),
+    )
+
+    SECTION_TOKENS = ("15537", "busy")
+
+    @staticmethod
+    def _extract_section(text: str, heading_substring: str) -> str | None:
+        lines = text.splitlines()
+        start = level = None
+        for idx, line in enumerate(lines):
+            if line.startswith("#") and heading_substring in line:
+                start = idx
+                level = len(line) - len(line.lstrip("#"))
+                break
+        if start is None:
+            return None
+        body = []
+        for line in lines[start + 1 :]:
+            stripped_level = len(line) - len(line.lstrip("#"))
+            if line.startswith("#") and stripped_level <= level:
+                break
+            body.append(line)
+        return "\n".join(body)
+
+    def test_promise_sections_state_the_busy_exception_in_section(self) -> None:
+        root = self._root()
+        problems = []
+        for rel, heading in self.SECTION_CONTRACTS:
+            text = (root / rel).read_text(encoding="utf-8")
+            section = self._extract_section(text, heading)
+            if section is None:
+                problems.append(f"{rel}: section heading containing {heading!r} not found")
+                continue
+            lowered = section.lower()
+            for token in self.SECTION_TOKENS:
+                if token.lower() not in lowered:
+                    problems.append(f"{rel} [{heading}]: missing {token!r} in section")
+        self.assertEqual(
+            [],
+            problems,
+            "a queue-enter promise section dropped the busy queued-submission "
+            "exception (#15537 / ADR-0002):\n" + "\n".join(problems),
+        )
+
+    def test_no_surface_reintroduces_the_unconditional_causal_only_claims(self) -> None:
+        root = self._root()
         surfaces = [root / "README.md"]
         surfaces += sorted((root / "vibes" / "docs").rglob("*.md"))
         surfaces += sorted((root / "skills").rglob("*.md"))
@@ -1486,7 +1605,6 @@ class StaleCausalOnlyClaimGuardTest(unittest.TestCase):
         self.assertEqual(
             [],
             offenders,
-            "pre-ADR-0002 unconditional causal-only claim(s) found — the busy "
-            "queued-submission exception (#15537) must stay stated:\n"
+            "pre-ADR-0002 unconditional causal-only claim(s) found:\n"
             + "\n".join(offenders),
         )

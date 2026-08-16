@@ -1593,7 +1593,9 @@ The queue seam owns this sequence:
    never resets it. If the preceding wait already consumed the interval, no extra
    sleep occurs. A zero or positive sub-millisecond window/interval disables extra
    Enter but does not itself suppress initial admission. First Enter and observation
-   still require the generation recheck, armed wait, and deadline check; invalid non-finite
+   still require the generation recheck and deadline check, plus the armed wait on an
+   idle/turn-ended baseline (a BUSY baseline takes the #15537 wait-free full effect fence and
+   reports the noncausal `sent` / `queue_enter` on composer clear); invalid non-finite
    input is rejected before injection. A sub-millisecond value is never rounded
    upward into a wider actuation budget.
 
@@ -1603,7 +1605,7 @@ screen gate passes; `busy` alone can never pass the **delivery confirmation** ga
 
 Telemetry remains in the queue-specific `queue_enter_turn_start_observation`; the
 seam does not emit standard `turn_start_outcome`. This preserves the queue delivery-
-ledger classification and its generation fence. A same-generation causal start maps
+ledger classification and its generation fence. A same-generation causal start (idle/turn-ended baseline) maps
 to `sent` / `ok` / exit 0. Otherwise the command fails closed and exits non-zero:
 wait `absent` maps to `blocked` / `turn_start_absent`; a fresh gate that observes
 runtime `blocked` maps to `blocked` / `receiver_blocked`; timeout, error, unarmed wait,
