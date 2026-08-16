@@ -321,6 +321,106 @@ stop
 @enduml
 ```
 
+## Adversarial Mode Convergence — Redmine #15553 (判断正本: ADR-0005)
+
+full_surface_adversarial mode の収束契約。escalation の入口 (central preset
+`### Late-Finding Full-Surface Adversarial Sweep Escalation` の deterministic trigger) と
+review / close authority は変更しない — 本節は mode 継続中の審査対象を宣言脅威モデルで
+区切り、圏外指摘の記録と必須 de-escalation を定める。wire format (canonical
+`review_result` 契約・finding manifest) は変更しない。
+
+```yaml
+adversarial_convergence:
+  # 判断正本は ADR-0005。本節は実行契約 (repo-local 宣言、中央 preset・wire format 不変)。
+  threat_model_declaration:
+    - guard / 検証機構 (tests/** の contract guard・mutation proof 等) を成果物として主張する
+      review request は、その脅威モデルを claim_schema と同じ journal に 1-2 行で宣言する
+      (例: 「偶発的な契約巻き戻しの検出が対象。故意の回避工作 (bait 工作等) は対象外」)
+    - 宣言を欠く request への guard 指摘は全て material として扱う (fail 側は常に深い方)
+  material_boundary:
+    in_model: |
+      宣言脅威モデル内の反証 (宣言した検出能力が実際には成立しない実証) は material —
+      従来どおり changes_requested の根拠になる
+    out_of_model: |
+      宣言脅威モデル外の指摘は changes_requested の根拠にしない。deferred finding として
+      review result journal に記録する (下記 deferred_finding_record)
+    model_challenge: |
+      「宣言脅威モデル自体が甘い」という主張は policy 論点であり、implementer / reviewer の
+      往復で裁定しない。owner-question bypass 禁止の正規導線 (implementer が対象 issue journal に
+      判断待ち記録 → coordinator へ canonical handoff → coordinator が owner 裁定 anchor を記録)
+      で owner へ回す (ADR-0001 の延長: モデルの甘さの裁定者は往復の当事者ではない)
+  mandatory_de_escalation:
+    trigger: |
+      テスト基盤 (tests/** の guard・検証 tooling) のみを対象とする severity Medium 以下の
+      finding が 2 round 連続した時点 (round の単位は ADR-0004 depth_round_derivation の
+      canonical review_request journal)
+    action: |
+      implementer は次の correction round へ進まず、対象 issue journal に判断待ちを記録して
+      coordinator 経由で owner 判断を仰ぐ。chat での懸念表明は本 action の代替にならない
+      (#15537 R10 の実例: 懸念表明のみで 2 round 追加続行した)
+    outcome: owner 裁定 anchor (続行 / deferred 化 / mode 解除) を記録してから再開する
+  deferred_finding_record:
+    place: review result journal (finding 単位の個別 issue は乱発しない)
+    fields:
+      - finding 名と severity (reviewer の記載のまま)
+      - disposition: deferred | wontfix_by_policy
+      - reason: 費用対効果の判断 1 行 (owner 方針: 「効用が低いものは今はやらない。残しておく
+        ことに価値はある」)
+      - reevaluate_on: 事象条件のみ (当該 surface の次回変更時 / 脅威モデルへの再挑戦時)。
+        時間条件 (「いつか」「N ヶ月後」) は書かない
+    invariants:
+      - 記録は判断の追跡可能性のためであり、TODO の約束ではない。後日の再評価で
+        wontfix_by_policy と結論することは正当な出口
+      - deferred 記録を省略して指摘を黙って落とすことは禁止 (ADR-0005 の adr_conflict_gate 対象)
+  authority_invariants:
+    - escalation の入口 trigger は不変 (#15537 R6 High を発見した実績)
+    - 本契約は review / close authority を緩めない。material finding の扱い・approved の条件は
+      既存 canonical 契約のまま
+```
+
+flow (最小 swimlane。既存 review flow の上に脅威モデル判定を重ねるだけで、gate 語彙・順序は
+変更しない):
+
+```plantuml
+@startuml
+|implementer|
+start
+:review request 発行
+(guard を成果物に含むなら脅威モデルを宣言);
+|reviewer|
+if (finding は宣言脅威モデル内の反証?) then (yes)
+  :material — changes_requested の根拠にできる
+(既存 flow のまま);
+else (no)
+  if (脅威モデル自体への挑戦?) then (yes)
+    |implementer|
+    :対象 issue journal に「owner 判断待ち」を記録;
+    :coordinator へ canonical handoff;
+    |coordinator|
+    :owner 裁定 anchor を対象 issue journal に記録;
+  else (no — 圏外指摘)
+    |reviewer|
+    :deferred finding として review journal に記録
+(disposition / reason / reevaluate_on);
+  endif
+endif
+|implementer|
+if (テスト基盤のみ・Medium 以下の finding が
+2 round 連続した?) then (yes)
+  :correction へ進まず判断待ちを記録;
+  :coordinator へ canonical handoff;
+  |coordinator|
+  :owner 裁定 anchor (続行 / deferred 化 / mode 解除)
+を記録;
+  |implementer|
+  :anchor を確認してから再開;
+else (no)
+  :従来どおり correction round へ;
+endif
+stop
+@enduml
+```
+
 ## Workflow Change Verification
 
 正本は skill `references/workflow.md` `## Workflow 変更の反映確認 (Workflow Change Verification)` (guardrail / skill / gate 変更後の新セッション反映確認、検証対象を直接変更しない通常開発 task の選定、Claude 実装 / Codex 選定・audit、結果記録と follow-up 起票)。本 doc は再掲しない (#13028 で pointer 化)。本 repo での適用: 反映確認は `mozyo_bridge` 本体の通常開発 task で行う。

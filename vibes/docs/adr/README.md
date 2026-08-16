@@ -57,3 +57,4 @@ fail-closed 動作) は `vibes/docs/rules/agent-workflow.md` の `adr_conflict_g
 | [ADR-0002](adr-0002-enter-resend-priority.md) | 受信側が busy でも Enter を押す (停止は二重送信より害が大きい) | active |
 | [ADR-0003](adr-0003-three-tier-granularity.md) | 3 階層粒度 (release / version / US) とレビューの単位は US | active |
 | [ADR-0004](adr-0004-review-depth-tiers.md) | レビュー深度は変更クラスで段階化し、途中再分類できる | active |
+| [ADR-0005](adr-0005-adversarial-mode-convergence.md) | adversarial review mode は宣言脅威モデルで収束させ、圏外指摘は保留記録する | active |
