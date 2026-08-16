@@ -1089,8 +1089,9 @@ This additionally writes `.mozyo-bridge/config.yaml` declaring
 it is **not** tracked by `scaffold status`, so editing it later never reports drift —
 and an already-existing `config.yaml` (any directory entry, symlinks included) makes
 the apply fail closed instead of overwriting it. `--backend tmux` writes the explicit
-tmux declaration the same way. **Omitting `--backend` changes nothing**: no config is
-written and the runtime default (tmux) applies, exactly as before this flag existed.
+tmux declaration the same way. **Omitting `--backend` writes no config**, so the
+runtime default applies — **herdr since 2.0** (see "Upgrading 1.x → 2.0" above);
+a target that should stay on tmux must declare `--backend tmux`.
 
 This creates:
 

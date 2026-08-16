@@ -366,12 +366,12 @@ TERMINAL_TRANSPORT_KEYS: frozenset[str] = frozenset({"version", "backend"})
 
 @dataclass(frozen=True)
 class TerminalTransportConfig:
-    """Projection-free selection of the terminal-transport backend (default off).
+    """Projection-free selection of the terminal-transport backend.
 
     The *only* thing this config expresses is which recognised backend to use.
-    The default (``tmux``) means herdr transport is off and the existing tmux
-    path is untouched, so a repo with no ``terminal_transport`` block behaves
-    exactly as before.
+    The default is ``herdr`` since 2.0 (Redmine #15531): a repo with no
+    ``terminal_transport`` block resolves to herdr, and staying on tmux takes
+    the explicit declaration ``backend: tmux``.
 
     **The herdr binary is intentionally not a config field.** Selecting herdr is
     a declarative, repo-local decision; but the *path of the executable mozyo
@@ -423,10 +423,10 @@ class TerminalTransportConfig:
     ) -> "TerminalTransportConfig":
         """Normalise a ``terminal_transport`` sub-record into a typed selection.
 
-        ``None`` or an empty mapping yields the default (tmux / off). A
-        non-mapping record, an unknown key, an unsupported version, or a
-        non-string / unrecognised backend fails closed with
-        :class:`TerminalTransportError`.
+        ``None`` or an empty mapping yields the default — herdr since 2.0
+        (Redmine #15531), marked ``backend_declared=False``. A non-mapping
+        record, an unknown key, an unsupported version, or a non-string /
+        unrecognised backend fails closed with :class:`TerminalTransportError`.
         """
         if record is None:
             return cls.default()

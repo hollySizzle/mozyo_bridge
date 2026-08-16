@@ -131,6 +131,60 @@ class DoctorUndeclaredGuidanceTest(unittest.TestCase):
         self.assertNotIn("does not declare", actions)
 
 
+class StaleDefaultClaimGuardTest(unittest.TestCase):
+    """No contract surface may claim the old tmux default (review j#106276).
+
+    The R1 flip left "omitted backend resolves to tmux" claims standing in the
+    README scaffold section, the transport / repo-config docstrings, and
+    scaffold-rules.md — the exact guidance an upgrading operator reads, saying
+    the opposite of the shipped runtime. This guard scans every current
+    contract surface (README, project logic docs, runtime sources) for the
+    stale-claim phrasings so the old default cannot quietly return. Patterns
+    are phrase-precise: historical narration ("...selected the tmux default,
+    and...") and unrelated tmux defaults (window styling, the presentation
+    ``tmux_user_option`` surface) stay out of scope.
+    """
+
+    #: Phrasings that assert tmux is what an omitted/absent selection yields.
+    FORBIDDEN = (
+        r"default \(`{0,2}tmux\b",          # "the default (tmux…" / "(``tmux``)"
+        r"= herdr off",                      # "``tmux`` default = herdr off"
+        r"defaults? to tmux",
+        r"default backend (stays|is) tmux",
+        r"tmux default applies",
+        r"yields the default \(tmux",
+    )
+
+    def test_no_surface_claims_the_old_tmux_default(self) -> None:
+        import re
+
+        patterns = [re.compile(p, re.IGNORECASE) for p in self.FORBIDDEN]
+        surfaces = [ROOT / "README.md"]
+        surfaces += sorted((ROOT / "vibes" / "docs").rglob("*.md"))
+        surfaces += sorted((ROOT / "src" / "mozyo_bridge").rglob("*.py"))
+        surfaces += sorted((ROOT / "src" / "mozyo_bridge").rglob("*.md"))
+
+        offenders = []
+        for path in surfaces:
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                for pattern in patterns:
+                    if pattern.search(line):
+                        offenders.append(
+                            f"{path.relative_to(ROOT)}:{lineno}: {line.strip()}"
+                        )
+        self.assertEqual(
+            [],
+            offenders,
+            "stale 'omitted backend -> tmux' claim(s) found — the 2.0 default "
+            "is herdr (#15531) and every contract surface must say so:\n"
+            + "\n".join(offenders),
+        )
+
+
 class InventoryDeclarednessTest(unittest.TestCase):
     """read_herdr_inventory carries declared-ness from the config it read."""
 
