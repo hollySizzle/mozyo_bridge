@@ -373,7 +373,21 @@ adversarial_convergence:
       owner_anchor: |
         coordinator の owner 裁定 anchor journal は `challenge_ref: j#<challenge result id>` と
         `challenge_verdict: update_model | defer | wontfix_by_policy` を持つ。どちらかの欠落・
-        重複・enum 外は anchor 不成立 (close blocked のまま)
+        重複・enum 外は anchor 不成立 (close blocked のまま)。裁定の訂正は新しい anchor journal に
+        `supersedes_anchor: j#<先行 anchor journal id>` (最大 1 行) を付して行う (旧 journal は
+        編集しない)
+    authoritative_chain: |
+      challenge result C ごとに、history 全体から一意に選ぶ:
+      (a) pending record = `challenge_pending: j#C` を持つ**最小 id** の journal (chain の必須要素)。
+      (b) owner anchor 集合 = `challenge_ref: j#C` を持つ有効 anchor 全部。authoritative anchor は
+      supersession 連鎖の末端 1 個 — 各 anchor は同じ challenge_ref を持つ先行 anchor のみを
+      supersede でき、連鎖は線形でなければならない。未 supersede の anchor が 2 個以上並立、
+      dangling な supersedes_anchor、別 challenge_ref の anchor への supersede、循環は、いずれも
+      conflict であり close blocked (どの anchor も authoritative にならない)。
+      (c) resumption request = **authoritative** anchor を指す `challenge_resolution` を持つ
+      canonical review_request のみ有効。superseded anchor を指す request は解決に数えない。
+      (d) challenged request = authoritative result が C である canonical review_request
+      (意味検証の基準)
       resumption_request: |
         再開する canonical review_request は `challenge_resolution: j#<owner anchor journal id>`
         を claim と同じ journal に持つ。challenge_verdict=update_model の場合は threat_model 行を
@@ -383,11 +397,19 @@ adversarial_convergence:
         result の `### Deferred (out-of-model)` 節に、item_grammar の entry として記録し、
         `resolution_anchor: j#<owner anchor journal id>` key を必須で付す
     close_predicate: |
-      challenge 節を含む各 result journal について、(i) `challenge_ref` がそれを指す owner
-      裁定 anchor journal が存在し、かつ (ii) `challenge_resolution` がその anchor を指す
-      canonical review_request の authoritative result が存在する (verdict が defer /
-      wontfix_by_policy の場合は加えて `resolution_anchor` 付き Deferred entry をその result が
-      含む) こと。いずれかを欠く間は close blocked (fail 側は blocked)
+      challenge 節を含む各 result journal C について、authoritative_chain の全要素が存在し、
+      かつ意味的に整合すること:
+      (i) pending record が存在する。
+      (ii) authoritative anchor が一意に定まる (conflict は blocked)。
+      (iii) authoritative anchor を指す有効な resumption request の authoritative result が
+      存在する。
+      (iv) 意味的一致 — challenge_verdict=update_model は resumption request が `threat_model:`
+      行をちょうど 1 行持ち、その値が challenged request の `threat_model:` 行と byte 一致
+      しないこと。challenge_verdict=defer は解決 result の `resolution_anchor` 付き Deferred
+      entry が `disposition: deferred` を持つこと。challenge_verdict=wontfix_by_policy は同
+      entry が `disposition: wontfix_by_policy` を持つこと。
+      duplicate・malformed・意味不一致はいずれも当該 chain を無効にする。有効で意味整合な
+      chain が 1 本存在するまで close blocked (fail 側は blocked)
   mandatory_de_escalation:
     severity_vocabulary:
       values: low | medium | high    # closed。canonical finding manifest v1 は変更しない
@@ -491,15 +513,17 @@ else (no)
     |coordinator|
     :owner 裁定 anchor を対象 issue journal に記録;
     |implementer|
-    :challenge_resolution key 付きの新 canonical request を発行
-(update_model なら threat_model 行を更新);
+    :authoritative anchor (supersession 連鎖の末端) を確認し、
+それを指す challenge_resolution key 付きの新 canonical request を発行
+(update_model なら threat_model 行を challenged request から更新);
     |reviewer|
     :authoritative result を発行 — verdict が defer /
-wontfix_by_policy なら Deferred 節に resolution_anchor 付き
-entry を記録;
+wontfix_by_policy なら Deferred 節に resolution_anchor 付き entry を
+verdict と同名の disposition で記録;
     |implementer|
-    :close は close_predicate (anchor + 解決 result) を
-確認してから;
+    :close は close_predicate (pending record + 一意な
+authoritative anchor + 解決 result + 意味的一致) を確認してから
+(conflict・意味不一致は blocked);
   else (no — 圏外指摘)
     |reviewer|
     :Deferred (out-of-model) 節に item_grammar で記録
