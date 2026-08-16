@@ -131,8 +131,13 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
         )
         from mozyo_bridge.shared.errors import die
 
+        # `lexists`, not `exists` (review j#106056 finding_1): a DANGLING symlink at
+        # the config path answers False to `exists()`, and following it on write
+        # would create a file OUTSIDE the target — reproduced before this fix. Any
+        # directory entry at the path, symlink included, is an existing declaration.
+        config_path = target / ".mozyo-bridge" / "config.yaml"
         declaration = backend_declaration(
-            target, backend, config_exists=(target / ".mozyo-bridge/config.yaml").exists()
+            target, backend, config_exists=os.path.lexists(config_path)
         )
         if not declaration.ok:
             die(declaration.refusal)
@@ -156,7 +161,21 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
         # stay clean when it is edited later (Redmine #15527).
         if not args.dry_run:
             declaration.path.parent.mkdir(parents=True, exist_ok=True)
-            declaration.path.write_text(declaration.content, encoding="utf-8")
+            # Exclusive create (review j#106056 finding_1): O_EXCL refuses when the
+            # final component exists — INCLUDING a symlink, dangling or not — so a
+            # link planted between the lexists check and this write cannot redirect
+            # the config outside the target. FileExistsError here is that race.
+            try:
+                fd = os.open(
+                    declaration.path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644
+                )
+            except FileExistsError:
+                die(
+                    f"refusing --backend {backend}: {declaration.path} appeared "
+                    "between the preflight check and the write; not overwriting it"
+                )
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(declaration.content)
         print(f"{action}: {declaration.path} (backend declaration; not in manifest)")
     return 0
 

@@ -418,8 +418,18 @@ mozyo-bridge scaffold apply <preset> \
   --target /path/to/project \
   --dry-run \
   --backup \
-  --force
+  --force \
+  --backend {herdr,tmux}
 ```
+
+`--backend` (Redmine #15527) writes `terminal_transport.backend: <value>` into the
+target's `.mozyo-bridge/config.yaml` after the scaffold. The declaration is
+deliberately **outside the scaffold manifest**: the config is coordinator-owned
+operational state, so `scaffold status` never tracks it and later operator edits
+never report drift. An existing `config.yaml` — any directory entry at that path,
+symlinks included — fails the apply closed before anything is written; the scaffold
+never replaces an operator's declaration. Omitted, no config is written and the
+runtime default (tmux) applies unchanged.
 
 `--target` should default to the current working directory. This command generates strong router files, so it must not walk upward to a parent repository unless the user explicitly passes `--target` or `--repo`.
 

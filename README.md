@@ -1046,6 +1046,20 @@ mozyo-bridge scaffold apply none --target /path/to/project
 
 When `--target` or `--repo` is omitted, scaffold writes to the current working directory. Use an explicit target to scaffold a different directory.
 
+To adopt the herdr terminal backend from day one, add `--backend herdr` (Redmine #15527):
+
+```bash
+mozyo-bridge scaffold apply redmine-governed --target /path/to/project --backend herdr
+```
+
+This additionally writes `.mozyo-bridge/config.yaml` declaring
+`terminal_transport.backend: herdr`. The file is operator-owned bootstrap output —
+it is **not** tracked by `scaffold status`, so editing it later never reports drift —
+and an already-existing `config.yaml` (any directory entry, symlinks included) makes
+the apply fail closed instead of overwriting it. `--backend tmux` writes the explicit
+tmux declaration the same way. **Omitting `--backend` changes nothing**: no config is
+written and the runtime default (tmux) applies, exactly as before this flag existed.
+
 This creates:
 
 - `AGENTS.md`
