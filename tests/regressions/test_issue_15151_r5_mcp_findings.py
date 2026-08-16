@@ -261,7 +261,13 @@ class R4F3PlanProjectionTests(unittest.TestCase):
         def as_payload(self):
             return {
                 "state": "review_requested",
-                "next_action": "await_review",
+                # Exactly the real producer shape (review j#106183 r5f1): the
+                # role-authority branch interpolates project_scope into this
+                # prose, and the blocked branch appends the resolver detail.
+                "next_action": (
+                    "authority resolves (project_scope='SCOPE_MARKER') "
+                    "(DETAIL_MARKER at /home/someone w9:p9)"
+                ),
                 "execution": "plan",
                 "reason": "ok",
                 "next_owner": "auditor",
@@ -310,6 +316,8 @@ class R4F3PlanProjectionTests(unittest.TestCase):
             "/home/someone/checkout",
             "secret-project",
             "future_private_thing",
+            "SCOPE_MARKER",
+            "DETAIL_MARKER",
         ):
             self.assertNotIn(leaked, rendered)
 
@@ -317,10 +325,52 @@ class R4F3PlanProjectionTests(unittest.TestCase):
         plan = self._payload()["plan"]
 
         self.assertEqual("review_requested", plan["state"])
-        self.assertEqual("await_review", plan["next_action"])
         self.assertEqual("#15151 j#103253", plan["durable_anchor"])
-        # The allowlist is the boundary: nothing outside it may appear.
-        self.assertTrue(set(plan).issubset(set(PLAN_PUBLIC_FIELDS)))
+        # The allowlist plus the ONE reconstructed member (review j#106183
+        # r5f1): `next_action` is never the producer's prose.
+        self.assertTrue(
+            set(plan).issubset(set(PLAN_PUBLIC_FIELDS) | {"next_action"})
+        )
+
+    def test_next_action_is_reconstructed_from_closed_tokens_only(self) -> None:
+        """Review j#106183 r5f1: the producer's next_action prose interpolates
+        project_scope (and, blocked, the resolver detail) — so the public value
+        is a fixed template over closed tokens, never the outcome's own text."""
+        plan = self._payload()["plan"]
+
+        self.assertNotIn("SCOPE_MARKER", plan["next_action"])
+        self.assertNotIn("DETAIL_MARKER", plan["next_action"])
+        self.assertIn("review_requested", plan["next_action"])
+        self.assertIn("auditor", plan["next_action"])
+
+
+class R5F1LaneRefusalStaysValueFreeTests(unittest.TestCase):
+    """Review j#106183 r5f1, third channel: the refusal must not copy str(exc)."""
+
+    def test_the_refusal_carries_fixed_wording_not_the_exception_body(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_step_plan_resolution import (  # noqa: E501
+            LaneUnavailable,
+        )
+
+        marker = "PANE_MARKER w7:p7 under /home/secret/checkout"
+        with patch(
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "workflow_step_plan_resolution.resolve_step_plan",
+            side_effect=LaneUnavailable(marker),
+        ):
+            outcome = run_workflow_step_plan({}, _context())
+
+        self.assertTrue(outcome.is_error)
+        rendered = json.dumps(outcome.payload, ensure_ascii=False) + (
+            outcome.summary or ""
+        )
+        for leaked in ("PANE_MARKER", "w7:p7", "/home/secret/checkout"):
+            self.assertNotIn(leaked, rendered)
+        self.assertIn("could not be resolved", outcome.payload["message"])
+        self.assertIn(
+            "could not be resolved", outcome.payload["source_health"]["notes"][0]
+        )
 
 
 class R4F4OutputSchemaConformanceTests(unittest.TestCase):

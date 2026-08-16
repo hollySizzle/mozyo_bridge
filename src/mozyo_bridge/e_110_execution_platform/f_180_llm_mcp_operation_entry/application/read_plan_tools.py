@@ -277,7 +277,6 @@ def run_workflow_glance(
 #: decides, in review, that it is public.
 PLAN_PUBLIC_FIELDS = (
     "state",
-    "next_action",
     "execution",
     "reason",
     "next_owner",
@@ -291,8 +290,34 @@ PLAN_PUBLIC_FIELDS = (
 
 
 def _public_plan(payload: Mapping[str, Any]) -> dict:
-    """The allowlisted projection of a step-outcome payload."""
-    return {name: payload[name] for name in PLAN_PUBLIC_FIELDS if name in payload}
+    """The allowlisted projection of a step-outcome payload.
+
+    ``next_action`` is deliberately NOT forwarded from the outcome (review
+    j#106183 r5f1): a key allowlist does not police values, and the real
+    role-authority producer interpolates ``project_scope=...`` — and, on the
+    blocked path, the resolver's free-text ``detail`` — straight into that
+    prose. The public ``next_action`` is re-CONSTRUCTED instead: a fixed
+    template over the closed tokens the projection already carries, with the
+    full operator prose reachable only through the CLI, which is an operator
+    surface and may say where things live.
+    """
+    plan = {name: payload[name] for name in PLAN_PUBLIC_FIELDS if name in payload}
+    plan["next_action"] = _reconstructed_next_action(plan)
+    return plan
+
+
+def _reconstructed_next_action(plan: Mapping[str, Any]) -> str:
+    """A fixed public sentence over closed tokens only — nothing producer-written."""
+    state = str(plan.get("state", "") or "unknown")
+    reason = str(plan.get("reason", "") or "unknown")
+    next_owner = str(plan.get("next_owner", "") or "unknown")
+    primitive = str(plan.get("primitive", "") or "none")
+    via = f" via the internal primitive {primitive}" if primitive != "none" else ""
+    return (
+        f"resolved state {state} (reason {reason}); the next step belongs to "
+        f"{next_owner}{via}. Run `mozyo-bridge workflow step` from the lane for "
+        "the full operator guidance."
+    )
 
 
 def run_workflow_step_plan(
@@ -327,18 +352,25 @@ def run_workflow_step_plan(
             issue=str(arguments.get("issue", "") or "").strip(),
             journal=str(arguments.get("journal", "") or "").strip(),
         )
-    except LaneUnavailable as exc:
+    except LaneUnavailable:
+        # Fixed wording only (review j#106183 r5f1): the resolver's exception
+        # body is the CLI's `die` message and can name panes, sessions, and
+        # private paths. This surface reports THAT the lane did not resolve and
+        # where to get the detail — never the detail itself.
+        refusal = "the current lane could not be resolved from the live runtime"
         return ToolOutcome(
             payload={
                 "error": "lane_unresolved",
-                "message": str(exc),
+                "message": refusal
+                + "; run `mozyo-bridge workflow step` from the lane for the "
+                "operator-facing diagnosis",
                 "plan": {},
                 "execution": EXECUTION_PLAN_ONLY,
                 "executed": False,
-                "source_health": _health(True, [str(exc)] + notes),
+                "source_health": _health(True, [refusal] + notes),
             },
             is_error=True,
-            summary="the current lane could not be resolved from the live runtime",
+            summary=refusal,
         )
 
     # `resolution.outcome` is the SAFE outcome — the rail's result after the store
@@ -373,8 +405,8 @@ def run_workflow_step_plan(
         is_error=not bool(getattr(resolution.outcome, "ok", True)),
         summary=(
             f"next step resolved on the {resolution.backend} backend: "
-            f"{plan.get('next_action') or plan.get('reason') or 'unknown'} "
-            "(plan only; nothing was dispatched)"
+            f"state {plan.get('state') or 'unknown'}, reason "
+            f"{plan.get('reason') or 'unknown'} (plan only; nothing was dispatched)"
         ),
     )
 
