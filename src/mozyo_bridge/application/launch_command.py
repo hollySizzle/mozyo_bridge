@@ -41,8 +41,13 @@ attach). This module carves that into an OOP-first boundary under #12638:
   next to the adapters that consume it; :mod:`commands` re-exports the legacy
   names so the ``commands.*`` import / monkeypatch seams are unchanged.
 
-Behavior-preserving: the refusal wording, the stdout/stderr text, the tmux side
-effects, and the exit codes are unchanged from the original command bodies.
+Behavior at extraction time was preserved byte-for-byte from the original command
+bodies. Since then, Redmine #15526 deliberately extended ONE refusal: an unadopted
+root whose subtree carries an adoption marker now names that marker and both routes
+out, instead of telling the operator to scaffold what they just scaffolded. Every
+other refusal, the stdout/stderr text, the tmux side effects, and the exit codes
+remain unchanged, and the untouched wordings are pinned as base-literal goldens in
+``tests/regressions/test_issue_15526_nested_scaffold_diagnostics.py``.
 """
 
 from __future__ import annotations

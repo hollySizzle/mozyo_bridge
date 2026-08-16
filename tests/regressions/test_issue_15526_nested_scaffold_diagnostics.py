@@ -11,9 +11,10 @@ Git-root-first resolution (#13641) is NOT changed here and these tests assert th
 is not: what changes is what gets said about it. So the suite is written around the two
 things that can silently rot —
 
-- the **byte-invariance** of every pre-existing message (asserted by comparing against
-  the same call with the new argument omitted, rather than by copying wording into an
-  expectation that would then need hand-maintenance), and
+- the **byte-invariance** of every pre-existing message, asserted against golden text
+  reproduced literally from base `59526e7a` (review j#105978 finding_2: an equivalence
+  between two calls of the same new implementation passes even when the legacy wording
+  changes, so only a pre-change literal actually pins the contract), and
 - the **trigger condition**, which must stay the Git root specifically. A marker walk
   would fire on a genuinely non-git scaffolded workspace (#11301), where the target is
   the root and there is nothing to warn about.

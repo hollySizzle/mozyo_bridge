@@ -42,7 +42,8 @@ def adoption_refusal(
     injectable for tests and defaults to the real home directory.
 
     ``nested`` is the ``(directory, marker)`` this walk passed on the way up (see
-    :func:`mozyo_bridge.shared.paths.nested_adoption_marker`). When the resolved
+    :func:`mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity
+    .domain.workspace_adoption.nested_adoption_marker`). When the resolved
     root is unadopted but such a marker exists, the generic "adopt this project
     first" text tells an operator to do the thing they just did — the loop
     measured in Redmine #15526 — so the refusal names the marker instead and
