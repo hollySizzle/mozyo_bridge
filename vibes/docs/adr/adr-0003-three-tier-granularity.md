@@ -7,9 +7,13 @@
 ## 決定 (規約行)
 
 作業の組織構造は 3 階層とする: **release 単位 = coordinator / version 単位 = project coordinator /
-UserStory 単位 = sublane**。レビュー (audit) は US 単位で行う — sublane 内の auditor は US の完了に
-対してレビューし、US 内のタスクレベルで相互レビューはしない。タスク規模の作業を新しい US に
-しない (それは US 内のタスクである)。
+UserStory 単位 = sublane**。レビュー (audit) は US 単位を default とする — sublane 内の auditor は
+US の完了に対してレビューし、US 内のタスクレベルで相互レビューはしない。タスク規模の作業を
+新しい US にしない (それは US 内のタスクである)。ただし central preset
+`us_level_audit.task_level例外` (guardrail / release・CI / credential・権限 / destructive・migration /
+architecture・互換性 / 実装者の判断迷い / owner・監査者の明示要求) は**維持**する — これらは US
+途中でも Task-level review / design consultation の対象のままである (owner 承認 2026-08-16、
+#15536 の R2 journal に anchor)。
 
 ## 背景
 
@@ -22,13 +26,13 @@ UserStory 単位 = sublane**。レビュー (audit) は US 単位で行う — s
 
 ## 根拠 (逐語引用)
 
-- 2026-08-16 owner (chat): 「これ確か3階層構想にしていて、リリース管理、バージョン管理、ユーザー
+- 2026-08-16 owner (chat、逐語記録 #15536 j#106346): 「これ確か3階層構想にしていて、リリース管理、バージョン管理、ユーザー
   ストーリーレベルにするべきなんだよね。で、今言っているユーザーストーリーレベルがサブレーン。
   で、バージョン単位がプロジェクトコーディネーター、で、リリース単位がコーディネーター」
-- 2026-08-16 owner (chat): 「タスクレベルをレビューしているっていうのは良くないと思う。US単位で
+- 2026-08-16 owner (chat、逐語記録 #15536 j#106346): 「タスクレベルをレビューしているっていうのは良くないと思う。US単位で
   レビューし始めるべきかな。…コーダーが作業してレビュアーがレビューをするのは、US単位での
   レビューになる。だから、タスクレベルについてレビューをし合うっていうのは想定してないかな」
-- 2026-08-16 owner (chat): 「少ないやつをUSに書くなみたいな。それはだってクリエイトタスク、
+- 2026-08-16 owner (chat、逐語記録 #15536 j#106346): 「少ないやつをUSに書くなみたいな。それはだってクリエイトタスク、
   タスクレベルの話だから。じゃあ1個のユニットでやるべきだよねって話になるかなって」
 
 ## 影響
@@ -37,5 +41,6 @@ UserStory 単位 = sublane**。レビュー (audit) は US 単位で行う — s
   扱い、独立 US を新設しない。
 - レビュー運用: audit request は US 完了時に出す。US 内の中間成果物ごとにフル審査サイクルを回す
   ことは想定しない (レビュー指摘への修正往復は US の審査の一部であり、これは従来どおり)。
+  task_level例外に該当する高リスク作業の mid-review / design consultation は従来どおり有効。
 - 既存の central preset `### US-Level Audit Model` と方向は一致する。運用が preset と乖離した場合は
   本 ADR が owner 意図の正本。

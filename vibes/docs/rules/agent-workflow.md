@@ -153,16 +153,34 @@ Redmine の表示上、Epic / Feature が `未着手` のまま配下 UserStory 
 
 ## ADR (Owner Decision Records) — Redmine #15536
 
-- owner の意思決定の正本は `vibes/docs/adr/` の ADR。書式と運用規則の正本は `vibes/docs/adr/README.md`、
-  運用規則そのものの決定は ADR-0001。
-- **reviewer の義務**: review finding を出す前に対象領域の active ADR を確認する。active な ADR と
-  矛盾する指摘は、その ADR を名指しした「ADR 変更の提案」としてのみ出せる。owner の明示承認
-  なしに required_correction として採用しない。黙った上書きは禁止。
-- **implementer の義務**: ADR と矛盾する変更を、レビュー指摘への対応であっても行わない。矛盾に
-  気づいたら owner へ escalate する。
-- ADR の作成・supersede は owner 決定があったときのみ。エージェント起草の draft は owner 承認の
-  記録が入るまで active にしない。
-- 本節は repo-local 宣言であり、中央 preset を変更しない。
+owner の意思決定の正本は `vibes/docs/adr/` の ADR (書式・索引は `vibes/docs/adr/README.md`、判断
+正本は ADR-0001)。本節はその**実行契約**であり、repo-local 宣言 (中央 preset 不変)。
+
+```yaml
+adr_conflict_gate:
+  trigger: review finding または実装変更が、active な ADR の「決定 (規約行)」と矛盾する、
+    または矛盾の疑いがある場合
+  required_fields:
+    - adr_id                # 例: ADR-0002
+    - conflict_statement    # どの規約行とどう衝突するか
+    - evidence              # 根拠 (evidence_source 分類つき)
+    - owner_approval_anchor # owner 承認の journal 参照。未取得なら空
+  reviewer:
+    - 指摘の起票は常に自由 (独立性を維持)。ただし ADR 矛盾指摘は required_fields を伴う
+      「ADR 変更の提案」として書く
+    - owner_approval_anchor が空の間、その指摘を required_correction として採用しない (zero_adopt)
+  implementer:
+    - owner_approval_anchor の無い ADR 矛盾変更は実装しない (zero_implementation)。レビュー指摘
+      への対応であっても同じ
+    - route: `design_consultation` (正本: rule-claude-design-consultation) で owner へ確認し、
+      判断を対象 issue の journal に記録する
+  invalid:
+    - 関連 ADR の特定に失敗した場合、または ADR index (`vibes/docs/adr/README.md`) が読めない
+      場合は「矛盾なし」とみなさず、design_consultation へ route する (fail_closed)
+  record:
+    - ADR の新規作成・supersede・status 変更は owner 決定の journal anchor がある場合のみ。
+      エージェント起草 draft は owner 承認記録が入るまで status: active にしない
+```
 
 ## Workflow Change Verification
 

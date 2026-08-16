@@ -40,13 +40,11 @@ owner が繰り返し指示した送信リトライ方針 (#12580 で承認) が
 <この決定が拘束する実装・レビュー・運用の範囲>
 ```
 
-## 運用規則 (正本: ADR-0001)
+## 運用規則 (pointer)
 
-- ADR の新規作成・supersede は owner の決定があったときのみ。エージェントが自発的に起草する場合は
-  draft と明示し、owner 承認の記録 (journal または chat 引用) が入るまで status: active にしない。
-- active な ADR と矛盾する review finding は、その ADR を **名指し** した上で挑戦する。owner の
-  明示承認なしに ADR と矛盾する変更を採用してはならない (黙った上書きの禁止)。
-- 決定が変わったら新しい ADR を作り、旧 ADR を `superseded (by ...)` にする。旧 ADR は消さない。
+判断の正本は [ADR-0001](adr-0001-adr-practice.md)、エージェントの実行契約 (trigger / 必須 field /
+fail-closed 動作) は `vibes/docs/rules/agent-workflow.md` の `adr_conflict_gate`。本 README は
+書式と索引のみを持ち、規則本文を重複させない。
 
 ## 索引
 
