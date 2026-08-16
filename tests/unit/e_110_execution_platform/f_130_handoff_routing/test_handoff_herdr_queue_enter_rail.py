@@ -1843,8 +1843,50 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         ),
     )
 
-    @staticmethod
-    def _argparse_help_text(source: str, option: str):
+    @classmethod
+    def _provable_literal_text(cls, node):
+        """The runtime string value of ``node``, or ``None`` when unprovable.
+
+        Review j#106528 (finding_helpexpressionbait): walking the expression and
+        concatenating every ``str`` Constant counts DEAD branches — bait in the
+        unselected arm of ``("actual" if True else "busy #15537 ...")`` passed a
+        contract check argparse never displays. Only constructions whose runtime
+        value is statically certain contribute here:
+
+        - a ``str`` Constant (implicit adjacent-literal concatenation is already
+          folded into one Constant by the parser);
+        - a JoinedStr (f-string): its Constant fragments, with interpolations
+          contributing nothing — under-counting, so it can only fail red, never
+          hide a missing contract;
+        - ``+`` concatenation of two provable operands.
+
+        Everything else — a conditional, a call, a name — returns ``None`` and
+        the caller fails closed.
+        """
+        import ast
+
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            return node.value
+        if isinstance(node, ast.JoinedStr):
+            parts = []
+            for value in node.values:
+                if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                    parts.append(value.value)
+                elif isinstance(value, ast.FormattedValue):
+                    parts.append("")
+                else:
+                    return None
+            return "".join(parts)
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
+            left = cls._provable_literal_text(node.left)
+            right = cls._provable_literal_text(node.right)
+            if left is None or right is None:
+                return None
+            return left + right
+        return None
+
+    @classmethod
+    def _argparse_help_text(cls, source: str, option: str):
         import ast
 
         tree = ast.parse(source)
@@ -1861,14 +1903,27 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
                 continue
             for kw in node.keywords:
                 if kw.arg == "help":
-                    parts = [
-                        sub.value
-                        for sub in ast.walk(kw.value)
-                        if isinstance(sub, ast.Constant)
-                        and isinstance(sub.value, str)
-                    ]
-                    return "".join(parts)
+                    return cls._provable_literal_text(kw.value)
         return None
+
+    def test_help_extractor_fails_closed_on_unproven_expressions(self) -> None:
+        """Dead-branch / computed help values must read as absent, not as bait."""
+        cases = (
+            (
+                'p.add_argument("--x", help=("actual" if True else "busy #15537 idle queue_enter"))',
+                None,
+            ),
+            ('p.add_argument("--x", help=make_help())', None),
+            ('p.add_argument("--x", help=("a " "b" " c"))', "a b c"),
+            (
+                'p.add_argument("--x", help=("a " f"{VALUE:g} tail" " z"))',
+                "a  tail z",
+            ),
+            ('p.add_argument("--x", help="lone" + " pair")', "lone pair"),
+        )
+        for source, expected in cases:
+            with self.subTest(source=source):
+                self.assertEqual(expected, self._argparse_help_text(source, "--x"))
 
     @staticmethod
     def _docstring_text(source: str, function):
