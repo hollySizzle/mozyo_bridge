@@ -1845,13 +1845,21 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
 
     @classmethod
     def _provable_literal_text(cls, node):
-        """The runtime string value of ``node``, or ``None`` when unprovable.
+        """A conservative static text projection of ``node`` for contract-token
+        checks, or ``None`` when the expression is unprovable.
+
+        This is NOT the runtime string value (review j#106536): a Constant or a
+        provable ``+`` concatenation projects exactly, but a JoinedStr projects
+        each unknown interpolation as a barrier sentinel, so the result exists
+        only to answer "does this contract token lie entirely inside a static
+        fragment?" — never to be compared with, displayed as, or re-evaluated
+        against the actual argparse help text.
 
         Review j#106528 (finding_helpexpressionbait): walking the expression and
         concatenating every ``str`` Constant counts DEAD branches — bait in the
         unselected arm of ``("actual" if True else "busy #15537 ...")`` passed a
-        contract check argparse never displays. Only constructions whose runtime
-        value is statically certain contribute here:
+        contract check argparse never displays. Only these constructions
+        contribute:
 
         - a ``str`` Constant (implicit adjacent-literal concatenation is already
           folded into one Constant by the parser);
