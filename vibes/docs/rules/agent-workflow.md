@@ -378,17 +378,24 @@ adversarial_convergence:
         編集しない)
     authoritative_chain: |
       challenge result C ごとに、history 全体から一意に選ぶ:
-      (a) pending record = `challenge_pending: j#C` を持つ**最小 id** の journal (chain の必須要素)。
+      (a) pending record = `challenge_pending: j#C` を持つ journal のうち **id > C の最小 id** の
+      1 個 (chain の必須要素。C より前の journal は選択対象外)。
       (b) owner anchor 集合 = `challenge_ref: j#C` を持つ有効 anchor 全部。authoritative anchor は
       supersession 連鎖の末端 1 個 — 各 anchor は同じ challenge_ref を持つ先行 anchor のみを
       supersede でき、連鎖は線形でなければならない。未 supersede の anchor が 2 個以上並立、
       dangling な supersedes_anchor、別 challenge_ref の anchor への supersede、循環は、いずれも
       conflict であり close blocked (どの anchor も authoritative にならない)。
-      (c) authoritative resumption request = **authoritative** anchor を指す
-      `challenge_resolution` を持つ canonical review_request のうち**最大 id の 1 個**
-      (Review Generation Marker Contract v2 の「最新 request が current generation を開く」と
-      同型の後勝ち規則。明示の supersession key は不要で、先行 resumption 候補は自動的に
-      非 authoritative)。superseded anchor を指す request は候補にもならない。
+      (c) resumption の選択は**二段階** (Review Generation Marker Contract v2 の「newer
+      malformed generation を旧 valid generation で置換しない」fail-closed 原則に従う):
+      第一段階 (latest attempt の選択) — challenge C の owner-anchor chain (`challenge_ref: j#C`
+      を持つ全 anchor、**superseded を含む**) のいずれかを `challenge_resolution` 行で参照する
+      canonical review_request 全体を母集団とし、その**最大 id の 1 個**を latest attempt とする
+      (duplicate・malformed な行を持つ request も、C の chain を参照する行を 1 行でも持てば
+      母集団に含める)。
+      第二段階 (validation) — latest attempt が `challenge_resolution` 行を**ちょうど 1 行**持ち、
+      それが現行 authoritative (terminal) anchor を指す場合のみ authoritative resumption request
+      となる。superseded anchor の再参照・duplicate・malformed は **旧 chain へ fallback せず
+      blocked** — より新しい well-formed attempt だけが解消できる。
       (d) challenged request = authoritative result が C である canonical review_request
       (意味検証の基準)
       resumption_request: |
@@ -412,9 +419,15 @@ adversarial_convergence:
       同 result の `resolution_anchor` 付き Deferred entry が `disposition: deferred` を持つこと。
       challenge_verdict=wontfix_by_policy は同 entry が `disposition: wontfix_by_policy` を
       持つこと。
-      duplicate・malformed・意味不一致・result 未発行は、より新しい意味整合な resumption
-      request とその result が authoritative になるまで close blocked (存在判定 (∃) ではなく
-      「authoritative な 1 本」の判定。fail 側は blocked)
+      (v) 時系列 — challenged request id < C < selected pending id < 初回 owner anchor id で
+      あり、各 supersession anchor はその `supersedes_anchor` 参照先より後、かつ
+      authoritative anchor id < authoritative resumption request id < その authoritative
+      result id であること。逆順・同 id・future reference (参照先 id が参照元 id より大きい、
+      または不存在) は blocked。
+      duplicate・malformed・意味不一致・時系列違反・result 未発行は、より新しい意味整合な
+      resumption request とその result が authoritative になるまで close blocked (存在判定 (∃)
+      ではなく「authoritative な 1 本」の判定。fail 側は blocked。validation 順序は
+      選択 → anchor 検証 → 時系列 → 意味)
   mandatory_de_escalation:
     severity_vocabulary:
       values: low | medium | high    # closed。canonical finding manifest v1 は変更しない
@@ -528,8 +541,10 @@ wontfix_by_policy なら Deferred 節に resolution_anchor 付き entry を
 verdict と同名の disposition で記録;
     |implementer|
     :close は close_predicate (pending record + 一意な
-authoritative anchor + 解決 result + 意味的一致) を確認してから
-(conflict・意味不一致は blocked);
+authoritative anchor + latest attempt の二段階検証 +
+時系列 + 意味的一致) を確認してから
+(conflict・stale/malformed な latest attempt・
+forward reference・意味不一致は blocked);
   else (no — 圏外指摘)
     |reviewer|
     :Deferred (out-of-model) 節に item_grammar で記録
