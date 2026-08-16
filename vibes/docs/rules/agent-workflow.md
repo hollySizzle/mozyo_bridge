@@ -390,7 +390,8 @@ adversarial_convergence:
       conflict であり close blocked (どの anchor も authoritative にならない)。
       (c) resumption の選択は**二段階** (Review Generation Marker Contract v2 の「newer
       malformed generation を旧 valid generation で置換しない」fail-closed 原則に従う):
-      第一段階 (latest attempt の選択) — `challenge_attempt: j#C` 行で C を参照する canonical
+      第一段階 (latest attempt の選択) — repair candidate (repair_record 参照) を除いた上で、
+      `challenge_attempt: j#C` 行で C を参照する canonical
       review_request 全体を母集団とする (`challenge_resolution` 行の有無・正否は問わない —
       target が malformed でも identity key により C へ帰属する)。加えて、challenge_attempt を
       欠くが C の owner-anchor chain (`challenge_ref: j#C` を持つ全 anchor、**superseded を
@@ -409,30 +410,37 @@ adversarial_convergence:
         最大 1 行) の**両方**を claim と同じ journal に持つ。challenge_verdict=update_model の
         場合は valid (non-empty) な threat_model 行を更新して宣言し直す
       repair_record: |
-        **repair record** = `repairs_attempt: j#<U の journal id>` をちょうど 1 行持ち、
-        **他の challenge key (challenge_attempt / challenge_resolution) を一切持たない**
-        canonical review_request。repair record は administrative record であり、challenge
-        帰属判定と resumption 母集団の**対象外** (blocker 候補にも attempt にもならない)。
-        valid であるのは target U が実在し、U < 自 journal id (後方参照) で、かつ評価時点で
-        U が outstanding blocker 集合の要素である場合のみ。valid repair の effect は
-        「U を集合から除去する」ことだけで、per-challenge の chain 判定には一切影響しない。
-        dangling・前方参照・重複行・blocker でない target への repair・challenge key との混在は
-        invalid — その record 自身が blocker 集合へ加わり、repair effect は 0 (同一 U への
-        2 個目以降の repair も「blocker でない target への repair」として invalid)
+        **repair candidate** = `repairs_attempt` 行を **1 行以上**含む canonical review_request
+        (行数・値の正否・他 key の有無を問わない母集合)。repair candidate は分類優先順位が
+        最初であり、ordinary の challenge 帰属判定・resumption 母集団には**恒久的に入らない**
+        (後続の valid repair が blocker を除去しても分類は single-pass 分類時に固定され、
+        attempt へ復帰しない)。
+        **valid repair record** = repair candidate の closed subset — `repairs_attempt:
+        j#<U の journal id>` がちょうど 1 行、他の challenge key (challenge_attempt /
+        challenge_resolution) を一切持たず、target U が実在し、U < 自 journal id (後方参照)、
+        かつ評価時点で U が outstanding blocker 集合の要素であるもの。effect は「U を集合から
+        除去する」ことだけで、per-challenge の chain 判定には一切影響しない。
+        それ以外の repair candidate (重複行・値 malformed・dangling・前方参照・blocker でない
+        target・challenge key との混在・同一 U への 2 個目以降) はすべて **invalid repair** —
+        その record 自身が blocker 集合へ加わり、repair effect は 0
       resolution_entry: |
         challenge_verdict が defer / wontfix_by_policy の場合、再開 request の authoritative
         result の `### Deferred (out-of-model)` 節に、item_grammar の entry として記録し、
         `resolution_anchor: j#<owner anchor journal id>` key を必須で付す
     close_predicate: |
       **issue-level 前提 (outstanding blocker 集合)**: journal id 昇順の**単一 pass** で
-      決定的に構成する — (1) challenge key (`challenge_attempt` / `challenge_resolution`) を
-      持つが既存の challenge result へ一意に帰属できない (typo・dangling・前方参照・duplicate
-      等) canonical review_request は出現時に集合へ追加 (repair record は repair_record の
-      規則で評価し、この帰属判定の対象外)。(2) valid repair record は出現時に target U を
-      集合から除去。(3) invalid repair record は出現時に自身を集合へ追加。
-      この pass の最終結果のみを判定に使う (評価順依存の非決定性を排除)。無関係な challenge の
-      well-formed attempt が最大 id を更新しても集合は変化しない。集合が空でない間は、個別
-      chain の状態にかかわらず issue close blocked。
+      決定的に構成する。各 canonical review_request は次の**優先順位付き分岐**でちょうど
+      1 分岐に落ちる:
+      (1) **repair candidate** (`repairs_attempt` 行を 1 行以上含む — repair_record の母集合
+      定義。ordinary 帰属判定より優先): valid repair record なら出現時に target U を集合から
+      除去、invalid repair なら出現時に自身を集合へ追加 (effect 0)。
+      (2) **ordinary challenge-key record** (repair candidate でなく `challenge_attempt` /
+      `challenge_resolution` を持つ): 既存の challenge result へ一意に帰属できない (typo・
+      dangling・前方参照・duplicate 等) 場合、出現時に集合へ追加。
+      (3) challenge key を持たない request は集合に関与しない。
+      この pass の最終結果のみを判定に使う (評価順依存の非決定性を排除。fall-through する
+      record は存在しない)。無関係な challenge の well-formed attempt が最大 id を更新しても
+      集合は変化しない。集合が空でない間は、個別 chain の状態にかかわらず issue close blocked。
       その上で、challenge 節を含む各 result journal C について、authoritative_chain の全要素が
       存在し、かつ意味的に整合すること:
       (i) pending record が存在する。
@@ -576,8 +584,8 @@ verdict と同名の disposition で記録;
 pending record + 一意な authoritative anchor +
 latest attempt の二段階検証 + 時系列 + 意味的一致
 (canonical value / entry の exact binding)) を確認してから
-(帰属不能 record は repair-only record (repairs_attempt のみ、
-単一 pass 評価) での個別修復のみ解消。
+(帰属不能 record は valid repair record (repair candidate 分類が
+ordinary 帰属判定に優先、単一 pass 評価) での個別修復のみ解消。
 conflict・stale/malformed・forward reference・意味不一致は blocked);
   else (no — 圏外指摘)
     |reviewer|
