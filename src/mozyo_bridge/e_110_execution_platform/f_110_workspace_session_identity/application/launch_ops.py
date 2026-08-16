@@ -3,8 +3,14 @@
 Split out of ``launch_command`` (Redmine #15526) when that module sat exactly at the
 module-health threshold and a diagnostics fix could not be added without crossing it.
 The adapter is the natural seam: it is the only part of the launch boundary that is
-pure I/O wiring, it depends on nothing else in ``launch_command``, and keeping it here
-means the use cases and the port protocol stay together in one readable file.
+pure I/O wiring, and it depends on nothing else in ``launch_command`` — the port
+protocol and the use cases stay together in the readable composition file, which
+re-exports this class so every importer and monkeypatch seam is unchanged.
+
+Placement (review j#105978 finding_1): session launch is the Workspace・Session識別
+feature's concern, so the adapter lives in
+``f_110_workspace_session_identity/application`` rather than as a new flat
+``application/`` module, which the source-layout migration contract does not admit.
 """
 
 from __future__ import annotations
@@ -47,7 +53,9 @@ class LiveLaunchOps:
     def nested_adoption_marker(self, repo_root: Path) -> tuple[Path, str] | None:
         # Searched from the CWD, which is the directory the operator actually ran
         # `mozyo` in — the resolution this refusal has to explain (Redmine #15526).
-        from mozyo_bridge.shared.paths import nested_adoption_marker
+        from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.workspace_adoption import (  # noqa: E501
+            nested_adoption_marker,
+        )
 
         return nested_adoption_marker(Path.cwd(), repo_root)
 

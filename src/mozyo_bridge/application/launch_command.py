@@ -68,10 +68,12 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.application.launch_adoption_gate import adoption_refusal
 
-# The live port adapter lives in its own module (Redmine #15526) but is re-exported
-# here, so `launch_command.LiveLaunchOps` keeps resolving for every existing importer
-# and monkeypatch seam.
-from mozyo_bridge.application.launch_command_ops import LiveLaunchOps
+# The live port adapter lives in its owning feature (Redmine #15526, review
+# j#105978 finding_1) but is re-exported here, so `launch_command.LiveLaunchOps`
+# keeps resolving for every existing importer and monkeypatch seam.
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.application.launch_ops import (  # noqa: E501
+    LiveLaunchOps,
+)
 
 
 # --- Pure policy: attach form, window parsing, payload / text rendering. -------

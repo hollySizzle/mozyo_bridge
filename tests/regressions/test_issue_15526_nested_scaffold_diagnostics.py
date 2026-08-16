@@ -37,16 +37,18 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.application.launch_adoption_gate import adoption_refusal  # noqa: E402
-from mozyo_bridge.application.scaffold_target_gate import (  # noqa: E402
-    nested_target_warning,
+from mozyo_bridge.e_110_execution_platform.f_110_workspace_session_identity.domain.workspace_adoption import (  # noqa: E402,E501
+    nested_adoption_marker,
 )
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application.commands_docs_scaffold import (  # noqa: E402,E501
     cmd_scaffold_apply,
 )
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.scaffold_target_note import (  # noqa: E402,E501
+    nested_target_warning,
+)
 from mozyo_bridge.shared.errors import CommandAbort  # noqa: E402
 from mozyo_bridge.shared.paths import (  # noqa: E402
     find_repo_root,
-    nested_adoption_marker,
     workspace_adoption_marker,
 )
 
@@ -56,13 +58,15 @@ def _git_repo(base: Path) -> Path:
     return base
 
 
-class NestedMarkerIsFoundBetweenStartAndRootTest(unittest.TestCase):
+class NestedMarkerIsFoundFromStartUpToRootTest(unittest.TestCase):
     def _tmp(self) -> Path:
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         return Path(tmp.name).resolve()
 
-    def test_a_marker_in_a_subdirectory_is_reported_with_its_path(self) -> None:
+    def test_a_marker_at_start_itself_is_reported_start_is_inclusive(self) -> None:
+        # The live reproduction: the CWD IS the freshly scaffolded subdirectory,
+        # so `start` must be included in the scan (review j#105978 finding_3).
         root = self._tmp()
         nested = root / "Source" / "rails"
         (nested / ".mozyo-bridge").mkdir(parents=True)
@@ -72,7 +76,7 @@ class NestedMarkerIsFoundBetweenStartAndRootTest(unittest.TestCase):
 
         self.assertEqual((nested, ".mozyo-bridge/scaffold.json"), found)
 
-    def test_the_root_itself_is_not_reported_as_nested(self) -> None:
+    def test_the_root_itself_is_excluded(self) -> None:
         # That is `workspace_adoption_marker`'s question; reporting it here would
         # make an adopted root look like a stray subtree.
         root = self._tmp()
@@ -112,6 +116,30 @@ class NestedMarkerIsFoundBetweenStartAndRootTest(unittest.TestCase):
         self.assertIsNone(workspace_adoption_marker(root))
 
 
+#: The refusal wordings as they stood on base `59526e7a`, BEFORE this issue —
+#: reproduced literally from that commit's `launch_adoption_gate.py` with the
+#: fixture paths below substituted. Golden text, not a call into the current
+#: implementation: an equivalence between two calls of the same code passes even
+#: when the legacy wording changes, which is exactly the regression these exist
+#: to catch (review j#105978 finding_2).
+_GOLDEN_UNADOPTED_REFUSAL = (
+    "bare `mozyo` resolved repo root /myapp, which is not an "
+    "adopted mozyo workspace (no .mozyo-bridge/config.yaml or "
+    "scaffold/workspace marker); refusing to start agent sessions "
+    "there. cd into an adopted project root, or adopt this project "
+    "first: `mozyo-bridge scaffold apply <preset> --target "
+    "<project_root>` (see `mozyo-bridge scaffold --help` for "
+    "presets), then re-run `mozyo`."
+)
+_GOLDEN_HOME_REFUSAL = (
+    "bare `mozyo` resolved repo root to the home directory "
+    "/home/someone; refusing to start agent sessions there (an "
+    "unadopted directory resolves up to incidental home markers). "
+    "cd into an adopted project root, or adopt the project first: "
+    "`mozyo-bridge scaffold apply <preset> --target <project_root>`."
+)
+
+
 class RefusalNamesTheMarkerItWalkedPastTest(unittest.TestCase):
     ROOT = Path("/myapp")
     NESTED = (Path("/myapp/Source/rails"), ".mozyo-bridge/scaffold.json")
@@ -127,11 +155,13 @@ class RefusalNamesTheMarkerItWalkedPastTest(unittest.TestCase):
         self.assertIn(f"--repo {self.NESTED[0]}", message)
         self.assertIn("workspace alias", message)
 
-    def test_without_a_nested_marker_the_wording_is_unchanged(self) -> None:
-        # Byte-invariance expressed as an equality against the pre-#15526 call,
-        # so it cannot drift out of sync with the wording it protects.
+    def test_without_a_nested_marker_the_wording_is_the_base_bytes(self) -> None:
+        # Against the pre-change golden, for both spellings of "no nested marker".
         self.assertEqual(
-            adoption_refusal(self.ROOT, None, self.HOME),
+            _GOLDEN_UNADOPTED_REFUSAL, adoption_refusal(self.ROOT, None, self.HOME)
+        )
+        self.assertEqual(
+            _GOLDEN_UNADOPTED_REFUSAL,
             adoption_refusal(self.ROOT, None, self.HOME, nested=None),
         )
 
@@ -144,11 +174,16 @@ class RefusalNamesTheMarkerItWalkedPastTest(unittest.TestCase):
             )
         )
 
-    def test_home_is_still_refused_for_its_own_reason(self) -> None:
-        message = adoption_refusal(self.HOME, None, self.HOME, nested=self.NESTED)
-
-        self.assertIn("home directory", message)
-        self.assertEqual(adoption_refusal(self.HOME, None, self.HOME), message)
+    def test_home_is_still_refused_with_the_base_bytes(self) -> None:
+        # The home refusal outranks the nested note and keeps its exact wording,
+        # with or without a nested marker in hand.
+        self.assertEqual(
+            _GOLDEN_HOME_REFUSAL,
+            adoption_refusal(self.HOME, None, self.HOME, nested=self.NESTED),
+        )
+        self.assertEqual(
+            _GOLDEN_HOME_REFUSAL, adoption_refusal(self.HOME, None, self.HOME)
+        )
 
 
 class ScaffoldNoteFiresOnlyForAGitRootAboveTest(unittest.TestCase):
@@ -217,19 +252,28 @@ class ScaffoldApplyEmitsTheNoteTest(unittest.TestCase):
         self.assertIn("is not the root that mozyo will resolve", output)
         self.assertIn(str(root), output)
 
+    def _assert_pre_write_stdout_is_empty(self, output: str) -> None:
+        # The byte-invariance claim for the untriggered cases (review j#105978
+        # finding_2): before this issue, NOTHING preceded the write output, so
+        # everything up to the first write line (or up to the abort, when the
+        # environment has no installed preset) must still be the empty string —
+        # not merely "does not contain the note".
+        for marker in ("would write:", "wrote:"):
+            index = output.find(marker)
+            if index != -1:
+                self.assertEqual("", output[:index])
+                return
+        self.assertEqual("", output)
+
     def test_the_git_root_target_output_carries_no_note(self) -> None:
         root = _git_repo(self._tmp())
 
-        output = self._run(root)
-
-        self.assertNotIn("is not the root that mozyo will resolve", output)
+        self._assert_pre_write_stdout_is_empty(self._run(root))
 
     def test_a_non_git_target_carries_no_note(self) -> None:
         plain = self._tmp()
 
-        output = self._run(plain)
-
-        self.assertNotIn("is not the root that mozyo will resolve", output)
+        self._assert_pre_write_stdout_is_empty(self._run(plain))
 
 
 if __name__ == "__main__":  # pragma: no cover

@@ -111,8 +111,10 @@ def cmd_scaffold_apply(args: argparse.Namespace) -> int:
     target = scaffold_target_from_args(args)
     # Say it BEFORE the write (Redmine #15526): a target the resolver will walk
     # past is worth knowing while it can still be retargeted, not at the next
-    # `mozyo` launch. Advisory only — see `scaffold_target_gate`.
-    from mozyo_bridge.application.scaffold_target_gate import nested_target_warning
+    # `mozyo` launch. Advisory only — see `scaffold_target_note`.
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.scaffold_target_note import (  # noqa: E501
+        nested_target_warning,
+    )
     from mozyo_bridge.shared.paths import infer_git_worktree_root
 
     warning = nested_target_warning(target, infer_git_worktree_root(target))
