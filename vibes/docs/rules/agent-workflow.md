@@ -337,7 +337,9 @@ adversarial_convergence:
       key: "threat_model: "          # 行頭 literal。この行の残り全体が宣言テキスト (自由文 1-2 行相当)
       placement: claim_schema block と同じ journal 本文 (位置は任意、行頭一致で同定する)
       cardinality: 1 request につき最大 1 行
-      value: trim 後 non-empty であること。空・whitespace-only は invalid = missing と同じ扱い
+      value: trim 後 non-empty であること。空・whitespace-only は invalid = missing と同じ扱い。
+        # canonical form = 外側 whitespace を trim した値。意味検証の同一性判定はすべて
+        # canonical value で行う (raw byte 差は substantive な差とみなさない)
       missing: 宣言なし → 当該 request が主張する guard への指摘は全て material (fail 側は深い方)
       duplicate: 2 行以上 → 宣言なしとして扱う (fail 側は深い方)
     example: |
@@ -406,17 +408,24 @@ adversarial_convergence:
         (identity、最大 1 行) と `challenge_resolution: j#<owner anchor journal id>` (target、
         最大 1 行) の**両方**を claim と同じ journal に持つ。challenge_verdict=update_model の
         場合は valid (non-empty) な threat_model 行を更新して宣言し直す
+      repair_record: |
+        帰属不能な challenge-bearing request U の修復は、後続の canonical review_request が
+        `repairs_attempt: j#<U の journal id>` (各 journal 最大 1 行、**後方参照必須** —
+        参照先は自 journal より前の帰属不能 record) を持つことで行う。dangling・前方参照・
+        duplicate な repairs_attempt を持つ request は、それ自身が帰属不能 record として
+        blocker 集合に加わる (再帰的 fail-closed)
       resolution_entry: |
         challenge_verdict が defer / wontfix_by_policy の場合、再開 request の authoritative
         result の `### Deferred (out-of-model)` 節に、item_grammar の entry として記録し、
         `resolution_anchor: j#<owner anchor journal id>` key を必須で付す
     close_predicate: |
-      **issue-level 前提**: いずれかの challenge key (`challenge_attempt` / `challenge_resolution`)
-      を持つ canonical review_request のうち**最大 id** のものが well-formed (該当 key が各
-      ちょうど 1 行) かつ既存の challenge result へ一意に帰属可能であること。latest bearer が
-      帰属不能 (typo・dangling・既存 challenge を指さない) または malformed なら、個別 chain の
-      状態にかかわらず issue close blocked — 回復はより新しい well-formed attempt のみ
-      (per-challenge の後勝ち規則の issue-level への拡張)。
+      **issue-level 前提 (outstanding blocker 集合)**: いずれかの challenge key
+      (`challenge_attempt` / `challenge_resolution` / `repairs_attempt`) を持つが既存の
+      challenge result へ一意に帰属できない (typo・dangling・前方参照・duplicate 等) canonical
+      review_request は、それぞれ独立の **outstanding blocker** である。blocker U は、後続の
+      canonical request が well-formed な `repairs_attempt: j#U` で U を明示参照した場合のみ
+      個別に解消する — 無関係な challenge の well-formed attempt が最大 id を更新しても解除
+      しない。blocker 集合が空でない間は、個別 chain の状態にかかわらず issue close blocked。
       その上で、challenge 節を含む各 result journal C について、authoritative_chain の全要素が
       存在し、かつ意味的に整合すること:
       (i) pending record が存在する。
@@ -425,11 +434,14 @@ adversarial_convergence:
       存在する。先行 resumption 候補とその result は判定に使わない。
       (iv) 意味的一致 — **(iii) の result のみ**で判定する。challenge_verdict=update_model は
       authoritative resumption request が **valid (trim 後 non-empty) な** `threat_model:` 行を
-      ちょうど 1 行持ち、その値が challenged request の `threat_model:` 行と byte 一致しない
-      こと (空・whitespace-only は invalid = 宣言なしであり、この条件を満たさない)。challenge_verdict=defer は
-      同 result の `resolution_anchor` 付き Deferred entry が `disposition: deferred` を持つこと。
-      challenge_verdict=wontfix_by_policy は同 entry が `disposition: wontfix_by_policy` を
-      持つこと。
+      ちょうど 1 行持ち、その **canonical value (外側 whitespace trim 後)** が challenged
+      request の canonical value と**一致しない**こと (空・whitespace-only は invalid = 宣言なし。
+      whitespace のみの差は不一致とみなさない)。加えて同 result は `resolution_anchor` entry を
+      **0 個**とする (混在禁止)。
+      challenge_verdict=defer / wontfix_by_policy は、同 result 内の `resolution_anchor` entry が
+      **全て authoritative anchor A を指し** (別 anchor 参照は blocked)、A を指す entry が
+      **ちょうど 1 個**で、その `disposition` が verdict と同名 (defer→deferred /
+      wontfix_by_policy→wontfix_by_policy) であること。重複・反対 disposition は blocked。
       (v) 時系列 — challenged request id < C < selected pending id < 初回 owner anchor id で
       あり、各 supersession anchor はその `supersedes_anchor` 参照先より後、かつ
       authoritative anchor id < authoritative resumption request id < その authoritative
@@ -553,11 +565,12 @@ malformed でも帰属して blocked を発動する);
 wontfix_by_policy なら Deferred 節に resolution_anchor 付き entry を
 verdict と同名の disposition で記録;
     |implementer|
-    :close は close_predicate (pending record + 一意な
-authoritative anchor + latest attempt の二段階検証 +
-時系列 + 意味的一致) を確認してから
-(conflict・stale/malformed な latest attempt・
-forward reference・意味不一致は blocked);
+    :close は close_predicate (outstanding blocker 集合が空 +
+pending record + 一意な authoritative anchor +
+latest attempt の二段階検証 + 時系列 + 意味的一致
+(canonical value / entry の exact binding)) を確認してから
+(帰属不能 record は repairs_attempt での個別修復のみ解消。
+conflict・stale/malformed・forward reference・意味不一致は blocked);
   else (no — 圏外指摘)
     |reviewer|
     :Deferred (out-of-model) 節に item_grammar で記録
