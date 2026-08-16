@@ -1855,9 +1855,14 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
 
         - a ``str`` Constant (implicit adjacent-literal concatenation is already
           folded into one Constant by the parser);
-        - a JoinedStr (f-string): its Constant fragments, with interpolations
-          contributing nothing — under-counting, so it can only fail red, never
-          hide a missing contract;
+        - a JoinedStr (f-string): its Constant fragments, joined by a barrier
+          sentinel (``"\\x00"``) in place of each interpolation. Review j#106532
+          (finding_formattedvaluejoin): joining with ``""`` is NOT a monotone
+          under-approximation for substring contracts — deleting the
+          interpolation glues fragments that are never adjacent at runtime and
+          can synthesize a token (``f"bu{{X}}sy"`` -> ``"busy"``). The barrier
+          cannot appear inside any contract token, so a token counts only when
+          it lies entirely inside one static fragment;
         - ``+`` concatenation of two provable operands.
 
         Everything else — a conditional, a call, a name — returns ``None`` and
@@ -1873,7 +1878,7 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
                 if isinstance(value, ast.Constant) and isinstance(value.value, str):
                     parts.append(value.value)
                 elif isinstance(value, ast.FormattedValue):
-                    parts.append("")
+                    parts.append("\x00")
                 else:
                     return None
             return "".join(parts)
@@ -1917,13 +1922,32 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
             ('p.add_argument("--x", help=("a " "b" " c"))', "a b c"),
             (
                 'p.add_argument("--x", help=("a " f"{VALUE:g} tail" " z"))',
-                "a  tail z",
+                "a \x00 tail z",
             ),
             ('p.add_argument("--x", help="lone" + " pair")', "lone pair"),
         )
         for source, expected in cases:
             with self.subTest(source=source):
                 self.assertEqual(expected, self._argparse_help_text(source, "--x"))
+
+    def test_help_extractor_cannot_synthesize_tokens_across_interpolations(
+        self,
+    ) -> None:
+        """Review j#106532: fragments split by an interpolation must not glue.
+
+        At runtime ``f"bu{VALUE}sy ..."`` renders ``bu1sy ...`` — no ``busy`` —
+        so the extracted contract text must not contain ``busy`` either. The
+        intact fragments (``#15537`` etc.) legitimately survive.
+        """
+        extracted = self._argparse_help_text(
+            'p.add_argument("--x", help=f"bu{VALUE}sy #15537 idle queue_enter")',
+            "--x",
+        )
+        self.assertIsNotNone(extracted)
+        self.assertNotIn("busy", extracted)
+        self.assertIn("#15537", extracted)
+        self.assertIn("idle", extracted)
+        self.assertIn("queue_enter", extracted)
 
     @staticmethod
     def _docstring_text(source: str, function):
