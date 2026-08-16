@@ -25,11 +25,11 @@ internal selection records:
   role fails closed) while the provider vocabulary stays open. Default (no
   overrides) is the legacy codex/claude map, so it is behavior-preserving.
 - ``terminal_transport`` -> :class:`mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport.TerminalTransportConfig`
-  (Redmine #13245): selects the runtime terminal-transport backend (``tmux``
-  default = herdr off / ``herdr`` opt-in). The herdr *binary* is not a config
-  field — it comes only from the trusted environment — so this block can never
-  point the runtime at an arbitrary executable. Default (``tmux``) is
-  behavior-preserving.
+  (Redmine #13245): selects the runtime terminal-transport backend. The default
+  is ``herdr`` since 2.0 (Redmine #15531); staying on tmux takes the explicit
+  ``backend: tmux`` declaration. The herdr *binary* is not a config field — it
+  comes only from the trusted environment — so this block can never point the
+  runtime at an arbitrary executable.
 
 Boundary, kept enforced in code (this is *schema only*):
 
@@ -713,11 +713,12 @@ class RepoLocalConfig:
             # block resolves to the behavior-preserving default (no ``--model`` flag).
             agent_launch = AgentLaunchConfig.from_record(record.get("agent_launch"))
         # The terminal-transport backend selection (#13245) picks the runtime
-        # transport backend (default ``tmux`` = herdr off). It is parsed by its
+        # transport backend (default ``herdr`` since 2.0, #15531). It is parsed by its
         # own self-contained domain schema; its TerminalTransportError is
         # re-raised as a RepoLocalConfigError so the loader keeps a single
         # fail-closed boundary. An absent ``terminal_transport`` block resolves to
-        # the tmux default, so it stays behavior-preserving. The herdr *binary*
+        # the runtime default backend (herdr since 2.0, Redmine #15531),
+        # marked ``backend_declared=False``. The herdr *binary*
         # is deliberately not a config field — it comes only from the trusted
         # environment (see TerminalTransportConfig).
         try:

@@ -203,13 +203,13 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.infrastructure.
 # Runtime terminal-transport backend switch (Redmine #13253). The wiring lives in
 # its own module so ``commands.py`` does not grow; for the opt-in herdr backend it
 # swaps this module's ``run_tmux`` / ``capture_pane`` for a tmux-shaped herdr shim
-# around the send (the tmux default installs nothing, byte-for-byte). Redmine #15149
+# around the send (a tmux selection installs nothing, byte-for-byte). Redmine #15149
 # moved that installation from a Namespace decorator into
 # ``runtime_transport_binding``, entered by the shared ``orchestrate_handoff_input``.
 
 # Redmine #13255: the herdr event-driven turn-start rail installed by
 # ``runtime_transport_binding`` for the duration of a herdr send. ``None`` for the
-# tmux default (and outside a send); the herdr+standard branch of
+# tmux selection (and outside a send); the herdr+standard branch of
 # ``orchestrate_handoff`` reads it to drive the rail in place of the capture-based
 # ``_observe_standard_turn_start``. Module-global (like the ``run_tmux`` /
 # ``capture_pane`` swap) so the decorator can install and restore it without

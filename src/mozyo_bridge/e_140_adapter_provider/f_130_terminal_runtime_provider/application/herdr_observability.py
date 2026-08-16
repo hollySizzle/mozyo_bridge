@@ -132,6 +132,10 @@ class HerdrInventoryView:
     """
 
     backend_selected: bool
+    #: Whether the herdr selection was explicitly declared in the repo-local
+    #: config, or is the 2.0 undeclared default (Redmine #15531). True for a
+    #: non-selected view (vacuous) so pre-flip consumers stay byte-invariant.
+    backend_declared: bool = True
     ok: bool = False
     reason: Optional[str] = None
     detail: str = ""
@@ -283,6 +287,7 @@ def read_herdr_inventory(
     config = _terminal_transport_config(repo_root)
     if config is None or config.backend != BACKEND_HERDR:
         return HerdrInventoryView(backend_selected=False)
+    declared = getattr(config, "backend_declared", True)
     segment = _workspace_segment(repo_root)
     source_env = env if env is not None else os.environ
     try:
@@ -295,6 +300,7 @@ def read_herdr_inventory(
         if lister is None:  # defensive: herdr_enabled implies non-None
             return HerdrInventoryView(
                 backend_selected=True,
+                backend_declared=declared,
                 ok=False,
                 reason=REASON_TRANSPORT_ERROR,
                 detail="herdr backend selected but no agent lister could be resolved",
@@ -304,6 +310,7 @@ def read_herdr_inventory(
     except TerminalTransportError as exc:
         return HerdrInventoryView(
             backend_selected=True,
+            backend_declared=declared,
             ok=False,
             reason=getattr(exc, "reason", None) or REASON_TRANSPORT_ERROR,
             detail=str(exc),
@@ -311,6 +318,7 @@ def read_herdr_inventory(
         )
     return HerdrInventoryView(
         backend_selected=True,
+        backend_declared=declared,
         ok=True,
         workspace_segment=segment,
         agents=project_observed_agents(rows),

@@ -605,9 +605,10 @@ def _terminal_transport_config(args: argparse.Namespace) -> Optional[TerminalTra
 def herdr_backend_selected(args: argparse.Namespace) -> bool:
     """True iff the repo-local config selects the herdr terminal backend.
 
-    A broken / unreadable config is *not* a herdr selection (it resolves to the tmux
-    default), exactly like :func:`resolve_handoff_transport_binding` — so an absent /
-    malformed config never diverts the send onto the herdr path.
+    Since 2.0 (Redmine #15531) an ABSENT config / block selects herdr (the
+    flipped :data:`DEFAULT_TERMINAL_BACKEND`); a present-but-broken config is
+    still *not* a herdr selection — it stays on the legacy tmux rail, exactly
+    like :func:`resolve_handoff_transport_binding`, never a silent divert.
     """
     config = _terminal_transport_config(args)
     return config is not None and config.backend == BACKEND_HERDR

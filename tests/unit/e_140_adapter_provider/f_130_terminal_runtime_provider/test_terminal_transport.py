@@ -4,8 +4,9 @@ Pins the first concrete cut of the built-in terminal runtime adapter boundary
 (Redmine #12001 design doc, "Terminal runtime adapter"): the core-owned backend
 / source / reason vocabularies, the fail-closed result records and their
 ok/reason invariant, the target guard, the three-primitive
-:class:`TerminalTransportPort` protocol, and the default-off
-:class:`TerminalTransportConfig`. A tiny in-memory fake stands in for a live
+:class:`TerminalTransportPort` protocol, and the
+:class:`TerminalTransportConfig` selection (default herdr since 2.0, Redmine
+#15531; explicit ``backend: tmux`` keeps tmux). A tiny in-memory fake stands in for a live
 provider so the port contract is exercised with no herdr binary and no
 subprocess. No network / tmux / herdr is touched here.
 """
@@ -84,7 +85,8 @@ class FakeTerminalTransport:
 class VocabularyTest(unittest.TestCase):
     def test_backends(self) -> None:
         self.assertEqual(TERMINAL_TRANSPORT_BACKENDS, {BACKEND_TMUX, BACKEND_HERDR})
-        self.assertEqual(DEFAULT_TERMINAL_BACKEND, BACKEND_TMUX)
+        # 2.0 contract (Redmine #15531): an undeclared backend resolves to herdr.
+        self.assertEqual(DEFAULT_TERMINAL_BACKEND, BACKEND_HERDR)
 
     def test_default_read_source_is_visible(self) -> None:
         self.assertEqual(DEFAULT_PANE_READ_SOURCE, SOURCE_VISIBLE)
@@ -191,14 +193,22 @@ class PortContractTest(unittest.TestCase):
 
 
 class ConfigTest(unittest.TestCase):
-    def test_default_is_tmux_off(self) -> None:
+    def test_default_is_herdr(self) -> None:
+        # 2.0 contract (Redmine #15531): the undeclared default is herdr.
         config = TerminalTransportConfig.default()
-        self.assertEqual(config.backend, BACKEND_TMUX)
-        self.assertFalse(config.herdr_enabled)
+        self.assertEqual(config.backend, BACKEND_HERDR)
+        self.assertTrue(config.herdr_enabled)
 
     def test_none_and_empty_are_default(self) -> None:
-        self.assertEqual(TerminalTransportConfig.from_record(None).backend, BACKEND_TMUX)
-        self.assertEqual(TerminalTransportConfig.from_record({}).backend, BACKEND_TMUX)
+        self.assertEqual(TerminalTransportConfig.from_record(None).backend, BACKEND_HERDR)
+        self.assertEqual(TerminalTransportConfig.from_record({}).backend, BACKEND_HERDR)
+
+    def test_explicit_tmux_declaration_stays_tmux(self) -> None:
+        # Staying on tmux now requires the explicit declaration (Redmine #15531).
+        config = TerminalTransportConfig.from_record({"version": 1, "backend": "tmux"})
+        self.assertEqual(config.backend, BACKEND_TMUX)
+        self.assertFalse(config.herdr_enabled)
+        self.assertEqual(TerminalTransportConfig(backend=BACKEND_TMUX).backend, BACKEND_TMUX)
 
     def test_explicit_herdr_selected(self) -> None:
         config = TerminalTransportConfig.from_record({"backend": "herdr"})

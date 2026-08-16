@@ -236,8 +236,18 @@ class FailClosedTest(unittest.TestCase):
 
 
 class ResolverTest(unittest.TestCase):
-    def test_default_tmux_returns_none(self) -> None:
-        self.assertIsNone(resolve_terminal_transport(TerminalTransportConfig.default(), env={}))
+    def test_default_is_herdr_and_fails_closed_unconfigured(self) -> None:
+        # 2.0 contract (Redmine #15531): the undeclared default resolves to
+        # herdr; with no trusted binary it fails closed, never tmux fallback.
+        with self.assertRaises(TerminalTransportError) as ctx:
+            resolve_terminal_transport(TerminalTransportConfig.default(), env={})
+        self.assertEqual(ctx.exception.reason, REASON_BINARY_UNCONFIGURED)
+
+    def test_explicit_tmux_returns_none(self) -> None:
+        # Staying on tmux requires the explicit declaration (Redmine #15531).
+        self.assertIsNone(
+            resolve_terminal_transport(TerminalTransportConfig(backend="tmux"), env={})
+        )
 
     def test_tmux_ignores_binary_env(self) -> None:
         self.assertIsNone(
@@ -274,8 +284,12 @@ class ResolverTest(unittest.TestCase):
             self.assertIsInstance(transport, HerdrCliTransport)
             self.assertEqual(transport.backend, BACKEND_HERDR)
 
-    def test_none_config_defaults_to_off(self) -> None:
-        self.assertIsNone(resolve_terminal_transport(None, env={}))
+    def test_none_config_defaults_to_herdr(self) -> None:
+        # None config now means the herdr default — fail closed when the
+        # trusted environment carries no binary (Redmine #15531).
+        with self.assertRaises(TerminalTransportError) as ctx:
+            resolve_terminal_transport(None, env={})
+        self.assertEqual(ctx.exception.reason, REASON_BINARY_UNCONFIGURED)
 
     def test_bare_name_resolves_on_trusted_env_path(self) -> None:
         # Finding 2 (j#72296): a bare binary name resolves against the *supplied

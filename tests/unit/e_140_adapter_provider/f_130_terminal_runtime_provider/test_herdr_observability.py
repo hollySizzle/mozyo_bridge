@@ -41,6 +41,17 @@ def _herdr_repo(tmp: str) -> Path:
     return repo
 
 
+def _tmux_repo(tmp: str) -> Path:
+    # Since 2.0 (Redmine #15531) tmux is the *declared* opt-out, not the default.
+    repo = Path(tmp) / "repo"
+    (repo / ".mozyo-bridge").mkdir(parents=True)
+    (repo / ".mozyo-bridge" / "config.yaml").write_text(
+        "version: 1\nterminal_transport:\n  version: 1\n  backend: tmux\n",
+        encoding="utf-8",
+    )
+    return repo
+
+
 class FakeLister:
     def __init__(self, rows=None, error: TerminalTransportError | None = None):
         self._rows = rows or []
@@ -104,16 +115,25 @@ class ProjectObservedAgentsTest(unittest.TestCase):
 
 class ReadHerdrInventoryTest(unittest.TestCase):
     def test_unselected_backend_reads_nothing(self) -> None:
+        # Under 2.0 the unselected backend is the explicitly declared tmux
+        # opt-out (Redmine #15531): it still performs no herdr read at all.
         with tempfile.TemporaryDirectory() as tmp:
-            repo = Path(tmp) / "repo"
-            repo.mkdir()
+            repo = _tmux_repo(tmp)
             lister = FakeLister()
 
             view = read_herdr_inventory(repo, lister=lister)
+            self.assertFalse(herdr_backend_selected_for(repo))
 
         self.assertFalse(view.backend_selected)
         self.assertEqual(0, lister.calls)
-        self.assertFalse(herdr_backend_selected_for(repo))
+
+    def test_undeclared_backend_defaults_to_herdr_selected(self) -> None:
+        # 2.0 contract (Redmine #15531): a repo with no terminal_transport
+        # declaration resolves to the herdr backend.
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            repo.mkdir()
+            self.assertTrue(herdr_backend_selected_for(repo))
 
     def test_selected_backend_with_fake_lister_projects_rows(self) -> None:
         name = encode_assigned_name("ws-a", "claude", "")

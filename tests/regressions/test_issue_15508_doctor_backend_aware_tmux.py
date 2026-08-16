@@ -136,6 +136,7 @@ class BackendSelectorWiringTest(unittest.TestCase):
             ).describe()
 
     HERDR_CONFIG = "version: 2\nterminal_transport:\n  backend: herdr\n"
+    TMUX_CONFIG = "version: 2\nterminal_transport:\n  backend: tmux\n"
 
     def test_declared_herdr_config_reaches_a_healthy_verdict_without_tmux(self) -> None:
         repo = self._repo(self.HERDR_CONFIG)
@@ -147,10 +148,25 @@ class BackendSelectorWiringTest(unittest.TestCase):
         # The whole point: doctor's overall verdict is ok on a herdr-only host.
         self.assertTrue(evaluate_doctor_health({"tmux": section}).ok)
 
-    def test_a_target_with_no_config_resolves_to_the_tmux_default(self) -> None:
-        # Pins the selector against a hardcode: an undeclared target must still
-        # be judged as tmux, which is what keeps the OR rule's fail-open away.
+    def test_a_target_with_no_config_resolves_to_the_herdr_default(self) -> None:
+        # Since 2.0 (Redmine #15531) an undeclared target resolves to herdr;
+        # the tmux section is then "just a fact about the host" (skipped) and
+        # the fail-closed verdict for the missing herdr binary belongs to the
+        # herdr section, not this one.
         repo = self._repo(None)
+        view = self._describe(repo, tmux_installed=False)
+        self.assertEqual("herdr", view["selected_backend"])
+
+        section = evaluate_tmux_section(view)
+        self.assertEqual("skipped", section["status"])
+
+    def test_a_declared_tmux_target_without_tmux_stays_unhealthy(self) -> None:
+        # Pins the selector against a hardcode: a target that explicitly
+        # declares tmux (the 2.0 opt-out, #15531) must be judged as tmux — a
+        # selector that stopped reading the config (always answering "herdr"
+        # after the default flip) would turn this host green and let the OR
+        # rule's fail-open back in.
+        repo = self._repo(self.TMUX_CONFIG)
         view = self._describe(repo, tmux_installed=False)
         self.assertEqual("tmux", view["selected_backend"])
 
@@ -163,7 +179,7 @@ class BackendSelectorWiringTest(unittest.TestCase):
         # available, a herdr-selected target's tmux section must be byte-identical
         # to a tmux-selected one — the backend branch exists only for absence.
         herdr_view = self._describe(self._repo(self.HERDR_CONFIG), tmux_installed=True)
-        tmux_view = self._describe(self._repo(None), tmux_installed=True)
+        tmux_view = self._describe(self._repo(self.TMUX_CONFIG), tmux_installed=True)
         self.assertEqual("herdr", herdr_view["selected_backend"])
         self.assertEqual("tmux", tmux_view["selected_backend"])
 

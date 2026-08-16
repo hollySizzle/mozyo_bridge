@@ -57,8 +57,18 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 # itself did not answer with a readable inventory (down / hung / incompatible).
 _BINARY_NEXT_ACTION = (
     "make herdr resolvable from the trusted environment (Redmine #13496): either "
-    "put an executable `herdr` on the trusted PATH, or set MOZYO_HERDR_BINARY "
-    "(daemon env) to the herdr executable, then re-run `mozyo-bridge doctor`"
+    "put an executable `herdr` on the trusted PATH (Homebrew carries the "
+    "supported version: `brew install herdr`; other platforms follow "
+    "https://herdr.dev), or set MOZYO_HERDR_BINARY (daemon env) to the herdr "
+    "executable, then re-run `mozyo-bridge doctor`"
+)
+#: Appended when the herdr selection is the UNDECLARED 2.0 default (Redmine
+#: #15531): the operator never wrote `backend: herdr`, so doctor must name the
+#: tmux route out, not only the herdr route forward.
+_UNDECLARED_DEFAULT_NEXT_ACTION = (
+    "this target does not declare `terminal_transport.backend`; since 2.0 the "
+    "undeclared default is herdr. To keep using tmux instead, declare "
+    "`terminal_transport: {version: 1, backend: tmux}` in .mozyo-bridge/config.yaml"
 )
 _BINARY_AMBIGUOUS_NEXT_ACTION = (
     "more than one distinct `herdr` executable resolved from the trusted PATH "
@@ -362,6 +372,11 @@ def evaluate_herdr_section(
             section["next_action"].append(_BINARY_UNSAFE_PATH_NEXT_ACTION)
         elif view.reason in (REASON_BINARY_UNCONFIGURED, REASON_BINARY_NOT_FOUND):
             section["next_action"].append(_BINARY_NEXT_ACTION)
+            # The 2.0 flip (Redmine #15531): an UNDECLARED target resolving to
+            # herdr on a host without the binary is exactly the upgrading tmux
+            # operator — tell them how to stay on tmux, explicitly.
+            if not getattr(view, "backend_declared", True):
+                section["next_action"].append(_UNDECLARED_DEFAULT_NEXT_ACTION)
         else:
             section["next_action"].append(_SERVER_NEXT_ACTION)
         return section

@@ -1598,7 +1598,12 @@ class HerdrLedgerSendSiteWiringTest(unittest.TestCase):
 
 
 class TmuxBackendUntouchedTest(unittest.TestCase):
-    """backend=tmux (and absent config) resolve to None — the shim installs nothing."""
+    """Explicit backend=tmux resolves to None — the shim installs nothing.
+
+    Since 2.0 (Redmine #15531) an ABSENT config resolves to the herdr default,
+    so only the explicit `terminal_transport.backend: tmux` declaration keeps
+    the tmux path untouched.
+    """
 
     def _binding_for(self, config_text):
         from mozyo_bridge.application.handoff_transport_wiring import (
@@ -1626,8 +1631,14 @@ class TmuxBackendUntouchedTest(unittest.TestCase):
             self._binding_for("version: 1\nterminal_transport:\n  backend: tmux\n")
         )
 
-    def test_absent_config_returns_none(self) -> None:
-        self.assertIsNone(self._binding_for(None))
+    def test_absent_config_resolves_the_herdr_binding(self) -> None:
+        # The 2.0 default flip (Redmine #15531): an undeclared backend selects
+        # herdr, so the wiring installs the herdr binding rather than leaving
+        # the tmux passthrough. Send-time failure stays fail-closed (typed
+        # refusal, never a silent tmux fallback).
+        binding = self._binding_for(None)
+        self.assertIsNotNone(binding)
+        self.assertEqual(binding.backend, "herdr")
 
     def test_herdr_backend_selected_predicate(self) -> None:
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_send_entry import (

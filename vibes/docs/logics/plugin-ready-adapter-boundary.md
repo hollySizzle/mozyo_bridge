@@ -1117,7 +1117,8 @@ have a fixed interface to build on. The existing tmux path is untouched.
   core.
 - `src/mozyo_bridge/e_130_governance_distribution/f_140_rules_docs_catalog/domain/repo_local_config.py`
   — adds the `terminal_transport` block to the closed repo-local config schema,
-  behaviour-preserving by default (tmux / off).
+  resolved from the repo-local declaration (default herdr since 2.0, Redmine
+  #15531; ``backend: tmux`` is the explicit compatibility route).
 
 ### Design decisions (enforced in code)
 

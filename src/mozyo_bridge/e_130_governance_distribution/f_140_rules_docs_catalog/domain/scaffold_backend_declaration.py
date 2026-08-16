@@ -9,9 +9,10 @@ answer "no, and there is no flag to ask for it".
 
 This module is the pure half of that flag. Three deliberate properties:
 
-- **Omitting the flag changes nothing.** The default backend stays tmux and no config
-  is written; the flip of the default is an explicitly separate, breaking decision
-  this issue does not make.
+- **Omitting the flag changes nothing.** No config is written and the runtime
+  default applies — tmux when this flag shipped (1.0.x), herdr since the 2.0
+  flip (Redmine #15531). Staying on tmux under 2.0 therefore means declaring it:
+  `--backend tmux` here, or `terminal_transport.backend: tmux` by hand.
 - **The declaration is not part of the scaffold manifest.** `config.yaml` is the
   coordinator-owned operational config; operators edit it afterwards, and a
   manifest-tracked copy would make `scaffold status` report drift on every legitimate

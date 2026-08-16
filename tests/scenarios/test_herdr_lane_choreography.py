@@ -210,10 +210,11 @@ class _Finding1World:
       root the outer ``sublane dispatch-worker`` selected herdr on and the ``--repo`` the
       #13397 pin carries into the inner send.
     * ``driving_child`` — the divergent driving cwd: a child dir under a separate root
-      that carries **no herdr config** (a plain ``.git`` checkout). Un-pinned, the inner
-      send's ``repo_root_from_args`` walks up from here to a non-herdr root and
-      re-derives ``backend: tmux`` — the finding-1 misroute. This is the ``child cwd``
-      root-inference axis.
+      whose config **declares ``backend: tmux``** (since 2.0 an undeclared backend
+      resolves to herdr, Redmine #15531, so the non-herdr root is expressed
+      explicitly). Un-pinned, the inner send's ``repo_root_from_args`` walks up from
+      here to this tmux root and re-derives ``backend: tmux`` — the finding-1
+      misroute. This is the ``child cwd`` root-inference axis.
     * a :class:`FakeHerdr` seeded with a same-lane gateway (codex) + worker (claude) so
       the herdr rail's #13305 route authority resolves the worker locator.
     """
@@ -232,10 +233,18 @@ class _Finding1World:
         register_workspace(self.external_root, home=self.home)
         self.workspace_id = read_anchor(self.external_root)["workspace_id"]
 
-        # The divergent driving root: a plain git checkout with NO herdr config, and a
-        # child dir the drive runs from (root-inference forced from a child cwd).
+        # The divergent driving root: a git checkout whose config declares the
+        # tmux backend, and a child dir the drive runs from (root-inference
+        # forced from a child cwd). Since 2.0 (Redmine #15531) an undeclared
+        # backend resolves to herdr, so the finding-1 "non-herdr root" is now
+        # expressed as the explicit tmux declaration — the misroute stays
+        # observable as the un-pinned walk reading THIS root's backend.
         self.driving_root = tmp / "driving_checkout"
         (self.driving_root / ".git").mkdir(parents=True)
+        (self.driving_root / ".mozyo-bridge").mkdir(parents=True)
+        (self.driving_root / ".mozyo-bridge" / "config.yaml").write_text(
+            "version: 1\nterminal_transport:\n  backend: tmux\n", encoding="utf-8"
+        )
         self.driving_child = self.driving_root / "pkg" / "sub"
         self.driving_child.mkdir(parents=True)
 

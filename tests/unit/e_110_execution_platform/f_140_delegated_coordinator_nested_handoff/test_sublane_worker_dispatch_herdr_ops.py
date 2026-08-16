@@ -1381,12 +1381,14 @@ class BackendSelectorTests(unittest.TestCase):
             ops = self._select(self._repo(tmp, "tmux"))
         self.assertIsInstance(ops, LiveWorkerDispatchOps)
 
-    def test_missing_config_defaults_to_tmux(self):
+    def test_missing_config_defaults_to_herdr(self):
+        # 2.0 contract (Redmine #15531): an undeclared backend resolves to
+        # herdr, so the selector picks the herdr adapter for a bare repo.
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo-none"
             repo.mkdir()
             ops = self._select(repo)
-        self.assertIsInstance(ops, LiveWorkerDispatchOps)
+        self.assertIsInstance(ops, HerdrWorkerDispatchOps)
 
 
 class HerdrUseCaseDriveTests(unittest.TestCase):
@@ -1492,8 +1494,15 @@ class InnerSendBackendPinTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             ext = self._herdr_external_project(tmp)
             # A divergent cwd that resolves to its OWN (non-herdr) repo root.
+            # Since 2.0 an undeclared backend defaults to herdr (Redmine
+            # #15531), so "non-herdr" must be the explicit tmux declaration.
             other = Path(tmp) / "other_cwd"
             (other / ".git").mkdir(parents=True)
+            (other / ".mozyo-bridge").mkdir()
+            (other / ".mozyo-bridge" / "config.yaml").write_text(
+                "version: 1\nterminal_transport:\n  version: 1\n  backend: tmux\n",
+                encoding="utf-8",
+            )
 
             seen: list[list] = []
 

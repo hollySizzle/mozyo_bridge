@@ -1934,6 +1934,13 @@ class MetadataOnlyRailIsDecoupledFromCallerWorktree(unittest.TestCase):
         _git("init", "-q", "-b", "main", cwd=self.repo)
         _git("config", "user.email", "t@example.com", cwd=self.repo)
         _git("config", "user.name", "t", cwd=self.repo)
+        # Since 2.0 (Redmine #15531) an undeclared backend resolves to herdr;
+        # this rail's regression pins exercise the legacy (tmux) live-zero
+        # measurement, so the fixture declares the tmux backend explicitly.
+        (self.repo / ".mozyo-bridge").mkdir()
+        (self.repo / ".mozyo-bridge" / "config.yaml").write_text(
+            "version: 1\nterminal_transport:\n  backend: tmux\n", encoding="utf-8"
+        )
         (self.repo / "f.txt").write_text("x\n", encoding="utf-8")
         _git("add", ".", cwd=self.repo)
         _git("commit", "-qm", "base", cwd=self.repo)

@@ -307,9 +307,14 @@ def _herdr_repo(tmp: str) -> Path:
 
 
 def _tmux_repo(tmp: str) -> Path:
+    # Since 2.0 (Redmine #15531) an undeclared backend defaults to herdr, so a
+    # tmux repo must carry the explicit `backend: tmux` declaration.
     repo = Path(tmp) / "repo"
     (repo / ".mozyo-bridge").mkdir(parents=True)
-    (repo / ".mozyo-bridge" / "config.yaml").write_text("version: 1\n", encoding="utf-8")
+    (repo / ".mozyo-bridge" / "config.yaml").write_text(
+        "version: 1\nterminal_transport:\n  version: 1\n  backend: tmux\n",
+        encoding="utf-8",
+    )
     return repo
 
 

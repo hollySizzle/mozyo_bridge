@@ -61,6 +61,37 @@ paths exceeds their operational benefit. If a broader or independently managed
 user base needs rolling upgrades later, that migration contract must be designed
 and tested as a separate feature before support is claimed.
 
+#### Upgrading 1.x → 2.0: the default terminal backend flips to herdr
+
+2.0 is a breaking release. A target whose `.mozyo-bridge/config.yaml` does not
+declare `terminal_transport.backend` resolved to **tmux** under 1.x and
+resolves to **herdr** under 2.0. Nothing falls back silently: on a host without
+the herdr binary, an undeclared target fails closed
+(`binary_unconfigured` / `binary_not_found`) and `mozyo-bridge doctor` names
+both routes out — install herdr (see above), or stay on tmux by declaring it.
+
+Before (or right after) upgrading, decide per target:
+
+- **Staying on tmux**: declare it explicitly —
+
+  ```yaml
+  # .mozyo-bridge/config.yaml
+  terminal_transport:
+    version: 1
+    backend: tmux
+  ```
+
+  (`mozyo-bridge scaffold apply <preset> --backend tmux` writes the same
+  declaration for a fresh target.) A target that already declares
+  `backend: tmux` or `backend: herdr` is unaffected by the flip.
+- **Moving to herdr** (the 2.0 default): remove nothing — just ensure the
+  herdr binary resolves (`brew install herdr`, or `MOZYO_HERDR_BINARY`), then
+  run `mozyo-bridge doctor --target <repo>` and check the `herdr` section.
+
+A present-but-malformed config is *not* a herdr selection under either version:
+it stays on the legacy tmux rail until the config parses. Fix the config rather
+than relying on that behavior.
+
 #### Identity store migration between release candidates (rc2 → rc3)
 
 Upgrading the CLI does not migrate the home-scoped identity stores by itself.
@@ -92,9 +123,10 @@ failed backup aborts with the store byte-unchanged.
    mozyo-bridge --version
    ```
 
-   The default backend is tmux, so `tmux` must be on `PATH` unless the project
-   declares `terminal_transport.backend: herdr` in `.mozyo-bridge/config.yaml`
-   — in which case `herdr` is the prerequisite instead (see “Herdr support and
+   Since 2.0 the default backend is herdr (Redmine #15531), so `herdr` is the
+   prerequisite unless the project declares `terminal_transport.backend: tmux`
+   in `.mozyo-bridge/config.yaml` — in which case `tmux` must be on `PATH`
+   instead (see “Herdr support and
    breaking upgrades” for how to install it). `mozyo-bridge doctor` judges the
    backend the project actually selects, so it will not ask a herdr-only host
    for tmux.
@@ -1057,8 +1089,9 @@ This additionally writes `.mozyo-bridge/config.yaml` declaring
 it is **not** tracked by `scaffold status`, so editing it later never reports drift —
 and an already-existing `config.yaml` (any directory entry, symlinks included) makes
 the apply fail closed instead of overwriting it. `--backend tmux` writes the explicit
-tmux declaration the same way. **Omitting `--backend` changes nothing**: no config is
-written and the runtime default (tmux) applies, exactly as before this flag existed.
+tmux declaration the same way. **Omitting `--backend` writes no config**, so the
+runtime default applies — **herdr since 2.0** (see "Upgrading 1.x → 2.0" above);
+a target that should stay on tmux must declare `--backend tmux`.
 
 This creates:
 

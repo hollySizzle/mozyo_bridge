@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.terminal_transport import (
     BACKEND_HERDR,
+    BACKEND_TMUX,
     REASON_BINARY_NOT_FOUND,
     REASON_BINARY_UNCONFIGURED,
     REASON_INVALID_PAYLOAD,
@@ -89,8 +90,22 @@ class HerdrCliAgentListerTest(unittest.TestCase):
 
 
 class ResolveAgentListerTest(unittest.TestCase):
-    def test_tmux_backend_returns_none(self) -> None:
-        self.assertIsNone(resolve_agent_lister(TerminalTransportConfig.default()))
+    def test_explicit_tmux_backend_returns_none(self) -> None:
+        # Since 2.0 (Redmine #15531) tmux must be declared explicitly; the
+        # declared tmux backend still resolves no herdr lister.
+        self.assertIsNone(
+            resolve_agent_lister(TerminalTransportConfig(backend=BACKEND_TMUX))
+        )
+
+    def test_missing_config_defaults_to_herdr_and_fails_closed(self) -> None:
+        # 2.0 contract (Redmine #15531): an undeclared backend resolves to herdr,
+        # and an unconfigured binary fails closed — never a silent tmux fallback.
+        with self.assertRaises(TerminalTransportError) as ctx:
+            resolve_agent_lister(None, env={})
+        self.assertEqual(ctx.exception.reason, REASON_BINARY_UNCONFIGURED)
+        with self.assertRaises(TerminalTransportError) as ctx:
+            resolve_agent_lister(TerminalTransportConfig.default(), env={})
+        self.assertEqual(ctx.exception.reason, REASON_BINARY_UNCONFIGURED)
 
     def test_herdr_unconfigured_binary_fails_closed(self) -> None:
         with self.assertRaises(TerminalTransportError) as ctx:

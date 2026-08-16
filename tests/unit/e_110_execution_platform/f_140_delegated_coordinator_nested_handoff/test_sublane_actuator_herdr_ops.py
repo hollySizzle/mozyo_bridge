@@ -1710,16 +1710,14 @@ class BackendSelectorTest(unittest.TestCase):
             ops = self._select(self._repo(tmp, "tmux"))
         self.assertIsInstance(ops, LiveSublaneActuatorOps)
 
-    def test_missing_config_defaults_to_tmux(self) -> None:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (  # noqa: E501
-            LiveSublaneActuatorOps,
-        )
-
+    def test_missing_config_defaults_to_herdr(self) -> None:
+        # 2.0 contract (Redmine #15531): an undeclared backend resolves to
+        # herdr, so the selector picks the herdr adapter for a bare repo.
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo-none"
             repo.mkdir()
             ops = self._select(repo)
-        self.assertIsInstance(ops, LiveSublaneActuatorOps)
+        self.assertIsInstance(ops, HerdrSublaneActuatorOps)
 
 
 class HerdrLinkedWorktreeRoundTripTest(unittest.TestCase):

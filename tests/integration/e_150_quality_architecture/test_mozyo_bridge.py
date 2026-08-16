@@ -77,6 +77,20 @@ from mozyo_bridge.scaffold.rules import package_version, rules_status, scaffold_
 from mozyo_bridge.shared.paths import default_queue_path, default_tmux_conf, find_repo_root, resolve_repo_root
 
 
+def _declare_tmux_backend(repo: Path) -> None:
+    """Pin the fixture repo to the tmux terminal backend.
+
+    Since 2.0 (Redmine #15531) an undeclared ``terminal_transport.backend``
+    resolves to herdr, which makes doctor collect the herdr section (and probe
+    a herdr binary) for a bare fixture repo. The tmux-shaped doctor tests
+    exercise the tmux rail, so they declare it explicitly.
+    """
+    (repo / ".mozyo-bridge").mkdir(parents=True, exist_ok=True)
+    (repo / ".mozyo-bridge" / "config.yaml").write_text(
+        "version: 1\nterminal_transport:\n  backend: tmux\n", encoding="utf-8"
+    )
+
+
 class QueueReaderTest(unittest.TestCase):
     def test_load_queue_returns_empty_tasks_when_file_is_missing(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -2194,6 +2208,7 @@ class CommandTest(unittest.TestCase):
             repo = Path(tmp) / "repo"
             repo.mkdir()
             (repo / ".claude" / "skills").mkdir(parents=True)
+            _declare_tmux_backend(repo)
             args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
             panes = [
                 {
@@ -2240,6 +2255,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
+            _declare_tmux_backend(repo)
             args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
             panes = [
                 {
@@ -2287,6 +2303,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
+            _declare_tmux_backend(repo)
             args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
             panes = [
                 {
@@ -2363,6 +2380,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
+            _declare_tmux_backend(repo)
             args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
             panes = [
                 {
@@ -2413,6 +2431,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
+            _declare_tmux_backend(repo)
             args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
             panes = [
                 {
@@ -2464,6 +2483,7 @@ class CommandTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             repo = Path(tmp) / "repo"
             repo.mkdir()
+            _declare_tmux_backend(repo)
             args = argparse.Namespace(repo=str(repo), queue=str(repo / ".agent_handoff" / "tasks.json"))
             panes = [
                 {
@@ -3737,6 +3757,7 @@ class DoctorEnvironmentTest(unittest.TestCase):
             target.mkdir()
             install_rules(home)
             write_scaffold("asana", target, home=home)
+            _declare_tmux_backend(target)
             self._seed_codex_skill(codex_home, complete=True)
             self._seed_claude_plugin_skill(claude_home, version="abc12345")
             env = {
@@ -3821,6 +3842,7 @@ class DoctorEnvironmentTest(unittest.TestCase):
             target.mkdir()
             install_rules(home)
             write_scaffold("asana", target, home=home)
+            _declare_tmux_backend(target)
             self._seed_codex_skill(codex_home, complete=True)
             self._seed_claude_global_skill(claude_home, complete=True)
             env = {

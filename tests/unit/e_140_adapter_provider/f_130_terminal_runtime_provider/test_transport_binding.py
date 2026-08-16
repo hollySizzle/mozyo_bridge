@@ -3,7 +3,8 @@
 Pins the pure ``config -> TransportBinding`` resolver and the tmux-shaped herdr
 shim *without a live herdr binary*:
 
-- the tmux backend (default) returns the injected tmux callables **unchanged**
+- the tmux backend (explicitly declared since 2.0, Redmine #15531; the
+  undeclared default is herdr) returns the injected tmux callables **unchanged**
   (byte-for-byte identity), so the handoff rail's send is untouched;
 - the herdr backend maps the four tmux argv shapes the rail emits onto the
   transport port's ``send_text`` / ``send_keys`` / ``read_pane`` primitives;
@@ -108,17 +109,32 @@ def _sentinel_tmux():
 
 
 class TmuxTransparencyTest(unittest.TestCase):
-    def test_default_none_config_returns_tmux_passthrough_identity(self) -> None:
+    def test_default_none_config_resolves_the_herdr_backend(self) -> None:
+        # 2.0 contract (Redmine #15531): an undeclared config resolves to the
+        # herdr backend — the shim is built, not the tmux passthrough.
         run_tmux, capture_pane = _sentinel_tmux()
         binding = resolve_runtime_transport_binding(
-            None, tmux_run_tmux=run_tmux, tmux_capture_pane=capture_pane
+            None,
+            tmux_run_tmux=run_tmux,
+            tmux_capture_pane=capture_pane,
+            port=FakePort(),
         )
         self.assertIsInstance(binding, TransportBinding)
-        self.assertEqual(binding.backend, BACKEND_TMUX)
-        # Byte-for-byte transparency: the SAME callable objects are returned, so
-        # the handoff rail runs the exact tmux primitives it always did.
-        self.assertIs(binding.run_tmux, run_tmux)
-        self.assertIs(binding.capture_pane, capture_pane)
+        self.assertEqual(binding.backend, BACKEND_HERDR)
+        self.assertIsNot(binding.run_tmux, run_tmux)
+        self.assertIsNot(binding.capture_pane, capture_pane)
+
+    def test_default_none_config_without_binary_fails_closed(self) -> None:
+        # No injected port + no trusted binary: the herdr default fails closed,
+        # never silently downgrading to the tmux passthrough (Redmine #15531).
+        run_tmux, capture_pane = _sentinel_tmux()
+        with self.assertRaises(TerminalTransportError):
+            resolve_runtime_transport_binding(
+                None,
+                tmux_run_tmux=run_tmux,
+                tmux_capture_pane=capture_pane,
+                env={},
+            )
 
     def test_explicit_tmux_config_returns_tmux_passthrough(self) -> None:
         run_tmux, capture_pane = _sentinel_tmux()

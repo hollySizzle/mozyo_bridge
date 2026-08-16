@@ -305,7 +305,7 @@ def observed_units_from_inventory(snapshot, *, observation):
 # cockpit_payload was tmux `take_inventory` only). This supplier folds the live
 # herdr `agent list` inventory into the SAME grouped read model, following the
 # #13303 membership-fold pattern: default-off and fail-soft on selection (the
-# tmux default / a broken config yields no herdr Units, so a tmux-only payload
+# a tmux selection / a broken config yields no herdr Units, so a tmux-only payload
 # is unchanged), fail-visible on an unreadable snapshot (a diagnostic, never a
 # silent "no herdr Units").
 
@@ -322,7 +322,7 @@ def herdr_observed_units(
 ) -> "tuple[list, list[str]]":
     """Fold the live herdr ``agent list`` inventory into grouped ``ObservedUnit``s.
 
-    Returns ``(units, diagnostics)``. Herdr off — the tmux default backend, or a
+    Returns ``(units, diagnostics)``. Herdr off — a declared tmux backend, or a
     missing / broken repo-local config — yields ``([], [])`` so the tmux-only
     grouped payload is byte-invariant. An unreadable live snapshot (herdr
     selected but the inventory could not be read) yields ``([],

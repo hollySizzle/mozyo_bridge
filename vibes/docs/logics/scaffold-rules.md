@@ -429,7 +429,8 @@ operational state, so `scaffold status` never tracks it and later operator edits
 never report drift. An existing `config.yaml` — any directory entry at that path,
 symlinks included — fails the apply closed before anything is written; the scaffold
 never replaces an operator's declaration. Omitted, no config is written and the
-runtime default (tmux) applies unchanged.
+runtime default applies — herdr since 2.0 (Redmine #15531); declare
+`--backend tmux` for a target that should stay on tmux.
 
 `--target` should default to the current working directory. This command generates strong router files, so it must not walk upward to a parent repository unless the user explicitly passes `--target` or `--repo`.
 
