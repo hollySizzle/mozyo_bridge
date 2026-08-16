@@ -1494,6 +1494,8 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         "busy自体を成功証拠にはしない。",
         "成功判定は marker ではなく causal event + coherent generation なので",
         "Herdr は causal confirmation が無ければ成功にせず",
+        "Herdr reports success only after causal",
+        "every actual Enter had a working-transition wait armed first",
     )
 
     def _root(self):
@@ -1542,7 +1544,23 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         ("vibes/docs/logics/tmux-send-safety-contract.md", "短い結論"),
         ("vibes/docs/logics/tmux-send-safety-contract.md", "Blind Enter を避ける条件"),
         ("vibes/docs/logics/tmux-send-safety-contract.md", "Fail-Closed Conditions"),
+        ("vibes/docs/logics/tmux-send-safety-contract.md", "用語の対応"),
+        ("skills/mozyo-bridge-agent/references/workflow.md", "完了チェックリスト"),
+        ("skills/mozyo-bridge-agent/references/workflow.md", "Callback outcome journal テンプレート"),
     )
+
+    #: Per-section additional literals (review j#106482): pin surfaces where the
+    #: generic tokens survive removal of the busy outcome itself — the status
+    #: table row and the retry-result busy outcome line.
+    SECTION_EXTRA_LITERALS = {
+        ("vibes/docs/logics/tmux-send-safety-contract.md", "用語の対応"): (
+            "Herdr queue-enter, busy queued submission",
+        ),
+        ("vibes/docs/logics/tmux-send-safety-contract.md", "herdr queue-enter (causal"): (
+            "`sent` / `queue_enter` / exit 0",
+            "arm を要求せず retry effect boundary 内で同じ gate を再証明する",
+        ),
+    }
 
     #: Two-outcome mapping: each promise section must anchor the busy exception
     #: AND carry the noncausal outcome token itself.
@@ -1560,9 +1578,12 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
         if start is None:
             return None
         body = []
+        in_fence = False
         for line in lines[start + 1 :]:
+            if line.lstrip().startswith("```"):
+                in_fence = not in_fence
             stripped_level = len(line) - len(line.lstrip("#"))
-            if line.startswith("#") and stripped_level <= level:
+            if not in_fence and line.startswith("#") and stripped_level <= level:
                 break
             body.append(line)
         return "\n".join(body)
@@ -1580,6 +1601,9 @@ class BusyContractSurfaceGuardTest(unittest.TestCase):
             for token in self.SECTION_TOKENS:
                 if token.lower() not in lowered:
                     problems.append(f"{rel} [{heading}]: missing {token!r} in section")
+            for literal in self.SECTION_EXTRA_LITERALS.get((rel, heading), ()):
+                if literal not in section:
+                    problems.append(f"{rel} [{heading}]: missing literal {literal!r}")
         self.assertEqual(
             [],
             problems,

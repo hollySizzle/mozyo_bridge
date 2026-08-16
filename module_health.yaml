@@ -1272,8 +1272,16 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
-    lines: 2211
+    lines: 2247
     reason: >-
+      Raised 2211 -> 2247 for #15537 review j#106482: the durable-record renderer
+      (`_header_label` / `_outcome_narrative`) must distinguish the herdr busy
+      queued submission (composer clear behind the wait-free full effect fence,
+      ADR-0002) from the tmux marker-unobserved `sent`/`queue_enter` wording and
+      from the idle/turn-ended armed-wait narrative; the two observation-gated
+      branches and their accurate narratives land here because record rendering
+      is this module's responsibility (the busy path itself lives in the
+      application rail).
       Lowered 2217 -> 2211 for #15242 while adding the causal queue-enter outcome:
       stale and repetitive rail comments were condensed without widening the module.
       Baseline 2216 -> 2217 for #14741 (Codex update prompt / managed binary authority

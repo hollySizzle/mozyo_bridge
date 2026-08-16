@@ -187,7 +187,8 @@ dogfood は safety bypass ではない。high-level primitive が fail-closed �
 | `submitted` (tmux queue-enter, marker 観測あり) | tmux `queue-enter` rail で typing 後 `wait_for_text(marker)` が true を返し、Enter を発行した。strict rail と同じ outcome に倒す。 | `sent` / `ok` |
 | `submitted` (tmux queue-enter, marker 未観測) | tmux `queue-enter` rail で marker が landing_timeout 内に observe できなかったが、target が agent pane であることを根拠に Enter を発行した。ACK 到達は strict と同じ `submitted`。`reason="queue_enter"` (v0.2 新規) は sender が pre-Enter で landing を確認していない事実を wording-layer で残すための差分情報。strict rail はこの分岐を持たない。 | `sent` / `queue_enter` (新規 reason; v0.2 で追加) |
 | `submitted` (Herdr queue-enter, causal turn start) | `awaiting_input` / `turn_ended` baseline より先に arm した working transition と、前後で coherent な同一 launch generation が揃った。marker 観測や post-hoc busy だけでは本 state にしない。 | `sent` / `ok` |
-| `blocked` (Herdr queue-enter, causal 未確認) | wait absent は `turn_start_absent`、fresh gate の runtime blocked は `receiver_blocked`、timeout/error/unarmed/drift/body-screen-state の再確認不成立は `turn_start_unconfirmed`、raised transport primitive failure は `transport_error`。本文/Enter は既に送られ得るため injection stage は `uncertain_partial` で blind retry 禁止。 | `blocked` / `turn_start_absent` \| `receiver_blocked` \| `turn_start_unconfirmed` \| `transport_error` (non-zero) |
+| `submitted` (Herdr queue-enter, busy queued submission) | busy baseline (ADR-0002 / #15537) で wait 非依存の full effect fence を通した Enter の後、injected body が current composer から消えたことを sender が確認した。非 causal な queued submission であり turn start は主張しない。injection stage は `uncertain_partial` のままで blind retry 禁止。 | `sent` / `queue_enter` |
+| `blocked` (Herdr queue-enter, causal / composer-clear どちらも未確認) | wait absent は `turn_start_absent`、fresh gate の runtime blocked は `receiver_blocked`、timeout/error/unarmed/drift/body-screen-state の再確認不成立は `turn_start_unconfirmed`、raised transport primitive failure は `transport_error`。本文/Enter は既に送られ得るため injection stage は `uncertain_partial` で blind retry 禁止。 | `blocked` / `turn_start_absent` \| `receiver_blocked` \| `turn_start_unconfirmed` \| `transport_error` (non-zero) |
 
 tmux 経路の最終到達は `submitted` を超えない。これは contract の弱点ではなく、tmux が原理的に receiver runtime 内部を覗けないことの正直な表現である。`queue-enter` rail の `marker 未観測 + Enter` 経路も `submitted` に到達する。`sender が pre-Enter 観測を持っていない` ことは `DeliveryOutcome.reason="queue_enter"` と durable record narrative で表現するが、`last_input` projection は strict `sent + ok` と同じ `submitted_at = outcome timestamp / ack_status="submitted"` を採る (上流 `receiver-state-inspector-contract.md` の Field-Level Source of Truth Map に従い `ack_status` は `submitted_at` / `acknowledged_at` から derive されるため、`submitted_at` を持ちながら `ack_status="unobserved"` を返す projection は構造上不可能)。詳細は `## Queue-Enter Default Rail` を参照。
 
@@ -517,13 +518,14 @@ herdr_queue_enter_retry:
     - startup / modal / trust / login / selection screen が検出されない
     - runtime read が成功し、state が busy / awaiting_input / turn_ended のいずれかである
     - blocked / unknown / read failure は拒否する
-    - 今回の追加 Enter より先に次の working-transition wait を arm できる
+    - idle / turn-ended 系列では、今回の追加 Enter より先に次の working-transition wait を arm できる (busy 系列 (#15537) は arm を要求せず retry effect boundary 内で同じ gate を再証明する)
     - 上記の全条件を追加 Enter ごとに fresh に取り直す
   result:
-    - causal event + coherent generation が揃えば `sent` / `ok` / exit 0
+    - idle / turn-ended 系列は causal event + coherent generation が揃えば `sent` / `ok` / exit 0
+    - busy 系列は full effect fence 後の composer clear を証拠に `sent` / `queue_enter` / exit 0 (#15537)
     - wait absent は `blocked` / `turn_start_absent` / non-zero
     - fresh gate が runtime blocked を確認した場合は `blocked` / `receiver_blocked` / non-zero
-    - timeout / error / wait unarmed / identity-generation drift / body-screen-state の
+    - timeout / error / wait unarmed (idle / turn-ended 系列) / identity-generation drift / body-screen-state の
       再確認不成立は `blocked` / `turn_start_unconfirmed` / non-zero
     - send primitive の TerminalTransportError は `blocked` / `transport_error` / non-zero
 ```

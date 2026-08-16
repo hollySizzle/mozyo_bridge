@@ -517,3 +517,89 @@ class QueueEnterUnconfirmedWordingTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+class BusyQueuedSubmissionRecordTest(unittest.TestCase):
+    """Review j#106482: the durable record must not deny the busy outcome.
+
+    ADR-0002 / #15537: a busy-baseline queued submission is proven by the
+    composer clearing behind the wait-free full effect fence. The renderer used
+    to map every `sent` / `queue_enter` to the tmux marker-unobserved wording
+    ("the sender did not verify submission"), which is the OPPOSITE of what the
+    busy rail verified; failures likewise claimed "every actual Enter had a
+    working-transition wait armed first", denying the waived pending observer.
+    """
+
+    @staticmethod
+    def _observation(**extra):
+        base = {
+            "observation_kind": "post_choreography_snapshot",
+            "source": "herdr_agent_get",
+            "runtime_state": "busy",
+            "read_ok": True,
+            "read_reason": None,
+            "poll_attempts": 1,
+            "enter_attempts": 1,
+            "first_event_wait_kind": None,
+            "final_event_wait_kind": None,
+            "resend_skipped_reason": "",
+            "baseline_runtime_state": "busy",
+        }
+        base.update(extra)
+        return base
+
+    def _record(self, status, reason, **extra):
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            build_delivery_record,
+        )
+
+        outcome = _outcome(
+            status,
+            reason,
+            mode="queue-enter",
+            queue_enter_turn_start_observation=self._observation(**extra),
+        )
+        return build_delivery_record(outcome)
+
+    def test_busy_queued_submission_record_states_composer_clear_not_tmux_wording(
+        self,
+    ) -> None:
+        record = self._record(
+            "sent",
+            "queue_enter",
+            busy_queue_path=True,
+            queued_submission_confirmed=True,
+        )
+        self.assertIn("busy queued submission, composer cleared", record)
+        self.assertIn("noncausal queued submission", record)
+        self.assertIn("#15537", record)
+        self.assertNotIn("marker unobserved", record)
+        self.assertNotIn("did not verify submission", record)
+
+    def test_tmux_queue_enter_record_keeps_marker_unobserved_wording(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            build_delivery_record,
+        )
+
+        record = build_delivery_record(_outcome("sent", "queue_enter"))
+        self.assertIn("marker unobserved", record)
+        self.assertIn("did not verify submission", record)
+        self.assertNotIn("busy queued submission", record)
+
+    def test_busy_uncertain_record_does_not_claim_an_armed_wait(self) -> None:
+        record = self._record(
+            "blocked",
+            "turn_start_unconfirmed",
+            busy_queue_path=True,
+            queued_submission_confirmed=False,
+        )
+        self.assertIn("busy queue path", record)
+        self.assertIn("wait-free full effect fence", record)
+        self.assertIn("waived", record)
+        self.assertNotIn("armed first", record)
+
+    def test_idle_uncertain_record_scopes_the_armed_wait_claim_to_its_series(
+        self,
+    ) -> None:
+        record = self._record("blocked", "turn_start_unconfirmed")
+        self.assertIn("idle/turn-ended series", record)
+        self.assertIn("working-transition wait armed first", record)
+        self.assertNotIn("busy queue path", record)

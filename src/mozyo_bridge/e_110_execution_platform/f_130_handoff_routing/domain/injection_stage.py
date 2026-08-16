@@ -341,6 +341,39 @@ def canonical_v2_generation_binding(observation: object) -> bool:
     )
 
 
+def busy_queue_path_observed(
+    queue_enter_turn_start_observation: object = None,
+) -> bool:
+    """True when the queue-enter rail took the busy queue path (ADR-0002 / #15537).
+
+    The rail sets ``busy_queue_path`` on the v2 observation only when the
+    baseline runtime state was ``busy`` and the pending working-transition
+    observer was waived; Enters then pass the wait-free full effect fence.
+    """
+    if not isinstance(queue_enter_turn_start_observation, dict):
+        return False
+    return bool(queue_enter_turn_start_observation.get("busy_queue_path"))
+
+
+def busy_queued_submission_observed(
+    queue_enter_turn_start_observation: object = None,
+) -> bool:
+    """True when the busy queue path proved submission by the composer clearing.
+
+    ADR-0002 / #15537: on a busy baseline no working-transition wait can attribute
+    a turn start to this send, so the rail instead verifies that the injected
+    body cleared the receiver composer — a **noncausal** queued submission
+    reported as ``sent`` / ``queue_enter``. This predicate never implies a causal
+    turn start; ``turn_start_positively_observed`` stays False on this path.
+    """
+    if not isinstance(queue_enter_turn_start_observation, dict):
+        return False
+    observation = queue_enter_turn_start_observation
+    return bool(observation.get("busy_queue_path")) and bool(
+        observation.get("queued_submission_confirmed")
+    )
+
+
 def turn_start_positively_observed(
     queue_enter_turn_start_observation: object = None,
     turn_start_outcome: object = None,

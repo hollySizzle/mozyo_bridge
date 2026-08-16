@@ -370,7 +370,7 @@ sublane が次のいずれかの state に到達したら callback を送る。�
 2. **same-lane への表出は callback ではない。** 自 lane の Codex への通知 (Claude → same-lane Codex の hop) は same-lane addressing を満たすが、それは coordinator callback では*ない*。main coordinator は別 lane の Codex である。review_request / review を sublane 自身の Codex にだけ届けると、coordinator は盲目のままになる。これが #12038 が skip した具体的な step である。
 3. **`--target coordinator` 経由で main coordinator へ lane 横断 callback を送信済み。** durable anchor (issue id、gate journal id、到達した state、関連する場合は commit hash) を添えて `mozyo-bridge handoff send --to codex --target coordinator --mode standard` を実行する。`--target coordinator` が通常経路である — workspace-scoped かつ fail-closed であるため、happy path で sublane が coordinator の `%pane` を手選びすることは決してない。明示的な `--target <coordinator_codex_%pane> --target-repo auto` (`mozyo-bridge agents targets`、`## 自然名 target への handoff` で解決) への fall back は、`coordinator` が解決できないときに限る。
 4. **callback outcome journal を記録済み** (下の template を参照)。結果は正確に次の 3 つのいずれかである:
-   - `sent` — target、command、causal confirmation を含む `injection_stage=submitted_confirmed` の delivery evidence。tmux compatibility outcome はそれ自身の contract どおり記録し、Herdr の causal success と混同しない。
+   - `sent` — idle / turn-ended 受信では target、command、causal confirmation を含む `injection_stage=submitted_confirmed` の delivery evidence。busy 受信 (ADR-0002 / #15537) では composer clear を証拠とする非 causal な `sent` / `queue_enter` (`injection_stage=uncertain_partial`、blind retry 禁止) が正規の delivery evidence である。tmux compatibility outcome はそれ自身の contract どおり記録し、Herdr の causal success と混同しない。
    - `blocked` — blocked の理由と `injection_stage`。`not_sent` の場合だけ、候補 pane (`agents targets` の行) と具体的な high-level retry command を記録する。`uncertain_partial` の場合は retry command を作らず、durable anchor / receiver state の reconcile plan を記録する。
    - `not-attempted` — 明示的な理由がある場合のみ (例: この lane 自身が coordinator lane であり、lane 横断 hop が適用されない)。沈黙は決して有効な outcome ではない。
 
@@ -387,7 +387,7 @@ box 1–4 が未完の state は、作業がどう位置づけられていよう
 - target: coordinator (`--target coordinator`) | <coordinator_codex_%pane>
 - result: sent | blocked | not-attempted
 - injection_stage: submitted_confirmed | not_sent | uncertain_partial (result=sent|blocked のとき)
-- on sent: command + causal confirmation evidence (`injection_stage=submitted_confirmed`)
+- on sent: command + evidence — causal confirmation (`injection_stage=submitted_confirmed`)、または busy queued submission の composer clear (`sent` / `queue_enter`、`injection_stage=uncertain_partial`、#15537)
 - on blocked: injection_stage=not_sent -> reason / candidates (`agents targets` rows) / high-level retry command (`--target %pane --target-repo auto`); injection_stage=uncertain_partial -> reason / durable reconcile plan (retry command と本文再入力は禁止)
 - on not-attempted: explicit reason (e.g. this lane is the coordinator lane)
 - commit_hash: (when the state carries one)
