@@ -321,6 +321,343 @@ stop
 @enduml
 ```
 
+## Adversarial Mode Convergence — Redmine #15553 (判断正本: ADR-0005)
+
+full_surface_adversarial mode の収束契約。escalation の入口 (central preset
+`### Late-Finding Full-Surface Adversarial Sweep Escalation` の deterministic trigger) と
+review / close authority は変更しない — 本節は mode 継続中の審査対象を宣言脅威モデルで
+区切り、圏外指摘の記録と必須 de-escalation を定める。wire format (canonical
+`review_result` 契約・finding manifest) は変更しない。
+
+```yaml
+adversarial_convergence:
+  # 判断正本は ADR-0005。本節は実行契約 (repo-local 宣言、中央 preset・wire format 不変)。
+  threat_model_declaration:
+    request_grammar:                 # review_request journal 本文の literal grammar
+      key: "threat_model: "          # 行頭 literal。この行の残り全体が宣言テキスト (自由文 1-2 行相当)
+      placement: claim_schema block と同じ journal 本文 (位置は任意、行頭一致で同定する)
+      cardinality: 1 request につき最大 1 行
+      value: trim 後 non-empty であること。空・whitespace-only は invalid = missing と同じ扱い。
+        # canonical form = 外側 whitespace を trim した値。意味検証の同一性判定はすべて
+        # canonical value で行う (raw byte 差は substantive な差とみなさない)
+      missing: 宣言なし → 当該 request が主張する guard への指摘は全て material (fail 側は深い方)
+      duplicate: 2 行以上 → 宣言なしとして扱う (fail 側は深い方)
+    example: |
+      threat_model: 将来の保守者による偶発的な契約巻き戻しの検出が対象。故意の回避工作 (bait 工作等) は対象外。
+  material_boundary:
+    in_model: |
+      宣言脅威モデル内の反証 (宣言した検出能力が実際には成立しない実証) は material —
+      従来どおり changes_requested の根拠になる
+    out_of_model: |
+      宣言脅威モデル外の指摘は changes_requested の根拠にしない。deferred finding として
+      review result journal に記録する (下記 deferred_finding_record)
+    model_challenge: |
+      「宣言脅威モデル自体が甘い」という主張は policy 論点であり、implementer / reviewer の
+      往復で裁定しない。reviewer は challenge を material finding にせず、review result journal
+      本文の `### Threat-model challenge (owner decision pending)` 見出し配下に記録し
+      (対象 model の引用 + 甘いと考える理由。machine marker prefix 不使用)、canonical
+      review_result の結論は**残余の material findings のみ**から既存規則で出す (material 0 件
+      なら approved も正当)。その後 implementer が対象 issue journal に判断待ちを記録 →
+      coordinator へ canonical handoff → coordinator が owner 裁定 anchor を記録する
+      (owner-question bypass 禁止の正規導線。ADR-0001 の延長: モデルの甘さの裁定者は往復の
+      当事者ではない)。challenge の相関と再開は下記 challenge_grammar の literal key で行い、
+      deferred / wontfix_by_policy の記録先は ADR-0005 のとおり **review result journal のみ**
+      (owner 裁定後も reviewer の新 atomic result を経由する — challenge は稀な事象であり、
+      追加 1 往復は placement 一貫性の価値を下回らない)。**停止点は Close Gate**: 下記
+      close_predicate を満たすまで当該 US は close できず、当該 guard 面に触れる light 主張は
+      invalid
+    challenge_grammar:               # 相関はすべて行頭 literal key。各 journal で該当 key は最大 1 行
+      challenge_section: |
+        reviewer は challenge を review result journal 本文の
+        `### Threat-model challenge (owner decision pending)` 見出し配下に記録する
+        (1 result につき最大 1 個。identity = その result journal id)
+      pending_record: |
+        **pending attempt** = `challenge_pending` 行を 1 行以上含む journal (validity 判定前の
+        母集合)。**valid pending record** = closed subset — challenge_pending がちょうど 1 行、
+        実在の challenge result C を指し、id > C、かつ challenge grammar の他 key
+        (repairs_attempt / challenge_attempt / challenge_resolution / challenge_ref /
+        challenge_verdict / supersedes_anchor) を一切持たない。重複行・dangling・混在の
+        pending attempt は帰属不能 record として outstanding blocker 集合へ入る
+        (repairs_attempt で修復可能)
+      owner_anchor: |
+        **anchor attempt** = `challenge_ref` / `challenge_verdict` / `supersedes_anchor` の
+        **いずれか**を 1 行以上含む journal (validity 判定前の母集合 — identity key を欠く
+        owner correction もここに入る)。challenge_ref がちょうど 1 行で実在の challenge
+        result C を指す attempt は「C へ帰属する candidate」。challenge_ref の欠落・重複行・
+        dangling target の attempt は**帰属不能 attempt** として outstanding blocker 集合へ
+        入る (repairs_attempt で修復可能。明示修復まで旧 anchor へ fallback しない)。
+        C へ帰属する candidate が **valid** であるのは、`challenge_verdict: update_model |
+        defer | wontfix_by_policy` をちょうど 1 行持ち、`supersedes_anchor: j#<先行 anchor
+        candidate id>` が最大 1 行・後方参照・同一 C の candidate を指す場合。裁定の訂正は
+        新しい candidate journal の append で行う (旧 journal は編集しない)。
+        **latest-anchor-attempt 検証**: C へ帰属する candidate のうち最大 id のものが invalid
+        なら、C の chain は close blocked — 旧 valid terminal へ fallback しない。回復はより
+        新しい valid candidate の append のみ
+    authoritative_chain: |
+      challenge result C ごとに、history 全体から一意に選ぶ:
+      (a) pending authority = **valid pending record** (pending_record 参照) のうち **id > C の
+      最小 id** の 1 個 (chain の必須要素。malformed / mixed な pending attempt は選択母集合に
+      入らず blocker になる。valid pending record が存在しない間は predicate (i) 不成立 =
+      blocked で、回復は新しい valid pending record の append のみ)。
+      (b) authoritative anchor の解決は二段階: まず C へ帰属する anchor candidate の**最大 id**
+      が valid であること (invalid なら C の chain は close blocked — 旧 valid terminal へ
+      fallback しない)。その上で、valid candidate 全部の supersession 連鎖の末端 1 個を
+      authoritative anchor とする — 各 anchor は同じ C の先行 candidate のみを supersede でき、
+      連鎖は線形でなければならない。未 supersede の valid anchor が 2 個以上並立、dangling な
+      supersedes_anchor、別 challenge の candidate への supersede、循環は、いずれも conflict で
+      あり close blocked (どの anchor も authoritative にならない)。
+      (c) resumption の選択は**二段階** (Review Generation Marker Contract v2 の「newer
+      malformed generation を旧 valid generation で置換しない」fail-closed 原則に従う):
+      第一段階 (latest attempt の選択) — repair candidate (repair_record 参照) を除いた上で、
+      `challenge_attempt: j#C` 行で C を参照する canonical
+      review_request 全体を母集団とする (`challenge_resolution` 行の有無・正否は問わない —
+      target が malformed でも identity key により C へ帰属する)。加えて、challenge_attempt を
+      欠くが C の owner-anchor chain (`challenge_ref: j#C` を持つ全 anchor、**superseded を
+      含む**) を `challenge_resolution` 行で参照する request も母集団に含める。その**最大 id の
+      1 個**を latest attempt とする。
+      第二段階 (validation) — latest attempt が `challenge_attempt` 行をちょうど 1 行 (=C) と、
+      `challenge_resolution` 行を**ちょうど 1 行**持ち、後者が現行 authoritative (terminal)
+      anchor を指し、かつ **challenge grammar の他 key 全て (challenge_pending /
+      challenge_ref / challenge_verdict / supersedes_anchor / repairs_attempt) を一切持たない**
+      (branch (2) と同一の排他条件) 場合のみ authoritative resumption request となる。
+      superseded anchor の再参照・key 欠落・duplicate・malformed・mixed (修復済みか否かを
+      問わない) は **旧 chain へ fallback せず blocked** — より
+      新しい well-formed attempt だけが解消できる。
+      (d) challenged request = authoritative result が C である canonical review_request
+      (意味検証の基準)
+      resumption_request: |
+        再開する canonical review_request は `challenge_attempt: j#<challenge result id>`
+        (identity、最大 1 行) と `challenge_resolution: j#<owner anchor journal id>` (target、
+        最大 1 行) の**両方**を claim と同じ journal に持つ。challenge_verdict=update_model の
+        場合は valid (non-empty) な threat_model 行を更新して宣言し直す
+      repair_record: |
+        **repair candidate** = `repairs_attempt` 行を **1 行以上**含む **journal**
+        (canonical review_request に限らない。行数・値の正否・他 key の有無を問わない母集合 —
+        single-pass 分岐 (1) と同一定義)。repair candidate は分類優先順位が
+        最初であり、ordinary の challenge 帰属判定・resumption 母集団には**恒久的に入らない**
+        (後続の valid repair が blocker を除去しても分類は single-pass 分類時に固定され、
+        attempt へ復帰しない)。
+        **valid repair record** = repair candidate の closed subset — canonical review_request
+        であり、`repairs_attempt: j#<U の journal id>` がちょうど 1 行、**challenge grammar の
+        他 key 全て (challenge_pending / challenge_attempt / challenge_resolution /
+        challenge_ref / challenge_verdict / supersedes_anchor) を一切持たず**、target U が
+        実在し、U < 自 journal id (後方参照)、
+        かつ**評価時点で U が outstanding blocker 集合の要素である journal** (種別を問わない —
+        帰属不能な ordinary challenge-key record / anchor attempt / pending attempt /
+        invalid repair record のいずれか。集合の要素であることが唯一の条件なので、分割へ
+        種別を追加しても本 union の同期漏れは起きない) であるもの。effect は「U を集合から
+        除去する」ことだけで、per-challenge の chain 判定には一切影響しない — U を resumption /
+        anchor / pending いずれの選択母集合・validity にも**復権させない** (非 rehabilitate
+        原則。mixed な latest attempt は修復後も blocked のままで、回復は新しい well-formed
+        record の append のみ)。
+        それ以外の repair candidate (非 request・重複行・値 malformed・dangling・前方参照・
+        blocker でない target・上記いずれかの key との混在 (anchor 系を含む)・同一 U への
+        2 個目以降) はすべて **invalid repair** —
+        その record 自身が blocker 集合へ加わり、repair effect は 0
+      resolution_entry: |
+        challenge_verdict が defer / wontfix_by_policy の場合、再開 request の authoritative
+        result の `### Deferred (out-of-model)` 節に、item_grammar の entry として記録し、
+        `resolution_anchor: j#<owner anchor journal id>` key を必須で付す
+    close_predicate: |
+      **issue-level 前提 (outstanding blocker 集合)**: 走査 domain は**当該 issue の全 journal**
+      (canonical review_request に限らない)。journal id 昇順の**単一 pass** で決定的に構成し、
+      各 journal は次の**優先順位付き完全分割**でちょうど 1 分岐に落ちる (fall-through も
+      到達不能分岐も存在しない):
+      (1) **repair candidate** (`repairs_attempt` 行を 1 行以上含む journal — repair_record と
+      同一の母集合): valid repair record (canonical review_request であること・challenge
+      grammar の他 key 全て (pending / attempt / resolution / anchor 系) の不在・target が
+      評価時点の集合要素 (種別不問) であることを validity に
+      含む) なら出現時に target U を集合から除去、それ以外 (非 request・key 混在・重複行・
+      malformed 等) は invalid repair として出現時に自身を集合へ追加 (effect 0)。
+      (2) **ordinary challenge-key record** ((1) 以外で `challenge_attempt` /
+      `challenge_resolution` 行を持つ journal): canonical review_request であり、anchor 系 key
+      (challenge_ref / challenge_verdict / supersedes_anchor) とも `challenge_pending` とも
+      混在せず、既存の challenge
+      result へ一意に帰属できる場合のみ blocker にならない。非 request・他 key との
+      混在・帰属不能 (typo・dangling・前方参照・duplicate 等) は出現時に集合へ追加。
+      (3) **anchor attempt** ((1)(2) 以外で anchor 系 key を 1 行以上持つ journal): owner_anchor
+      の帰属規則で C へ一意帰属できない (challenge_ref 欠落・重複行・dangling・
+      `challenge_pending` との混在) 場合は出現時に集合へ追加。帰属可能な candidate は
+      authoritative_chain の規則 (latest 検証 → 線形 supersession) で評価する。
+      (4) **pending attempt** ((1)-(3) 以外で `challenge_pending` 行を持つ journal): valid
+      pending record (pending_record 参照) なら blocker にならず authoritative_chain (a) で
+      評価する。invalid (重複行・dangling) は出現時に集合へ追加。
+      (5) いずれの key も持たない journal は集合に関与しない。
+      この pass の最終結果のみを判定に使う (評価順依存の非決定性を排除。fall-through する
+      record は存在しない)。無関係な challenge の well-formed attempt が最大 id を更新しても
+      集合は変化しない。集合が空でない間は、個別 chain の状態にかかわらず issue close blocked。
+      その上で、challenge 節を含む各 result journal C について、authoritative_chain の全要素が
+      存在し、かつ意味的に整合すること:
+      (i) pending record が存在する。
+      (ii) authoritative anchor が一意に定まる (conflict は blocked)。
+      (iii) **authoritative resumption request (最大 id の 1 個)** の authoritative result が
+      存在する。先行 resumption 候補とその result は判定に使わない。
+      (iv) 意味的一致 — **(iii) の result のみ**で判定する。challenge_verdict=update_model は
+      authoritative resumption request が **valid (trim 後 non-empty) な** `threat_model:` 行を
+      ちょうど 1 行持ち、その **canonical value (外側 whitespace trim 後)** が challenged
+      request の canonical value と**一致しない**こと (空・whitespace-only は invalid = 宣言なし。
+      whitespace のみの差は不一致とみなさない)。加えて同 result は `resolution_anchor` entry を
+      **0 個**とする (混在禁止)。
+      challenge_verdict=defer / wontfix_by_policy は、同 result 内の `resolution_anchor` entry が
+      **全て authoritative anchor A を指し** (別 anchor 参照は blocked)、A を指す entry が
+      **ちょうど 1 個**で、その `disposition` が verdict と同名 (defer→deferred /
+      wontfix_by_policy→wontfix_by_policy) であること。重複・反対 disposition は blocked。
+      (v) 時系列 — challenged request id < C < selected pending id < 初回 owner anchor id で
+      あり、各 supersession anchor はその `supersedes_anchor` 参照先より後、かつ
+      authoritative anchor id < authoritative resumption request id < その authoritative
+      result id であること。逆順・同 id・future reference (参照先 id が参照元 id より大きい、
+      または不存在) は blocked。
+      duplicate・malformed・意味不一致・時系列違反・result 未発行は、より新しい意味整合な
+      resumption request とその result が authoritative になるまで close blocked (存在判定 (∃)
+      ではなく「authoritative な 1 本」の判定。fail 側は blocked。validation 順序は
+      選択 → anchor 検証 → 時系列 → 意味)
+  mandatory_de_escalation:
+    severity_vocabulary:
+      values: low | medium | high    # closed。canonical finding manifest v1 は変更しない
+      recording_authority: |
+        reviewer が review result journal 本文の各 finding 見出しに `[High]` / `[Medium]` /
+        `[Low]` (または `severity: <値>` 行) で記す。structured manifest には severity field を
+        追加しない (payload contract 不変)。本文から severity を同定できない finding を含む
+        round は「導出不能 round」であり、disposition は qualifying_round.unreadable の
+        一経路のみ (high とみなす等の代替解釈をしない)
+    round_pairing:                   # round の単位は ADR-0004 depth_round_derivation の canonical request
+      authoritative_result: |
+        request R の authoritative result は、R より後かつ次の canonical review_request より前に
+        あり、`req=<R>` と head 一致を満たす canonical review_result journal (最初の 1 件)。
+        これを満たす result が無い round (orphan request)、または相関不能 result しか無い round は
+        「導出不能 round」
+    qualifying_round:                # counter が数える round の述語
+      predicate: |
+        authoritative result の全 finding が (a) 対象 location が tests/** の guard・検証 tooling
+        のみ、かつ (b) severity が medium 以下、を満たす changes_requested round
+      reset: |
+        material finding に (a)(b) を満たさないものが 1 件でも含まれる round、および
+        conclusion=approved の round は counter を 0 に戻す
+      unreadable: |
+        導出不能 round (authoritative result の pairing 不能・orphan、または severity を同定
+        できない finding を含む) は count も reset もせず、その時点で下記 action と同じ
+        owner 判断ルートへ止める (fail-closed の倒し先は owner)。これが severity 欠落・
+        malformed に対する**唯一の** disposition である
+    worked_sequence: |
+      例: R1 = changes_requested (全 finding が tests/** guard・medium 以下) → counter 1。
+      R2 = changes_requested だが 1 finding に severity 記載なし → 導出不能 round。counter は
+      1 のまま増減せず、この時点で owner 判断ルートへ停止 (correction round へ進まない)。
+      owner 裁定 anchor (続行) の後、R3 = qualifying → counter 2 → trigger 発火。
+      R3 が approved なら counter 0 に reset
+    trigger: 直近の連続 qualifying round 数が 2 に達した時点
+    action: |
+      implementer は次の correction round へ進まず、対象 issue journal に判断待ちを記録して
+      coordinator 経由で owner 判断を仰ぐ。chat での懸念表明は本 action の代替にならない
+      (#15537 R10 の実例: 懸念表明のみで 2 round 追加続行した)
+    outcome: owner 裁定 anchor (続行 / deferred 化 / mode 解除) を記録してから再開する
+  deferred_finding_record:
+    placement: |
+      review result journal 本文の `### Deferred (out-of-model)` 見出し配下のみ (actor:
+      reviewer、result の atomic append の一部。ADR-0005 が固定する唯一の置き場であり、
+      challenge 経由の disposition も再開 request の authoritative result を経由してここに置く)。
+      finding 単位の個別 issue は乱発しない。material findings の `## Findings` 系見出しとは
+      別見出しであり、deferred entry に machine marker prefix (`[mozyo:` 等) を使わない —
+      strict parser の material finding / gate marker と衝突しない
+    item_grammar:                    # 1 finding = 1 list item。closed keys、順不同、他 key は invalid
+      name: <finding 名>             # 同一 result 内で一意。identity は (result journal id, name)
+      severity: low | medium | high  # severity_vocabulary と同じ closed enum
+      disposition: deferred | wontfix_by_policy
+      reason: 費用対効果の判断 1 行 (owner 方針: 「効用が低いものは今はやらない。残しておく
+        ことに価値はある」)
+      reevaluate_on: surface_change | model_challenge   # closed enum。事象条件のみ。
+        # 時間条件 (「いつか」「N ヶ月後」) は書かない
+      resolution_anchor: "j#<owner anchor journal id>"  # challenge 由来 entry (challenge_grammar
+        # の resolution_entry) では必須、それ以外の entry では禁止 (存在すれば invalid)
+    invalid_handling: |
+      closed key の欠落・enum 外の値・同一 result 内の name 重複は、その entry を deferred として
+      無効化し、当該 finding を material として扱う (fail 側は深い方)
+    example: |
+      ### Deferred (out-of-model)
+      - name: guard_dead_branch_bait
+        severity: medium
+        disposition: deferred
+        reason: 故意の bait 工作は宣言脅威モデル外。committer が自組織のみの repo では費用対効果が薄い
+        reevaluate_on: model_challenge
+    invariants:
+      - 記録は判断の追跡可能性のためであり、TODO の約束ではない。後日の再評価で
+        wontfix_by_policy と結論することは正当な出口
+      - deferred 記録を省略して指摘を黙って落とすことは禁止 (ADR-0005 の adr_conflict_gate 対象)
+  authority_invariants:
+    - escalation の入口 trigger は不変 (#15537 R6 High を発見した実績)
+    - 本契約は review / close authority を緩めない。material finding の扱い・approved の条件は
+      既存 canonical 契約のまま
+```
+
+flow (最小 swimlane。既存 review flow の上に脅威モデル判定を重ねるだけで、gate 語彙・順序は
+変更しない):
+
+```plantuml
+@startuml
+|implementer|
+start
+:review request 発行
+(guard を成果物に含むなら脅威モデルを宣言);
+|reviewer|
+if (finding は宣言脅威モデル内の反証?) then (yes)
+  :material — changes_requested の根拠にできる
+(既存 flow のまま);
+else (no)
+  if (脅威モデル自体への挑戦?) then (yes)
+    :Threat-model challenge 節に記録し、
+結論は残余 material findings のみから発行
+(material 0 件なら approved も正当);
+    |implementer|
+    :対象 issue journal に「owner 判断待ち」を記録
+(以後 owner anchor まで US close 不可・
+当該 guard 面の light 主張 invalid);
+    :coordinator へ canonical handoff;
+    |coordinator|
+    :owner 裁定 anchor candidate を対象 issue journal に append
+(challenge_ref=C + verdict。訂正は supersedes_anchor 付き新 candidate。
+最大 id の candidate が invalid なら C は blocked — 旧裁定へ fallback しない);
+    |implementer|
+    :authoritative anchor (supersession 連鎖の末端) を確認し、
+challenge_attempt (=C) + challenge_resolution (=anchor) の
+両 key 付きの新 canonical request を発行
+(update_model なら valid な threat_model 行を challenged request から更新。
+この request が最大 id の latest attempt になる — 先行候補は自動失効、
+malformed でも帰属して blocked を発動する);
+    |reviewer|
+    :authoritative result を発行 — verdict が defer /
+wontfix_by_policy なら Deferred 節に resolution_anchor 付き entry を
+verdict と同名の disposition で記録;
+    |implementer|
+    :close は close_predicate (outstanding blocker 集合が空 +
+pending record + 一意な authoritative anchor +
+latest attempt の二段階検証 + 時系列 + 意味的一致
+(canonical value / entry の exact binding)) を確認してから
+(帰属不能 record は valid repair record (全 journal を domain とする
+優先順位付き完全分割の単一 pass 評価) での個別修復のみ解消。
+conflict・stale/malformed・forward reference・意味不一致は blocked);
+  else (no — 圏外指摘)
+    |reviewer|
+    :Deferred (out-of-model) 節に item_grammar で記録
+(name / severity / disposition / reason / reevaluate_on);
+  endif
+endif
+|implementer|
+if (qualifying round (test-infra のみ・medium 以下の
+changes_requested) が 2 連続した?
+(導出不能 round はその場で owner ルートへ)) then (yes)
+  :correction へ進まず判断待ちを記録;
+  :coordinator へ canonical handoff;
+  |coordinator|
+  :owner 裁定 anchor (続行 / deferred 化 / mode 解除)
+を記録;
+  |implementer|
+  :anchor を確認してから再開;
+else (no)
+  :従来どおり correction round へ;
+endif
+stop
+@enduml
+```
+
 ## Workflow Change Verification
 
 正本は skill `references/workflow.md` `## Workflow 変更の反映確認 (Workflow Change Verification)` (guardrail / skill / gate 変更後の新セッション反映確認、検証対象を直接変更しない通常開発 task の選定、Claude 実装 / Codex 選定・audit、結果記録と follow-up 起票)。本 doc は再掲しない (#13028 で pointer 化)。本 repo での適用: 反映確認は `mozyo_bridge` 本体の通常開発 task で行う。

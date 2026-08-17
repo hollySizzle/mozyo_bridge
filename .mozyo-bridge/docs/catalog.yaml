@@ -96,6 +96,15 @@ documents:
     related_document_refs:
       - rule-adr-index
 
+  - id: rule-adr-0005-adversarial-mode-convergence
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0005-adversarial-mode-convergence.md
+    purpose: "ADR-0005: adversarial review mode は宣言脅威モデルで収束させ、圏外指摘は保留記録する (#15553)。"
+    audit_role: adr_0005_rule
+    related_document_refs:
+      - rule-adr-index
+
   - id: rule-release-distribution
     type: rule
     status: active
