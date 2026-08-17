@@ -78,15 +78,21 @@ SERVER_CAPABILITIES: Mapping[str, Any] = {"tools": {"listChanged": False}}
 #: Shown to the client as ``instructions``. States the surface's boundary in the
 #: one place an LLM client is guaranteed to read.
 SERVER_INSTRUCTIONS = (
-    "Read/plan tools for mozyo-bridge. Every tool is read-only: none delivers a "
-    "handoff, writes a durable record, mutates a lane, or runs a command. "
-    "`workflow_step_plan` resolves the next safe step without performing it. "
-    "`unit_state` reports four independent axes (workflow / runtime / delivery / "
-    "health) with per-field source, observed_at and freshness; treat `unknown` "
-    "and `unconfirmed` as real answers, and never infer blocked, idle, or "
-    "completed from an absent journal update, a silent pane, or an ended turn. "
-    "Workflow truth is the Redmine durable record; runtime observation is never "
-    "workflow truth, review state, owner approval, or task completion."
+    "Read/plan and high-level mutating tools for mozyo-bridge. The read tools "
+    "(`docs_resolve`, `workflow_glance`, `workflow_step_plan`, `unit_state`) "
+    "are read-only; `workflow_step_plan` resolves the next safe step without "
+    "performing it. The mutating tools (`handoff_send`, `handoff_reply`, "
+    "`sublane_start`) run the same shared application gates the CLI runs — "
+    "durable anchor, role, lane, and authority are verified and a gap refuses "
+    "with a typed reason BEFORE any side effect. No tool accepts a pane "
+    "locator, a tmux target, or a command string; receivers are roles and "
+    "lanes are identities, resolved through managed durable authority only. "
+    "`sublane_start` is a plan unless `actuate` is true. Treat `delivered: "
+    "false` and `unconfirmed` as real answers — never assume delivery or "
+    "completion from an exit code, an absent journal update, a silent pane, "
+    "or an ended turn. Workflow truth is the Redmine durable record; runtime "
+    "observation is never workflow truth, review state, owner approval, or "
+    "task completion."
 )
 
 
@@ -402,7 +408,7 @@ class McpServer:
                 "capabilities": dict(SERVER_CAPABILITIES),
                 "serverInfo": {
                     "name": SERVER_NAME,
-                    "title": "mozyo-bridge local read/plan tools",
+                    "title": "mozyo-bridge local operation tools",
                     "version": __version__,
                 },
                 "instructions": SERVER_INSTRUCTIONS,

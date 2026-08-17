@@ -73,12 +73,15 @@ def register(sub) -> None:
     """Register the ``mcp`` family on the top-level subparsers action."""
     mcp = sub.add_parser(
         "mcp",
-        help="Local MCP server exposing the read/plan tools to an LLM client.",
+        help="Local MCP server exposing the high-level operation tools to an LLM client.",
         description=(
             "Local Model Context Protocol server. `serve` runs a non-interactive "
             "stdio session (the transport an MCP client spawns); `tools` prints "
-            "the published read-only tool catalog. No tool published here mutates "
-            "anything, delivers a handoff, or runs a command."
+            "the published tool catalog. Read/plan tools are read-only; the "
+            "declared mutating tools (handoff_send / handoff_reply / "
+            "sublane_start) run the same shared application gates the CLI runs "
+            "and refuse with typed reasons before any side effect. No tool "
+            "accepts a pane locator, a tmux target, or a command string."
         ),
     )
     mcp_sub = mcp.add_subparsers(dest="mcp_command", required=True)

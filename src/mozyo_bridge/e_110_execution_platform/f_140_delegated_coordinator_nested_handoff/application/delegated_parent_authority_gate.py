@@ -29,7 +29,25 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 __all__ = (
     "delegated_parent_authority_refusal",
+    "delegated_parent_authority_verdict",
 )
+
+
+def delegated_parent_authority_verdict(
+    repo_root: Path, lane_kind: str
+) -> Optional[ParentAuthorityVerdict]:
+    """The typed admission verdict for creating ``lane_kind``, or ``None``.
+
+    ``None`` for every lane kind other than ``delegated_coordinator`` — the
+    admission is the geometry assertion's own cost, and no other kind asserts a
+    parent. For a delegated_coordinator the verdict is returned whether or not it
+    admits, so a typed caller (#15152: the shared sublane-start service both the
+    CLI and the MCP mutating tool run) reads the closed ``reason`` token instead
+    of parsing the refusal prose.
+    """
+    if (lane_kind or "").strip() != DELEGATED_COORDINATOR_LANE_KIND:
+        return None
+    return _decide(repo_root)
 
 
 def delegated_parent_authority_refusal(
@@ -42,10 +60,8 @@ def delegated_parent_authority_refusal(
     parent — and for a delegated_coordinator whose parent gateway is both declared
     and verified.
     """
-    if (lane_kind or "").strip() != DELEGATED_COORDINATOR_LANE_KIND:
-        return None
-    verdict = _decide(repo_root)
-    if verdict.ok:
+    verdict = delegated_parent_authority_verdict(repo_root, lane_kind)
+    if verdict is None or verdict.ok:
         return None
     return parent_authority_refusal_text(verdict)
 

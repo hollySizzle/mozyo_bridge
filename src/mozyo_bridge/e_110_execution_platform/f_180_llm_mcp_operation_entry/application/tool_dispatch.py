@@ -35,12 +35,20 @@ from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.applica
     run_workflow_glance,
     run_workflow_step_plan,
 )
+from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+    run_handoff_reply,
+    run_handoff_send,
+    run_sublane_start_tool,
+)
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.unit_state_tool import (  # noqa: E501
     run_unit_state,
 )
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.tool_catalog import (  # noqa: E501
     TOOL_DOCS_RESOLVE,
+    TOOL_HANDOFF_REPLY,
+    TOOL_HANDOFF_SEND,
     TOOL_NAMES,
+    TOOL_SUBLANE_START,
     TOOL_UNIT_STATE,
     TOOL_WORKFLOW_GLANCE,
     TOOL_WORKFLOW_STEP_PLAN,
@@ -55,12 +63,16 @@ from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.
 
 #: name -> handler. Statically bound built-in functions only; there is no
 #: registration hook and no path-resolved import, so dispatch can never reach code
-#: outside this package.
+#: outside this package. The mutating handlers (#15152) reach the typed shared
+#: application services — never a subprocess, never a raw pane.
 _HANDLERS: Mapping[str, Callable[[Mapping[str, Any], ReadPlanContext], ToolOutcome]] = {
     TOOL_DOCS_RESOLVE: run_docs_resolve,
     TOOL_WORKFLOW_GLANCE: run_workflow_glance,
     TOOL_WORKFLOW_STEP_PLAN: run_workflow_step_plan,
     TOOL_UNIT_STATE: run_unit_state,
+    TOOL_HANDOFF_SEND: run_handoff_send,
+    TOOL_HANDOFF_REPLY: run_handoff_reply,
+    TOOL_SUBLANE_START: run_sublane_start_tool,
 }
 
 

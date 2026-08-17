@@ -15,9 +15,10 @@ read as "nothing is active".
 ``workflow_step_plan`` is the plan half of ``workflow step`` and nothing else. It
 runs the same pure ``resolve_workflow_step`` state machine and reports the
 resolved outcome with ``execution="plan_only"``. It does not dispatch the
-resolved primitive, deliver a handoff, or write a durable record — executing a
-step stays on the CLI until #15152 connects durable authority verification to the
-mutating tools.
+resolved primitive, deliver a handoff, or write a durable record — the mutating
+operations live on the DECLARED mutating tools (#15152,
+``application.mutation_tools``), each behind the same shared authority gates the
+CLI runs, never on this read surface.
 """
 
 from __future__ import annotations

@@ -144,15 +144,31 @@ class LifecycleTests(unittest.TestCase):
 
 
 class ToolsTests(unittest.TestCase):
-    def test_tools_list_publishes_the_four_read_only_tools(self) -> None:
+    def test_tools_list_publishes_the_declared_catalog(self) -> None:
+        # Contract updated by #15152 (was: exactly the four read-only tools):
+        # the three declared mutating tools are now published, honestly
+        # annotated as not read-only.
         session = handshake({"jsonrpc": "2.0", "id": 2, "method": "tools/list"})
         tools = session.by_id(2)["result"]["tools"]
         self.assertEqual(
             [t["name"] for t in tools],
-            ["docs_resolve", "workflow_glance", "workflow_step_plan", "unit_state"],
+            [
+                "docs_resolve",
+                "workflow_glance",
+                "workflow_step_plan",
+                "unit_state",
+                "handoff_send",
+                "handoff_reply",
+                "sublane_start",
+            ],
         )
+        mutating = {"handoff_send", "handoff_reply", "sublane_start"}
         for tool in tools:
-            self.assertTrue(tool["annotations"]["readOnlyHint"], tool["name"])
+            self.assertEqual(
+                tool["annotations"]["readOnlyHint"],
+                tool["name"] not in mutating,
+                tool["name"],
+            )
 
     def test_a_tool_call_returns_content_and_structured_content(self) -> None:
         session = handshake(
@@ -172,18 +188,20 @@ class ToolsTests(unittest.TestCase):
         self.assertIn("resolutions", result["structuredContent"])
 
     def test_an_unknown_tool_is_a_protocol_error_naming_the_available_tools(self) -> None:
+        # `handoff_send` became a published tool in #15152; the unknown-name
+        # probe now uses a name that stays outside the closed vocabulary.
         session = handshake(
             {
                 "jsonrpc": "2.0",
                 "id": 4,
                 "method": "tools/call",
-                "params": {"name": "handoff_send", "arguments": {}},
+                "params": {"name": "sublane_retire", "arguments": {}},
             }
         )
         error = session.by_id(4)["error"]
         self.assertEqual(error["code"], ERROR_INVALID_PARAMS)
         self.assertIn("available_tools", error["data"])
-        self.assertNotIn("handoff_send", error["data"]["available_tools"])
+        self.assertNotIn("sublane_retire", error["data"]["available_tools"])
 
     def test_malformed_arguments_are_a_protocol_error_listing_the_violations(self) -> None:
         session = handshake(
@@ -312,7 +330,7 @@ class InstalledPackageSmokeTests(unittest.TestCase):
         lines = [line for line in completed.stdout.split("\n") if line]
         self.assertEqual(len(lines), 2)
         listed = json.loads(lines[1])["result"]["tools"]
-        self.assertEqual(len(listed), 4)
+        self.assertEqual(len(listed), 7)  # 4 read/plan + 3 declared mutating (#15152)
 
     def test_stdout_carries_no_non_frame_byte(self) -> None:
         completed = self._run(
@@ -337,7 +355,9 @@ class InstalledPackageSmokeTests(unittest.TestCase):
         )
         self.assertEqual(completed.returncode, 0, completed.stderr)
         payload = json.loads(completed.stdout)
-        self.assertEqual(len(payload["tools"]), 4)
+        self.assertEqual(
+            len(payload["tools"]), 7
+        )  # 4 read/plan + 3 declared mutating (#15152)
 
 
 if __name__ == "__main__":  # pragma: no cover

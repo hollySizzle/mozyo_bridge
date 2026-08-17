@@ -544,21 +544,21 @@ def _repo_root(args: argparse.Namespace) -> Path:
     return Path(repo).expanduser() if repo else Path.cwd()
 
 
-def resolve_work_unit_request_fields(
-    args: argparse.Namespace, repo_root: Path
+def resolve_work_unit_fields(
+    explicit: Optional[str], anchor: Optional[str], repo_root: Path
 ) -> tuple[str, Optional[str]]:
-    """Resolve the #13002 work-unit granularity + decision anchor for a create.
+    """Resolve the #13002 work-unit granularity + decision anchor (typed inputs).
 
-    Precedence: an explicit ``--work-unit`` flag wins; otherwise the repo-local
+    Precedence: an explicit work-unit value wins; otherwise the repo-local
     ``.mozyo-bridge/config.yaml`` ``work_unit.granularity`` (a missing / absent
     block is the ``user_story`` default). A present-but-broken config raises
     ``RepoLocalConfigError`` — the caller fails closed instead of silently
-    dispatching with the default unit. The decision anchor
-    (``--work-unit-decision-journal``) passes through verbatim; whether it is
-    required is the pure :func:`decide_work_unit_dispatch` gate's call.
+    dispatching with the default unit. The decision anchor passes through
+    verbatim; whether it is required is the pure
+    :func:`decide_work_unit_dispatch` gate's call. The ONE statement of the
+    precedence rule: the CLI Namespace adapter below and the #15152 typed
+    sublane-start service both call it.
     """
-    anchor = getattr(args, "work_unit_decision_journal", None)
-    explicit = getattr(args, "work_unit", None)
     if explicit:
         return normalize_work_unit_granularity(explicit), anchor
     # Imported lazily so the pure use cases / tests never require the loader
@@ -569,6 +569,17 @@ def resolve_work_unit_request_fields(
 
     config = load_repo_local_config(repo_root)
     return config.work_unit.granularity, anchor
+
+
+def resolve_work_unit_request_fields(
+    args: argparse.Namespace, repo_root: Path
+) -> tuple[str, Optional[str]]:
+    """The Namespace adapter over :func:`resolve_work_unit_fields` (unchanged shape)."""
+    return resolve_work_unit_fields(
+        getattr(args, "work_unit", None),
+        getattr(args, "work_unit_decision_journal", None),
+        repo_root,
+    )
 
 
 def _build_create_request(
@@ -920,6 +931,7 @@ __all__ = (
     "SublaneLifecycleOps",
     "LiveSublaneLifecycleOps",
     "RetireAssertions",
+    "resolve_work_unit_fields",
     "resolve_work_unit_request_fields",
     "SublaneListOutcome",
     "SublaneCreateOutcome",

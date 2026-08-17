@@ -647,10 +647,25 @@ documents:
     audit_role: local_mcp_tool_surface_logic
     related_document_refs:
       - logic-cli-mcp-shared-application-api
+      - logic-mcp-mutation-tool-authority
       - logic-unit-target-model
       - logic-ack-completion-receiver-state
       - logic-managed-state-model
       - logic-runtime-observability-boundary
+      - logic-plugin-ready-adapter-boundary
+      - rule-public-private-boundary
+      - spec-project-map
+
+  - id: logic-mcp-mutation-tool-authority
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/mcp-mutation-tool-authority.md
+    purpose: "local MCP serverのmutating tool (handoff_send / handoff_reply / sublane_start) とdurable authority検証の設計正本 (Redmine #15152 / 親Feature #15148)。宣言済み閉集合MUTATING_TOOL_NAMESのみにread_only=Falseを許し、handoffは#15149のtyped API run_handoff、sublaneは新設のtyped shared service run_sublane_start (work-unit config fail-closed → #15146 delegated_coordinator parent-authority admission → provider launchability preflight → actuation use case) をCLIと同一bodyとして呼ぶ。authority不足・identity不一致・曖昧targetは副作用前に閉じたreason tokenで拒否し、MCP adapterを#15146の回避策にしない。pane locator / tmux target / 任意command文字列はschema上表現できず、unmanaged (assigned identityなし) rowへ副作用を届かせる経路を構造的に持たない。result projectionはallowlist (閉token + caller供給identityのみ、producer自由文とpane/private path evidenceは捨てる)。deliveredはinjection-stage authorityのみから導く。sublane_startはplan既定でactuate明示のみ副作用。"
+    audit_role: mcp_mutation_tool_authority_logic
+    related_document_refs:
+      - logic-cli-mcp-shared-application-api
+      - logic-local-mcp-tool-surface
+      - logic-tmux-send-safety-contract
       - logic-plugin-ready-adapter-boundary
       - rule-public-private-boundary
       - spec-project-map

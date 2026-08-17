@@ -24,6 +24,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.tool_catalog import (  # noqa: E402,E501
     FORBIDDEN_PROPERTY_TOKENS,
+    MUTATING_TOOL_NAMES,
     SUPPORTED_SCHEMA_KEYWORDS,
     TOOL_CATALOG,
     TOOL_NAMES,
@@ -53,31 +54,48 @@ def synthetic(name: str, input_schema: dict, *, read_only: bool = True) -> dict:
 
 
 class ShippedCatalogTests(unittest.TestCase):
-    def test_catalog_is_the_closed_four_tool_vocabulary(self) -> None:
+    # Contract updated by #15152 (was: "the closed four-tool vocabulary, every
+    # tool read-only, no tool name suggests a mutating operation"). The catalog
+    # now publishes the four read/plan tools PLUS the three DECLARED mutating
+    # tools; the negative surface (no pane / tmux / command capability) is
+    # unchanged and still guard-enforced on every tool, mutating included.
+    def test_catalog_is_the_closed_seven_tool_vocabulary(self) -> None:
         self.assertEqual(tuple(TOOL_CATALOG), TOOL_NAMES)
-        self.assertEqual(len(TOOL_NAMES), 4)
+        self.assertEqual(len(TOOL_NAMES), 7)
 
     def test_shipped_catalog_publishes_no_forbidden_capability(self) -> None:
         self.assertEqual(catalog_surface_violations(), ())
 
-    def test_every_shipped_tool_is_read_only(self) -> None:
+    def test_read_only_split_matches_the_declared_mutating_set(self) -> None:
+        # Was `test_every_shipped_tool_is_read_only` before #15152: read-only is
+        # now exactly the complement of the closed MUTATING_TOOL_NAMES set, and
+        # the annotations a client plans around match the declaration.
         for name, definition in TOOL_CATALOG.items():
-            self.assertTrue(definition.read_only, name)
+            expected_read_only = name not in MUTATING_TOOL_NAMES
+            self.assertEqual(definition.read_only, expected_read_only, name)
             annotations = definition.as_payload()["annotations"]
-            self.assertTrue(annotations["readOnlyHint"], name)
+            self.assertEqual(annotations["readOnlyHint"], expected_read_only, name)
+            self.assertEqual(annotations["idempotentHint"], expected_read_only, name)
             self.assertFalse(annotations["destructiveHint"], name)
 
-    def test_no_tool_name_suggests_a_mutating_operation(self) -> None:
-        """`handoff send`, `sublane create`, `workflow step` (execute) are absent."""
+    def test_no_read_tool_name_suggests_a_mutating_operation(self) -> None:
+        """The read/plan tool names stay free of mutating verbs (#15152 keeps
+        the mutating names to exactly the declared closed set)."""
         for forbidden in ("send", "reply", "create", "retire", "dispatch", "execute"):
             for name in TOOL_NAMES:
+                if name in MUTATING_TOOL_NAMES:
+                    continue
                 self.assertNotIn(forbidden, name, f"{name} looks mutating")
+        self.assertEqual(
+            MUTATING_TOOL_NAMES,
+            frozenset({"handoff_send", "handoff_reply", "sublane_start"}),
+        )
 
     def test_tools_list_payload_is_json_serializable_plain_containers(self) -> None:
         import json
 
         payload = list_tools_payload()
-        self.assertEqual(len(payload), 4)
+        self.assertEqual(len(payload), 7)
         json.dumps(payload)  # must not raise on MappingProxyType / tuple
         for tool in payload:
             self.assertIsInstance(tool["inputSchema"], dict)
@@ -89,8 +107,11 @@ class ShippedCatalogTests(unittest.TestCase):
             schema["properties"] = {}  # type: ignore[index]
 
     def test_unknown_tool_fails_closed(self) -> None:
-        with self.assertRaises(UnknownToolError):
-            tool_definition("handoff_send")
+        # `handoff_send` became a published tool in #15152; the fail-closed
+        # probe now uses names that stay outside the closed vocabulary.
+        for unknown in ("workflow_step_run", "sublane_retire", "cockpit_append"):
+            with self.assertRaises(UnknownToolError):
+                tool_definition(unknown)
 
 
 class SurfaceGuardDetectionTests(unittest.TestCase):

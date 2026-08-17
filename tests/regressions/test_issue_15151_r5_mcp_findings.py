@@ -389,6 +389,12 @@ class R4F4OutputSchemaConformanceTests(unittest.TestCase):
                 "unit_state": {
                     "unit": {"workspace_id": "w", "lane_id": "l", "project_id": "p"}
                 },
+                # #15152's declared mutating tools ride the same conformance
+                # contract: a handler failure still yields a schema-conformant
+                # (or withheld) structured result.
+                "handoff_send": {"to": "codex"},
+                "handoff_reply": {"to": "claude"},
+                "sublane_start": {"issue": "1", "lane_label": "issue_1_x"},
             }[name]
             with patch.dict(
                 "mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry."

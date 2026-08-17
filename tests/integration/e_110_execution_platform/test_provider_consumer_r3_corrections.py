@@ -88,18 +88,26 @@ class R3F1RealCompositionThreadsSnapshotToSublanePreflight(unittest.TestCase):
 
     def test_real_handler_delivers_the_injected_snapshot_to_the_preflight(self) -> None:
         # Drive the REAL parser -> parsed handler -> preflight seam and capture what the
-        # preflight received. Blocking (return True) makes cmd_sublane_start return before
-        # any side effect, so the test stays hermetic.
-        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator as act  # noqa: E501
+        # preflight received. Blocking (returning a refusal) makes cmd_sublane_start
+        # return before any side effect, so the test stays hermetic.
+        #
+        # #15152 moved the preflight decision into the typed shared service
+        # (`sublane_start_service.provider_preflight_refusal`) that the CLI handler and
+        # the MCP `sublane_start` tool both run, so the spy seam moved with it; the
+        # contract pinned here — the composition-injected snapshot reaches the
+        # preflight — is unchanged.
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_start_service as svc  # noqa: E501
 
         captured = {}
-        orig = act._sublane_start_provider_preflight_blocked
+        orig = svc.provider_preflight_refusal
 
-        def _spy(repo_root, *, snapshot=None):
+        def _spy(repo_root, snapshot=None):
             captured["snapshot"] = snapshot
-            return True
+            return svc.SublaneStartRefusal(
+                reason=svc.REFUSAL_PROVIDER_NOT_LAUNCHABLE, message="spy block"
+            )
 
-        act._sublane_start_provider_preflight_blocked = _spy
+        svc.provider_preflight_refusal = _spy
         try:
             import tempfile
 
@@ -108,7 +116,7 @@ class R3F1RealCompositionThreadsSnapshotToSublanePreflight(unittest.TestCase):
                 ns.repo = tmp  # a clean, config-less repo -> work-unit resolves to default
                 rc = ns.func(ns)
         finally:
-            act._sublane_start_provider_preflight_blocked = orig
+            svc.provider_preflight_refusal = orig
         self.assertEqual(rc, 1)  # blocked -> zero side effect
         self.assertIs(captured["snapshot"], SYNTH)  # the injection reached the preflight
 

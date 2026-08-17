@@ -70,7 +70,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (
     cmd_sublane_create,
-    resolve_work_unit_request_fields,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     DISPATCH_DELIVERY_NOT_SENT,
@@ -203,7 +202,7 @@ def resolve_dispatch_admission_args(
 
 
 def _resolve_sublane_ops(
-    args: argparse.Namespace,
+    args: Optional[argparse.Namespace],
     *,
     repo_root: Path,
     request: SublaneCreateRequest,
@@ -215,6 +214,10 @@ def _resolve_sublane_ops(
     :class:`~...application.sublane_actuator_herdr_ops.HerdrSublaneActuatorOps`, carrying the
     requested lane identity so its inventory read-back projects the lane. Anything else →
     the tmux :class:`LiveSublaneActuatorOps`, unchanged.
+
+    ``args`` is not read by the selection; the typed #15152 service passes ``None``
+    while the historical test callers keep passing a Namespace. Kept as the ONE
+    selection point for both entries.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
         repo_backend_is_herdr,
@@ -246,48 +249,21 @@ def _resolve_sublane_ops(
 def _sublane_start_provider_preflight_blocked(repo_root, *, snapshot=None) -> bool:
     """Fail closed (True) when a lane's bound gateway/worker provider cannot be launched.
 
-    Redmine #13569 R1-F2 / R2-F2b. Resolves the coordinator (gateway) and implementer
-    (worker) providers from the repo-local ``RoleProviderBinding`` and checks each against
-    the ``snapshot``'s mechanical launchability (the same protocol + interactive-TUI
-    predicate the launch preflight enforces). ``snapshot`` is the composition's injected
-    agent-provider snapshot (R2-F2b): a provider that is launchable in the injected
-    registry — a rebound synthetic worker — PASSES, so the preflight does not reject a
-    valid rebind against a stale built-in set. ``None`` uses the built-in snapshot,
-    byte-identical. Returns ``True`` — and prints an actionable reason — when a role is
-    unbound, or its provider is unknown or not launchable, so ``cmd_sublane_start`` returns
-    before any side effect.
+    Redmine #13569 R1-F2 / R2-F2b. Since #15152 the decision itself lives in the
+    typed shared service (:func:`...sublane_start_service.provider_preflight_refusal`),
+    which the CLI and the MCP mutating entry both run; this wrapper keeps the
+    historical print-and-bool shape for its direct callers and prints the same
+    fixed wording to stderr.
     """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
-        WorkflowProviderUnresolved,
-        resolve_gateway_provider,
-        resolve_worker_provider,
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_start_service import (  # noqa: E501
+        provider_preflight_refusal,
     )
 
-    if snapshot is None:
-        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_runtime import (  # noqa: E501
-            BUILTIN_AGENT_PROVIDER_SNAPSHOT,
-        )
-
-        snapshot = BUILTIN_AGENT_PROVIDER_SNAPSHOT
-    root = str(repo_root)
-    try:
-        providers = (
-            ("gateway", resolve_gateway_provider(root)),
-            ("worker", resolve_worker_provider(root)),
-        )
-    except WorkflowProviderUnresolved as exc:
-        print(f"sublane start refused: {exc}; no lane was created.", file=sys.stderr)
-        return True
-    for role, provider in providers:
-        if not snapshot.is_launchable(provider):
-            print(
-                f"sublane start refused: the {role} provider {provider!r} is not a "
-                f"launchable agent provider (unknown, or a non-interactive protocol / "
-                f"missing capability); no lane was created.",
-                file=sys.stderr,
-            )
-            return True
-    return False
+    refusal = provider_preflight_refusal(Path(str(repo_root)), snapshot=snapshot)
+    if refusal is None:
+        return False
+    print(refusal.message, file=sys.stderr)
+    return True
 
 
 def cmd_sublane_start(args: argparse.Namespace) -> int:
@@ -304,109 +280,60 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
         return cmd_sublane_create(args)
 
     repo_root = _repo_root(args)
-    # Resolve the #13002 work-unit granularity exactly as the plan-only surface
-    # does (flag > repo-local config > user_story default), failing closed on a
-    # present-but-broken config instead of silently actuating the default unit.
-    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
-        RepoLocalConfigError,
-    )
-
-    try:
-        work_unit, decision_anchor = resolve_work_unit_request_fields(args, repo_root)
-    except RepoLocalConfigError as exc:
-        print(f"invalid repo-local config: {exc}", file=sys.stderr)
-        return 1
-
-    # Parent-authority admission (Redmine #15146): a delegated_coordinator lane
-    # asserts a parent project gateway; with no such gateway durably declared AND
-    # verified, the creation used to succeed and the resulting Unit projected a
-    # different role on every surface. Refused HERE — before the provider
-    # preflight and before any worktree / pane / dispatch side effect — with the
-    # same decision the plan-only surface runs, so plan and execute cannot drift.
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.delegated_parent_authority_gate import (  # noqa: E501
-        delegated_parent_authority_refusal,
-    )
-
-    parent_refusal = delegated_parent_authority_refusal(
-        repo_root, getattr(args, "lane_kind", "") or ""
-    )
-    if parent_refusal is not None:
-        print(parent_refusal, file=sys.stderr)
-        return 1
-
-    # Binding / launchability preflight (Redmine #13569 R1-F2): before ANY worktree or
-    # pane actuation, verify the providers the repo-local binding assigns to the lane's
-    # gateway (coordinator) and worker (implementer) roles are recognized AND mechanically
-    # launchable. An unbound role, an unknown provider, or a provider that is expressible
-    # but not launchable (a non-interactive protocol / missing capability) fails closed
-    # here — zero-start — rather than letting the default pair launch and then being unable
-    # to route to the intended provider. For the built-in binding (codex / claude, both
-    # launchable) this always passes, so the default path is byte-identical.
-    if _sublane_start_provider_preflight_blocked(
-        repo_root, snapshot=getattr(args, "snapshot", None)
-    ):
-        return 1
-
-    request = SublaneCreateRequest(
-        issue=getattr(args, "issue", "") or "",
-        lane_label=getattr(args, "lane_label", "") or "",
-        branch=getattr(args, "branch", "") or "",
-        worktree_path=getattr(args, "worktree", "") or "",
-        journal=getattr(args, "journal", None),
-        upstream_coordinator=getattr(args, "upstream_coordinator", None),
-        work_unit=work_unit,
-        work_unit_decision_anchor=decision_anchor,
-        # Redmine #14224 correction (j#84882): this is the SECOND request-construction
-        # site (the plan-only surface builds its own in sublane_lifecycle_command). Both
-        # must carry the same leaf admission input, or the same argv resolves differently
-        # across `sublane create` (plan) and `--dry-run` / `--execute` — which is exactly
-        # the drift the exact-installed black-box caught.
-        leaf_standalone=bool(getattr(args, "leaf_standalone", False)),
-        base_ref=getattr(args, "base_ref", None),
-        lane_kind=getattr(args, "lane_kind", "") or "",
-    )
     fill_inputs, override_fill_stop = resolve_dispatch_admission_args(args)
     # #13293: in --json mode, confine the composed sub-CLI (cockpit append / handoff
     # send) progress text to stderr so stdout is a single parseable JSON envelope.
     json_mode = bool(getattr(args, "json", False))
-    # #13293: convert the --gateway-ready-timeout window into a bounded probe count
-    # (<=0 disables the pre-dispatch readiness wait for back-compat / non-tmux runs).
-    ready_timeout = float(getattr(args, "gateway_ready_timeout", 10.0) or 0.0)
-    interval = DEFAULT_GATEWAY_READY_INTERVAL_SECONDS
-    ready_probes = (
-        0 if ready_timeout <= 0 else max(1, round(ready_timeout / interval))
+
+    # Redmine #15152: the whole actuation body — the #13002 work-unit config
+    # fail-closed, the #15146 delegated_coordinator parent-authority admission,
+    # the #13569 provider launchability preflight, the backend-selected adapter,
+    # and the use-case run — lives in the typed shared service the local MCP
+    # `sublane_start` tool also calls. This adapter only terminates the parsed
+    # Namespace and owns stdout/stderr + the exit code, so the two entries cannot
+    # drift (#14224); the Namespace never crosses into the service.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_start_service import (  # noqa: E501
+        SublaneStartCommand,
+        run_sublane_start,
     )
-    # Redmine #13331 (option A, j#73314): under `terminal_transport.backend: herdr` a lane
-    # is its own herdr workspace (prepare_session on the lane worktree), not a tmux cockpit
-    # column — so pick the herdr actuation adapter. The pure use-case choreography is
-    # unchanged (both adapters satisfy the same SublaneActuatorOps port); the tmux path is
-    # byte-for-byte the #12973 behaviour (a broken / absent config resolves to tmux, exactly
-    # like the send path's `herdr_backend_selected`).
-    ops = _resolve_sublane_ops(
-        args,
-        repo_root=repo_root,
-        request=request,
-        quiet_stdout=json_mode,
+
+    result = run_sublane_start(
+        SublaneStartCommand(
+            repo_root=repo_root,
+            issue=getattr(args, "issue", "") or "",
+            lane_label=getattr(args, "lane_label", "") or "",
+            branch=getattr(args, "branch", "") or "",
+            worktree_path=getattr(args, "worktree", "") or "",
+            journal=getattr(args, "journal", None),
+            upstream_coordinator=getattr(args, "upstream_coordinator", None),
+            work_unit=getattr(args, "work_unit", None),
+            work_unit_decision_anchor=getattr(
+                args, "work_unit_decision_journal", None
+            ),
+            # Redmine #14224 correction (j#84882): both request-construction
+            # sites (the plan-only surface and this actuating one) must carry
+            # the same leaf admission input, or the same argv resolves
+            # differently across `sublane create` (plan) and `--dry-run` /
+            # `--execute`.
+            leaf_standalone=bool(getattr(args, "leaf_standalone", False)),
+            base_ref=getattr(args, "base_ref", None),
+            lane_kind=getattr(args, "lane_kind", "") or "",
+            execute=execute and not dry_run,
+            dispatch=not getattr(args, "no_dispatch", False),
+            target_repo=getattr(args, "target_repo", None) or "auto",
+            gateway_ready_timeout=float(
+                getattr(args, "gateway_ready_timeout", 10.0) or 0.0
+            ),
+            fill_inputs=fill_inputs,
+            override_fill_stop=override_fill_stop,
+            quiet_stdout=json_mode,
+            provider_snapshot=getattr(args, "snapshot", None),
+        )
     )
-    use_case = SublaneActuateUseCase(
-        ops,
-        gateway_ready_probes=ready_probes,
-        gateway_ready_interval_seconds=interval,
-    )
-    # Action-time sender-attestation preflight (#13518 R3-F4a → #13613): the sender identity is no
-    # longer measured here by mere env *presence*. The single authority is the use case's
-    # `ops.preflight_dispatch_sender()` (#13613), which resolves the sender identity and compares it
-    # against the workspace anchor / registry / coordinator provider and fails closed BEFORE any
-    # lane / worktree mutation. A wrong-but-nonempty MOZYO_WORKSPACE_ID / MOZYO_AGENT_ROLE therefore
-    # no longer passes as "attested". No second presence-only authority is retained here.
-    outcome = use_case.run(
-        request,
-        execute=execute and not dry_run,
-        dispatch=not getattr(args, "no_dispatch", False),
-        target_repo=getattr(args, "target_repo", None) or "auto",
-        fill_inputs=fill_inputs,
-        override_fill_stop=override_fill_stop,
-    )
+    if result.refused:
+        print(result.refusal.message, file=sys.stderr)
+        return result.exit_code
+    outcome = result.outcome
     if json_mode:
         print(
             json.dumps(
@@ -415,7 +342,7 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
         )
     else:
         print(format_actuate_text(outcome))
-    return 1 if outcome.is_blocked else 0
+    return result.exit_code
 
 
 __all__ = (

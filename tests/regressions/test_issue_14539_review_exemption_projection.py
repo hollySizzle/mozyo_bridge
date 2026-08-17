@@ -4589,6 +4589,15 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "token itself, renders none, and reads no durable note — it captures the "
             "already-built outcome objects the orchestration publishes",
         ),
+        "src/mozyo_bridge/e_110_execution_platform/f_180_llm_mcp_operation_entry/domain/tool_catalog.py": (
+            ['handoff'],
+            "inherits via a used import of handoff for the canonical `KIND_LABELS` / "
+            "`SOURCES` vocabularies its mutating tool input schemas enumerate (Redmine "
+            "#15152: the MCP `kind` / `source` enums are sourced from the same domain "
+            "constants the orchestration gate checks, so the schema boundary cannot "
+            "drift from the gate); names no marker token itself, renders none, and "
+            "reads no durable note — it declares tool schemas",
+        ),
         "src/mozyo_bridge/application/handoff_transport_wiring.py": (
             ['handoff'],
             "inherits via a used import of handoff for the pure `is_explicit_pane_target` "

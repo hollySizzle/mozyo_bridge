@@ -6,13 +6,16 @@ Unit 状態の read model を確定する設計正本。
 
 前提となる境界は `cli-mcp-shared-application-api.md`（#15149）が確定した
 「判断は 1 箇所、entry は 2 つ」である。本書はその上に **MCP 側の entry** を置く。
-本書は mutating tool への authority 検証（#15152）、managed LLM の入口切替（#15150）、
+本書は mutating tool への authority 検証（#15152 — 正本は
+`mcp-mutation-tool-authority.md`）、managed LLM の入口切替（#15150）、
 CLI の維持境界（#15154）を含まない。
 
 ## Decision
 
-local MCP server は **read/plan のみ** を公開する。tool 語彙は閉じた 4 つで、
-外部から 5 つ目を表現する手段を持たない。
+local MCP server の **read/plan surface** は閉じた 4 tool である（#15152 が同じ catalog に
+宣言済み mutating tool の閉集合を追加した。read/plan 側の契約 — 本書 — は不変で、
+mutating 側の宣言・authority 検証・projection 規律は `mcp-mutation-tool-authority.md` を
+読む）。外部から語彙を拡張する手段は無い。
 
 | tool | 対応 CLI | 内容 |
 | --- | --- | --- |
@@ -58,11 +61,14 @@ resolve_workflow_step / lane lifecycle store）
 
 ## Invariants
 
-1. **read/plan のみ。** 公開 tool は 4 つで、mutating handoff / sublane 操作、任意
-   command 文字列、shell argv、raw pane / tmux 操作を **schema 上表現できない**。
-   これは散文の約束ではなく `catalog_surface_violations()` が構造検査する
-   （input property 名と enum 値を禁止 token 集合に照合し、server 起動時に
-   fail-closed）。
+1. **read/plan tool は read-only であり、raw surface は誰にも表現できない。**
+   read/plan の公開 tool は 4 つ。任意 command 文字列、shell argv、raw pane / tmux
+   操作は **どの tool の schema 上も表現できない**。これは散文の約束ではなく
+   `catalog_surface_violations()` が構造検査する（input property 名と enum 値を
+   禁止 token 集合に照合し、server 起動時に fail-closed）。#15152 以降、
+   `read_only=False` は宣言済み mutating 閉集合の member にのみ許される
+   （宣言と annotation の双方向一致も同 guard が検査。mutating 側の契約は
+   `mcp-mutation-tool-authority.md`）。
 2. **MCP が CLI を subprocess 実行しない。** handler は CLI と同じ in-process entry
    を呼ぶ。client が server を spawn するのは stdio transport そのものであり、
    本条の対象ではない。
@@ -357,7 +363,8 @@ behavior 差分（意図的、#15151）: workflow-runtime store の構築が fai
 
 ## Non-goals
 
-- mutating MCP tool と durable authority 検証（#15152）。
+- mutating MCP tool と durable authority 検証（#15152 で実装済み。正本は
+  `mcp-mutation-tool-authority.md` — 本書の scope 外のまま）。
 - managed LLM の標準操作入口切替（#15150）。
 - CLI の削除 / 維持境界（#15154）。
 - external plugin API。

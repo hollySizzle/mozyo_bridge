@@ -219,7 +219,9 @@ class Finding1LifecycleTests(unittest.TestCase):
             [INITIALIZE, INITIALIZED, {"jsonrpc": "2.0", "id": 2, "method": "tools/list"}]
         )
         self.assertEqual(server._phase, PHASE_READY)
-        self.assertEqual(len(responses[1]["result"]["tools"]), 4)
+        self.assertEqual(
+            len(responses[1]["result"]["tools"]), 7
+        )  # 4 read/plan + 3 declared mutating (#15152)
 
     def test_requests_are_refused_between_initialize_and_initialized(self) -> None:
         responses, _, server = session(

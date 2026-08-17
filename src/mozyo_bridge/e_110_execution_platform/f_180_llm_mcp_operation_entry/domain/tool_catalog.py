@@ -1,23 +1,35 @@
-"""The closed tool vocabulary and its typed schemas (pure, Redmine #15161).
+"""The closed tool vocabulary and its typed schemas (pure, Redmine #15161 / #15152).
 
-Four read/plan tools, and no way to express a fifth from outside this module. The
-catalog is a frozen table, :func:`tool_definition` fails closed on an unknown name,
-and there is no registration hook — a new tool is a source change that a reviewer
-sees, never a runtime extension. That is also why no external plugin API is
-exposed: this Feature's non-goals inherit
-``plugin-ready-adapter-boundary.md``'s.
+Four read/plan tools plus three declared mutating tools, and no way to express an
+eighth from outside this module. The catalog is a frozen table,
+:func:`tool_definition` fails closed on an unknown name, and there is no
+registration hook — a new tool is a source change that a reviewer sees, never a
+runtime extension. That is also why no external plugin API is exposed: this
+Feature's non-goals inherit ``plugin-ready-adapter-boundary.md``'s.
 
 The negative surface is enforced, not merely intended. #15148's Boundary forbids
-publishing arbitrary command strings, shell argv, raw pane / tmux operations, and
-mutating handoff / sublane operations as tools. A prose promise is not a
-guarantee, so :func:`catalog_surface_violations` walks every declared schema and
-reports any property whose name or enum value lands in
-:data:`FORBIDDEN_PROPERTY_TOKENS`. The server calls it at startup and refuses to
-serve a violating catalog; a test calls the same function, so the invariant cannot
-rot into a comment.
+publishing arbitrary command strings, shell argv, and raw pane / tmux operations
+as tools; #15152 adds the HIGH-LEVEL mutating handoff / sublane operations while
+keeping that boundary intact. A prose promise is not a guarantee, so
+:func:`catalog_surface_violations` walks every declared schema — mutating tools
+included — and reports any property whose name or enum value lands in
+:data:`FORBIDDEN_PROPERTY_TOKENS`, plus any non-read-only tool that is not a
+member of the closed :data:`MUTATING_TOOL_NAMES` declaration (and any declared
+mutating name that claims to be read-only). The server calls it at startup and
+refuses to serve a violating catalog; a test calls the same function, so the
+invariant cannot rot into a comment.
+
+The mutating tools carry no authority of their own: each handler calls the same
+shared application processing the CLI calls (#15149's ``run_handoff``, #15152's
+``run_sublane_start``), so authority / identity / anchor / send-safety gates run
+identically for both entries and refuse with typed reasons BEFORE any side
+effect. A receiver is named by ROLE and a lane by its identity — a pane locator,
+tmux target, or command string is not representable in these schemas, which is
+how the surface refuses to address the unmanaged (receipt-less) rows measured in
+#15152 j#102930 / j#102998.
 
 Argument validation is a **closed subset** of JSON Schema — the constructs these
-four schemas actually use (``type`` / ``properties`` / ``required`` /
+schemas actually use (``type`` / ``properties`` / ``required`` /
 ``additionalProperties`` / ``items`` / ``enum`` / ``minItems`` / ``minLength``).
 Implementing that subset rather than adding a ``jsonschema`` dependency keeps the
 published package's dependency set as small as it is today, and the subset is
@@ -32,6 +44,11 @@ from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Mapping
 
+from mozyo_bridge.core.state.lane_kind import LANE_KINDS
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
+    KIND_LABELS,
+    SOURCES,
+)
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.unit_selector import (  # noqa: E501
     REQUIRED_SELECTOR_FIELDS,
 )
@@ -45,12 +62,27 @@ TOOL_DOCS_RESOLVE = "docs_resolve"
 TOOL_WORKFLOW_GLANCE = "workflow_glance"
 TOOL_WORKFLOW_STEP_PLAN = "workflow_step_plan"
 TOOL_UNIT_STATE = "unit_state"
+TOOL_HANDOFF_SEND = "handoff_send"
+TOOL_HANDOFF_REPLY = "handoff_reply"
+TOOL_SUBLANE_START = "sublane_start"
 
 TOOL_NAMES = (
     TOOL_DOCS_RESOLVE,
     TOOL_WORKFLOW_GLANCE,
     TOOL_WORKFLOW_STEP_PLAN,
     TOOL_UNIT_STATE,
+    TOOL_HANDOFF_SEND,
+    TOOL_HANDOFF_REPLY,
+    TOOL_SUBLANE_START,
+)
+
+#: The CLOSED declaration of which tools are allowed to be non-read-only
+#: (Redmine #15152). :func:`catalog_surface_violations` enforces it both ways: a
+#: non-read-only tool outside this set is a violation, and a member claiming
+#: ``read_only`` is one too — the annotation a client plans around must match the
+#: declaration a reviewer sees.
+MUTATING_TOOL_NAMES = frozenset(
+    {TOOL_HANDOFF_SEND, TOOL_HANDOFF_REPLY, TOOL_SUBLANE_START}
 )
 
 #: Property-name and enum-value substrings that would publish a forbidden
@@ -96,13 +128,15 @@ SUPPORTED_SCHEMA_KEYWORDS = frozenset(
     }
 )
 
-_TYPE_CHECKS = {
-    "object": lambda v: isinstance(v, Mapping),
-    "array": lambda v: isinstance(v, (list, tuple)) and not isinstance(v, (str, bytes)),
-    "string": lambda v: isinstance(v, str),
-    "boolean": lambda v: isinstance(v, bool),
-    "integer": lambda v: isinstance(v, int) and not isinstance(v, bool),
-}
+# The recursive validator, the freeze/copy helpers, and the skeleton projection
+# live in `.tool_schema_subset` (mechanical #15152 carve-out for module health).
+# `conforming_skeleton` is re-exported here so import sites are unchanged.
+from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.tool_schema_subset import (  # noqa: E501
+    conforming_skeleton,
+    freeze as _freeze,
+    plain as _plain,
+    validate_value,
+)
 
 
 @dataclass(frozen=True)
@@ -110,8 +144,10 @@ class ToolDefinition:
     """One published tool.
 
     ``read_only`` is stated on every tool in this catalog and is not a hint the
-    handler may contradict: the handlers reach read-only application processing,
-    and the mutating operations live behind #15152's separate authority work.
+    handler may contradict: read-only handlers reach read-only application
+    processing, and a ``read_only=False`` tool is only publishable when its name
+    is a member of the closed :data:`MUTATING_TOOL_NAMES` declaration (#15152) —
+    :func:`catalog_surface_violations` refuses everything else at startup.
     """
 
     name: str
@@ -122,7 +158,14 @@ class ToolDefinition:
     read_only: bool = True
 
     def as_payload(self) -> dict:
-        """The MCP ``tools/list`` entry for this tool."""
+        """The MCP ``tools/list`` entry for this tool.
+
+        A mutating tool is honestly annotated: not read-only and not idempotent
+        (re-running a delivered send or an executed lane creation is a second
+        operation, not a no-op). ``destructiveHint`` stays False for every tool —
+        the published mutating surface is additive-only (a governed send / an
+        additive lane create); no tool here deletes, kills, or overwrites.
+        """
         return {
             "name": self.name,
             "title": self.title,
@@ -132,28 +175,10 @@ class ToolDefinition:
             "annotations": {
                 "readOnlyHint": self.read_only,
                 "destructiveHint": False,
-                "idempotentHint": True,
+                "idempotentHint": self.read_only,
                 "openWorldHint": False,
             },
         }
-
-
-def _plain(value: Any) -> Any:
-    """Deep-copy a frozen schema into plain JSON containers for serialization."""
-    if isinstance(value, Mapping):
-        return {key: _plain(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_plain(item) for item in value]
-    return value
-
-
-def _freeze(value: Any) -> Any:
-    """Deep-freeze a schema literal so a consumer cannot mutate the catalog."""
-    if isinstance(value, Mapping):
-        return MappingProxyType({key: _freeze(item) for key, item in value.items()})
-    if isinstance(value, (list, tuple)):
-        return tuple(_freeze(item) for item in value)
-    return value
 
 
 # --- shared schema fragments ----------------------------------------------- #
@@ -391,6 +416,263 @@ _UNIT_STATE = ToolDefinition(
     ),
 )
 
+# --- the three mutating tools (Redmine #15152) ----------------------------- #
+#
+# Each is the typed MCP entry over the SAME shared application processing the
+# CLI runs — no judgement is restated here, and none can be skipped. The schemas
+# deliberately cannot name a pane, a tmux target, or a command string: a
+# receiver is a ROLE, a lane is an identity, and an anchor is issue/journal
+# (or task/comment) ids. Authority, identity, anchor-ownership, route, and
+# send-safety gates all run inside the shared orchestration and refuse with
+# typed reasons before any side effect.
+
+_HANDOFF_ANCHOR_PROPERTIES = {
+    "source": {
+        "type": "string",
+        "enum": sorted(SOURCES),
+        "default": "redmine",
+        "description": (
+            "Durable anchor system. `redmine` anchors with issue+journal; "
+            "`asana` anchors with task_id+comment_id. Cross-source fields are "
+            "refused by the shared anchor gate."
+        ),
+    },
+    "issue": {
+        "type": "string",
+        "description": "Redmine durable-anchor issue id (required by the gate for source=redmine).",
+    },
+    "journal": {
+        "type": "string",
+        "description": "Redmine durable-anchor journal id (required by the gate for source=redmine).",
+    },
+    "task_id": {
+        "type": "string",
+        "description": "Asana durable-anchor task id (source=asana).",
+    },
+    "comment_id": {
+        "type": "string",
+        "description": "Asana durable-anchor comment id (source=asana).",
+    },
+}
+
+
+def _handoff_input_schema(operation_note: str) -> Mapping[str, Any]:
+    return _freeze(
+        {
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": (
+                        "Receiver ROLE vocabulary (e.g. `claude` / `codex`), "
+                        "validated by the orchestration's receiver gate. Never "
+                        "a pane locator: delivery resolves only through managed "
+                        "assigned identity, so an unmanaged (identity-less) row "
+                        "cannot be addressed."
+                    ),
+                },
+                **_HANDOFF_ANCHOR_PROPERTIES,
+                "kind": {
+                    "type": "string",
+                    "enum": sorted(KIND_LABELS),
+                    "description": (
+                        "Handoff intent label. " + operation_note
+                    ),
+                },
+                "summary": {
+                    "type": "string",
+                    "description": "Optional summary line (required by the gate for kind=custom).",
+                },
+                "lane": {
+                    "type": "string",
+                    "description": (
+                        "Target lane identity (narrowing). The lane's receiver "
+                        "is resolved from durable lane authority, not from a "
+                        "pane position."
+                    ),
+                },
+                "target_repo": {
+                    "type": "string",
+                    "default": "auto",
+                    "description": "Target-repo resolution (default: auto).",
+                },
+            },
+            "required": ["to"],
+            "additionalProperties": False,
+        }
+    )
+
+
+#: Output schema shared by the two handoff tools. `default`s are the fail-closed
+#: neutrals `conforming_skeleton` fills on an error result: a failed call must
+#: never look delivered.
+_HANDOFF_OUTPUT_SCHEMA = _freeze(
+    {
+        "type": "object",
+        "properties": {
+            "operation": {"type": "string", "default": ""},
+            "status": {"type": "string", "default": "fail_closed"},
+            "exit_code": {"type": "integer", "default": 2},
+            "delivered": {"type": "boolean", "default": False},
+            "injection_stage": {"type": "string", "default": ""},
+            "outcome": {"type": "object", "default": {}},
+            "refusal": {"type": "string", "default": ""},
+        },
+        "required": ["operation", "status", "delivered", "outcome"],
+    }
+)
+
+_HANDOFF_MUTATION_DESCRIPTION = (
+    "MUTATING. Runs the same shared handoff orchestration the CLI runs "
+    "(in-process, #15149): durable-anchor ownership, receiver vocabulary, "
+    "identity, gateway-route and send-safety gates all apply and refuse with "
+    "typed reasons before any side effect. Delivery is reported from the shared "
+    "injection-stage authority; `delivered: false` with status `completed` "
+    "means the send terminated without confirmed submission — never assume "
+    "delivery from exit alone."
+)
+
+_HANDOFF_SEND = ToolDefinition(
+    name=TOOL_HANDOFF_SEND,
+    title="Send an anchored cross-agent handoff",
+    description=(
+        "Send a governed, durable-anchored handoff to a receiver ROLE. "
+        + _HANDOFF_MUTATION_DESCRIPTION
+    ),
+    input_schema=_handoff_input_schema(
+        "Defaults per the shared entry policy for `send`."
+    ),
+    output_schema=_HANDOFF_OUTPUT_SCHEMA,
+    read_only=False,
+)
+
+_HANDOFF_REPLY = ToolDefinition(
+    name=TOOL_HANDOFF_REPLY,
+    title="Reply on an anchored handoff rail",
+    description=(
+        "Reply to a received handoff on the anchored reply rail (`kind` "
+        "defaults to `reply` per the shared entry policy). "
+        + _HANDOFF_MUTATION_DESCRIPTION
+    ),
+    input_schema=_handoff_input_schema("Defaults to `reply` for this operation."),
+    output_schema=_HANDOFF_OUTPUT_SCHEMA,
+    read_only=False,
+)
+
+_SUBLANE_START = ToolDefinition(
+    name=TOOL_SUBLANE_START,
+    title="Plan or actuate a sublane (worktree + managed pair + dispatch)",
+    description=(
+        "MUTATING when `actuate` is true; the default is the side-effect-free "
+        "actuation plan. Runs the same typed shared service the CLI's `sublane "
+        "create/start` runs: the work-unit granularity gate, the #15146 "
+        "delegated_coordinator PARENT-AUTHORITY admission (a delegated_"
+        "coordinator lane is refused with a typed verdict unless its parent "
+        "project gateway is durably declared AND verified), the provider "
+        "launchability preflight, and every actuation gate (identity, anchor, "
+        "sender attestation, fill admission) — all decided BEFORE any worktree "
+        "/ pair / dispatch side effect. Launching goes only through the "
+        "managed creator rail that assigns durable identity; no raw pane "
+        "creation is expressible."
+    ),
+    input_schema=_freeze(
+        {
+            "type": "object",
+            "properties": {
+                "issue": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Ticket issue id the lane implements.",
+                },
+                "lane_label": {
+                    "type": "string",
+                    "minLength": 1,
+                    "description": "Lane label (e.g. issue_<id>_<slug>).",
+                },
+                "branch": {
+                    "type": "string",
+                    "description": "Branch for the lane worktree (required in a Git workspace).",
+                },
+                "worktree": {
+                    "type": "string",
+                    "description": "Worktree path for the lane (required in a Git workspace).",
+                },
+                "journal": {
+                    "type": "string",
+                    "description": "Durable-anchor journal id for the dispatch step.",
+                },
+                "lane_kind": {
+                    "type": "string",
+                    "enum": sorted(LANE_KINDS),
+                    "description": (
+                        "Delegation-geometry kind. `delegated_coordinator` "
+                        "asserts a parent project gateway and is admitted only "
+                        "when that parent authority is durably declared and "
+                        "verified (#15146)."
+                    ),
+                },
+                "work_unit": {
+                    "type": "string",
+                    "enum": ["epic", "feature", "user_story", "leaf_issue"],
+                    "description": "Dispatched work-unit granularity (default: repo-local config, else user_story).",
+                },
+                "work_unit_decision_journal": {
+                    "type": "string",
+                    "description": "Durable journal id authorizing an oversized / leaf-with-parent work unit.",
+                },
+                "leaf_standalone": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": "Declare the leaf_issue has no parent UserStory.",
+                },
+                "base_ref": {
+                    "type": "string",
+                    "description": "Explicit git base ref the lane worktree branches from.",
+                },
+                "actuate": {
+                    "type": "boolean",
+                    "default": False,
+                    "description": (
+                        "true actuates (worktree + managed pair + governed "
+                        "dispatch) — the CLI's --execute; false (default) "
+                        "resolves the same plan with zero side effects. Named "
+                        "`actuate` because this surface's guard forbids any "
+                        "input property carrying an exec-like token."
+                    ),
+                },
+                "dispatch": {
+                    "type": "boolean",
+                    "default": True,
+                    "description": "With actuate, also dispatch the governed implementation_request.",
+                },
+                "target_repo": {
+                    "type": "string",
+                    "default": "auto",
+                    "description": "Target-repo resolution for the dispatch (default: auto).",
+                },
+            },
+            "required": ["issue", "lane_label"],
+            "additionalProperties": False,
+        }
+    ),
+    output_schema=_freeze(
+        {
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "default": "refused"},
+                "executed": {"type": "boolean", "default": False},
+                "exit_code": {"type": "integer", "default": 1},
+                "refusal_reason": {"type": "string", "default": ""},
+                "refusal": {"type": "string", "default": ""},
+                "outcome": {"type": "object", "default": {}},
+            },
+            "required": ["status", "executed", "outcome"],
+        }
+    ),
+    read_only=False,
+)
+
 #: The published catalog, in ``tools/list`` order.
 TOOL_CATALOG: Mapping[str, ToolDefinition] = MappingProxyType(
     {
@@ -400,6 +682,9 @@ TOOL_CATALOG: Mapping[str, ToolDefinition] = MappingProxyType(
             _WORKFLOW_GLANCE,
             _WORKFLOW_STEP_PLAN,
             _UNIT_STATE,
+            _HANDOFF_SEND,
+            _HANDOFF_REPLY,
+            _SUBLANE_START,
         )
     }
 )
@@ -451,14 +736,20 @@ def _forbidden_token_in(text: str) -> str:
 
 def catalog_surface_violations(
     catalog: Mapping[str, ToolDefinition] = TOOL_CATALOG,
+    mutating_names: frozenset = MUTATING_TOOL_NAMES,
 ) -> tuple[str, ...]:
     """Report every way ``catalog`` would publish a forbidden capability.
 
-    Two checks, both structural:
+    Structural checks:
 
+    - a non-read-only tool must be a member of the closed ``mutating_names``
+      declaration (#15152), and a declared mutating name must not claim
+      ``read_only`` — the annotation a client plans around must match the
+      reviewed declaration, in both directions;
     - no **input** property name (at any depth) and no enum value contains a
-      :data:`FORBIDDEN_PROPERTY_TOKENS` token — so no tool can accept an arbitrary
-      command string, shell argv, or a raw pane / tmux target;
+      :data:`FORBIDDEN_PROPERTY_TOKENS` token — so no tool, mutating tools
+      included, can accept an arbitrary command string, shell argv, or a raw
+      pane / tmux target;
     - every input schema uses only :data:`SUPPORTED_SCHEMA_KEYWORDS` — so no
       declared constraint goes unchecked at call time;
     - every OUTPUT schema uses only supported keywords too (added with
@@ -473,8 +764,15 @@ def catalog_surface_violations(
     """
     violations: list[str] = []
     for name, definition in catalog.items():
-        if not definition.read_only:
-            violations.append(f"{name}: catalog publishes a non-read-only tool")
+        if not definition.read_only and name not in mutating_names:
+            violations.append(
+                f"{name}: catalog publishes an undeclared mutating "
+                "(non-read-only) tool"
+            )
+        if definition.read_only and name in mutating_names:
+            violations.append(
+                f"{name}: a declared mutating tool claims to be read-only"
+            )
         for path, schema in _walk_schema(definition.output_schema, f"{name}(output)"):
             unsupported = set(schema.keys()) - SUPPORTED_SCHEMA_KEYWORDS
             if unsupported:
@@ -513,53 +811,8 @@ def catalog_surface_violations(
 
 
 # --- argument validation (closed JSON Schema subset) ----------------------- #
-
-
-def _validate(value: Any, schema: Mapping[str, Any], path: str, errors: list) -> None:
-    expected = schema.get("type")
-    if expected is not None:
-        check = _TYPE_CHECKS.get(expected)
-        if check is None:
-            errors.append(f"{path}: schema declares unsupported type {expected!r}")
-            return
-        if not check(value):
-            errors.append(f"{path}: expected {expected}, got {type(value).__name__}")
-            return
-
-    enum = schema.get("enum")
-    if isinstance(enum, (list, tuple)) and value not in enum:
-        errors.append(f"{path}: {value!r} is not one of {list(enum)}")
-
-    if isinstance(value, str):
-        minimum = schema.get("minLength")
-        if isinstance(minimum, int) and len(value) < minimum:
-            errors.append(f"{path}: must be at least {minimum} character(s)")
-
-    if isinstance(value, Mapping):
-        properties = schema.get("properties")
-        properties = properties if isinstance(properties, Mapping) else {}
-        for name in schema.get("required", ()) or ():
-            if name not in value:
-                errors.append(f"{path}.{name}: required property is missing")
-        if schema.get("additionalProperties") is False:
-            for name in value:
-                if name not in properties:
-                    errors.append(f"{path}.{name}: unknown property is not accepted")
-        for name, sub in properties.items():
-            if name in value:
-                _validate(value[name], sub, f"{path}.{name}", errors)
-
-    if isinstance(value, (list, tuple)) and not isinstance(value, (str, bytes)):
-        minimum = schema.get("minItems")
-        if isinstance(minimum, int) and len(value) < minimum:
-            errors.append(f"{path}: must have at least {minimum} item(s)")
-        maximum = schema.get("maxItems")
-        if isinstance(maximum, int) and len(value) > maximum:
-            errors.append(f"{path}: must have at most {maximum} item(s)")
-        items = schema.get("items")
-        if isinstance(items, Mapping):
-            for index, item in enumerate(value):
-                _validate(item, items, f"{path}[{index}]", errors)
+# The recursive validator / skeleton live in `.tool_schema_subset` (mechanical
+# #15152 carve-out for module health); these wrappers keep the public surface.
 
 
 def validate_arguments(
@@ -573,7 +826,7 @@ def validate_arguments(
     schema-valid and still name a Unit that does not exist).
     """
     errors: list[str] = []
-    _validate(arguments, definition.input_schema, "arguments", errors)
+    validate_value(arguments, definition.input_schema, "arguments", errors)
     return tuple(errors)
 
 
@@ -590,40 +843,8 @@ def validate_output(
     schema paths and type names only — never payload values.
     """
     errors: list[str] = []
-    _validate(payload, definition.output_schema, "structuredContent", errors)
+    validate_value(payload, definition.output_schema, "structuredContent", errors)
     return tuple(errors)
-
-
-def conforming_skeleton(schema: Mapping[str, Any]) -> Any:
-    """The minimal value satisfying ``schema``: required members filled, neutrally.
-
-    Recursive, because a required object member can carry its own ``required``
-    list (``source_health`` does). A declared ``default`` wins over the type's
-    neutral zero, so a schema can state what "no answer" means for a member — the
-    read-only flag's neutral is True, and a failed call's ``source_health`` is
-    degraded, never the healthy-looking boolean zero. Used to project an error
-    payload into the declared shape:
-    ``{**conforming_skeleton(schema), **error_fields}``.
-    """
-    if not isinstance(schema, Mapping):
-        return None
-    if "default" in schema:
-        return _plain(schema["default"])
-    kind = schema.get("type")
-    if kind == "object":
-        properties = schema.get("properties")
-        properties = properties if isinstance(properties, Mapping) else {}
-        return {
-            name: conforming_skeleton(properties.get(name, {}))
-            for name in schema.get("required", ()) or ()
-        }
-    if kind == "array":
-        return []
-    if kind == "boolean":
-        return False
-    if kind == "integer":
-        return 0
-    return ""
 
 
 def default_arguments(definition: ToolDefinition) -> dict:
@@ -649,10 +870,14 @@ def resolve_arguments(
 
 __all__ = (
     "FORBIDDEN_PROPERTY_TOKENS",
+    "MUTATING_TOOL_NAMES",
     "SUPPORTED_SCHEMA_KEYWORDS",
     "TOOL_CATALOG",
     "TOOL_DOCS_RESOLVE",
+    "TOOL_HANDOFF_REPLY",
+    "TOOL_HANDOFF_SEND",
     "TOOL_NAMES",
+    "TOOL_SUBLANE_START",
     "TOOL_UNIT_STATE",
     "TOOL_WORKFLOW_GLANCE",
     "TOOL_WORKFLOW_STEP_PLAN",
