@@ -168,14 +168,18 @@ class SublaneActuateUseCase:
                 dispatch=dispatch,
             )
 
-        # 3. Anchor requirement: a live dispatch needs a durable journal id.
+        # 3. Anchor requirement: ANY live actuation needs a durable journal id —
+        #    scoped to `execute and dispatch` until #15152 R2 (review j#106834
+        #    finding_authoritybypass), which let `--no-dispatch` mutate the
+        #    workspace with no durable authority. A lane hangs from the record.
         anchor = (request.journal or "").strip()
-        if execute and dispatch and not anchor:
+        if execute and not anchor:
             return self._blocked(
                 request,
                 launch_action=None,
-                reason="a live dispatch requires a durable-anchor journal id "
-                "(--journal); refusing to dispatch a worker without an anchor",
+                reason="a live actuation requires a durable-anchor journal id "
+                "(--journal); refusing to create or adopt a lane without one "
+                "(dispatch and --no-dispatch alike)",
                 reasons=(REASON_ANCHOR_REQUIRED,),
                 dispatch=dispatch,
             )
@@ -200,8 +204,10 @@ class SublaneActuateUseCase:
             fill_decision_token = admission.fill_decision
             fill_override_reason = admission.override_reason
 
-            # #13613: optional herdr sender attestation must fail before mutation;
-            # absence preserves tmux and existing test-port compatibility.
+        # 3c. #13613: optional herdr sender attestation must fail before mutation;
+        # absence preserves tmux and existing test-port compatibility. Scoped to
+        # EVERY actuation since #15152 R2 (j#106834): create-only mutates too.
+        if execute:
             sender_preflight = getattr(self.ops, "preflight_dispatch_sender", None)
             if callable(sender_preflight):
                 sender_ok, sender_detail = sender_preflight()

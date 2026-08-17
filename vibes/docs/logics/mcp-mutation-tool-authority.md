@@ -35,9 +35,20 @@ tool 語彙に**含めない**。durable anchor 検証を核とする本 surface
    できず、CLI が通さない gate を足さない（#15149 Invariant 2 / 3 の継承）。
 2. **authority 不足・identity 不一致・曖昧 target は副作用前に typed refusal。**
    sublane の admission refusal は閉じた reason token（`invalid_repo_local_config` /
-   #15146 の `parent_*` 4 token / `provider_unresolved` / `provider_not_launchable`）で
-   返り、worktree / pair / dispatch の副作用はゼロ。handoff の refusal は orchestration が
-   publish する structured blocked outcome（`DeliveryOutcome.reason` の閉語彙）で返る。
+   #15146 の `parent_*` 4 token / `provider_unresolved` / `provider_not_launchable` /
+   anchor ownership の `anchor_*` 4 token）で返り、worktree / pair / dispatch の副作用は
+   ゼロ。handoff の refusal は orchestration が publish する structured blocked outcome
+   （`DeliveryOutcome.reason` の閉語彙）で返る。
+   **actuation は dispatch の有無を問わず durable authority を要求する**（R2、review
+   j#106834 finding_authoritybypass）: `actuate=true` は journal を必須とし
+   （`anchor_required`）、その journal が当該 issue に実在し帰属することを共有 authority
+   `verify_live_handoff_anchor`（#14246）で **worktree / pair mutation より前に**検証する。
+   sender attestation preflight（#13613、port が提供する backend）も create-only を含む
+   全 actuation で mutation 前に走る。dispatch leg の send-time 検証は従来どおり残るが、
+   それだけでは lane 作成後の検出になる — その順序こそが finding の内容だった。この
+   強化は共有 body（service / use case）側にあり、CLI の `--execute --no-dispatch`
+   （journal なし create-only）も同じ契約変更を受ける（MCP-only の adapter gate は
+   作らない）。
 3. **MCP adapter は #15146 の回避策ではない。** parent-authority の判定は
    `delegated_parent_authority_gate`（core 修正そのもの）を service 経由で呼ぶ。CLI 側
    handler `cmd_sublane_start` も同じ service を呼ぶ Namespace adapter に縮退しており、
@@ -85,7 +96,10 @@ f_180 application/mutation_tools.py     <- projection allowlist だけを持つ
             resolve_work_unit_fields (共有 precedence)
             delegated_parent_authority_verdict (#15146 gate)
             provider_preflight_refusal (#13569)
-            _resolve_sublane_ops -> SublaneActuateUseCase.run (actuation 全 gate)
+            verify_live_handoff_anchor (#14246 — actuate 時の pre-mutation
+                anchor ownership、R2 j#106834)
+            _resolve_sublane_ops -> SublaneActuateUseCase.run (actuation 全 gate。
+                anchor 必須と sender attestation は dispatch=false を含む)
                   ^
             CLI cmd_sublane_start も同じ service を呼ぶ（Namespace はここで終端）
 ```

@@ -1412,6 +1412,10 @@ class HerdrSublaneOpsTest(unittest.TestCase):
                 runner=herdr.run,
                 runtime_fingerprint_reader=lambda: drift_fingerprint,
             )
+            # #15152 R2 (j#106834) widened the sender-attestation gate to
+            # create-only runs; stub it attested so this test keeps isolating
+            # the fingerprint gate it exists for.
+            ops.preflight_dispatch_sender = lambda: (True, "sender_attested")
             request = SublaneCreateRequest(
                 issue="13705",
                 lane_label="issue_13705_x",
@@ -1485,6 +1489,10 @@ class HerdrSublaneOpsTest(unittest.TestCase):
                 runner=herdr.run,
                 # No runtime_fingerprint_reader -> the REAL run_runtime_fingerprint runs.
             )
+            # #15152 R2 (j#106834): the sender gate now covers create-only runs;
+            # stub it attested so the REAL fingerprint composition stays the
+            # gate under test.
+            ops.preflight_dispatch_sender = lambda: (True, "sender_attested")
             request = SublaneCreateRequest(
                 issue="13705",
                 lane_label="issue_13705_x",
@@ -1849,6 +1857,10 @@ class HerdrUseCaseIntegrationTest(unittest.TestCase):
             runner=herdr.run,
         )
         herdr.attest_home = home
+        # #15152 R2 (j#106834): the sender gate now covers create-only runs;
+        # stub it attested — these tests exercise the lane standup / adopt
+        # mechanics, not the sender authority (covered by its own suite above).
+        ops.preflight_dispatch_sender = lambda: (True, "sender_attested")
         request = SublaneCreateRequest(
             issue="13331",
             lane_label="issue_13331_lane",

@@ -125,6 +125,27 @@ _SUBLANE_REFUSAL_SENTENCES = {
         "provider; check the repo-local workflow role bindings. No lane was "
         "created."
     ),
+    # #15152 R2 (review j#106834 finding_authoritybypass): the durable-anchor
+    # ownership verification now runs BEFORE any worktree / pair mutation, for
+    # dispatch and create-only alike.
+    "anchor_issue_not_found": (
+        "the durable-anchor issue was not found; supply a real issue id. No "
+        "worktree, pair, or dispatch was created."
+    ),
+    "anchor_journal_not_found": (
+        "the durable-anchor journal was not found under the given issue; "
+        "supply a journal id that belongs to it. No worktree, pair, or "
+        "dispatch was created."
+    ),
+    "anchor_issue_journal_mismatch": (
+        "the durable-anchor journal does not belong to the given issue. No "
+        "worktree, pair, or dispatch was created."
+    ),
+    "anchor_provider_unreadable": (
+        "the durable-anchor provider could not be read, so the anchor's "
+        "ownership could not be verified; an unverifiable authority admits "
+        "nothing. No worktree, pair, or dispatch was created."
+    ),
 }
 
 _SUBLANE_REFUSAL_FALLBACK = (

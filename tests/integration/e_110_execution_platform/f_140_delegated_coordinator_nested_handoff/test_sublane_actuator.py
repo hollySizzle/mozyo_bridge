@@ -331,14 +331,22 @@ class MissingIdentityTests(unittest.TestCase):
         self.assertEqual(outcome.status, ACTUATE_BLOCKED)
         self.assertIn(REASON_ANCHOR_REQUIRED, outcome.blocked_reasons)
 
-    def test_no_dispatch_execute_without_journal_is_allowed(self):
-        # --no-dispatch drops the anchor requirement (no worker is dispatched).
+    def test_no_dispatch_execute_without_journal_is_refused(self):
+        # Contract INVERTED by #15152 R2 (review j#106834 finding_authoritybypass).
+        # This test previously pinned the opposite: "--no-dispatch drops the
+        # anchor requirement (no worker is dispatched)". That reading treated the
+        # journal as the DISPATCH's anchor only — but the worktree + managed pair
+        # are side effects that hang from the durable record too, and create-only
+        # was the exact route around the durable-authority gate. Any actuation
+        # now requires the anchor; zero mutation on refusal.
         ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
         outcome = SublaneActuateUseCase(ops).run(
             _req(journal=None), execute=True, dispatch=False
         )
-        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
-        self.assertEqual(outcome.dispatch_result, DISPATCH_SKIPPED)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_ANCHOR_REQUIRED, outcome.blocked_reasons)
+        self.assertNotIn("create_worktree", ops._names())
+        self.assertNotIn("append_lane_column", ops._names())
 
 
 class SenderAttestationPreflightTests(unittest.TestCase):
@@ -379,17 +387,24 @@ class SenderAttestationPreflightTests(unittest.TestCase):
         outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 
-    def test_no_dispatch_is_not_gated_by_sender(self):
-        # --no-dispatch creates/adopts but dispatches no worker, so the sender gate does not arm.
-        class ExplodingSenderOps(FakeActuatorOps):
+    def test_no_dispatch_is_gated_by_sender_too(self):
+        # Contract INVERTED by #15152 R2 (review j#106834 finding_authoritybypass).
+        # This test previously asserted the opposite ("create-only must not
+        # inspect dispatch sender") — but a create-only run mutates the workspace
+        # exactly as a dispatching one does, so the caller's role/lane authority
+        # is verified before either. Zero mutation on the refusal.
+        class MismatchedSenderOps(FakeActuatorOps):
             def preflight_dispatch_sender(self):
-                raise AssertionError("create-only must not inspect dispatch sender")
+                return False, "sender_workspace_mismatch: resolved != anchor"
 
-        ops = ExplodingSenderOps(git=True, lanes=[None, _lane()])
+        ops = MismatchedSenderOps(git=True, lanes=[None, _lane()])
         outcome = SublaneActuateUseCase(ops).run(
-            _req(journal=None), execute=True, dispatch=False
+            _req(), execute=True, dispatch=False
         )
-        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn("sender_attestation", outcome.blocked_reasons)
+        self.assertNotIn("create_worktree", ops._names())
+        self.assertNotIn("append_lane_column", ops._names())
 
 
 class WorkUnitGateTests(unittest.TestCase):

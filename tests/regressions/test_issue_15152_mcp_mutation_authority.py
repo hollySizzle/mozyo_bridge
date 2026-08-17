@@ -269,6 +269,141 @@ class McpHandoffSharedGateTest(unittest.TestCase):
         self.assertNotIn("martian", content["refusal"])
 
 
+class R2PreMutationDurableAuthorityTest(_TempRepo):
+    """R2 (review j#106834 finding_authoritybypass): every MCP actuation mode
+    verifies the durable anchor and the caller's sender authority BEFORE any
+    workspace / lane / pair mutation.
+
+    R1 shipped `actuate=true, dispatch=false` riding the use case's old
+    `execute and dispatch` gate scope — a create-only run mutated the workspace
+    with no journal and no sender attestation, and even a dispatching run only
+    checked the journal for non-emptiness before mutating (ownership was
+    verified inside the dispatch handoff, after the lane existed). Pinned here
+    through the REAL dispatch path for both dispatch values: missing anchor,
+    unreadable / not-found / mismatched anchor, and an unattested sender each
+    refuse typed with zero worktree / pair / dispatch calls.
+    """
+
+    def _fake_ops_cls(self, *, sender_ok=True):
+        from tests.integration.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_sublane_actuator import (  # noqa: E501
+            FakeActuatorOps,
+            _lane,
+        )
+
+        class _Ops(FakeActuatorOps):
+            def __init__(self):
+                super().__init__(git=True, lanes=[None, _lane()])
+
+            def preflight_dispatch_sender(self):
+                return (True, "sender_attested") if sender_ok else (
+                    False,
+                    "sender_workspace_mismatch: resolved != anchor",
+                )
+
+        return _Ops
+
+    def _run(self, repo, *, dispatch, journal, ops_cls, verify=None):
+        from unittest.mock import patch
+
+        import mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_anchor_authority as anchor_authority  # noqa: E501
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator as act  # noqa: E501
+
+        ops = ops_cls()
+        arguments = {
+            "issue": "15152",
+            "lane_label": "issue_15152_probe",
+            "branch": "issue_15152_probe",
+            "worktree": "/wt/issue_15152_probe",
+            "actuate": True,
+            "dispatch": dispatch,
+        }
+        if journal:
+            arguments["journal"] = journal
+        with patch.object(
+            anchor_authority,
+            "verify_live_handoff_anchor",
+            verify if verify is not None else (lambda anchor: anchor),
+        ):
+            with patch.object(act, "_resolve_sublane_ops", return_value=ops) as resolver:
+                dispatched = dispatch_tool_call(
+                    "sublane_start", arguments, ReadPlanContext(repo_root=repo)
+                )
+        return dispatched, ops, resolver
+
+    def _mutations(self, ops):
+        names = [c[0] if isinstance(c, tuple) else c for c in ops.calls]
+        return [
+            n
+            for n in names
+            if n in ("create_worktree", "append_lane_column", "dispatch")
+        ]
+
+    def test_a_missing_journal_refuses_both_dispatch_modes(self) -> None:
+        for dispatch in (True, False):
+            with self.subTest(dispatch=dispatch):
+                dispatched, ops, _ = self._run(
+                    self._repo(),
+                    dispatch=dispatch,
+                    journal=None,
+                    ops_cls=self._fake_ops_cls(),
+                )
+                content = dispatched.result["structuredContent"]
+                self.assertTrue(dispatched.result["isError"])
+                self.assertIn(
+                    "anchor_required", content["outcome"]["blocked_reasons"]
+                )
+                self.assertEqual([], self._mutations(ops))
+
+    def test_an_unowned_or_unreadable_anchor_refuses_before_ops(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_anchor_authority import (  # noqa: E501
+            AnchorAuthorityError,
+        )
+
+        for reason in (
+            "anchor_issue_not_found",
+            "anchor_journal_not_found",
+            "anchor_issue_journal_mismatch",
+            "anchor_provider_unreadable",
+        ):
+            for dispatch in (True, False):
+                with self.subTest(reason=reason, dispatch=dispatch):
+
+                    def _refuse(anchor, _reason=reason):
+                        raise AnchorAuthorityError(_reason, "refused", anchor)
+
+                    dispatched, ops, resolver = self._run(
+                        self._repo(),
+                        dispatch=dispatch,
+                        journal="999",
+                        ops_cls=self._fake_ops_cls(),
+                        verify=_refuse,
+                    )
+                    content = dispatched.result["structuredContent"]
+                    self.assertTrue(dispatched.result["isError"])
+                    self.assertEqual("refused", content["status"])
+                    self.assertEqual(reason, content["refusal_reason"])
+                    # Refused in the service admission, strictly before the
+                    # actuation ops even exist.
+                    self.assertEqual(0, resolver.call_count)
+                    self.assertEqual([], self._mutations(ops))
+
+    def test_an_unattested_sender_refuses_both_dispatch_modes(self) -> None:
+        for dispatch in (True, False):
+            with self.subTest(dispatch=dispatch):
+                dispatched, ops, _ = self._run(
+                    self._repo(),
+                    dispatch=dispatch,
+                    journal="999",
+                    ops_cls=self._fake_ops_cls(sender_ok=False),
+                )
+                content = dispatched.result["structuredContent"]
+                self.assertTrue(dispatched.result["isError"])
+                self.assertIn(
+                    "sender_attestation", content["outcome"]["blocked_reasons"]
+                )
+                self.assertEqual([], self._mutations(ops))
+
+
 class NoRawSurfaceExpressibleTest(unittest.TestCase):
     """j#102930 / j#102998: the mutating surface cannot address unmanaged rows.
 

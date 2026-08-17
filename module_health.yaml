@@ -1482,8 +1482,12 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator_use_case.py
-    lines: 1086
+    lines: 1091
     reason: >-
+      Redmine #15152 R2 (review j#106834 finding_authoritybypass) crossed 1086 to
+      1091: the anchor-requirement and sender-attestation gates widened from
+      `execute and dispatch` to every actuation (create-only mutates too), a
+      review-required fail-closed change of the same shape as the branches below.
       Backend-agnostic sublane actuation choreography (create / adopt / confirm /
       dispatch). Already at 999 lines before #13810; the #13809 review (j#78890
       R3-F3) required an owner-unbound fail-closed BLOCK on the adopt path, which

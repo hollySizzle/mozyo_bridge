@@ -600,7 +600,12 @@ _SUBLANE_START = ToolDefinition(
                 },
                 "journal": {
                     "type": "string",
-                    "description": "Durable-anchor journal id for the dispatch step.",
+                    "description": (
+                        "Durable-anchor journal id the lane hangs from. Required "
+                        "when `actuate` is true (dispatch true or false alike) "
+                        "and verified against Redmine ownership before any "
+                        "worktree / pair mutation (#15152)."
+                    ),
                 },
                 "lane_kind": {
                     "type": "string",
@@ -644,7 +649,12 @@ _SUBLANE_START = ToolDefinition(
                 "dispatch": {
                     "type": "boolean",
                     "default": True,
-                    "description": "With actuate, also dispatch the governed implementation_request.",
+                    "description": (
+                        "With actuate, also dispatch the governed "
+                        "implementation_request. false still requires — and "
+                        "verifies — the durable anchor and the caller's "
+                        "sender authority before any mutation (#15152 R2)."
+                    ),
                 },
                 "target_repo": {
                     "type": "string",

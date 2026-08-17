@@ -109,6 +109,21 @@ class SublaneStartRefusal:
 
 
 @dataclass(frozen=True)
+class _DispatchAnchor:
+    """The redmine anchor a sublane actuation hangs from (#15152 R2).
+
+    Exactly the `--source redmine --issue --journal` triple the dispatch leg's
+    governed `handoff send` carries, so the pre-mutation ownership verification
+    below checks the SAME anchor the send-time authority (#14246) would check —
+    just before the worktree / pair exists instead of after.
+    """
+
+    source: str
+    issue: str
+    journal: str
+
+
+@dataclass(frozen=True)
 class SublaneStartResult:
     """The typed result of one sublane create/start run.
 
@@ -233,6 +248,32 @@ def _admission_refusal(command: SublaneStartCommand) -> tuple[
     )
     if refusal is not None:
         return refusal, None, None
+
+    # 4. Pre-mutation durable-anchor OWNERSHIP verification (#15152 R2, review
+    #    j#106834 finding_authoritybypass): a live actuation's journal must be a
+    #    real Redmine journal OF this issue, verified BEFORE any worktree / pair
+    #    mutation and for dispatch and create-only alike. The dispatch leg's
+    #    send-time authority (#14246) re-verifies, but by then the lane already
+    #    exists — which is exactly the ordering the finding was filed on. A
+    #    MISSING journal is refused by the use case's own typed
+    #    `anchor_required` gate (kept there so the plan-side rendering and the
+    #    fake-port suites share one statement); this step verifies a PRESENT one.
+    if command.execute and (command.journal or "").strip():
+        import mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_anchor_authority as anchor_authority  # noqa: E501
+
+        anchor = _DispatchAnchor(
+            source="redmine",
+            issue=command.issue,
+            journal=(command.journal or "").strip(),
+        )
+        try:
+            anchor_authority.verify_live_handoff_anchor(anchor)
+        except anchor_authority.AnchorAuthorityError as exc:
+            return (
+                SublaneStartRefusal(reason=exc.reason, message=exc.message),
+                None,
+                None,
+            )
     return None, work_unit, decision_anchor
 
 

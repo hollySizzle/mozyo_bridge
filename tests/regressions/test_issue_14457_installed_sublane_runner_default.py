@@ -241,6 +241,11 @@ class InstalledSublaneExecutePathTest(unittest.TestCase):
             fixture = InstalledSublaneRunnerDefaultTest()
             repo, env, _head = fixture._fixture(root, _pre_14258_help())
             ops = fixture._ops(repo, env)
+            # #15152 R2 (j#106834): the sender-attestation gate now covers
+            # create-only runs and would refuse first in this credential-less
+            # fixture; stub it attested so the launcher-compatibility gate stays
+            # the one under test.
+            ops.preflight_dispatch_sender = lambda: (True, "sender_attested")
             worktree = root / "lane-worktree"
 
             outcome = SublaneActuateUseCase(ops, gateway_ready_probes=0).run(

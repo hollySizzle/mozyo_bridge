@@ -179,17 +179,24 @@ class CreateGateTests(unittest.TestCase):
             "manual_mozyo_env_injection", next_action["forbidden_methods"]
         )
 
-    def test_sender_attestation_is_not_required_for_create_only(self):
-        class MissingSenderOps(FakeActuatorOps):
+    def test_sender_attestation_is_required_for_create_only_too(self):
+        # Contract INVERTED by #15152 R2 (review j#106834 finding_authoritybypass).
+        # Previously this pinned the opposite ("create-only must not inspect
+        # dispatch sender"): a create-only run mutates the workspace exactly as
+        # a dispatching one does, so the caller's role/lane authority is now
+        # verified before either — an unattested sender refuses with zero
+        # worktree / append / dispatch side effects.
+        class MismatchedSenderOps(FakeActuatorOps):
             def preflight_dispatch_sender(self):
-                raise AssertionError("create-only must not inspect dispatch sender")
+                return False, "sender_workspace_mismatch: resolved != anchor"
 
-        ops = MissingSenderOps()
+        ops = MismatchedSenderOps()
         outcome = SublaneActuateUseCase(ops).run(
             _create_req(), execute=True, dispatch=False
         )
-        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
-        self.assertNotIn("dispatch", ops.calls)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn("sender_attestation", outcome.blocked_reasons)
+        self.assertEqual(ops.calls, [])
 
     def test_stop_without_override_fails_closed_before_side_effects(self):
         ops = FakeActuatorOps()
