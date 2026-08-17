@@ -395,11 +395,36 @@ class R6CallerAuthDisclaimerTests(unittest.TestCase):
                 CALLER_AUTH_DISCLAIMER, TOOL_CATALOG[name].description, name
             )
 
+    _SUBJECTS = ("caller", "sender", "coordinator identity", "caller identity")
+    _CLAIM_VERBS = ("authenticat", "authority", "verified as", "verifies")
+
+    @classmethod
+    def _caller_auth_claim(cls, text, disclaimer):
+        """Return (subject, verb) of a caller-auth claim outside the disclaimer.
+
+        #15152 R7 (finding_overclaimguardorder): the R6 window scanned only
+        FORWARD from the subject, so a claim verb BEFORE the subject
+        ("Authenticated coordinator identity is accepted") slipped through. The
+        window is now symmetric around each subject occurrence, so the check is
+        independent of subject/claim order.
+        """
+        remainder = text.replace(disclaimer, " ").lower()
+        for subject in cls._SUBJECTS:
+            idx = remainder.find(subject)
+            while idx != -1:
+                window = remainder[max(0, idx - 60) : idx + len(subject) + 60]
+                for verb in cls._CLAIM_VERBS:
+                    if verb in window:
+                        return (subject, verb)
+                idx = remainder.find(subject, idx + 1)
+        return None
+
     def test_no_caller_auth_claim_outside_the_canonical_disclaimer(self) -> None:
         # Robust negative: strip the ONE canonical disclaimer, then no remaining
         # text may pair an authentication/authority verb with a caller/sender/
-        # identity subject. This is broader than a fixed phrase list and catches
-        # the synonym "verified as coordinator authority" the R5 guard missed.
+        # identity subject in EITHER order. Broader than a fixed phrase list; it
+        # catches the synonym "verified as coordinator authority" (R5) and the
+        # reverse-order "Authenticated coordinator identity" (R6).
         from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mcp_server import (  # noqa: E501
             SERVER_INSTRUCTIONS,
         )
@@ -407,28 +432,34 @@ class R6CallerAuthDisclaimerTests(unittest.TestCase):
             CALLER_AUTH_DISCLAIMER,
         )
 
-        subjects = ("caller", "sender", "coordinator identity", "caller identity")
-        claim_verbs = ("authenticat", "authority", "verified as", "verifies")
         surfaces = [("SERVER_INSTRUCTIONS", "", SERVER_INSTRUCTIONS)] + list(
             self._mutating_texts()
         )
         for where, name, text in surfaces:
-            remainder = text.replace(CALLER_AUTH_DISCLAIMER, " ").lower()
-            for subject in subjects:
-                for verb in claim_verbs:
-                    # A subject and a claim-verb co-occurring within ~60 chars is
-                    # an auth claim; the disclaimer is the only sanctioned one and
-                    # was removed above.
-                    idx = remainder.find(subject)
-                    while idx != -1:
-                        window = remainder[idx : idx + 60]
-                        self.assertNotIn(
-                            verb,
-                            window,
-                            f"{where} {name}: caller-auth claim "
-                            f"({subject!r}+{verb!r}) outside the disclaimer",
-                        )
-                        idx = remainder.find(subject, idx + 1)
+            claim = self._caller_auth_claim(text, CALLER_AUTH_DISCLAIMER)
+            self.assertIsNone(
+                claim, f"{where} {name}: caller-auth claim {claim} outside disclaimer"
+            )
+
+    def test_a_reverse_order_overclaim_is_caught_beside_the_disclaimer(self) -> None:
+        # #15152 R7 (finding_overclaimguardorder): pin the reverse-order mutant
+        # red. Even WITH the canonical disclaimer present, a claim whose verb
+        # precedes the subject must be detected.
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.tool_catalog import (  # noqa: E501
+            CALLER_AUTH_DISCLAIMER,
+        )
+
+        forward = CALLER_AUTH_DISCLAIMER + " The caller is authenticated before mutation."
+        reverse = (
+            CALLER_AUTH_DISCLAIMER
+            + " Authenticated coordinator identity is accepted before mutation."
+        )
+        self.assertIsNotNone(self._caller_auth_claim(forward, CALLER_AUTH_DISCLAIMER))
+        self.assertIsNotNone(self._caller_auth_claim(reverse, CALLER_AUTH_DISCLAIMER))
+        # The bare disclaimer itself is clean once removed.
+        self.assertIsNone(
+            self._caller_auth_claim(CALLER_AUTH_DISCLAIMER, CALLER_AUTH_DISCLAIMER)
+        )
 
 
 class R6PublicVocabularyDriftTests(unittest.TestCase):
@@ -478,6 +509,138 @@ class R6PublicVocabularyDriftTests(unittest.TestCase):
         self.assertEqual(
             _UNCLASSIFIED_BLOCKER, _public_blocker_token("missing_field:secret_path")
         )
+
+
+class R7ProducerFieldClosureTests(unittest.TestCase):
+    """#15152 R7 (review j#107015 finding_projectiontokensopen): R6 closed only
+    `status` and `blocked_reasons`; the sibling producer-owned string fields were
+    still copied verbatim. The projection is now closed AS A CLASS — every field
+    is routed through a declared category and producer tokens are validated
+    against their producing registry."""
+
+    def test_every_projected_field_is_categorized_exactly_once(self) -> None:
+        # Exhaustiveness drift guard: a new field added to the public projection
+        # without a category fails here instead of silently leaking.
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+            SUBLANE_OUTCOME_PUBLIC_FIELDS,
+            _BOOL_PUBLIC_FIELDS,
+            _CALLER_ECHO_PUBLIC_FIELDS,
+            _PRESENCE_ONLY_PUBLIC_FIELDS,
+            _PRODUCER_TOKEN_REGISTRIES,
+            _STATUS_PUBLIC_FIELDS,
+        )
+
+        categories = [
+            _STATUS_PUBLIC_FIELDS,
+            _BOOL_PUBLIC_FIELDS,
+            _CALLER_ECHO_PUBLIC_FIELDS,
+            frozenset(_PRODUCER_TOKEN_REGISTRIES),
+            _PRESENCE_ONLY_PUBLIC_FIELDS,
+        ]
+        declared = set(SUBLANE_OUTCOME_PUBLIC_FIELDS)
+        union = set().union(*categories)
+        self.assertEqual(declared, union, "a projected field is uncategorized")
+        # Exactly once: no field appears in two categories.
+        for i, a in enumerate(categories):
+            for b in categories[i + 1 :]:
+                self.assertEqual(frozenset(), a & b, f"field in two categories: {a & b}")
+
+    def test_producer_registries_match_their_producers(self) -> None:
+        # Pin each producer-token registry to its producing module so a new token
+        # cannot silently start mapping to the unclassified fallback.
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+            _PRODUCER_TOKEN_REGISTRIES,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (  # noqa: E501
+            INJECTION_STAGES,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            DISPATCH_RESULTS,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            LAUNCH_ACTIONS,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_fill_decision import (  # noqa: E501
+            FILL_DECISIONS,
+        )
+
+        self.assertEqual(
+            set(_PRODUCER_TOKEN_REGISTRIES["launch_action"]), set(LAUNCH_ACTIONS)
+        )
+        self.assertEqual(
+            set(_PRODUCER_TOKEN_REGISTRIES["dispatch_result"]), set(DISPATCH_RESULTS)
+        )
+        self.assertEqual(
+            set(_PRODUCER_TOKEN_REGISTRIES["dispatch_injection_stage"]),
+            set(INJECTION_STAGES),
+        )
+        self.assertEqual(
+            set(_PRODUCER_TOKEN_REGISTRIES["fill_decision"]), set(FILL_DECISIONS)
+        )
+
+    def test_hostile_producer_field_values_never_reach_the_public_surface(self) -> None:
+        # Inject a private path / pane id / operator token into EACH producer-owned
+        # field; none may appear in structuredContent or the text summary, and each
+        # maps to its fixed unclassified token (durable_anchor -> presence bool).
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_start_service as svc  # noqa: E501
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            SublaneActuationOutcome,
+        )
+
+        hostile = SublaneActuationOutcome(
+            status="ready",
+            execute=True,
+            reason="planned",
+            issue="15152",
+            lane_label="issue_15152_probe",
+            launch_action="secret_workspace_key_abc",
+            dispatch_result="/home/holly/private/pane-%7",
+            dispatch_injection_stage="operator_token_xyz",
+            fill_decision="private_customer_alpha",
+            durable_anchor="/home/holly/private/anchor-note",
+        )
+        result = svc.SublaneStartResult(
+            status=svc.STATUS_COMPLETED, exit_code=0, outcome=hostile
+        )
+        with patch.object(svc, "run_sublane_start", return_value=result):
+            outcome = run_sublane_start_tool(
+                {"issue": "15152", "lane_label": "issue_15152_probe", "actuate": True},
+                _context(),
+            )
+
+        body = json.dumps(outcome.payload)
+        for sentinel in (
+            "secret_workspace_key_abc",
+            "/home/holly/private",
+            "%7",
+            "operator_token_xyz",
+            "private_customer_alpha",
+            "anchor-note",
+        ):
+            self.assertNotIn(sentinel, body, sentinel)
+            self.assertNotIn(sentinel, outcome.summary, sentinel)
+        projected = outcome.payload["outcome"]
+        self.assertEqual("unclassified_launch_action", projected["launch_action"])
+        self.assertEqual("unclassified_dispatch_result", projected["dispatch_result"])
+        self.assertEqual(
+            "unclassified_dispatch_injection_stage",
+            projected["dispatch_injection_stage"],
+        )
+        self.assertEqual("unclassified_fill_decision", projected["fill_decision"])
+        self.assertIs(True, projected["durable_anchor_present"])
+        self.assertNotIn("durable_anchor", projected)
+
+    def test_valid_producer_tokens_survive(self) -> None:
+        # A legitimate registry member is republished unchanged.
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+            _public_producer_token,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+            LAUNCH_ACTIONS,
+        )
+
+        member = sorted(LAUNCH_ACTIONS)[0]
+        self.assertEqual(member, _public_producer_token("launch_action", member))
 
 
 class MutatingDeclarationGuardTests(unittest.TestCase):

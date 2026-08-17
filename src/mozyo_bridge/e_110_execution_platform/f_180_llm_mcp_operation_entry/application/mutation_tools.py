@@ -86,9 +86,16 @@ SUBLANE_OUTCOME_PUBLIC_FIELDS = (
 # published only if it is an exact member, or a `<prefix>:<value>` form whose
 # prefix AND value both belong to a closed registry. Everything else — including a
 # launcher verdict's free-text `gate_reason` — maps to _UNCLASSIFIED_BLOCKER.
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (  # noqa: E501
+    INJECTION_STAGES,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     ACTUATE_STATES,
     BLOCKED_REASONS,
+    DISPATCH_RESULTS,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_integration_policy import (  # noqa: E501
+    LAUNCH_ACTIONS,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.work_unit_granularity import (  # noqa: E501
     WORK_UNIT_EXPLICIT_DECISION_RECORDED,
@@ -146,6 +153,49 @@ _PREFIXED_BLOCKER_REGISTRIES = {
 _PUBLIC_STATUSES = frozenset(ACTUATE_STATES)
 _UNCLASSIFIED_BLOCKER = "unclassified_blocker"
 _UNKNOWN_STATUS = "unknown_status"
+
+# The TYPED projection schema for the sublane outcome (#15152 R7, review j#107015
+# finding_projectiontokensopen). R6 closed only `status` and `blocked_reasons`; the
+# sibling producer-owned string fields (launch_action / dispatch_result /
+# dispatch_injection_stage / fill_decision) were still copied VERBATIM by the field
+# loop, so a private path / pane id / operator detail in any of them reached the
+# public structuredContent. The fix closes the projection AS A CLASS: every field
+# the projection can emit is assigned exactly one category, and a producer-owned
+# token is republished only when it is an exact member of its producing registry.
+# The exhaustiveness drift test fails if a field escapes categorization, so a new
+# outcome field cannot silently leak.
+#
+#: Booleans — coerced to ``bool``; a producer string can never ride these out.
+_BOOL_PUBLIC_FIELDS = frozenset(
+    {"execute", "adopted", "worker_dispatch_confirmed", "gateway_ready"}
+)
+#: Caller-supplied identifiers the caller itself declared — echoed as short text,
+#: explicitly separated from producer-owned tokens (the reviewer's required split).
+_CALLER_ECHO_PUBLIC_FIELDS = frozenset({"issue", "lane_label", "branch"})
+#: Producer-owned enumerated tokens — each validated against its producing registry;
+#: an unknown / hostile value maps to the field's fixed ``unclassified_<field>``.
+_PRODUCER_TOKEN_REGISTRIES = {
+    "launch_action": frozenset(LAUNCH_ACTIONS),
+    "dispatch_result": frozenset(DISPATCH_RESULTS),
+    "dispatch_injection_stage": frozenset(INJECTION_STAGES),
+    "fill_decision": frozenset(FILL_DECISIONS),
+}
+#: Producer-owned free text that must NEVER publish raw (it can name a durable
+#: anchor path / marker) — replaced by a ``<field>_present`` boolean.
+_PRESENCE_ONLY_PUBLIC_FIELDS = frozenset({"durable_anchor"})
+#: ``status`` is projected on its own via :func:`_public_status`.
+_STATUS_PUBLIC_FIELDS = frozenset({"status"})
+
+
+def _unclassified_producer_token(field: str) -> str:
+    """The fixed public token for an out-of-registry producer value."""
+    return f"unclassified_{field}"
+
+
+def _public_producer_token(field: str, value: str) -> str:
+    """One producer-owned token validated against its producing registry."""
+    registry = _PRODUCER_TOKEN_REGISTRIES[field]
+    return value if value in registry else _unclassified_producer_token(field)
 
 
 def _public_blocker_token(token: str) -> str:
@@ -379,23 +429,34 @@ def _reconstructed_sublane_reason(status: str, blocked: list) -> str:
 def _public_sublane_outcome(outcome: Any) -> dict:
     """The allowlisted projection of one SublaneActuationOutcome.
 
-    `blocked_reasons` and the reconstructed `reason` are both built from the
-    validated token list — the same output feeds all three surfaces
-    (structured blocked_reasons, reason, and the summary), so no unvalidated
-    producer string reaches the public boundary (#15152 R5, j#106995).
+    Every field is routed through its declared category (#15152 R7,
+    finding_projectiontokensopen): booleans are coerced, caller identifiers are
+    echoed, producer-owned tokens are validated against their producing registry
+    (unknown -> a fixed ``unclassified_<field>``), and producer free text is
+    reduced to a ``<field>_present`` boolean. No producer string reaches the
+    public boundary raw. `blocked_reasons` and the reconstructed `reason` are
+    both built from the validated token list, feeding all three surfaces
+    (structured blocked_reasons, reason, and the summary) identically.
     """
     payload: dict = {}
-    for name in SUBLANE_OUTCOME_PUBLIC_FIELDS:
-        value = getattr(outcome, name, None)
-        if isinstance(value, tuple):
-            value = list(value)
-        if value is not None:
-            payload[name] = value
-    # #15152 R6 (finding_projectionvocabopen): status is validated against the
-    # closed ACTUATE_STATES vocabulary too, not published verbatim (the field is
-    # a plain str with no runtime invariant).
+    # status: closed ACTUATE_STATES vocabulary (the field is a plain str with no
+    # runtime invariant, so it is validated, not published verbatim).
     status = _public_status(str(getattr(outcome, "status", "") or ""))
     payload["status"] = status
+    for name in _BOOL_PUBLIC_FIELDS:
+        value = getattr(outcome, name, None)
+        if value is not None:
+            payload[name] = bool(value)
+    for name in _CALLER_ECHO_PUBLIC_FIELDS:
+        value = getattr(outcome, name, None)
+        if value is not None:
+            payload[name] = str(value)
+    for name in _PRODUCER_TOKEN_REGISTRIES:
+        value = getattr(outcome, name, None)
+        if value is not None:
+            payload[name] = _public_producer_token(name, str(value))
+    for name in _PRESENCE_ONLY_PUBLIC_FIELDS:
+        payload[f"{name}_present"] = getattr(outcome, name, None) is not None
     blocked = _public_blocked_reasons(outcome)
     payload["blocked_reasons"] = blocked
     payload["reason"] = _reconstructed_sublane_reason(status, blocked)
