@@ -417,8 +417,11 @@ adversarial_convergence:
       1 個**を latest attempt とする。
       第二段階 (validation) — latest attempt が `challenge_attempt` 行をちょうど 1 行 (=C) と、
       `challenge_resolution` 行を**ちょうど 1 行**持ち、後者が現行 authoritative (terminal)
-      anchor を指す場合のみ authoritative resumption request となる。superseded anchor の
-      再参照・key 欠落・duplicate・malformed は **旧 chain へ fallback せず blocked** — より
+      anchor を指し、かつ **challenge grammar の他 key 全て (challenge_pending /
+      challenge_ref / challenge_verdict / supersedes_anchor / repairs_attempt) を一切持たない**
+      (branch (2) と同一の排他条件) 場合のみ authoritative resumption request となる。
+      superseded anchor の再参照・key 欠落・duplicate・malformed・mixed (修復済みか否かを
+      問わない) は **旧 chain へ fallback せず blocked** — より
       新しい well-formed attempt だけが解消できる。
       (d) challenged request = authoritative result が C である canonical review_request
       (意味検証の基準)
@@ -443,7 +446,10 @@ adversarial_convergence:
         帰属不能な ordinary challenge-key record / anchor attempt / pending attempt /
         invalid repair record のいずれか。集合の要素であることが唯一の条件なので、分割へ
         種別を追加しても本 union の同期漏れは起きない) であるもの。effect は「U を集合から
-        除去する」ことだけで、per-challenge の chain 判定には一切影響しない。
+        除去する」ことだけで、per-challenge の chain 判定には一切影響しない — U を resumption /
+        anchor / pending いずれの選択母集合・validity にも**復権させない** (非 rehabilitate
+        原則。mixed な latest attempt は修復後も blocked のままで、回復は新しい well-formed
+        record の append のみ)。
         それ以外の repair candidate (非 request・重複行・値 malformed・dangling・前方参照・
         blocker でない target・上記いずれかの key との混在 (anchor 系を含む)・同一 U への
         2 個目以降) はすべて **invalid repair** —
