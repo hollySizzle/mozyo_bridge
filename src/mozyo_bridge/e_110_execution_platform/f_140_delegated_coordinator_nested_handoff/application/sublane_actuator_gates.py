@@ -64,14 +64,20 @@ def sender_authority_admission(
     fill_decision: Optional[str],
     fill_override_reason: Optional[str],
 ):
-    """The pre-mutation sender-authority gate for EVERY actuation (#15152 R2/R3).
+    """The pre-mutation sender-identity gate for EVERY actuation (#15152 R2/R3).
 
-    Two refusals, both decided before any worktree / pane / dispatch side effect:
+    This is a WEAK sender-identity signal, NOT caller authentication (ADR-0006,
+    #15152 review j#106903/j#106995): the resolved identity comes from the
+    process env, which a caller controls, and it is compared to
+    repo/board/marker-derivable values — so a caller can present matching values.
+    It refuses obviously-wrong or unestablished senders; it does not prove the
+    caller IS the coordinator. Forgery-proof caller authentication is deferred to
+    #15579. Two refusals, both before any worktree / pane / dispatch side effect:
 
     - the ops port carries NO ``preflight_dispatch_sender`` capability (#15152 R3,
-      review j#106868 finding_senderauthoritygap): absence used to be a #13613
-      backcompat pass, which made every non-herdr backend fail open — an ops port
-      that cannot establish the caller's authority must not mutate a lane;
+      review j#106868): absence used to be a #13613 backcompat pass, which made
+      every non-herdr backend skip the check — an ops port that cannot even run
+      the weak check must not mutate a lane;
     - the capability exists and refuses (#13613): the resolved sender identity
       does not match the workspace anchor / coordinator binding / default lane.
 

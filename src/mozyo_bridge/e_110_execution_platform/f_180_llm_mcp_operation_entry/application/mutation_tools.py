@@ -27,6 +27,7 @@ say where things live.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping
 
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.read_plan_tools import (  # noqa: E501
@@ -74,10 +75,34 @@ SUBLANE_OUTCOME_PUBLIC_FIELDS = (
     "worker_dispatch_confirmed",
     "dispatch_injection_stage",
     "durable_anchor",
-    "blocked_reasons",
     "fill_decision",
     "gateway_ready",
 )
+
+#: The public grammar for a blocker reason token (#15152 R5, review j#106995
+#: finding_blockedreasonleak). `blocked_reasons` is only type-hinted
+#: ``Tuple[str, ...]`` — its producers append registry tokens (`missing_identity`)
+#: but ALSO dynamic values (`missing_field:<field>`, `unattested:<role>`, a
+#: launcher capability verdict's free-text `gate_reason`), so it is NOT a
+#: validated closed vocabulary. R4 published it verbatim, which just moved the
+#: leak. A blocker reason is published only if it matches this grammar — a
+#: lowercase identifier, optionally namespaced with ONE `:identifier` — which the
+#: whole registry and the `<prefix>:<identifier>` forms satisfy, but a path
+#: (`/`), a pane id (`%`), or exception prose (spaces / punctuation / capitals)
+#: cannot. Anything else maps to :data:`_UNCLASSIFIED_BLOCKER`.
+_PUBLIC_BLOCKER_TOKEN = re.compile(r"^[a-z0-9_]+(:[a-z0-9_]+)?$")
+
+#: The fixed disposition for a blocker token that fails the public grammar.
+_UNCLASSIFIED_BLOCKER = "unclassified_blocker"
+
+
+def _public_blocked_reasons(outcome: Any) -> list:
+    """The blocked_reasons validated to the closed public grammar (#15152 R5)."""
+    out: list = []
+    for raw in getattr(outcome, "blocked_reasons", ()) or ():
+        token = str(raw)
+        out.append(token if _PUBLIC_BLOCKER_TOKEN.match(token) else _UNCLASSIFIED_BLOCKER)
+    return out
 
 #: Fixed refusal sentence for a fail-closed handoff run. The gate's own message
 #: is NOT forwarded (it is operator prose that can name panes and paths); the
@@ -264,17 +289,16 @@ def run_handoff_reply(
 # --- sublane_start ---------------------------------------------------------- #
 
 
-def _reconstructed_sublane_reason(outcome: Any) -> str:
-    """A fixed public sentence over the closed status / blocked-reason tokens.
+def _reconstructed_sublane_reason(status: str, blocked: list) -> str:
+    """A fixed public sentence over the status + validated blocker tokens.
 
-    #15152 R4 (review j#106903 finding_reasonproseleak): the raw `outcome.reason`
-    carries a gate's free-text detail (private paths, exception text) and must not
-    reach the public surface. This reconstructs a reason from closed tokens only —
-    the `status` and the `blocked_reasons` tuple, both of which are closed
-    vocabulary — with the operator-facing detail reachable through the CLI.
+    #15152 R4/R5 (reviews j#106903 / j#106995): the raw `outcome.reason` carries
+    a gate's free-text detail (private paths, exception text) and never reaches
+    the public surface. This reconstructs a reason from the `status` and the
+    ALREADY-VALIDATED blocker tokens (see :func:`_public_blocked_reasons`), with
+    the operator-facing detail reachable through the CLI.
     """
-    status = str(getattr(outcome, "status", "") or "unknown")
-    blocked = [str(r) for r in (getattr(outcome, "blocked_reasons", ()) or ())]
+    status = status or "unknown"
     if blocked:
         return (
             f"status {status}; blocked reasons {', '.join(blocked)}. Run "
@@ -285,7 +309,13 @@ def _reconstructed_sublane_reason(outcome: Any) -> str:
 
 
 def _public_sublane_outcome(outcome: Any) -> dict:
-    """The allowlisted projection of one SublaneActuationOutcome."""
+    """The allowlisted projection of one SublaneActuationOutcome.
+
+    `blocked_reasons` and the reconstructed `reason` are both built from the
+    validated token list — the same output feeds all three surfaces
+    (structured blocked_reasons, reason, and the summary), so no unvalidated
+    producer string reaches the public boundary (#15152 R5, j#106995).
+    """
     payload: dict = {}
     for name in SUBLANE_OUTCOME_PUBLIC_FIELDS:
         value = getattr(outcome, name, None)
@@ -293,7 +323,11 @@ def _public_sublane_outcome(outcome: Any) -> dict:
             value = list(value)
         if value is not None:
             payload[name] = value
-    payload["reason"] = _reconstructed_sublane_reason(outcome)
+    blocked = _public_blocked_reasons(outcome)
+    payload["blocked_reasons"] = blocked
+    payload["reason"] = _reconstructed_sublane_reason(
+        str(getattr(outcome, "status", "") or ""), blocked
+    )
     return payload
 
 
@@ -362,10 +396,11 @@ def run_sublane_start_tool(
         "refusal": "",
         "outcome": _public_sublane_outcome(outcome),
     }
-    # #15152 R4 (finding_reasonproseleak): the summary uses closed tokens only —
-    # the raw `outcome.reason` (which can carry a gate's private-path detail) is
-    # never interpolated into the public text.
-    blocked = [str(r) for r in (outcome.blocked_reasons or ())]
+    # #15152 R4/R5 (finding_reasonproseleak / finding_blockedreasonleak): the
+    # summary uses the SAME validated blocker tokens the projection publishes —
+    # never the raw outcome.reason (private-path detail) nor an unvalidated
+    # blocked_reasons value.
+    blocked = payload["outcome"].get("blocked_reasons", [])
     summary = (
         f"sublane_start: {outcome.status} "
         f"(executed={str(bool(outcome.executed)).lower()}"

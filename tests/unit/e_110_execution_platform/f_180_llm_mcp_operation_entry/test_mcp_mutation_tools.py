@@ -258,6 +258,146 @@ class SublaneProjectionTests(unittest.TestCase):
         self.assertIn("declare-project-gateway", outcome.payload["refusal"])
 
 
+class R5BlockedReasonGrammarTests(unittest.TestCase):
+    """#15152 R5 (review j#106995 finding_blockedreasonleak): blocked_reasons is
+    only a `Tuple[str, ...]`, and producers append dynamic / free-text values
+    (a launcher capability verdict's `gate_reason`, `missing_field:<field>`,
+    `unattested:<role>`). R4 published it verbatim, moving the leak. Now every
+    published blocker token must match the closed public grammar; anything else
+    (a path, a pane id, exception prose) maps to a fixed fallback, in all three
+    surfaces (structured blocked_reasons, reconstructed reason, summary)."""
+
+    def _run_with_blocked(self, blocked):
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_start_service as svc  # noqa: E501
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            SublaneActuationOutcome,
+        )
+
+        outcome = SublaneActuationOutcome(
+            status="blocked",
+            execute=True,
+            reason="clean token reason",
+            issue="15152",
+            lane_label="issue_15152_probe",
+            blocked_reasons=tuple(blocked),
+        )
+        result = svc.SublaneStartResult(
+            status=svc.STATUS_COMPLETED, exit_code=1, outcome=outcome
+        )
+        with patch.object(svc, "run_sublane_start", return_value=result):
+            return run_sublane_start_tool(
+                {"issue": "15152", "lane_label": "issue_15152_probe", "actuate": True},
+                _context(),
+            )
+
+    def test_a_path_or_pane_blocked_reason_maps_to_fallback_everywhere(self) -> None:
+        outcome = self._run_with_blocked(
+            [
+                "missing_identity",  # legit closed token — kept
+                "launcher failed at /home/holly/private/x",  # free text — fallback
+                "%7",  # pane id — fallback
+            ]
+        )
+        projected = outcome.payload["outcome"]
+        self.assertEqual(
+            ["missing_identity", "unclassified_blocker", "unclassified_blocker"],
+            projected["blocked_reasons"],
+        )
+        body = json.dumps(outcome.payload)
+        self.assertNotIn("/home/holly/private", body)
+        self.assertNotIn("%7", body)
+        # The reconstructed reason and the summary use the validated tokens only.
+        self.assertNotIn("/home/holly/private", outcome.summary)
+        self.assertNotIn("%7", outcome.summary)
+        self.assertIn("unclassified_blocker", projected["reason"])
+        self.assertNotIn("/home/holly/private", projected["reason"])
+
+    def test_the_namespaced_forms_are_kept(self) -> None:
+        # The `<prefix>:<identifier>` producer forms are safe and preserved.
+        outcome = self._run_with_blocked(["missing_field:issue", "unattested:codex"])
+        self.assertEqual(
+            ["missing_field:issue", "unattested:codex"],
+            outcome.payload["outcome"]["blocked_reasons"],
+        )
+
+
+class R5HandoffAnchorSourceTests(unittest.TestCase):
+    """#15152 R5 (review j#106995 finding_handoffauthoritygap a): the shared
+    anchor gate returns any non-Redmine anchor UNVERIFIED, so `source=asana` and
+    its task/comment anchor fields are made unrepresentable on the MCP mutating
+    surface — a schema violation (protocol error), not a silent unverified send."""
+
+    def _dispatch(self, name, arguments):
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.tool_dispatch import (  # noqa: E501
+            dispatch_tool_call,
+        )
+
+        return dispatch_tool_call(name, arguments, _context())
+
+    def test_source_asana_is_a_protocol_error(self) -> None:
+        for name in ("handoff_send", "handoff_reply"):
+            dispatched = self._dispatch(name, {"to": "codex", "source": "asana"})
+            self.assertTrue(dispatched.is_protocol_error, name)
+
+    def test_task_id_and_comment_id_are_unknown_properties(self) -> None:
+        for field in ("task_id", "comment_id"):
+            dispatched = self._dispatch(
+                "handoff_send", {"to": "codex", field: "123"}
+            )
+            self.assertTrue(dispatched.is_protocol_error, field)
+            self.assertTrue(
+                any(
+                    "unknown property" in v
+                    for v in dispatched.protocol_error.data["violations"]
+                ),
+                field,
+            )
+
+
+class R5NoCallerAuthenticationOverclaimTests(unittest.TestCase):
+    """#15152 R5 (review j#106995 finding_callerauthorityoverclaim): no shipped
+    tool description or SERVER_INSTRUCTIONS may claim the caller's own identity is
+    authenticated / verified as authority — ADR-0006 / j#106959 fixed the trust
+    boundary at the runtime perimeter and the sender check as a weak signal."""
+
+    def _texts(self):
+        from collections.abc import Mapping
+
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mcp_server import (  # noqa: E501
+            SERVER_INSTRUCTIONS,
+        )
+
+        texts = [SERVER_INSTRUCTIONS]
+        for definition in TOOL_CATALOG.values():
+            texts.append(definition.description)
+            # The frozen schema uses MappingProxyType, so match on Mapping — a
+            # `dict`-only check silently skipped every property description
+            # (the exact hole the mutant `--` exposed).
+            props = definition.input_schema.get("properties", {})
+            if isinstance(props, Mapping):
+                for prop in props.values():
+                    if isinstance(prop, Mapping) and isinstance(
+                        prop.get("description"), str
+                    ):
+                        texts.append(prop["description"])
+        return texts
+
+    def test_no_description_claims_caller_authentication(self) -> None:
+        # Phrases that would assert the caller's own identity is authenticated /
+        # verified as authority. "authenticated here" is allowed ONLY in the
+        # explicit negation "NOT ... authenticated".
+        forbidden = [
+            "verifies the caller",
+            "caller's sender authority",
+            "verify caller",
+            "authenticates the caller",
+        ]
+        for text in self._texts():
+            lowered = text.lower()
+            for phrase in forbidden:
+                self.assertNotIn(phrase.lower(), lowered, f"overclaim: {phrase!r}")
+
+
 class MutatingDeclarationGuardTests(unittest.TestCase):
     def _tool(self, name: str, schema: dict, *, read_only: bool) -> dict:
         return {

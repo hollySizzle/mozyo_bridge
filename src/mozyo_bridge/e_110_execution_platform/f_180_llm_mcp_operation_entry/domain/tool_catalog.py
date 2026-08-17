@@ -47,7 +47,6 @@ from typing import Any, Mapping
 from mozyo_bridge.core.state.lane_kind import LANE_KINDS
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     KIND_LABELS,
-    SOURCES,
 )
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.unit_selector import (  # noqa: E501
     REQUIRED_SELECTOR_FIELDS,
@@ -426,32 +425,36 @@ _UNIT_STATE = ToolDefinition(
 # send-safety gates all run inside the shared orchestration and refuse with
 # typed reasons before any side effect.
 
+# Redmine-only anchor fields. `source=asana` is DELIBERATELY unrepresentable
+# here (#15152 R5, review j#106995 finding_handoffauthoritygap): the shared
+# anchor gate `verify_live_handoff_anchor` verifies ownership only for a Redmine
+# anchor and returns any non-Redmine anchor UNVERIFIED, so a fabricated Asana
+# task/comment would pass. Until an Asana live verifier exists this surface fails
+# closed by not accepting the source at all — `additionalProperties: False` makes
+# a `task_id` / `comment_id` a schema violation (a protocol error), not a silent
+# unverified send.
 _HANDOFF_ANCHOR_PROPERTIES = {
     "source": {
         "type": "string",
-        "enum": sorted(SOURCES),
+        "enum": ["redmine"],
         "default": "redmine",
         "description": (
-            "Durable anchor system. `redmine` anchors with issue+journal; "
-            "`asana` anchors with task_id+comment_id. Cross-source fields are "
-            "refused by the shared anchor gate."
+            "Durable anchor system. Only `redmine` (issue + journal) is "
+            "accepted on this surface; its ownership is verified before send. "
+            "Other sources are not representable here (no live verifier yet)."
         ),
     },
     "issue": {
         "type": "string",
-        "description": "Redmine durable-anchor issue id (required by the gate for source=redmine).",
+        "description": "Redmine durable-anchor issue id (required by the gate).",
     },
     "journal": {
         "type": "string",
-        "description": "Redmine durable-anchor journal id (required by the gate for source=redmine).",
-    },
-    "task_id": {
-        "type": "string",
-        "description": "Asana durable-anchor task id (source=asana).",
-    },
-    "comment_id": {
-        "type": "string",
-        "description": "Asana durable-anchor comment id (source=asana).",
+        "description": (
+            "Redmine durable-anchor journal id. Verified to EXIST and to BELONG "
+            "to the issue before send; whether that journal authorizes the "
+            "requested kind (kind/gate join) is NOT verified here (#15595)."
+        ),
     },
 }
 
@@ -525,19 +528,23 @@ _HANDOFF_OUTPUT_SCHEMA = _freeze(
 
 _HANDOFF_MUTATION_DESCRIPTION = (
     "MUTATING. Runs the same shared handoff orchestration the CLI runs "
-    "(in-process, #15149): durable-anchor ownership, receiver vocabulary, "
-    "identity, gateway-route and send-safety gates all apply and refuse with "
-    "typed reasons before any side effect. Delivery is reported from the shared "
-    "injection-stage authority; `delivered: false` with status `completed` "
-    "means the send terminated without confirmed submission — never assume "
-    "delivery from exit alone."
+    "(in-process, #15149): the receiver / role vocabulary, gateway-route and "
+    "send-safety gates apply and refuse with typed reasons before any side "
+    "effect, and the Redmine anchor is verified to EXIST and BELONG to its "
+    "issue. What is NOT verified (#15152 R5 / ADR-0006): the caller's own "
+    "coordinator identity is not authenticated (trust boundary = runtime "
+    "perimeter), and whether the anchor journal authorizes the requested kind "
+    "(kind/gate join) is not checked here (#15595). Delivery is reported from "
+    "the shared injection-stage authority; `delivered: false` with status "
+    "`completed` means the send terminated without confirmed submission — never "
+    "assume delivery from exit alone."
 )
 
 _HANDOFF_SEND = ToolDefinition(
     name=TOOL_HANDOFF_SEND,
     title="Send an anchored cross-agent handoff",
     description=(
-        "Send a governed, durable-anchored handoff to a receiver ROLE. "
+        "Send an anchored handoff to a receiver ROLE. "
         + _HANDOFF_MUTATION_DESCRIPTION
     ),
     input_schema=_handoff_input_schema(
@@ -653,10 +660,13 @@ _SUBLANE_START = ToolDefinition(
                     "type": "boolean",
                     "default": True,
                     "description": (
-                        "With actuate, also dispatch the governed "
-                        "implementation_request. false still requires — and "
-                        "verifies — the durable anchor and the caller's "
-                        "sender authority before any mutation (#15152 R2)."
+                        "With actuate, also dispatch the "
+                        "implementation_request. false still requires the "
+                        "durable anchor before any mutation (#15152 R2). The "
+                        "caller's own coordinator identity is NOT authenticated "
+                        "either way (ADR-0006, deferred to #15579): the "
+                        "sender-identity check is a weak signal, not "
+                        "forgery-proof authority."
                     ),
                 },
                 "target_repo": {
