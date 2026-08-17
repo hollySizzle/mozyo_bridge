@@ -334,6 +334,91 @@ class HandoffProjectionTests(unittest.TestCase):
         body = json.dumps(outcome.payload)
         self.assertNotIn("[mozyo:handoff:", body)
         self.assertNotIn("[mozyo:handoff:", outcome.summary)
+
+    def test_caller_facing_fields_are_sealed_against_producer_drift(self) -> None:
+        # #15152 R11 (review j#107115 finding_outcomeprojectionunsealed): the
+        # DeliveryOutcome is a plain dataclass with NO runtime validator, so an
+        # ordinary producer contract drift can put a private path in receiver /
+        # kind / an anchor value / a marker-shaped notification. The projection
+        # SEALS each caller-facing field against a closed vocabulary / grammar
+        # (source-independently — neither raw input nor raw outcome is trusted) and
+        # correlates the marker with the canonical envelope; every drifted value is
+        # dropped from BOTH the structured payload and the text summary.
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service import (  # noqa: E501
+            HandoffResult,
+        )
+
+        hostile = _delivery_outcome(
+            status="sent",
+            reason="ok",
+            receiver="/private/runtime/evilrcv",
+            kind="/private/runtime/evilkind",
+            anchor={
+                "source": "/private/src",
+                "issue": "/private/runtime/evilissue",
+                "journal": "%9",
+            },
+            notification_marker="[mozyo:handoff:leaked /private/runtime/pane-%9 to=mallory]",
+        )
+        outcome = self._run_with_result(
+            HandoffResult(
+                operation="send", status="completed", exit_code=0, outcome=hostile, delivered=True
+            )
+        )
+
+        body = json.dumps(outcome.payload)
+        for sentinel in (
+            "/private/runtime",
+            "/private/src",
+            "%9",
+            "evilrcv",
+            "evilkind",
+            "evilissue",
+            "mallory",
+            "leaked",
+        ):
+            self.assertNotIn(sentinel, body, sentinel)
+            self.assertNotIn(sentinel, outcome.summary, sentinel)
+        projected = outcome.payload["outcome"]
+        self.assertNotIn("receiver", projected)
+        self.assertNotIn("kind", projected)
+        self.assertNotIn("anchor", projected)
+        self.assertNotIn("notification_marker", projected)
+
+    def test_a_marker_that_does_not_correlate_is_dropped(self) -> None:
+        # #15152 R11: even when receiver / kind / anchor are individually valid, the
+        # marker is republished ONLY if it byte-equals the canonical envelope rebuilt
+        # from those validated parts. A marker that drifted (an injected field, an
+        # extra segment) does not correlate and is dropped — so a private value
+        # smuggled into an otherwise-valid-looking marker never reaches the surface.
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service import (  # noqa: E501
+            HandoffResult,
+        )
+
+        drifted_marker = self._CANONICAL_REPLY_MARKER[:-1] + ":injected=/private/x]"
+        outcome = self._run_reply_with_result(
+            self._completed_result(
+                _delivery_outcome(
+                    status="sent",
+                    reason="ok",
+                    receiver="codex",
+                    kind="reply",
+                    notification_marker=drifted_marker,
+                )
+            ),
+            {"to": "codex", "source": "redmine", "issue": "15152", "journal": "1"},
+        )
+
+        projected = outcome.payload["outcome"]
+        # The valid caller-facing fields still publish...
+        self.assertEqual("codex", projected["receiver"])
+        self.assertEqual("reply", projected["kind"])
+        # ...but the non-correlating marker (and its smuggled value) do not.
+        self.assertNotIn("notification_marker", projected)
+        body = json.dumps(outcome.payload)
+        self.assertNotIn("/private/x", body)
+        self.assertNotIn("/private/x", outcome.summary)
+        self.assertNotIn("injected=", body)
         self.assertNotIn("/private/runtime", body)
         self.assertNotIn("%7", body)
 

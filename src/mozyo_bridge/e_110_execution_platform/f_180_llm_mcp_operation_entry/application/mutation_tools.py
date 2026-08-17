@@ -27,6 +27,7 @@ say where things live.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Mapping, get_args
 
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.read_plan_tools import (  # noqa: E501
@@ -94,6 +95,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
     MODES,
+    RECEIVERS,
+    SOURCES,
+    build_marker,
+    normalize_anchor,
     NextActionOwner,
     Reason,
     Status,
@@ -356,8 +361,74 @@ _SUBLANE_REFUSAL_FALLBACK = (
 # --- handoff_send / handoff_reply ------------------------------------------ #
 
 
+# The public grammar for the caller-facing structured facts (#15152 R11, review
+# j#107115 finding_outcomeprojectionunsealed). DeliveryOutcome is a plain dataclass
+# with NO runtime validator, so an ordinary producer contract drift can put a
+# private path in receiver / kind / an anchor value / a marker-shaped notification.
+# Neither the raw input (R9) nor the raw outcome (R10) is safe; the projection
+# itself SEALS every caller-facing field against a closed vocabulary / grammar, and
+# the marker is republished only when it correlates with the canonical envelope
+# rebuilt from the validated parts. Drop on any mismatch.
+_HANDOFF_KIND_GRAMMAR = re.compile(r"^[a-z][a-z0-9_]*$")
+_HANDOFF_ANCHOR_ID_GRAMMAR = re.compile(r"^[A-Za-z0-9_.:#-]+$")
+_HANDOFF_ANCHOR_ID_FIELDS = ("issue", "journal", "task_id", "comment_id")
+
+
+def _sealed_receiver(outcome: Any):
+    """The receiver validated against the closed ``RECEIVERS`` set, else ``None``."""
+    receiver = getattr(outcome, "receiver", None)
+    return str(receiver) if receiver in RECEIVERS else None
+
+
+def _sealed_kind(outcome: Any):
+    """The kind validated against the safe-token grammar, else ``None``."""
+    kind = getattr(outcome, "kind", None)
+    return kind if isinstance(kind, str) and _HANDOFF_KIND_GRAMMAR.match(kind) else None
+
+
+def _sealed_anchor(outcome: Any) -> dict:
+    """The anchor filtered to closed-source + id-grammar members (defense in depth)."""
+    raw = getattr(outcome, "anchor", None)
+    if not isinstance(raw, Mapping):
+        return {}
+    sealed: dict = {}
+    source = raw.get("source")
+    if source in SOURCES:
+        sealed["source"] = str(source)
+    for field in _HANDOFF_ANCHOR_ID_FIELDS:
+        value = raw.get(field)
+        if value is not None and _HANDOFF_ANCHOR_ID_GRAMMAR.match(str(value)):
+            sealed[field] = str(value)
+    return sealed
+
+
+def _sealed_marker(outcome: Any, receiver, kind, anchor: dict):
+    """The marker republished ONLY when it correlates with the canonical envelope.
+
+    Rebuild the marker from the already-validated receiver / kind / anchor with the
+    same ``build_marker`` the producer uses, and publish the outcome's own marker
+    only when it byte-equals that reconstruction. A refusal (marker ``None``), an
+    un-normalizable anchor, or any drift that changed a validated part yields
+    ``None`` and the field is omitted. The marker is NEVER built from raw args.
+    """
+    marker = getattr(outcome, "notification_marker", None)
+    if marker is None or receiver is None or kind is None:
+        return None
+    try:
+        normalized = normalize_anchor(
+            anchor.get("source", ""),
+            issue=anchor.get("issue"),
+            journal=anchor.get("journal"),
+            task_id=anchor.get("task_id"),
+            comment_id=anchor.get("comment_id"),
+        )
+    except Exception:
+        return None
+    return str(marker) if str(marker) == build_marker(normalized, kind, receiver) else None
+
+
 def _public_delivery_outcome(outcome: Any) -> dict:
-    """The runtime-closed projection of one DeliveryOutcome (#15152 R7/R8/R9).
+    """The runtime-SEALED projection of one DeliveryOutcome (#15152 R7..R11).
 
     Every published member is the EFFECTIVE, domain-validated fact the shared
     application layer actually adopted, taken SOLELY from the returned
@@ -375,42 +446,41 @@ def _public_delivery_outcome(outcome: Any) -> dict:
     ``None`` on any pre-envelope refusal (every terminal is published through
     ``make_publishing_emitter``), so it is the single authority here.
 
-    Producer-owned token fields (status/reason/next_action_owner/mode) are still
+    Producer-owned token fields (status/reason/next_action_owner/mode) are
     validated against their closed registries (unknown -> ``unknown_<field>``);
     producer FREE TEXT and pane/path evidence (``next_action`` / ``target`` /
-    ``execution_root``) stay dropped — the R8 boundary this keeps. The R10 threat
-    model excludes a malicious output producer, so these domain-validated
-    structured facts are echoed as-is; the anchor is filtered to its closed public
-    member allowlist as defense in depth.
+    ``execution_root``) stay dropped — the R8 boundary this keeps. #15152 R11
+    (review j#107115 finding_outcomeprojectionunsealed): the ``DeliveryOutcome`` is
+    a plain dataclass with NO runtime validator, so an ordinary producer contract
+    drift can still put a private path in receiver / kind / an anchor value / a
+    marker-shaped notification. So every caller-facing structured fact is now
+    SEALED here regardless of source — receiver against ``RECEIVERS``, kind against
+    a safe-token grammar, the anchor against ``SOURCES`` + an id-grammar, and the
+    notification marker republished ONLY when it correlates with the canonical
+    envelope rebuilt from the validated parts. Any drifted value is dropped.
     """
     payload: dict = {}
     for name in _HANDOFF_PRODUCER_REGISTRIES:
         value = getattr(outcome, name, None)
         if value is not None:
             payload[name] = _public_handoff_token(name, value)
-    # Effective caller-echo: the receiver / kind the shared layer adopted (the
-    # consult pin, the reply default_kind), from the domain-validated outcome.
-    receiver = getattr(outcome, "receiver", None)
+    # Every caller-facing structured fact is SEALED against a closed vocabulary /
+    # grammar here (#15152 R11) — source-independently, so neither raw-input (R9)
+    # nor raw-outcome (R10) drift can leak a private value. The marker is
+    # republished only when it correlates with the canonical envelope rebuilt from
+    # the validated parts (present on envelope success, absent on refusal / drift).
+    receiver = _sealed_receiver(outcome)
     if receiver is not None:
-        payload["receiver"] = str(receiver)
-    kind = getattr(outcome, "kind", None)
+        payload["receiver"] = receiver
+    kind = _sealed_kind(outcome)
     if kind is not None:
-        payload["kind"] = str(kind)
-    raw_anchor = getattr(outcome, "anchor", None)
-    if isinstance(raw_anchor, Mapping):
-        anchor = {
-            key: str(raw_anchor[key])
-            for key in HANDOFF_ANCHOR_PUBLIC_FIELDS
-            if raw_anchor.get(key) is not None
-        }
-        if anchor:
-            payload["anchor"] = anchor
-    # The marker: ONLY the canonical envelope marker the outcome carries — present
-    # when the run formed the envelope, ``None`` on any pre-envelope refusal. Never
-    # rebuilt from raw args (#15152 R9 finding_effectiveinputprojection).
-    marker = getattr(outcome, "notification_marker", None)
+        payload["kind"] = kind
+    anchor = _sealed_anchor(outcome)
+    if anchor:
+        payload["anchor"] = anchor
+    marker = _sealed_marker(outcome, receiver, kind, anchor)
     if marker is not None:
-        payload["notification_marker"] = str(marker)
+        payload["notification_marker"] = marker
     return payload
 
 
