@@ -2049,6 +2049,11 @@ class _EmbeddedStartupOps:
         self.reads = 0
         self.dispatches = 0
 
+    def preflight_dispatch_sender(self):
+        # #15152 R3 (j#106868): capability absence now fails actuation closed;
+        # attested here so the startup-health gate stays the one under test.
+        return True, "sender_attested"
+
     def is_git_workspace(self):
         return True
 

@@ -43,12 +43,19 @@ tool 語彙に**含めない**。durable anchor 検証を核とする本 surface
    j#106834 finding_authoritybypass）: `actuate=true` は journal を必須とし
    （`anchor_required`）、その journal が当該 issue に実在し帰属することを共有 authority
    `verify_live_handoff_anchor`（#14246）で **worktree / pair mutation より前に**検証する。
-   sender attestation preflight（#13613、port が提供する backend）も create-only を含む
-   全 actuation で mutation 前に走る。dispatch leg の send-time 検証は従来どおり残るが、
-   それだけでは lane 作成後の検出になる — その順序こそが finding の内容だった。この
-   強化は共有 body（service / use case）側にあり、CLI の `--execute --no-dispatch`
-   （journal なし create-only）も同じ契約変更を受ける（MCP-only の adapter gate は
-   作らない）。
+   sender attestation preflight も create-only を含む全 actuation で mutation 前に走り、
+   **capability の欠落自体が typed refusal**（R3、review j#106868
+   finding_senderauthoritygap）: `preflight_dispatch_sender` を持たない ops port は
+   `sender_authority_capability_missing` で fail-closed になる（#13613 の port-opt-in
+   読みは撤回 — port 不在は authority 成立ではない）。判定本体は 1 つの共有 authority
+   `evaluate_dispatch_sender`（workspace anchor + env 解決 sender identity +
+   coordinator provider binding + default lane 照合。herdr runtime 非依存）で、herdr
+   adapter と tmux の `LiveSublaneActuatorOps` の双方がそれへ委譲する。dispatch leg の
+   send-time 検証は従来どおり残るが、それだけでは lane 作成後の検出になる — その順序
+   こそが R1 finding の内容だった。この強化は共有 body（service / use case、gate 本体は
+   `sublane_actuator_gates.sender_authority_admission`）側にあり、CLI の
+   `--execute --no-dispatch`（journal なし create-only）も同じ契約変更を受ける
+   （MCP-only の adapter gate は作らない）。
 3. **MCP adapter は #15146 の回避策ではない。** parent-authority の判定は
    `delegated_parent_authority_gate`（core 修正そのもの）を service 経由で呼ぶ。CLI 側
    handler `cmd_sublane_start` も同じ service を呼ぶ Namespace adapter に縮退しており、

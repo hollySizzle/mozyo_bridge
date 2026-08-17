@@ -101,10 +101,18 @@ def _dispatch_next_inputs():
 
 
 class FakeActuatorOps:
-    """Adopt-path fake: an already-live, identity-matching lane, dispatch exit 0."""
+    """Adopt-path fake: an already-live, identity-matching lane, dispatch exit 0.
+
+    Attested-by-default sender preflight since #15152 R3 (j#106868): capability
+    absence now fails actuation closed, so the sender-authority tests override
+    this while every other gate test proceeds past it.
+    """
 
     def __init__(self):
         self.calls = []
+
+    def preflight_dispatch_sender(self):
+        return True, "sender_attested"
 
     def is_git_workspace(self):
         return True

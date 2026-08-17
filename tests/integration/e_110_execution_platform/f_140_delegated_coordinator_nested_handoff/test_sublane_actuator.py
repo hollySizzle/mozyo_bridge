@@ -90,7 +90,16 @@ def _split_lane(**kw):
 
 
 class FakeActuatorOps:
-    """A scriptable :class:`SublaneActuatorOps` recording every call made to it."""
+    """A scriptable :class:`SublaneActuatorOps` recording every call made to it.
+
+    Carries an attested-by-default ``preflight_dispatch_sender`` since #15152 R3
+    (review j#106868): capability ABSENCE now fails the actuation closed, so a
+    fake without the port would block every execute test at the sender gate
+    instead of the gate that test exists for. Sender-authority tests override it.
+    """
+
+    def preflight_dispatch_sender(self):
+        return True, "sender_attested"
 
     def __init__(
         self,
@@ -370,13 +379,24 @@ class SenderAttestationPreflightTests(unittest.TestCase):
         self.assertIn("sender_workspace_mismatch", outcome.reason)
         self.assertFalse([c for c in ops.calls if isinstance(c, tuple) and c[0] == "create_worktree"])
 
-    def test_absent_ops_preflight_is_backcompat_no_op(self):
-        # An ops port without preflight_dispatch_sender (tmux / legacy) is not gated — the #13613
-        # attestation is opt-in per the backend port, keeping existing callers byte-for-byte.
-        ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
-        self.assertFalse(hasattr(ops, "preflight_dispatch_sender"))
+    def test_absent_ops_preflight_fails_closed(self):
+        # Contract INVERTED by #15152 R3 (review j#106868 finding_senderauthoritygap).
+        # This test previously pinned the opposite ("an ops port without
+        # preflight_dispatch_sender is not gated — #13613 opt-in backcompat"),
+        # which made every backend without the port — the tmux adapter among
+        # them — mutate lanes with NO caller authority at all. Capability
+        # absence is not authority: an ops port that cannot establish the
+        # sender must not mutate a lane, and refuses typed with zero mutation.
+        class CapabilityLessOps(FakeActuatorOps):
+            preflight_dispatch_sender = None  # the port is absent, not failing
+
+        ops = CapabilityLessOps(git=True, lanes=[None, _lane()])
         outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
-        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn("sender_authority_capability_missing", outcome.blocked_reasons)
+        self.assertIn("sender_attestation", outcome.blocked_reasons)
+        self.assertNotIn("create_worktree", ops._names())
+        self.assertNotIn("append_lane_column", ops._names())
 
     def test_passing_ops_preflight_proceeds(self):
         class AttestedSenderOps(FakeActuatorOps):

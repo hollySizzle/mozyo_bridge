@@ -379,6 +379,11 @@ class PreWorktreeGateTest(unittest.TestCase):
             self.verdict = verdict
             self.calls: list[str] = []
 
+        def preflight_dispatch_sender(self):
+            # #15152 R3 (j#106868): capability absence now fails actuation
+            # closed; attested so the launcher gate stays the one under test.
+            return True, "sender_attested"
+
         def is_git_workspace(self) -> bool:
             return True
 
@@ -1373,6 +1378,10 @@ class R13SymlinkMaterializationTest(unittest.TestCase):
             class _SpyOps:
                 """Every mutating port method raises; the reads are the real git ones."""
 
+                def preflight_dispatch_sender(self):
+                    # #15152 R3: attested so the symlink gate stays under test.
+                    return True, "sender_attested"
+
                 def is_git_workspace(self) -> bool:
                     return True
 
@@ -1686,6 +1695,10 @@ class R13PublicReasonTest(unittest.TestCase):
                         """Reads are real; the REASON comes from the real evaluator; every
                         mutation raises."""
 
+                        def preflight_dispatch_sender(self):
+                            # #15152 R3: attested; the reason path stays under test.
+                            return True, "sender_attested"
+
                         def is_git_workspace(self) -> bool:
                             return True
 
@@ -1910,6 +1923,10 @@ class R17AttributeSentinelTest(unittest.TestCase):
             git_ops = LiveSublaneGitOperations(repo_root=repo)
 
             class _Ops:
+                def preflight_dispatch_sender(self):
+                    # #15152 R3: attested; the sentinel gate stays under test.
+                    return True, "sender_attested"
+
                 def is_git_workspace(self) -> bool:
                     return True
 

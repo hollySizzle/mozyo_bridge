@@ -300,6 +300,26 @@ class LiveSublaneActuatorOps:
         # of a non-git (skip_no_git) lane, which has no worktree and runs here.
         return str(self.repo_root)
 
+    def preflight_dispatch_sender(self) -> tuple[bool, str]:
+        """Verify the command-shell sender before any lane mutation.
+
+        #15152 R3 (review j#106868 finding_senderauthoritygap): the tmux adapter
+        previously carried no sender-authority capability at all, and the use
+        case treated that absence as a pass — so on the tmux backend every
+        actuation mode mutated the workspace with no caller role/lane authority.
+        The judgement itself was never herdr-specific: the SAME shared authority
+        the herdr adapter runs (workspace anchor + env-resolved sender identity +
+        coordinator provider binding + default lane) applies here verbatim, over
+        the process environment this CLI-composed adapter actually runs in.
+        """
+        import os
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
+            evaluate_dispatch_sender,
+        )
+
+        return evaluate_dispatch_sender(os.environ, self.repo_root)
+
     def is_git_workspace(self) -> bool:
         return self._git().is_git_workspace()
 

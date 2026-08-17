@@ -30,6 +30,7 @@ from typing import Optional
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     REASON_LAUNCH_BLOCKED,
     REASON_LAUNCHER_INCOMPATIBLE,
+    REASON_MISSING_IDENTITY,
     REASON_PAIR_SPLIT,
     REASON_PARTIAL_PAIR_RECOVERY,
     REASON_RUNTIME_FINGERPRINT,
@@ -53,6 +54,58 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     SUBLANE_STATE_PAIR_SPLIT,
 )
+
+
+def sender_authority_admission(
+    use_case,
+    request,
+    *,
+    dispatch: bool,
+    fill_decision: Optional[str],
+    fill_override_reason: Optional[str],
+):
+    """The pre-mutation sender-authority gate for EVERY actuation (#15152 R2/R3).
+
+    Two refusals, both decided before any worktree / pane / dispatch side effect:
+
+    - the ops port carries NO ``preflight_dispatch_sender`` capability (#15152 R3,
+      review j#106868 finding_senderauthoritygap): absence used to be a #13613
+      backcompat pass, which made every non-herdr backend fail open — an ops port
+      that cannot establish the caller's authority must not mutate a lane;
+    - the capability exists and refuses (#13613): the resolved sender identity
+      does not match the workspace anchor / coordinator binding / default lane.
+
+    Returns the typed blocked outcome, or ``None`` to proceed.
+    """
+    sender_preflight = getattr(use_case.ops, "preflight_dispatch_sender", None)
+    if not callable(sender_preflight):
+        return use_case._blocked(
+            request,
+            launch_action=None,
+            reason="the actuation ops port provides no sender-authority "
+            "capability; an unverifiable sender must not mutate a lane",
+            reasons=(
+                REASON_MISSING_IDENTITY,
+                "sender_attestation",
+                "sender_authority_capability_missing",
+            ),
+            dispatch=dispatch,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
+        )
+    sender_ok, sender_detail = sender_preflight()
+    if not sender_ok:
+        return use_case._blocked(
+            request,
+            launch_action=None,
+            reason="dispatch sender attestation failed before actuation; "
+            f"{sender_detail}",
+            reasons=(REASON_MISSING_IDENTITY, "sender_attestation"),
+            dispatch=dispatch,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
+        )
+    return None
 
 
 def runtime_placement_gate(
@@ -455,5 +508,6 @@ __all__ = (
     "pair_attestation_admission",
     "pair_split_admission",
     "runtime_placement_gate",
+    "sender_authority_admission",
     "startup_health_admission",
 )

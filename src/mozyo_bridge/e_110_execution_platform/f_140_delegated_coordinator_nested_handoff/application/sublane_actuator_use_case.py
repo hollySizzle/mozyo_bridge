@@ -74,6 +74,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     pair_attestation_admission,
     pair_split_admission,
     pre_mutation_admission,
+    sender_authority_admission,
     startup_health_admission,
 )
 
@@ -204,24 +205,19 @@ class SublaneActuateUseCase:
             fill_decision_token = admission.fill_decision
             fill_override_reason = admission.override_reason
 
-        # 3c. #13613: optional herdr sender attestation must fail before mutation;
-        # absence preserves tmux and existing test-port compatibility. Scoped to
-        # EVERY actuation since #15152 R2 (j#106834): create-only mutates too.
+        # 3c. Sender authority for EVERY actuation (#15152 R2 j#106834; R3
+        # j#106868 made capability ABSENCE fail closed too). Gate body lives in
+        # `sublane_actuator_gates.sender_authority_admission`.
         if execute:
-            sender_preflight = getattr(self.ops, "preflight_dispatch_sender", None)
-            if callable(sender_preflight):
-                sender_ok, sender_detail = sender_preflight()
-                if not sender_ok:
-                    return self._blocked(
-                        request,
-                        launch_action=None,
-                        reason="dispatch sender attestation failed before actuation; "
-                        f"{sender_detail}",
-                        reasons=(REASON_MISSING_IDENTITY, "sender_attestation"),
-                        dispatch=dispatch,
-                        fill_decision=fill_decision_token,
-                        fill_override_reason=fill_override_reason,
-                    )
+            gate_outcome = sender_authority_admission(
+                self,
+                request,
+                dispatch=dispatch,
+                fill_decision=fill_decision_token,
+                fill_override_reason=fill_override_reason,
+            )
+            if gate_outcome is not None:
+                return gate_outcome
 
         # 4. Resolve the launch decision and preserve a fail-closed future contract.
         launch = decide_create_launch(self.ops, request, self.policy)

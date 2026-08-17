@@ -404,6 +404,123 @@ class R2PreMutationDurableAuthorityTest(_TempRepo):
                 self.assertEqual([], self._mutations(ops))
 
 
+class R3SenderAuthorityCapabilityTest(_TempRepo):
+    """R3 (review j#106868 finding_senderauthoritygap): capability absence is a
+    typed pre-mutation refusal, and the tmux adapter carries the SAME shared
+    sender authority the herdr adapter carries.
+
+    R2 kept the #13613 port-opt-in reading — an ops port without
+    ``preflight_dispatch_sender`` passed the sender gate — so the tmux backend's
+    ``LiveSublaneActuatorOps`` (which had no such port) let every actuation mode
+    mutate the workspace with no caller role/lane authority. Pinned here through
+    the real MCP dispatch path (capability-less ops refuse with zero mutation,
+    both dispatch modes) and at the adapter seam (BOTH live adapters delegate to
+    the one shared ``evaluate_dispatch_sender`` authority).
+    """
+
+    def _capability_less_ops_cls(self):
+        from tests.integration.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.test_sublane_actuator import (  # noqa: E501
+            FakeActuatorOps,
+            _lane,
+        )
+
+        class _Ops(FakeActuatorOps):
+            preflight_dispatch_sender = None  # the port is absent, not failing
+
+            def __init__(self):
+                super().__init__(git=True, lanes=[None, _lane()])
+
+        return _Ops
+
+    def test_a_capability_less_ops_refuses_both_dispatch_modes(self) -> None:
+        from unittest.mock import patch
+
+        import mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_anchor_authority as anchor_authority  # noqa: E501
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator as act  # noqa: E501
+
+        for dispatch in (True, False):
+            with self.subTest(dispatch=dispatch):
+                ops = self._capability_less_ops_cls()()
+                with patch.object(
+                    anchor_authority,
+                    "verify_live_handoff_anchor",
+                    lambda anchor: anchor,
+                ):
+                    with patch.object(act, "_resolve_sublane_ops", return_value=ops):
+                        dispatched = dispatch_tool_call(
+                            "sublane_start",
+                            {
+                                "issue": "15152",
+                                "lane_label": "issue_15152_probe",
+                                "branch": "issue_15152_probe",
+                                "worktree": "/wt/issue_15152_probe",
+                                "journal": "999",
+                                "actuate": True,
+                                "dispatch": dispatch,
+                            },
+                            ReadPlanContext(repo_root=self._repo()),
+                        )
+                content = dispatched.result["structuredContent"]
+                self.assertTrue(dispatched.result["isError"])
+                self.assertIn(
+                    "sender_authority_capability_missing",
+                    content["outcome"]["blocked_reasons"],
+                )
+                names = [c[0] if isinstance(c, tuple) else c for c in ops.calls]
+                self.assertEqual(
+                    [],
+                    [
+                        n
+                        for n in names
+                        if n in ("create_worktree", "append_lane_column", "dispatch")
+                    ],
+                )
+
+    def test_both_live_adapters_delegate_to_the_one_shared_authority(self) -> None:
+        # The judgement is `evaluate_dispatch_sender`, once: the herdr adapter
+        # and the tmux adapter both reach it, and both pass its verdict through
+        # (authorized and unauthorized alike). A second sender-authority
+        # statement in either adapter would be the drift this issue forbids.
+        from unittest.mock import patch
+
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_ops as herdr_ops_module  # noqa: E501
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight as preflight  # noqa: E501
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (  # noqa: E501
+            LiveSublaneActuatorOps,
+        )
+
+        repo = self._repo()
+        adapters = (
+            LiveSublaneActuatorOps(repo_root=repo),
+            herdr_ops_module.HerdrSublaneActuatorOps(
+                repo_root=repo, lane_label="issue_15152_probe", issue="15152"
+            ),
+        )
+        for verdict in ((True, "sender_attested"), (False, "sender_mismatch")):
+            for ops in adapters:
+                with self.subTest(ops=type(ops).__name__, verdict=verdict):
+                    seen = {}
+
+                    def _shared(env, repo_root, _verdict=verdict):
+                        seen["repo_root"] = repo_root
+                        return _verdict
+
+                    # One judgement, two import spellings: the tmux adapter
+                    # resolves the preflight module attribute at call time; the
+                    # herdr adapter bound the name at its module top. Both
+                    # bindings are replaced with the SAME probe, so whichever
+                    # spelling an adapter uses, the shared authority is what
+                    # answers.
+                    with patch.object(
+                        preflight, "evaluate_dispatch_sender", _shared
+                    ), patch.object(
+                        herdr_ops_module, "evaluate_dispatch_sender", _shared
+                    ):
+                        result = ops.preflight_dispatch_sender()
+                    self.assertEqual(verdict, result)
+                    self.assertEqual(repo, Path(seen["repo_root"]))
+
+
 class NoRawSurfaceExpressibleTest(unittest.TestCase):
     """j#102930 / j#102998: the mutating surface cannot address unmanaged rows.
 
