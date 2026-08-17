@@ -105,6 +105,24 @@ documents:
     related_document_refs:
       - rule-adr-index
 
+  - id: rule-adr-0007-two-oh-scope-herdr-flip
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0007-two-oh-scope-herdr-flip.md
+    purpose: "ADR-0007: v2.0.0 は herdr 既定化の破壊的リリースで切り、MCP 標準入口 (#15148 配下) は 2.1 へ回す (#15594)。"
+    audit_role: adr_0007_rule
+    related_document_refs:
+      - rule-adr-index
+
+  - id: rule-adr-0008-release-cadence
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0008-release-cadence.md
+    purpose: "ADR-0008: リリースは早く小さく出す。現段階の cadence は半日に 1 回を上限、1 日複数回はしない (#15594)。"
+    audit_role: adr_0008_rule
+    related_document_refs:
+      - rule-adr-index
+
   - id: rule-release-distribution
     type: rule
     status: active
