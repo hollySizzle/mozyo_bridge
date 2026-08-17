@@ -105,6 +105,16 @@ documents:
     related_document_refs:
       - rule-adr-index
 
+  - id: rule-adr-0006-mcp-mutation-auth-boundary
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0006-mcp-mutation-auth-boundary.md
+    purpose: "ADR-0006: 変更操作の caller 認証は runtime perimeter に置き (ambient env を authority にしない)、偽造不能認証 (operator トークン→証明書/#15195) は user 貸し借り/ネットワーク露出機能と同時に導入する (#15152 / #15579)。"
+    audit_role: adr_0006_rule
+    related_document_refs:
+      - rule-adr-index
+      - logic-mcp-mutation-tool-authority
+
   - id: rule-release-distribution
     type: rule
     status: active

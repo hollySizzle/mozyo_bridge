@@ -185,6 +185,51 @@ class SublaneProjectionTests(unittest.TestCase):
         self.assertNotIn("gateway_pane", projected)
         self.assertNotIn("steps", projected)
 
+    def test_a_hostile_actuation_reason_is_reconstructed_not_leaked(self) -> None:
+        # #15152 R4 (review j#106903 finding_reasonproseleak): the ACTUATION
+        # producer's `reason` concatenates a gate's free-text detail (a sender
+        # preflight can emit "workspace anchor unreadable (/home/holly/private/
+        # ...)"), so the raw reason must never reach the public surface — neither
+        # structuredContent nor the text summary. The public reason is
+        # reconstructed from the closed status + blocked_reasons tokens.
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_start_service as svc  # noqa: E501
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            SublaneActuationOutcome,
+        )
+
+        hostile = SublaneActuationOutcome(
+            status="blocked",
+            execute=True,
+            reason=(
+                "dispatch sender attestation failed before actuation; "
+                "workspace anchor unreadable (/home/holly/private/secret at %5)"
+            ),
+            issue="15152",
+            lane_label="issue_15152_probe",
+            blocked_reasons=("missing_identity", "sender_attestation"),
+        )
+        result = svc.SublaneStartResult(
+            status=svc.STATUS_COMPLETED, exit_code=1, outcome=hostile
+        )
+        with patch.object(svc, "run_sublane_start", return_value=result):
+            outcome = run_sublane_start_tool(
+                {"issue": "15152", "lane_label": "issue_15152_probe", "actuate": True},
+                _context(),
+            )
+
+        # Neither the structured payload nor the text summary carries the raw
+        # reason's private path / pane id.
+        body = json.dumps(outcome.payload)
+        self.assertNotIn("/home/holly/private", body)
+        self.assertNotIn("%5", body)
+        self.assertNotIn("/home/holly/private", outcome.summary)
+        self.assertNotIn("%5", outcome.summary)
+        # The public reason is reconstructed from the closed tokens.
+        projected_reason = outcome.payload["outcome"]["reason"]
+        self.assertIn("blocked", projected_reason)
+        self.assertIn("sender_attestation", projected_reason)
+        self.assertNotIn("unreadable", projected_reason)
+
     def test_a_service_refusal_is_reconstructed_not_forwarded(self) -> None:
         import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_start_service as svc  # noqa: E501
 

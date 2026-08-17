@@ -56,6 +56,17 @@ tool 語彙に**含めない**。durable anchor 検証を核とする本 surface
    `sublane_actuator_gates.sender_authority_admission`）側にあり、CLI の
    `--execute --no-dispatch`（journal なし create-only）も同じ契約変更を受ける
    （MCP-only の adapter gate は作らない）。
+   **ただし sender check は caller 認証ではない**（ADR-0006、review j#106903
+   finding_clientenvspoof）: `evaluate_dispatch_sender` が照合する `MOZYO_*` は呼び出し元
+   プロセスの ambient env であり、stdio MCP server では client 制御下。照合先 (workspace
+   anchor は gitignore だが workspace_id は board / assigned name / journal marker に半公開、
+   coordinator provider は committed / 既定 codex、lane_id は定数) は repo / 運用面から取得
+   可能なので、client は一致値を自己設定できる = **偽造可能**。これは弱い identity 信号で
+   あり偽造防止 authority ではない。**現段階の信頼境界は runtime perimeter (同一ホスト・
+   attested pane 内に居ること)** と正直に宣言する (SERVER_INSTRUCTIONS / tool description /
+   本 doc)。偽造不能な caller 認証 (operator トークン → 証明書 / #15195) は user 貸し借り・
+   ネットワーク露出機能と同時に導入する (#15579 へ park)。finding_clientenvspoof は本 threat
+   model 明示化により deferred (再評価トリガー = 露出拡大機能の実装)。
 3. **MCP adapter は #15146 の回避策ではない。** parent-authority の判定は
    `delegated_parent_authority_gate`（core 修正そのもの）を service 経由で呼ぶ。CLI 側
    handler `cmd_sublane_start` も同じ service を呼ぶ Namespace adapter に縮退しており、
@@ -74,12 +85,15 @@ tool 語彙に**含めない**。durable anchor 検証を核とする本 surface
    のみを通る。runtime 発行 action receipt による更なる束縛は upstream 依存
    （#15195 NO-GO、Herdr Discussions #2652）で本書の scope 外。
 6. **result projection は allowlist。** #15151 の r4f3 / r5f1 規律を mutating 側にも適用
-   する。republish するのは閉 token（status / reason / injection stage / dispatch result
-   等）と caller 供給 identity（anchor issue/journal、lane_label 等）のみ。producer 自由文
-   （CLI `die` message、`next_action` prose、step command line）と pane / private path
-   evidence（`target` / `worktree_path` / `gateway_pane` / `steps`）は**捨てる**（scrub
-   しない）。fail-closed の説明は閉 token 上の固定文で再構成し、operator 詳細は CLI に
-   残す。
+   する。republish するのは閉 token（status / injection stage / dispatch result /
+   `blocked_reasons` の閉 token 等）と caller 供給 identity（anchor issue/journal、
+   lane_label 等）のみ。producer 自由文（CLI `die` message、`next_action` prose、step
+   command line、**および sublane の `outcome.reason`** — gate の自由文 detail を連結する
+   ため private path / exception 本文を含み得る。R4、review j#106903
+   finding_reasonproseleak）と pane / private path evidence（`target` / `worktree_path`
+   / `gateway_pane` / `steps`）は**捨てる**（scrub しない）。公開 `reason` は
+   `status` と `blocked_reasons`（いずれも閉 token）から固定文で**再構成**し、summary も
+   閉 token のみで組む。operator 詳細は CLI に残す。
 7. **delivered は injection-stage authority のみから導く。** `delivered: false` +
    `status: completed` は「送信は終端したが submission 未確認」であり、exit code から
    配達を推定しない（#13583 / #14232 の継承）。

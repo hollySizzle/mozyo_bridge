@@ -53,14 +53,18 @@ HANDOFF_OUTCOME_PUBLIC_FIELDS = (
 #: or a path.
 HANDOFF_ANCHOR_PUBLIC_FIELDS = ("source", "issue", "journal", "task_id", "comment_id")
 
-#: The SublaneActuationOutcome members the sublane tool republishes. Absent by
-#: decision: `worktree_path` (a private filesystem path), `gateway_pane` /
-#: `worker_pane` / `dispatch_target` (pane identities), `steps` (replayable
-#: command lines that interpolate both).
+#: The SublaneActuationOutcome members the sublane tool republishes VERBATIM.
+#: Absent by decision: `worktree_path` (a private filesystem path), `gateway_pane`
+#: / `worker_pane` / `dispatch_target` (pane identities), `steps` (replayable
+#: command lines that interpolate both), and — since #15152 R4 (review j#106903
+#: finding_reasonproseleak) — `reason`: the actuation producer builds it by
+#: concatenating a gate's free-text detail (e.g. `evaluate_dispatch_sender`'s
+#: "workspace anchor unreadable ({exc})", which can name a private path), and
+#: this allowlist is a copy, not a scrub. The closed `blocked_reasons` tokens ARE
+#: published; the public prose `reason` is RECONSTRUCTED from them below.
 SUBLANE_OUTCOME_PUBLIC_FIELDS = (
     "status",
     "execute",
-    "reason",
     "issue",
     "lane_label",
     "branch",
@@ -260,6 +264,26 @@ def run_handoff_reply(
 # --- sublane_start ---------------------------------------------------------- #
 
 
+def _reconstructed_sublane_reason(outcome: Any) -> str:
+    """A fixed public sentence over the closed status / blocked-reason tokens.
+
+    #15152 R4 (review j#106903 finding_reasonproseleak): the raw `outcome.reason`
+    carries a gate's free-text detail (private paths, exception text) and must not
+    reach the public surface. This reconstructs a reason from closed tokens only —
+    the `status` and the `blocked_reasons` tuple, both of which are closed
+    vocabulary — with the operator-facing detail reachable through the CLI.
+    """
+    status = str(getattr(outcome, "status", "") or "unknown")
+    blocked = [str(r) for r in (getattr(outcome, "blocked_reasons", ()) or ())]
+    if blocked:
+        return (
+            f"status {status}; blocked reasons {', '.join(blocked)}. Run "
+            "`mozyo-bridge sublane create` from the lane for the operator-facing "
+            "detail."
+        )
+    return f"status {status}."
+
+
 def _public_sublane_outcome(outcome: Any) -> dict:
     """The allowlisted projection of one SublaneActuationOutcome."""
     payload: dict = {}
@@ -269,6 +293,7 @@ def _public_sublane_outcome(outcome: Any) -> dict:
             value = list(value)
         if value is not None:
             payload[name] = value
+    payload["reason"] = _reconstructed_sublane_reason(outcome)
     return payload
 
 
@@ -337,9 +362,15 @@ def run_sublane_start_tool(
         "refusal": "",
         "outcome": _public_sublane_outcome(outcome),
     }
+    # #15152 R4 (finding_reasonproseleak): the summary uses closed tokens only —
+    # the raw `outcome.reason` (which can carry a gate's private-path detail) is
+    # never interpolated into the public text.
+    blocked = [str(r) for r in (outcome.blocked_reasons or ())]
     summary = (
-        f"sublane_start: {outcome.status} (reason {outcome.reason}, "
-        f"executed={str(bool(outcome.executed)).lower()})"
+        f"sublane_start: {outcome.status} "
+        f"(executed={str(bool(outcome.executed)).lower()}"
+        + (f", blocked {', '.join(blocked)}" if blocked else "")
+        + ")"
     )
     return ToolOutcome(payload=payload, is_error=outcome.is_blocked, summary=summary)
 

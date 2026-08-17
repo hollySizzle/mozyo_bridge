@@ -570,11 +570,14 @@ _SUBLANE_START = ToolDefinition(
         "delegated_coordinator PARENT-AUTHORITY admission (a delegated_"
         "coordinator lane is refused with a typed verdict unless its parent "
         "project gateway is durably declared AND verified), the provider "
-        "launchability preflight, and every actuation gate (identity, anchor, "
-        "sender attestation, fill admission) — all decided BEFORE any worktree "
-        "/ pair / dispatch side effect. Launching goes only through the "
-        "managed creator rail that assigns durable identity; no raw pane "
-        "creation is expressible."
+        "launchability preflight, and every actuation gate (identity, the "
+        "durable anchor's Redmine ownership, fill admission) — all decided "
+        "BEFORE any worktree / pair / dispatch side effect. The caller's own "
+        "coordinator identity is NOT cryptographically authenticated (ADR-0006, "
+        "deferred to #15579): the sender check is a weak signal and the trust "
+        "boundary is the runtime perimeter (attested host / pane). Launching "
+        "goes only through the managed creator rail that assigns durable "
+        "identity; no raw pane creation is expressible."
     ),
     input_schema=_freeze(
         {
