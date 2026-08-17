@@ -85,7 +85,7 @@ class HandoffProjectionTests(unittest.TestCase):
             exit_code=2,
             outcome=outcome,
             delivered=False,
-            error_message="died: pane %7 at /home/holly/private/checkout is busy",
+            error_message="died: pane %7 at /private/runtime/checkout is busy",
         )
 
     def test_the_gate_message_is_never_forwarded(self) -> None:
@@ -93,7 +93,7 @@ class HandoffProjectionTests(unittest.TestCase):
 
         body = json.dumps(outcome.payload)
         self.assertTrue(outcome.is_error)
-        self.assertNotIn("/home/holly/private", body)
+        self.assertNotIn("/private/runtime", body)
         self.assertNotIn("%7", body)
         self.assertEqual(HANDOFF_REFUSAL_SENTENCE, outcome.payload["refusal"])
 
@@ -133,6 +133,53 @@ class HandoffProjectionTests(unittest.TestCase):
         self.assertTrue(outcome.payload["delivered"])
         self.assertEqual("", outcome.payload["refusal"])
 
+    def test_hostile_producer_drift_never_reaches_the_public_surface(self) -> None:
+        # #15152 R7 (review j#107015 finding_handoffprojectionopen): DeliveryOutcome
+        # `Literal` types are NOT runtime guards; a producer contract drift can put a
+        # private path in `reason` or an off-set `status`/`mode`. None may reach the
+        # structured payload OR the text summary; each maps to its closed set / token.
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service import (  # noqa: E501
+            HandoffResult,
+        )
+
+        hostile = _delivery_outcome(
+            status="/private/runtime/pane-%7",
+            reason="workspace anchor unreadable (/private/runtime/secret at %5)",
+            mode="internal_mode_alpha",
+            next_action_owner="operator_beta",
+            receiver="codex",
+        )
+        outcome = self._run_with_result(
+            HandoffResult(
+                operation="send",
+                status="internal_state_gamma",  # off-set top-level status
+                exit_code=0,
+                outcome=hostile,
+                delivered="false",  # string, must not read as delivered
+            )
+        )
+
+        body = json.dumps(outcome.payload)
+        for sentinel in (
+            "/private/runtime",
+            "%5",
+            "%7",
+            "internal_mode_alpha",
+            "operator_beta",
+            "internal_state_gamma",
+            "unreadable",
+        ):
+            self.assertNotIn(sentinel, body, sentinel)
+            self.assertNotIn(sentinel, outcome.summary, sentinel)
+        projected = outcome.payload["outcome"]
+        self.assertEqual("unknown_status", projected["status"])
+        self.assertEqual("unknown_reason", projected["reason"])
+        self.assertEqual("unknown_mode", projected["mode"])
+        self.assertEqual("unknown_next_action_owner", projected["next_action_owner"])
+        # Top-level result status and delivered are closed / exact-bool too.
+        self.assertEqual("unknown_status", outcome.payload["status"])
+        self.assertIs(False, outcome.payload["delivered"])
+
 
 class SublaneProjectionTests(unittest.TestCase):
     def _actuation_outcome(self):
@@ -148,7 +195,7 @@ class SublaneProjectionTests(unittest.TestCase):
             issue="15152",
             lane_label="issue_15152_probe",
             branch="issue_15152_probe",
-            worktree_path="/home/holly/private/.worktrees/issue_15152_probe",
+            worktree_path="/private/runtime/.worktrees/issue_15152_probe",
             gateway_pane="%3",
             worker_pane="%4",
             dispatch_target="%3",
@@ -158,7 +205,7 @@ class SublaneProjectionTests(unittest.TestCase):
                     title="worktree",
                     status="ready",
                     detail="would run",
-                    command="git worktree add /home/holly/private/.worktrees/x b",
+                    command="git worktree add /private/runtime/.worktrees/x b",
                 ),
             ),
         )
@@ -175,7 +222,7 @@ class SublaneProjectionTests(unittest.TestCase):
             )
 
         body = json.dumps(outcome.payload)
-        self.assertNotIn("/home/holly/private", body)
+        self.assertNotIn("/private/runtime", body)
         self.assertNotIn("%3", body)
         self.assertNotIn("git worktree add", body)
         projected = outcome.payload["outcome"]
@@ -188,7 +235,7 @@ class SublaneProjectionTests(unittest.TestCase):
     def test_a_hostile_actuation_reason_is_reconstructed_not_leaked(self) -> None:
         # #15152 R4 (review j#106903 finding_reasonproseleak): the ACTUATION
         # producer's `reason` concatenates a gate's free-text detail (a sender
-        # preflight can emit "workspace anchor unreadable (/home/holly/private/
+        # preflight can emit "workspace anchor unreadable (/private/runtime/
         # ...)"), so the raw reason must never reach the public surface — neither
         # structuredContent nor the text summary. The public reason is
         # reconstructed from the closed status + blocked_reasons tokens.
@@ -202,7 +249,7 @@ class SublaneProjectionTests(unittest.TestCase):
             execute=True,
             reason=(
                 "dispatch sender attestation failed before actuation; "
-                "workspace anchor unreadable (/home/holly/private/secret at %5)"
+                "workspace anchor unreadable (/private/runtime/secret at %5)"
             ),
             issue="15152",
             lane_label="issue_15152_probe",
@@ -220,9 +267,9 @@ class SublaneProjectionTests(unittest.TestCase):
         # Neither the structured payload nor the text summary carries the raw
         # reason's private path / pane id.
         body = json.dumps(outcome.payload)
-        self.assertNotIn("/home/holly/private", body)
+        self.assertNotIn("/private/runtime", body)
         self.assertNotIn("%5", body)
-        self.assertNotIn("/home/holly/private", outcome.summary)
+        self.assertNotIn("/private/runtime", outcome.summary)
         self.assertNotIn("%5", outcome.summary)
         # The public reason is reconstructed from the closed tokens.
         projected_reason = outcome.payload["outcome"]["reason"]
@@ -238,7 +285,7 @@ class SublaneProjectionTests(unittest.TestCase):
             exit_code=1,
             refusal=svc.SublaneStartRefusal(
                 reason="parent_gateway_binding_missing",
-                message="producer prose mentioning /home/holly/private and %5",
+                message="producer prose mentioning /private/runtime and %5",
             ),
         )
         with patch.object(svc, "run_sublane_start", return_value=result):
@@ -252,7 +299,7 @@ class SublaneProjectionTests(unittest.TestCase):
             "parent_gateway_binding_missing", outcome.payload["refusal_reason"]
         )
         body = json.dumps(outcome.payload)
-        self.assertNotIn("/home/holly/private", body)
+        self.assertNotIn("/private/runtime", body)
         self.assertNotIn("%5", body)
         # The fixed sentence names the recovery surface, not the producer text.
         self.assertIn("declare-project-gateway", outcome.payload["refusal"])
@@ -294,7 +341,7 @@ class R5BlockedReasonGrammarTests(unittest.TestCase):
         outcome = self._run_with_blocked(
             [
                 "missing_identity",  # legit closed token — kept
-                "launcher failed at /home/holly/private/x",  # free text — fallback
+                "launcher failed at /private/runtime/x",  # free text — fallback
                 "%7",  # pane id — fallback
             ]
         )
@@ -304,13 +351,13 @@ class R5BlockedReasonGrammarTests(unittest.TestCase):
             projected["blocked_reasons"],
         )
         body = json.dumps(outcome.payload)
-        self.assertNotIn("/home/holly/private", body)
+        self.assertNotIn("/private/runtime", body)
         self.assertNotIn("%7", body)
         # The reconstructed reason and the summary use the validated tokens only.
-        self.assertNotIn("/home/holly/private", outcome.summary)
+        self.assertNotIn("/private/runtime", outcome.summary)
         self.assertNotIn("%7", outcome.summary)
         self.assertIn("unclassified_blocker", projected["reason"])
-        self.assertNotIn("/home/holly/private", projected["reason"])
+        self.assertNotIn("/private/runtime", projected["reason"])
 
     def test_the_namespaced_forms_are_kept(self) -> None:
         # The `<prefix>:<identifier>` producer forms are safe and preserved.
@@ -498,7 +545,7 @@ class R6PublicVocabularyDriftTests(unittest.TestCase):
         )
         # A hostile identifier-shaped sentinel also falls to the fallback.
         self.assertEqual(
-            _UNCLASSIFIED_BLOCKER, _public_blocker_token("secret_workspace_key_abc")
+            _UNCLASSIFIED_BLOCKER, _public_blocker_token("internal_identifier_alpha")
         )
         # Legit registry tokens and namespaced forms survive.
         self.assertEqual("missing_identity", _public_blocker_token("missing_identity"))
@@ -593,11 +640,11 @@ class R7ProducerFieldClosureTests(unittest.TestCase):
             reason="planned",
             issue="15152",
             lane_label="issue_15152_probe",
-            launch_action="secret_workspace_key_abc",
-            dispatch_result="/home/holly/private/pane-%7",
-            dispatch_injection_stage="operator_token_xyz",
-            fill_decision="private_customer_alpha",
-            durable_anchor="/home/holly/private/anchor-note",
+            launch_action="internal_identifier_alpha",
+            dispatch_result="/private/runtime/pane-%7",
+            dispatch_injection_stage="private_stage_beta",
+            fill_decision="internal_customer_gamma",
+            durable_anchor="/private/runtime/anchor-note",
         )
         result = svc.SublaneStartResult(
             status=svc.STATUS_COMPLETED, exit_code=0, outcome=hostile
@@ -610,11 +657,11 @@ class R7ProducerFieldClosureTests(unittest.TestCase):
 
         body = json.dumps(outcome.payload)
         for sentinel in (
-            "secret_workspace_key_abc",
-            "/home/holly/private",
+            "internal_identifier_alpha",
+            "/private/runtime",
             "%7",
-            "operator_token_xyz",
-            "private_customer_alpha",
+            "private_stage_beta",
+            "internal_customer_gamma",
             "anchor-note",
         ):
             self.assertNotIn(sentinel, body, sentinel)
@@ -641,6 +688,89 @@ class R7ProducerFieldClosureTests(unittest.TestCase):
 
         member = sorted(LAUNCH_ACTIONS)[0]
         self.assertEqual(member, _public_producer_token("launch_action", member))
+
+    def test_non_bool_boolean_fields_never_coerce_to_an_affirmative(self) -> None:
+        # #15152 R7 (review j#107015 finding_booleantruthinessoverclaim): a string
+        # `false`, an int, or a container in a boolean field must NOT be published
+        # as `true`. The field is omitted rather than coerced.
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_start_service as svc  # noqa: E501
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            SublaneActuationOutcome,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+            _public_bool,
+        )
+
+        # The pure helper: only exact bools pass, everything else is None (omit).
+        for hostile in ("false", "true", "0", 0, 1, [], {}, "False"):
+            self.assertIsNone(_public_bool(hostile), repr(hostile))
+        self.assertIs(True, _public_bool(True))
+        self.assertIs(False, _public_bool(False))
+
+        # End-to-end: a string `false` in `execute`/`adopted` is omitted, not `true`.
+        hostile = SublaneActuationOutcome(
+            status="ready",
+            execute="false",  # type: ignore[arg-type]
+            reason="planned",
+            issue="15152",
+            lane_label="issue_15152_probe",
+            adopted="false",  # type: ignore[arg-type]
+        )
+        result = svc.SublaneStartResult(
+            status=svc.STATUS_COMPLETED, exit_code=0, outcome=hostile
+        )
+        with patch.object(svc, "run_sublane_start", return_value=result):
+            outcome = run_sublane_start_tool(
+                {"issue": "15152", "lane_label": "issue_15152_probe", "actuate": True},
+                _context(),
+            )
+        projected = outcome.payload["outcome"]
+        self.assertNotIn("execute", projected)
+        self.assertNotIn("adopted", projected)
+
+    def test_every_handoff_field_is_categorized_exactly_once(self) -> None:
+        # #15152 R7: the handoff projection is closed AS A CLASS too — a new field
+        # added to HANDOFF_OUTCOME_PUBLIC_FIELDS without a category fails here.
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+            HANDOFF_OUTCOME_PUBLIC_FIELDS,
+            _HANDOFF_CALLER_ECHO_FIELDS,
+            _HANDOFF_PRODUCER_REGISTRIES,
+        )
+
+        producer = set(_HANDOFF_PRODUCER_REGISTRIES)
+        echo = set(_HANDOFF_CALLER_ECHO_FIELDS)
+        self.assertEqual(
+            set(HANDOFF_OUTCOME_PUBLIC_FIELDS), producer | echo, "handoff field uncategorized"
+        )
+        self.assertEqual(set(), producer & echo, "handoff field in two categories")
+
+    def test_handoff_producer_registries_match_their_types(self) -> None:
+        # Pin each handoff producer registry to its source Literal / constants so a
+        # new member cannot silently start mapping to unknown_<field>.
+        from typing import get_args
+
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            NextActionOwner,
+            Reason,
+            Status,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+            MODE_PENDING,
+            MODE_QUEUE_ENTER,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+            _HANDOFF_PRODUCER_REGISTRIES,
+        )
+
+        self.assertEqual(_HANDOFF_PRODUCER_REGISTRIES["status"], frozenset(get_args(Status)))
+        self.assertEqual(_HANDOFF_PRODUCER_REGISTRIES["reason"], frozenset(get_args(Reason)))
+        self.assertEqual(
+            _HANDOFF_PRODUCER_REGISTRIES["next_action_owner"],
+            frozenset(get_args(NextActionOwner)),
+        )
+        self.assertEqual(
+            _HANDOFF_PRODUCER_REGISTRIES["mode"], frozenset({MODE_QUEUE_ENTER, MODE_PENDING})
+        )
 
 
 class MutatingDeclarationGuardTests(unittest.TestCase):

@@ -27,7 +27,7 @@ say where things live.
 
 from __future__ import annotations
 
-from typing import Any, Mapping
+from typing import Any, Mapping, get_args
 
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.read_plan_tools import (  # noqa: E501
     ReadPlanContext,
@@ -53,15 +53,17 @@ HANDOFF_OUTCOME_PUBLIC_FIELDS = (
 #: or a path.
 HANDOFF_ANCHOR_PUBLIC_FIELDS = ("source", "issue", "journal", "task_id", "comment_id")
 
-#: The SublaneActuationOutcome members the sublane tool republishes VERBATIM.
-#: Absent by decision: `worktree_path` (a private filesystem path), `gateway_pane`
-#: / `worker_pane` / `dispatch_target` (pane identities), `steps` (replayable
-#: command lines that interpolate both), and — since #15152 R4 (review j#106903
-#: finding_reasonproseleak) — `reason`: the actuation producer builds it by
-#: concatenating a gate's free-text detail (e.g. `evaluate_dispatch_sender`'s
-#: "workspace anchor unreadable ({exc})", which can name a private path), and
-#: this allowlist is a copy, not a scrub. The closed `blocked_reasons` tokens ARE
-#: published; the public prose `reason` is RECONSTRUCTED from them below.
+#: The SublaneActuationOutcome members the sublane tool may publish. Since #15152
+#: R7 (review j#107015 finding_projectiontokensopen) none is copied VERBATIM: every
+#: field is routed through a typed category below (bool / caller-echo /
+#: producer-token / presence). Absent by decision: `worktree_path` (a private
+#: filesystem path), `gateway_pane` / `worker_pane` / `dispatch_target` (pane
+#: identities), `steps` (replayable command lines that interpolate both), and —
+#: since #15152 R4 (review j#106903 finding_reasonproseleak) — `reason`: the
+#: actuation producer builds it by concatenating a gate's free-text detail (e.g.
+#: `evaluate_dispatch_sender`'s "workspace anchor unreadable ({exc})", which can
+#: name a private path). The closed `blocked_reasons` tokens ARE published; the
+#: public prose `reason` is RECONSTRUCTED from them below.
 SUBLANE_OUTCOME_PUBLIC_FIELDS = (
     "status",
     "execute",
@@ -86,6 +88,19 @@ SUBLANE_OUTCOME_PUBLIC_FIELDS = (
 # published only if it is an exact member, or a `<prefix>:<value>` form whose
 # prefix AND value both belong to a closed registry. Everything else — including a
 # launcher verdict's free-text `gate_reason` — maps to _UNCLASSIFIED_BLOCKER.
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service import (  # noqa: E501
+    STATUS_COMPLETED,
+    STATUS_FAIL_CLOSED,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+    NextActionOwner,
+    Reason,
+    Status,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
+    MODE_PENDING,
+    MODE_QUEUE_ENTER,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (  # noqa: E501
     INJECTION_STAGES,
 )
@@ -153,6 +168,43 @@ _PREFIXED_BLOCKER_REGISTRIES = {
 _PUBLIC_STATUSES = frozenset(ACTUATE_STATES)
 _UNCLASSIFIED_BLOCKER = "unclassified_blocker"
 _UNKNOWN_STATUS = "unknown_status"
+
+# The CLOSED runtime projection for the handoff outcome (#15152 R7, review j#107015
+# finding_handoffprojectionopen). R7 wrongly reasoned that DeliveryOutcome's
+# ``Literal`` annotations (Status / Reason / NextActionOwner) make the fields safe:
+# a ``Literal`` is a STATIC hint, NOT a runtime guard, and this module is not a
+# mypy-checked island, so a producer contract drift can put a private path in
+# ``reason`` and it reaches the public MCP response verbatim. Each producer-owned
+# field is now validated at runtime against a closed set derived from its own type
+# (``get_args``) or its producing registry; an unknown value maps to a fixed
+# ``unknown_<field>`` token. ``receiver`` / ``kind`` / ``notification_marker`` are
+# caller-derived (the caller's ``--to`` / ``--kind`` and the tool-composed marker),
+# echoed as a distinct category.
+_HANDOFF_PRODUCER_REGISTRIES = {
+    "status": frozenset(get_args(Status)),
+    "reason": frozenset(get_args(Reason)),
+    "next_action_owner": frozenset(get_args(NextActionOwner)),
+    "mode": frozenset({MODE_QUEUE_ENTER, MODE_PENDING}),
+}
+_HANDOFF_CALLER_ECHO_FIELDS = ("receiver", "kind", "notification_marker")
+#: The closed top-level handoff-result status set (HandoffResult.status).
+_HANDOFF_RESULT_STATUSES = frozenset({STATUS_COMPLETED, STATUS_FAIL_CLOSED})
+
+
+def _public_handoff_token(field: str, value: Any) -> str:
+    """One producer-owned handoff field validated against its closed set."""
+    text = str(value)
+    return text if text in _HANDOFF_PRODUCER_REGISTRIES[field] else f"unknown_{field}"
+
+
+def _public_bool(value: Any):
+    """An exact bool only (#15152 R7 finding_booleantruthinessoverclaim).
+
+    ``bool("false")`` is ``True``; a string / int / container producer value must
+    never coerce to an affirmative. Returns the bool unchanged, or ``None`` for
+    anything that is not exactly ``True`` / ``False`` so the caller can omit it.
+    """
+    return value if isinstance(value, bool) else None
 
 # The TYPED projection schema for the sublane outcome (#15152 R7, review j#107015
 # finding_projectiontokensopen). R6 closed only `status` and `blocked_reasons`; the
@@ -306,12 +358,21 @@ _SUBLANE_REFUSAL_FALLBACK = (
 
 
 def _public_delivery_outcome(outcome: Any) -> dict:
-    """The allowlisted projection of one DeliveryOutcome."""
+    """The runtime-closed projection of one DeliveryOutcome (#15152 R7).
+
+    Producer-owned fields are validated against a closed set (unknown ->
+    ``unknown_<field>``); caller-derived fields are echoed as a distinct
+    category; the anchor members the caller supplied are echoed unchanged.
+    """
     payload: dict = {}
-    for name in HANDOFF_OUTCOME_PUBLIC_FIELDS:
+    for name in _HANDOFF_PRODUCER_REGISTRIES:
         value = getattr(outcome, name, None)
         if value is not None:
-            payload[name] = value
+            payload[name] = _public_handoff_token(name, value)
+    for name in _HANDOFF_CALLER_ECHO_FIELDS:
+        value = getattr(outcome, name, None)
+        if value is not None:
+            payload[name] = str(value)
     anchor = getattr(outcome, "anchor", None)
     if isinstance(anchor, Mapping):
         payload["anchor"] = {
@@ -361,23 +422,31 @@ def _run_handoff_operation(
         _public_delivery_outcome(result.outcome) if result.outcome is not None else {}
     )
     is_error = result.fail_closed or result.exit_code != 0
+    # Top-level fields are runtime-closed too (#15152 R7): the handoff-result
+    # status against its closed set, `delivered` to an EXACT bool (a string
+    # `false` must not read as delivered), and `injection_stage` against the
+    # closed INJECTION_STAGES.
+    status = (
+        result.status
+        if result.status in _HANDOFF_RESULT_STATUSES
+        else "unknown_status"
+    )
+    delivered = _public_bool(result.delivered) is True
+    stage = injection_stage_for_outcome(result.outcome) if result.outcome else None
+    injection_stage = stage if stage in INJECTION_STAGES else "unknown_injection_stage"
     payload = {
         "operation": operation,
-        "status": result.status,
+        "status": status,
         "exit_code": int(result.exit_code),
-        "delivered": bool(result.delivered),
-        "injection_stage": (
-            str(injection_stage_for_outcome(result.outcome) or "")
-            if result.outcome is not None
-            else ""
-        ),
+        "delivered": delivered,
+        "injection_stage": injection_stage if result.outcome is not None else "",
         "outcome": outcome_payload,
         "refusal": HANDOFF_REFUSAL_SENTENCE if result.fail_closed else "",
     }
     reason = outcome_payload.get("reason") or "none"
     summary = (
-        f"handoff {operation}: {result.status} "
-        f"(delivered={str(bool(result.delivered)).lower()}, reason {reason})"
+        f"handoff {operation}: {status} "
+        f"(delivered={str(delivered).lower()}, reason {reason})"
     )
     return ToolOutcome(payload=payload, is_error=is_error, summary=summary)
 
@@ -444,9 +513,11 @@ def _public_sublane_outcome(outcome: Any) -> dict:
     status = _public_status(str(getattr(outcome, "status", "") or ""))
     payload["status"] = status
     for name in _BOOL_PUBLIC_FIELDS:
-        value = getattr(outcome, name, None)
+        # Exact bool only (#15152 R7 finding_booleantruthinessoverclaim): a string
+        # `false` must not coerce to a published `true`. A non-bool is omitted.
+        value = _public_bool(getattr(outcome, name, None))
         if value is not None:
-            payload[name] = bool(value)
+            payload[name] = value
     for name in _CALLER_ECHO_PUBLIC_FIELDS:
         value = getattr(outcome, name, None)
         if value is not None:
