@@ -427,6 +427,61 @@ class HandoffProjectionTests(unittest.TestCase):
         self.assertNotIn("/private/x", body)
         self.assertNotIn("/private/x", outcome.summary)
         self.assertNotIn("injected=", body)
+
+    def test_kind_and_anchor_are_sealed_to_the_mcp_closed_contract(self) -> None:
+        # #15152 R12 (review j#107173 finding_projectiongrammaropen): the seal is THIS
+        # MCP surface's exact closed contract, not a generic grammar. A kind matching
+        # the old [a-z_]+ grammar but OUTSIDE KIND_LABELS, a trailing-newline kind, an
+        # asana anchor, a colon-bearing / non-decimal id, and a partial anchor are all
+        # rejected atomically.
+        from types import SimpleNamespace as NS
+
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+            _sealed_anchor,
+            _sealed_kind,
+        )
+
+        self.assertEqual("reply", _sealed_kind(NS(kind="reply")))
+        self.assertEqual("review_request", _sealed_kind(NS(kind="review_request")))
+        self.assertIsNone(_sealed_kind(NS(kind="arbitrarykind")))  # matched the old grammar
+        self.assertIsNone(_sealed_kind(NS(kind="reply\n")))  # a `$` anchor let this through
+        self.assertIsNone(_sealed_kind(NS(kind="Reply")))
+        self.assertEqual(
+            {"source": "redmine", "issue": "15152", "journal": "1"},
+            _sealed_anchor(NS(anchor={"source": "redmine", "issue": "15152", "journal": "1"})),
+        )
+        for bad in (
+            {"source": "asana", "task_id": "T1", "comment_id": "C1"},  # not this surface
+            {"source": "redmine", "issue": "15152", "journal": "1", "task_id": "T1"},  # asana field
+            {"source": "redmine", "issue": "15152:to=mallory", "journal": "1"},  # colon
+            {"source": "redmine", "issue": "15152", "journal": "1\n"},  # trailing newline
+            {"source": "redmine", "issue": "15152"},  # partial
+            {"source": "redmine", "issue": 15152, "journal": "1"},  # wrong type (non-coercing)
+        ):
+            self.assertEqual({}, _sealed_anchor(NS(anchor=bad)), bad)
+
+    def test_a_contradictory_blocked_outcome_publishes_no_marker(self) -> None:
+        # #15152 R12 (finding_markercorrelationselfattested): a fail-closed result whose
+        # outcome carries a self-consistent marker (built from valid parts) must NOT
+        # publish the marker — the phase authority is the shared layer's result status
+        # (fail_closed), read here, not the outcome's own self-correlation.
+        contradictory = _delivery_outcome(
+            status="blocked",
+            reason="invalid_anchor",
+            receiver="codex",
+            kind="reply",
+            notification_marker=self._CANONICAL_REPLY_MARKER,  # self-consistent, but the run refused
+        )
+        outcome = self._run_reply_with_result(
+            self._fail_closed_result(contradictory),
+            {"to": "codex", "source": "redmine", "issue": "15152", "journal": "1"},
+        )
+
+        projected = outcome.payload["outcome"]
+        self.assertNotIn("notification_marker", projected)
+        body = json.dumps(outcome.payload)
+        self.assertNotIn("[mozyo:handoff:", body)
+        self.assertNotIn("[mozyo:handoff:", outcome.summary)
         self.assertNotIn("/private/runtime", body)
         self.assertNotIn("%7", body)
 

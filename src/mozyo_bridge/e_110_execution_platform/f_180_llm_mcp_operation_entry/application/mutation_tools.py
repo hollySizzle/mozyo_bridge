@@ -94,9 +94,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     STATUS_FAIL_CLOSED,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+    KIND_LABELS,
     MODES,
     RECEIVERS,
-    SOURCES,
+    SOURCE_REDMINE,
     build_marker,
     normalize_anchor,
     NextActionOwner,
@@ -369,9 +370,8 @@ _SUBLANE_REFUSAL_FALLBACK = (
 # itself SEALS every caller-facing field against a closed vocabulary / grammar, and
 # the marker is republished only when it correlates with the canonical envelope
 # rebuilt from the validated parts. Drop on any mismatch.
-_HANDOFF_KIND_GRAMMAR = re.compile(r"^[a-z][a-z0-9_]*$")
-_HANDOFF_ANCHOR_ID_GRAMMAR = re.compile(r"^[A-Za-z0-9_.:#-]+$")
-_HANDOFF_ANCHOR_ID_FIELDS = ("issue", "journal", "task_id", "comment_id")
+#: This MCP surface only issues redmine anchors whose ids are canonical decimals.
+_HANDOFF_DECIMAL_ID = re.compile(r"[0-9]+")
 
 
 def _sealed_receiver(outcome: Any):
@@ -381,54 +381,69 @@ def _sealed_receiver(outcome: Any):
 
 
 def _sealed_kind(outcome: Any):
-    """The kind validated against the safe-token grammar, else ``None``."""
+    """The kind validated against the canonical ``KIND_LABELS`` enum, else ``None``.
+
+    #15152 R12 (review j#107173 finding_projectiongrammaropen): the MCP surface's kind
+    is the closed ``KIND_LABELS`` enum, not an open ``[a-z_]+`` grammar. Exact
+    membership also rejects a trailing newline / whitespace a ``$`` anchor allowed.
+    """
     kind = getattr(outcome, "kind", None)
-    return kind if isinstance(kind, str) and _HANDOFF_KIND_GRAMMAR.match(kind) else None
+    return kind if kind in KIND_LABELS else None
 
 
 def _sealed_anchor(outcome: Any) -> dict:
-    """The anchor filtered to closed-source + id-grammar members (defense in depth)."""
+    """The anchor validated ATOMICALLY against this surface's redmine-only contract.
+
+    #15152 R12 (finding_projectiongrammaropen): this MCP surface only issues redmine
+    anchors, so the whole anchor is accepted only when source is exactly redmine and
+    issue AND journal are canonical positive decimals (non-coercing, no colon /
+    whitespace / control / trailing newline). Asana members (task_id / comment_id),
+    a wrong type, or a partial anchor drop the WHOLE anchor.
+    """
     raw = getattr(outcome, "anchor", None)
     if not isinstance(raw, Mapping):
         return {}
-    sealed: dict = {}
-    source = raw.get("source")
-    if source in SOURCES:
-        sealed["source"] = str(source)
-    for field in _HANDOFF_ANCHOR_ID_FIELDS:
-        value = raw.get(field)
-        if value is not None and _HANDOFF_ANCHOR_ID_GRAMMAR.match(str(value)):
-            sealed[field] = str(value)
-    return sealed
+    if raw.get("source") != SOURCE_REDMINE:
+        return {}
+    if raw.get("task_id") is not None or raw.get("comment_id") is not None:
+        return {}
+    issue, journal = raw.get("issue"), raw.get("journal")
+    if not (isinstance(issue, str) and _HANDOFF_DECIMAL_ID.fullmatch(issue)):
+        return {}
+    if not (isinstance(journal, str) and _HANDOFF_DECIMAL_ID.fullmatch(journal)):
+        return {}
+    return {"source": SOURCE_REDMINE, "issue": issue, "journal": journal}
 
 
-def _sealed_marker(outcome: Any, receiver, kind, anchor: dict):
-    """The marker republished ONLY when it correlates with the canonical envelope.
+def _sealed_marker(outcome: Any, receiver, kind, anchor: dict, *, envelope_reached: bool):
+    """The marker republished ONLY on real envelope authority + canonical correlation.
 
-    Rebuild the marker from the already-validated receiver / kind / anchor with the
-    same ``build_marker`` the producer uses, and publish the outcome's own marker
-    only when it byte-equals that reconstruction. A refusal (marker ``None``), an
-    un-normalizable anchor, or any drift that changed a validated part yields
-    ``None`` and the field is omitted. The marker is NEVER built from raw args.
+    #15152 R12 (finding_markercorrelationselfattested): correlating the marker with
+    the SAME outcome's receiver / kind / anchor only proves the outcome is internally
+    self-consistent, not that the canonical envelope actually formed — a contradictory
+    blocked outcome could carry a self-consistent marker. So the phase authority is the
+    shared application's own result status (``envelope_reached`` = the run was NOT
+    fail-closed), read here rather than inferred from the raw outcome; on top of that
+    authority the marker must still byte-equal the canonical envelope rebuilt from the
+    validated parts. Any refusal, an un-normalizable anchor, or drift yields ``None``.
+    The marker is NEVER built from raw args.
     """
     marker = getattr(outcome, "notification_marker", None)
-    if marker is None or receiver is None or kind is None:
+    if not envelope_reached or marker is None or receiver is None or kind is None:
         return None
     try:
         normalized = normalize_anchor(
             anchor.get("source", ""),
             issue=anchor.get("issue"),
             journal=anchor.get("journal"),
-            task_id=anchor.get("task_id"),
-            comment_id=anchor.get("comment_id"),
         )
     except Exception:
         return None
     return str(marker) if str(marker) == build_marker(normalized, kind, receiver) else None
 
 
-def _public_delivery_outcome(outcome: Any) -> dict:
-    """The runtime-SEALED projection of one DeliveryOutcome (#15152 R7..R11).
+def _public_delivery_outcome(outcome: Any, *, envelope_reached: bool) -> dict:
+    """The runtime-SEALED projection of one DeliveryOutcome (#15152 R7..R12).
 
     Every published member is the EFFECTIVE, domain-validated fact the shared
     application layer actually adopted, taken SOLELY from the returned
@@ -453,11 +468,17 @@ def _public_delivery_outcome(outcome: Any) -> dict:
     (review j#107115 finding_outcomeprojectionunsealed): the ``DeliveryOutcome`` is
     a plain dataclass with NO runtime validator, so an ordinary producer contract
     drift can still put a private path in receiver / kind / an anchor value / a
-    marker-shaped notification. So every caller-facing structured fact is now
-    SEALED here regardless of source — receiver against ``RECEIVERS``, kind against
-    a safe-token grammar, the anchor against ``SOURCES`` + an id-grammar, and the
-    notification marker republished ONLY when it correlates with the canonical
-    envelope rebuilt from the validated parts. Any drifted value is dropped.
+    marker-shaped notification. So every caller-facing structured fact is SEALED
+    here regardless of source, against THIS MCP surface's exact closed contract
+    (#15152 R12 review j#107173 finding_projectiongrammaropen): receiver against
+    ``RECEIVERS``, kind against the canonical ``KIND_LABELS`` enum, and the anchor
+    ATOMICALLY as a redmine anchor with canonical-decimal issue + journal (this
+    surface is redmine-only). The notification marker is republished ONLY when the
+    shared application reports the run reached its envelope (``envelope_reached`` =
+    a non-fail-closed result — the shared layer's authority, #15152 R12
+    finding_markercorrelationselfattested, not the outcome's self-attestation) AND
+    it byte-equals the canonical envelope rebuilt from the validated parts. Any
+    drifted value is dropped.
     """
     payload: dict = {}
     for name in _HANDOFF_PRODUCER_REGISTRIES:
@@ -478,7 +499,7 @@ def _public_delivery_outcome(outcome: Any) -> dict:
     anchor = _sealed_anchor(outcome)
     if anchor:
         payload["anchor"] = anchor
-    marker = _sealed_marker(outcome, receiver, kind, anchor)
+    marker = _sealed_marker(outcome, receiver, kind, anchor, envelope_reached=envelope_reached)
     if marker is not None:
         payload["notification_marker"] = marker
     return payload
@@ -520,7 +541,9 @@ def _run_handoff_operation(
     )
 
     outcome_payload = (
-        _public_delivery_outcome(result.outcome) if result.outcome is not None else {}
+        _public_delivery_outcome(result.outcome, envelope_reached=not result.fail_closed)
+        if result.outcome is not None
+        else {}
     )
     is_error = result.fail_closed or result.exit_code != 0
     # Top-level fields are runtime-closed too (#15152 R7): the handoff-result
