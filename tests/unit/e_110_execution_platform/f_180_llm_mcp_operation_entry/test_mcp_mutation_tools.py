@@ -16,14 +16,22 @@ Two claims, each pinned structurally:
 
 from __future__ import annotations
 
+import argparse
+import contextlib
+import io
 import json
+import shutil
+import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
+sys.path.insert(0, str(ROOT))
 
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E402,E501
     HANDOFF_REFUSAL_SENTENCE,
@@ -421,6 +429,244 @@ class HandoffProjectionTests(unittest.TestCase):
         self.assertNotIn("injected=", body)
         self.assertNotIn("/private/runtime", body)
         self.assertNotIn("%7", body)
+
+
+class RealOrchestrationHandoffTests(unittest.TestCase):
+    """#15152 R10 (review j#107115 finding_outcomeprojectionunsealed): the
+    ``HandoffProjectionTests`` above MOCK ``run_handoff`` and hand back a hand-built
+    ``DeliveryOutcome``, so they pin the PROJECTION but not that the REAL shared
+    orchestration supplies the effective kind + canonical marker. R10 required a
+    regression that drives the REAL ``run_handoff`` from the MCP tool entrypoints
+    (``run_handoff_reply`` / ``run_handoff_send``) with ONLY the low-level terminal
+    transport stubbed — no ``patch.object(api, "run_handoff", ...)``.
+
+    The stub seam is the one the CLI's own fake-tmux orchestrator tests use
+    (``tests/integration/e_110_execution_platform/f_130_handoff_routing/
+    test_handoff_orchestrator.py`` + its package ``__init__`` transport-isolation
+    fixture): the tmux send/capture primitives in ``mozyo_bridge.application.commands``
+    (``require_tmux`` / ``capture_pane`` / ``run_tmux`` / ``time.sleep`` /
+    ``current_session_name``) and the ``pane_resolver`` snapshot are patched, the
+    ``handoff_transport_wiring`` resolvers are pinned to the tmux default so the
+    committed herdr cutover config does not drive the send, and the live Redmine
+    anchor source is replaced by the hermetic ``matching_redmine_anchor_source``
+    ownership fixture. Everything BETWEEN the MCP entrypoint and those primitives —
+    the entry policy (effective ``default_kind``), receiver/anchor gates, target
+    resolution, admission pipeline, envelope planning, and ``build_marker`` — runs
+    for real. The single real terminal that types the marker+body is the patched
+    ``run_tmux``; the assertion is on the MCP tool's PROJECTED payload.
+    """
+
+    @classmethod
+    def setUpClass(cls) -> None:
+        # A real identity-bearing workspace: the MCP `handoff_reply` tool sends the
+        # default `target_repo=auto`, but `auto` requires an explicit `%pane` (which
+        # this surface deliberately has no property for), so a real end-to-end send
+        # is reached by naming `target_repo` at a workspace whose resolved receiver
+        # pane cwd matches. A git repo is the cheapest such identity marker.
+        cls._repo_dir = tempfile.mkdtemp(prefix="mcp_real_handoff_")
+        subprocess.run(
+            ["git", "init", "-q", cls._repo_dir],
+            check=True,
+            capture_output=True,
+        )
+        cls.REPO = str(Path(cls._repo_dir).resolve())
+
+    @classmethod
+    def tearDownClass(cls) -> None:
+        shutil.rmtree(cls._repo_dir, ignore_errors=True)
+
+    #: The resolved receiver pane the stubbed pane snapshot returns. `pane_active=1`
+    #: makes it the active split so the queue-enter rail (the only mode this surface
+    #: uses) does not fail closed on an inactive split; `window_name=codex` is what
+    #: the receiver-label resolver binds `to=codex` against; `cwd=REPO` is what the
+    #: `--target-repo` identity gate observes.
+    def _pane(self) -> dict:
+        return {
+            "id": "%2",
+            "location": "agents:0.1",
+            "command": "node",
+            "cwd": self.REPO,
+            "window_name": "codex",
+            "pane_active": "1",
+        }
+
+    def _run_real(self, fn, arguments):
+        """Drive ``fn`` (an MCP handoff tool) through the REAL orchestration.
+
+        Only the terminal transport + environment probes are stubbed. Returns the
+        tool's :class:`ToolOutcome` plus the recorded tmux ``send-keys`` calls so a
+        caller can prove the real rail typed the marker.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.read_plan_tools import (  # noqa: E501
+            ReadPlanContext,
+        )
+        from tests.support.redmine_anchor_authority import (
+            matching_redmine_anchor_source_patch,
+        )
+
+        pane_value = self._pane()
+        sent: list = []
+        pane_text = {"buf": ""}
+
+        def fake_capture(_target: str, _lines: int) -> str:
+            return pane_text["buf"]
+
+        def fake_run_tmux(*tmux_args: str, check: bool = True):
+            # The ONE real terminal, stubbed: record the send-keys, and model a
+            # well-behaved receiver whose pane advances on Enter (the queue-enter
+            # turn-start observation confirms). No keystroke leaves the process.
+            if tmux_args[:4] == ("send-keys", "-t", "%2", "-l"):
+                pane_text["buf"] += tmux_args[-1]
+                sent.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            if tmux_args[:3] == ("send-keys", "-t", "%2"):
+                if tmux_args[-1] == "Enter":
+                    pane_text["buf"] += "\n<codex-turn-started>"
+                sent.append(tmux_args)
+                return argparse.Namespace(returncode=0, stdout="", stderr="")
+            raise AssertionError(f"unexpected tmux call: {tmux_args}")
+
+        pane_resolver = (
+            "mozyo_bridge.e_110_execution_platform."
+            "f_120_agent_discovery_pane_resolution.domain.pane_resolver."
+        )
+        patches = [
+            # Transport isolation (Redmine #13254): pin the resolver to the tmux
+            # default so the committed herdr cutover config does not route the send.
+            mock.patch(
+                "mozyo_bridge.application.handoff_transport_wiring."
+                "resolve_handoff_transport_binding",
+                return_value=None,
+            ),
+            mock.patch(
+                "mozyo_bridge.application.handoff_transport_wiring."
+                "resolve_handoff_transport_runtime",
+                return_value=(None, None),
+            ),
+            mock.patch(
+                "mozyo_bridge.application.commands.herdr_effective_backend_selected",
+                return_value=False,
+            ),
+            # Hermetic Redmine ownership: the production anchor-authority gate still
+            # executes; only its live source constructor is replaced.
+            matching_redmine_anchor_source_patch(),
+            # The low-level tmux terminal + environment probes.
+            patch("mozyo_bridge.application.commands.require_tmux"),
+            patch(
+                "mozyo_bridge.application.commands.capture_pane",
+                side_effect=fake_capture,
+            ),
+            patch(
+                "mozyo_bridge.application.commands.run_tmux",
+                side_effect=fake_run_tmux,
+            ),
+            patch("mozyo_bridge.application.commands.time.sleep"),
+            patch(
+                "mozyo_bridge.application.commands.current_session_name",
+                return_value="agents",
+            ),
+            patch(pane_resolver + "current_session_name", return_value="agents"),
+            patch(pane_resolver + "validate_target"),
+            patch(pane_resolver + "pane_lines", return_value=[pane_value]),
+        ]
+        for started in patches:
+            started.start()
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(
+                io.StringIO()
+            ):
+                outcome = fn(dict(arguments), ReadPlanContext(repo_root=Path(self.REPO)))
+        finally:
+            for started in reversed(patches):
+                started.stop()
+        return outcome, sent
+
+    def test_real_run_handoff_kind_omitted_reply_supplies_effective_kind_and_marker(
+        self,
+    ) -> None:
+        # (1) A `handoff reply` with `kind` OMITTED, driven through the REAL
+        # `run_handoff`: the operation's entry policy supplies the effective
+        # `default_kind` ("reply"), the run forms the canonical envelope, and the
+        # real `build_marker` produces the canonical marker. The projection must
+        # publish kind="reply" AND that exact canonical marker — proven here by the
+        # real path, not a hand-built DeliveryOutcome.
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            build_marker,
+            normalize_anchor,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+            run_handoff_reply,
+        )
+
+        arguments = {
+            "to": "codex",
+            "source": "redmine",
+            "issue": "15152",
+            "journal": "1",
+            "target_repo": self.REPO,
+            # `kind` deliberately omitted — the effective kind must come from the
+            # reply operation's default_kind, supplied by the real entry policy.
+        }
+        outcome, sent = self._run_real(run_handoff_reply, arguments)
+
+        self.assertFalse(outcome.is_error, outcome.payload)
+        self.assertEqual("completed", outcome.payload["status"])
+        projected = outcome.payload["outcome"]
+        # The effective kind the shared layer adopted for an omitted --kind reply.
+        self.assertEqual("reply", projected["kind"])
+        # The canonical marker, correlated with build_marker over the effective
+        # anchor / kind / receiver (the projection republishes it only when it
+        # byte-equals this reconstruction), AND stated as the exact expected string.
+        expected_marker = build_marker(
+            normalize_anchor("redmine", issue="15152", journal="1"),
+            "reply",
+            "codex",
+        )
+        self.assertEqual(
+            "[mozyo:handoff:source=redmine:issue=15152:journal=1:kind=reply:to=codex]",
+            expected_marker,
+        )
+        self.assertEqual(expected_marker, projected["notification_marker"])
+        self.assertIn(expected_marker, json.dumps(outcome.payload))
+        # The one real terminal actually typed the canonical marker+body then Enter.
+        self.assertTrue(
+            any(call[:4] == ("send-keys", "-t", "%2", "-l") for call in sent), sent
+        )
+        self.assertIn(("send-keys", "-t", "%2", "Enter"), sent)
+
+    def test_real_run_handoff_pre_envelope_refusal_publishes_no_marker(self) -> None:
+        # (2) The REAL `run_handoff` driven into a domain refusal BEFORE an envelope
+        # forms: a redmine anchor missing its journal is rejected as invalid_anchor
+        # by the real anchor planner, which publishes a blocked DeliveryOutcome whose
+        # notification_marker is None. No marker — and no `[mozyo:handoff:` string at
+        # all — may appear in structuredContent or the text summary. Proven by the
+        # real refusal path, not a hand-built outcome.
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+            run_handoff_reply,
+        )
+
+        arguments = {
+            "to": "codex",
+            "source": "redmine",
+            "issue": "15152",
+            # `journal` omitted: the redmine anchor is structurally invalid, so the
+            # real orchestration fails closed before any envelope / marker is built.
+            "target_repo": self.REPO,
+        }
+        outcome, sent = self._run_real(run_handoff_reply, arguments)
+
+        self.assertTrue(outcome.is_error)
+        self.assertEqual("fail_closed", outcome.payload["status"])
+        projected = outcome.payload["outcome"]
+        # A blocked terminal was published (the refusal is a real domain outcome),
+        # but it formed no envelope, so it carries no marker.
+        self.assertEqual("invalid_anchor", projected["reason"])
+        self.assertNotIn("notification_marker", projected)
+        body = json.dumps(outcome.payload)
+        self.assertNotIn("[mozyo:handoff:", body)
+        self.assertNotIn("[mozyo:handoff:", outcome.summary)
+        # The real refusal happened before delivery: no keystroke was ever sent.
+        self.assertEqual([], sent)
 
 
 class SublaneProjectionTests(unittest.TestCase):
