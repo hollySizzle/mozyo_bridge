@@ -97,8 +97,6 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     NextActionOwner,
     Reason,
     Status,
-    build_marker,
-    normalize_anchor,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.injection_stage import (  # noqa: E501
     INJECTION_STAGES,
@@ -176,9 +174,9 @@ _UNKNOWN_STATUS = "unknown_status"
 # ``reason`` and it reaches the public MCP response verbatim. Each producer-owned
 # field is now validated at runtime against a closed set derived from its own type
 # (``get_args``) or its producing registry; an unknown value maps to a fixed
-# ``unknown_<field>`` token. ``receiver`` / ``kind`` / ``notification_marker`` are
-# caller-derived (the caller's ``--to`` / ``--kind`` and the tool-composed marker),
-# echoed as a distinct category.
+# ``unknown_<field>`` token. ``receiver`` / ``kind`` / ``anchor`` /
+# ``notification_marker`` are the EFFECTIVE, domain-validated facts the shared
+# application layer adopted, echoed as a distinct category (#15152 R9, below).
 _HANDOFF_PRODUCER_REGISTRIES = {
     "status": frozenset(get_args(Status)),
     "reason": frozenset(get_args(Reason)),
@@ -188,9 +186,6 @@ _HANDOFF_PRODUCER_REGISTRIES = {
     # subset — otherwise a legitimate mode is falsely mapped to unknown_mode.
     "mode": frozenset(MODES),
 }
-#: The anchor members the caller supplies; sourced from the validated caller INPUT
-#: (never the producer outcome) so producer drift cannot substitute a private value.
-_HANDOFF_ANCHOR_INPUT_FIELDS = ("source", "issue", "journal", "task_id", "comment_id")
 #: The closed top-level handoff-result status set (HandoffResult.status).
 _HANDOFF_RESULT_STATUSES = frozenset({STATUS_COMPLETED, STATUS_FAIL_CLOSED})
 
@@ -199,32 +194,6 @@ def _public_handoff_token(field: str, value: Any) -> str:
     """One producer-owned handoff field validated against its closed set."""
     text = str(value)
     return text if text in _HANDOFF_PRODUCER_REGISTRIES[field] else f"unknown_{field}"
-
-
-def _reconstructed_marker(inp: Any):
-    """The notification marker rebuilt from the validated caller anchor/kind/to.
-
-    #15152 R8 (finding_callerechobindingopen): the marker must NOT be echoed from
-    the producer outcome (drift could substitute a private string). It is rebuilt
-    canonically with the same ``build_marker`` the producer uses, from the caller's
-    own anchor input; an anchor that does not normalize (or no kind/receiver)
-    yields ``None`` and the field is omitted.
-    """
-    to = getattr(inp, "to", None)
-    kind = getattr(inp, "kind", None)
-    if not to or not kind:
-        return None
-    try:
-        anchor = normalize_anchor(
-            getattr(inp, "source", None) or "",
-            issue=getattr(inp, "issue", None),
-            journal=getattr(inp, "journal", None),
-            task_id=getattr(inp, "task_id", None),
-            comment_id=getattr(inp, "comment_id", None),
-        )
-    except Exception:
-        return None
-    return build_marker(anchor, str(kind), str(to))
 
 
 def _public_bool(value: Any):
@@ -387,38 +356,61 @@ _SUBLANE_REFUSAL_FALLBACK = (
 # --- handoff_send / handoff_reply ------------------------------------------ #
 
 
-def _public_delivery_outcome(outcome: Any, inp: Any) -> dict:
-    """The runtime-closed projection of one DeliveryOutcome (#15152 R7/R8).
+def _public_delivery_outcome(outcome: Any) -> dict:
+    """The runtime-closed projection of one DeliveryOutcome (#15152 R7/R8/R9).
 
-    Producer-owned fields (status/reason/next_action_owner/mode) are validated
-    against a closed set (unknown -> ``unknown_<field>``). Caller-derived fields
-    (receiver/kind/anchor/notification_marker) are sourced SOLELY from the
-    validated caller input ``inp`` — never the producer outcome — so producer
-    drift cannot substitute a private/runtime value (#15152 R8
-    finding_callerechobindingopen). The marker is rebuilt canonically.
+    Every published member is the EFFECTIVE, domain-validated fact the shared
+    application layer actually adopted, taken SOLELY from the returned
+    ``DeliveryOutcome`` — never the raw MCP argument the handler built before the
+    entry policy ran. #15152 R9 (review j#107091 finding_effectiveinputprojection):
+    the R8 caller-echo-from-input binding published the RAW ``--to`` / ``--kind``,
+    which is not the effective input the shared layer adopts. So a ``handoff
+    reply`` with ``--kind`` OMITTED (effective kind ``reply`` via the operation's
+    ``default_kind``) lost both its ``kind`` and its ``notification_marker``, and a
+    domain-refused receiver (a delimiter-bearing ``--to`` the domain rejects with
+    ``invalid_args``) still got a ``build_marker`` rebuilt from the raw args — a
+    bogus marker-shaped string for an operation that never formed an envelope. The
+    returned outcome instead carries the effective kind (``inp.kind or
+    default_kind``) and the CANONICAL envelope ``notification_marker`` on success /
+    ``None`` on any pre-envelope refusal (every terminal is published through
+    ``make_publishing_emitter``), so it is the single authority here.
+
+    Producer-owned token fields (status/reason/next_action_owner/mode) are still
+    validated against their closed registries (unknown -> ``unknown_<field>``);
+    producer FREE TEXT and pane/path evidence (``next_action`` / ``target`` /
+    ``execution_root``) stay dropped — the R8 boundary this keeps. The R10 threat
+    model excludes a malicious output producer, so these domain-validated
+    structured facts are echoed as-is; the anchor is filtered to its closed public
+    member allowlist as defense in depth.
     """
     payload: dict = {}
     for name in _HANDOFF_PRODUCER_REGISTRIES:
         value = getattr(outcome, name, None)
         if value is not None:
             payload[name] = _public_handoff_token(name, value)
-    # Caller-echo: the caller's own declared identity, from the validated input.
-    receiver = getattr(inp, "to", None)
+    # Effective caller-echo: the receiver / kind the shared layer adopted (the
+    # consult pin, the reply default_kind), from the domain-validated outcome.
+    receiver = getattr(outcome, "receiver", None)
     if receiver is not None:
         payload["receiver"] = str(receiver)
-    kind = getattr(inp, "kind", None)
+    kind = getattr(outcome, "kind", None)
     if kind is not None:
         payload["kind"] = str(kind)
-    anchor = {
-        key: str(getattr(inp, key))
-        for key in _HANDOFF_ANCHOR_INPUT_FIELDS
-        if getattr(inp, key, None) is not None
-    }
-    if anchor:
-        payload["anchor"] = anchor
-    marker = _reconstructed_marker(inp)
+    raw_anchor = getattr(outcome, "anchor", None)
+    if isinstance(raw_anchor, Mapping):
+        anchor = {
+            key: str(raw_anchor[key])
+            for key in HANDOFF_ANCHOR_PUBLIC_FIELDS
+            if raw_anchor.get(key) is not None
+        }
+        if anchor:
+            payload["anchor"] = anchor
+    # The marker: ONLY the canonical envelope marker the outcome carries — present
+    # when the run formed the envelope, ``None`` on any pre-envelope refusal. Never
+    # rebuilt from raw args (#15152 R9 finding_effectiveinputprojection).
+    marker = getattr(outcome, "notification_marker", None)
     if marker is not None:
-        payload["notification_marker"] = marker
+        payload["notification_marker"] = str(marker)
     return payload
 
 
@@ -458,7 +450,7 @@ def _run_handoff_operation(
     )
 
     outcome_payload = (
-        _public_delivery_outcome(result.outcome, inp) if result.outcome is not None else {}
+        _public_delivery_outcome(result.outcome) if result.outcome is not None else {}
     )
     is_error = result.fail_closed or result.exit_code != 0
     # Top-level fields are runtime-closed too (#15152 R7): the handoff-result

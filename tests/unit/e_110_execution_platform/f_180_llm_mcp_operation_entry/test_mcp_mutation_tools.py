@@ -27,6 +27,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E402,E501
     HANDOFF_REFUSAL_SENTENCE,
+    run_handoff_reply,
     run_handoff_send,
     run_sublane_start_tool,
 )
@@ -68,8 +69,11 @@ def _delivery_outcome(**overrides):
 
 
 class HandoffProjectionTests(unittest.TestCase):
-    # A coherent caller input; the projection sources receiver/kind/anchor/marker
-    # from THIS, never the producer outcome (#15152 R8 finding_callerechobindingopen).
+    # A coherent caller input. #15152 R9 (review j#107091 finding_effectiveinputprojection):
+    # the projection sources receiver/kind/anchor/marker from the EFFECTIVE,
+    # domain-validated DeliveryOutcome the shared layer returns — never this raw
+    # input (which precedes the entry policy). The input only reaches the shared
+    # `run_handoff`, patched away in these tests.
     _INPUT_ARGS = {
         "to": "codex",
         "source": "redmine",
@@ -108,24 +112,25 @@ class HandoffProjectionTests(unittest.TestCase):
         self.assertEqual(HANDOFF_REFUSAL_SENTENCE, outcome.payload["refusal"])
 
     def test_the_outcome_projection_is_the_allowlist(self) -> None:
+        # #15152 R9: every published member is the EFFECTIVE outcome fact, not the
+        # raw input. The blocked fixture carries kind="reply" and no marker (a
+        # blocked terminal never formed an envelope), so THOSE — not the input's
+        # kind="review_request" — are what the projection publishes.
         outcome = self._run_with_result(self._fail_closed_result(_delivery_outcome()))
 
         projected = outcome.payload["outcome"]
         # Closed producer tokens (from the outcome) survive...
         self.assertEqual("blocked", projected["status"])
         self.assertEqual("invalid_anchor", projected["reason"])
-        # ...caller-echo comes from the INPUT, not the outcome...
+        # ...effective caller-echo comes from the OUTCOME, not the input...
         self.assertEqual("codex", projected["receiver"])
-        self.assertEqual("review_request", projected["kind"])
+        self.assertEqual("reply", projected["kind"])  # the outcome's effective kind
         self.assertEqual(
             {"source": "redmine", "issue": "15152", "journal": "1"},
             projected["anchor"],
         )
-        # ...the marker is rebuilt canonically from the input anchor/kind/to...
-        self.assertEqual(
-            "[mozyo:handoff:source=redmine:issue=15152:journal=1:kind=review_request:to=codex]",
-            projected["notification_marker"],
-        )
+        # ...a blocked terminal formed no envelope, so no marker is published...
+        self.assertNotIn("notification_marker", projected)
         # ...pane evidence and producer prose do not appear.
         self.assertNotIn("target", projected)
         self.assertNotIn("next_action", projected)
@@ -197,42 +202,140 @@ class HandoffProjectionTests(unittest.TestCase):
         self.assertEqual("unknown_status", outcome.payload["status"])
         self.assertIs(False, outcome.payload["delivered"])
 
-    def test_caller_echo_ignores_a_hostile_producer_outcome(self) -> None:
-        # #15152 R8 (finding_callerechobindingopen): receiver / kind / anchor /
-        # notification_marker are sourced from the validated INPUT, never the
-        # producer outcome. Hostile drift on any of them must not leak.
+    # --- #15152 R9 (review j#107091 finding_effectiveinputprojection) ---------- #
+    # The projection MUST use the EFFECTIVE, domain-validated public facts the
+    # shared application layer adopted — the returned DeliveryOutcome — as its sole
+    # authority. It must publish the effective kind and the canonical envelope
+    # marker on success, and NO marker on a domain refusal (the R9 bug rebuilt a
+    # bogus marker from raw args for a refused op, and dropped the effective kind
+    # of a kind-omitted reply). Every assertion covers BOTH structuredContent and
+    # the text summary.
+
+    _CANONICAL_REPLY_MARKER = (
+        "[mozyo:handoff:source=redmine:issue=15152:journal=1:kind=reply:to=codex]"
+    )
+
+    def _completed_result(self, outcome):
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service import (  # noqa: E501
             HandoffResult,
         )
 
-        hostile = _delivery_outcome(
-            status="sent",
-            reason="ok",
-            receiver="/private/runtime/evilrcv",
-            anchor={"source": "redmine", "issue": "/private/runtime/evilanchor", "journal": "%9"},
-            notification_marker="[mozyo:handoff:leaked /private/runtime/pane-%9]",
-        )
-        outcome = self._run_with_result(
-            HandoffResult(
-                operation="send", status="completed", exit_code=0, outcome=hostile, delivered=True
-            )
+        return HandoffResult(
+            operation="reply",
+            status="completed",
+            exit_code=0,
+            outcome=outcome,
+            delivered=True,
         )
 
-        body = json.dumps(outcome.payload)
-        for sentinel in ("/private/runtime", "%9", "evilrcv", "evilanchor", "leaked"):
-            self.assertNotIn(sentinel, body, sentinel)
-            self.assertNotIn(sentinel, outcome.summary, sentinel)
+    def _run_reply_with_result(self, result, args=None):
+        import mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service as api  # noqa: E501
+
+        with patch.object(api, "run_handoff", return_value=result):
+            return run_handoff_reply(dict(args or self._INPUT_ARGS), _context())
+
+    def test_kind_omitted_reply_publishes_effective_kind_and_canonical_marker(self) -> None:
+        # (a) A `handoff reply` with `--kind` OMITTED is executed as a reply
+        # (effective kind "reply", via the operation's default_kind) and the run
+        # forms the canonical envelope. The projection must publish kind="reply"
+        # AND that canonical marker — the R9 raw-input binding published neither
+        # (raw kind was None). The caller omits `kind` entirely here.
+        effective = _delivery_outcome(
+            status="sent",
+            reason="ok",
+            kind="reply",  # the EFFECTIVE kind the shared layer adopted
+            notification_marker=self._CANONICAL_REPLY_MARKER,
+        )
+        args = {"to": "codex", "source": "redmine", "issue": "15152", "journal": "1"}
+        outcome = self._run_reply_with_result(self._completed_result(effective), args)
+
         projected = outcome.payload["outcome"]
-        # The clean INPUT values win on every caller-echo / anchor field.
-        self.assertEqual("codex", projected["receiver"])
-        self.assertEqual("review_request", projected["kind"])
-        self.assertEqual(
-            {"source": "redmine", "issue": "15152", "journal": "1"}, projected["anchor"]
+        self.assertEqual("reply", projected["kind"])
+        self.assertEqual(self._CANONICAL_REPLY_MARKER, projected["notification_marker"])
+        # The canonical marker also survives into the serialized body.
+        self.assertIn(self._CANONICAL_REPLY_MARKER, json.dumps(outcome.payload))
+
+    def test_invalid_delimiter_receiver_refusal_emits_no_marker(self) -> None:
+        # (b) `--to codex:evil` is schema-valid (minLength only) but the DOMAIN
+        # refuses it with invalid_args before any envelope is formed. The blocked
+        # terminal carries notification_marker=None. NO marker — and no
+        # marker-shaped string at all — may appear anywhere. The R9 code applied
+        # build_marker to the raw `to` and returned a bogus marker for this
+        # REFUSED operation.
+        refused = _delivery_outcome(
+            status="blocked",
+            reason="invalid_args",
+            receiver="codex:evil",  # the domain-refused receiver, echoed as-is
+            anchor=None,
+            notification_marker=None,
         )
-        self.assertEqual(
-            "[mozyo:handoff:source=redmine:issue=15152:journal=1:kind=review_request:to=codex]",
-            projected["notification_marker"],
+        args = {
+            "to": "codex:evil",
+            "source": "redmine",
+            "issue": "15152",
+            "journal": "1",
+            "kind": "reply",
+        }
+        outcome = self._run_reply_with_result(self._fail_closed_result(refused), args)
+
+        projected = outcome.payload["outcome"]
+        self.assertNotIn("notification_marker", projected)
+        body = json.dumps(outcome.payload)
+        self.assertNotIn("[mozyo:handoff:", body)
+        self.assertNotIn("[mozyo:handoff:", outcome.summary)
+
+    def test_delimiter_or_duplicate_field_input_yields_no_bogus_marker(self) -> None:
+        # (c) A delimiter / duplicate-field-shaped input (an anchor field carrying
+        # `:` / `=` / a `to=`-shaped fragment) is refused before the envelope; the
+        # published outcome carries no marker. The R9 code fed these raw args to
+        # build_marker and produced a duplicate/delimiter-laden marker-shaped
+        # string. Nothing marker-shaped may appear.
+        refused = _delivery_outcome(
+            status="blocked",
+            reason="invalid_args",
+            receiver="codex",
+            anchor=None,
+            notification_marker=None,
         )
+        args = {
+            "to": "codex",
+            "source": "redmine",
+            "issue": "15152:to=mallory",  # delimiter / duplicate-field injection
+            "journal": "1=x",
+            "kind": "reply",
+        }
+        outcome = self._run_reply_with_result(self._fail_closed_result(refused), args)
+
+        body = json.dumps(outcome.payload)
+        self.assertNotIn("[mozyo:handoff:", body)
+        self.assertNotIn("[mozyo:handoff:", outcome.summary)
+        self.assertNotIn("to=mallory", body)
+        self.assertNotIn("to=mallory", outcome.summary)
+        self.assertNotIn("notification_marker", outcome.payload["outcome"])
+
+    def test_pre_envelope_refusal_publishes_no_marker(self) -> None:
+        # (d) A gate refusing before any DeliveryOutcome is published leaves
+        # result.outcome None; the projection is empty and carries no marker.
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service import (  # noqa: E501
+            HandoffResult,
+        )
+
+        result = HandoffResult(
+            operation="reply",
+            status="fail_closed",
+            exit_code=2,
+            outcome=None,
+            delivered=False,
+            error_message="died before the envelope at /private/runtime pane %7",
+        )
+        outcome = self._run_reply_with_result(result)
+
+        self.assertEqual({}, outcome.payload["outcome"])
+        body = json.dumps(outcome.payload)
+        self.assertNotIn("[mozyo:handoff:", body)
+        self.assertNotIn("[mozyo:handoff:", outcome.summary)
+        self.assertNotIn("/private/runtime", body)
+        self.assertNotIn("%7", body)
 
 
 class SublaneProjectionTests(unittest.TestCase):
@@ -822,9 +925,10 @@ class R7ProducerFieldClosureTests(unittest.TestCase):
         self.assertNotIn("adopted", projected)
 
     def test_every_handoff_field_is_categorized_exactly_once(self) -> None:
-        # #15152 R7/R8: the handoff projection is closed AS A CLASS — every published
-        # field is either a producer-owned closed token (from the outcome) or a
-        # caller-echo (sourced from the validated input). A new field without a
+        # #15152 R7/R8/R9: the handoff projection is closed AS A CLASS — every
+        # published field is either a producer-owned closed token (validated against
+        # its registry) or an effective caller-echo (receiver/kind/marker, sourced
+        # from the domain-validated outcome since R9). A new field without a
         # category fails here.
         from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
             HANDOFF_OUTCOME_PUBLIC_FIELDS,
@@ -832,7 +936,7 @@ class R7ProducerFieldClosureTests(unittest.TestCase):
         )
 
         producer = set(_HANDOFF_PRODUCER_REGISTRIES)  # status/reason/next_action_owner/mode
-        caller_echo = {"receiver", "kind", "notification_marker"}  # sourced from input
+        caller_echo = {"receiver", "kind", "notification_marker"}  # effective, from outcome
         self.assertEqual(
             set(HANDOFF_OUTCOME_PUBLIC_FIELDS), producer | caller_echo, "handoff field uncategorized"
         )
