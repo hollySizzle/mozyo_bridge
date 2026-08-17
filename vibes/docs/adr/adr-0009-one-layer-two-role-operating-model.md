@@ -2,7 +2,8 @@
 
 - status: proposed (owner ratify 待ち。owner は本 ADR の *file 化* を承認済み (#15578 j#107064 proceed (b)) だが、本文の exact text はまだ ratify していない。active 化は owner の文面裁定 anchor 成立後)
 - date: 2026-08-17
-- related: Redmine #15578 j#107053 (coordinator decision-capture、item ①) / j#107064 (owner ratification)、#15601 (役割 identity を MCP 応答へ埋める US)、#15152 (退行の実証根拠)、#15594 / ADR-0007 (v2.0/v2.1 の versioning context)、ADR-0001 (owner 決定は ADR、レビューは黙って上書きできない)
+- 改稿注記: 初版は subagent 起草だったが、owner の「ADR は coordinator が直接書く」境界 (#15578 j#107114) に従い、以後 coordinator が直接執筆・改稿する。本改稿で「運用モードの列挙 (フラット + instruction 注入)」「誰が書くか」節を追加 (owner discussion j#107108 / j#107114 の反映)。
+- related: Redmine #15578 j#107053 (coordinator decision-capture、item ①) / j#107064 (owner ratification) / j#107108 (フラットモード列挙) / j#107114 (誰が書くか境界)、#15601 (役割 identity を MCP 応答へ埋める US)、#15152 (退行の実証根拠)、#12952 / #12953 (role_profile / workflow_contract 注入)、#15594 / ADR-0007 (v2.0/v2.1 の versioning context)、ADR-0001 (owner 決定は ADR、レビューは黙って上書きできない)
 
 ## 決定 (規約行)
 
@@ -11,6 +12,54 @@
 project-coordinator 層も置かない。並列・スケールが要る場合に限り multi-layer の委任コーディ
 ネーション (3 階層) へ**上げる**。ただし**実装者とレビューアの分離は 1 階層でも常時必須**とし、
 規模を理由に統合しない (根拠は #15152 の退行実例、下記)。
+
+## 運用モードの列挙 (フラット、モードごとに instruction を注入)
+
+運用モードは **2 軸マトリクスではなく、認可済みモードのフラットな列挙** として扱う。各モードで
+注入すべき workflow / custom instruction (role_profile / workflow_contract) が異なるため、
+自由な直交軸ではなく「それぞれ専用の instruction set を持つモードの列挙」が正しいモデルである。
+マトリクスにすると murky な組合せ (下記の除外セル) にも instruction を定義する義務が生じるが、
+フラット列挙なら instruction を実際に書いたモードだけを認可でき、未定義の組合せを綺麗に外せる
+(除外が gap でなく feature になる)。
+
+認可モード (暫定 3 つ):
+
+1. **1 階層 / native subagent なし** — 実装者 + cross-family reviewer の逐次。最小オーバーヘッド。
+   小規模 / 線形、または orchestrator が非力な場合。
+2. **1 階層 / native subagent あり** — orchestrator が自身の subagent 機能で独立作業を並列化する。
+   独立に分解できる作業 + 有能な orchestrator (上級モデル) の場合。
+3. **3 階層 (default の委任コーディネーション)** — constructed な coordinator / project-gateway /
+   サブレーン。別 pane・provider bound・durable な役割 identity・cross-model。スケール / cross-model
+   サブレーン / 1 context を超える規模の場合。
+
+**「3 階層 + native subagent」は意図的に除外**する (instruction set 未定義・運用が不明瞭)。
+
+補足:
+
+- 「1 階層 + subagent」は per-task の runtime 戦術ではなく**一級モード**とする。理由は注入する
+  instruction が変わるから (owner の instruction-injection 基準)。
+- 実装は新アーキ不要 — 既存の role_profile / workflow_contract 注入 (#12952 / #12953、packaged
+  `role_profile_templates.yaml` / `workflow_contract_config.yaml`) に**モード単位の selector を 1 枚
+  被せる**だけで足りる。「モード」= 注入 instruction bundle の選択である。
+- **全モード共通の不変条件** (モード差にしない): (a) cross-model の review 分離を全モードで持続する
+  (native subagent は同一モデルで**手を増やすが目は増やさない**=盲点を共有するため、review の
+  代替にならない)。(b) durable record と review dispatch は coordinator が保持する (native subagent は
+  実行するだけで governance をしない)。
+- 選択ルール (モード数より重要): 小規模/線形 or 非力 orchestrator → 1、独立分解可 + 有能
+  orchestrator → 2、スケール / cross-model サブレーン / 1 context 超過 → 3。
+
+## 誰が書くか (執筆 / dispatch / review の境界)
+
+- **coordinator が直接書く (subagent へ dispatch しない)**: ADR、および owner が直接発話した意思決定を
+  捕捉する doc。かつ catalog 登録レベルのもの。理由: owner 意思決定の文脈は relay (伝言ゲーム) で
+  劣化し、coordinator だけが直接対話の文脈を持つ。**深い理由**: 実装エラーは test + cross-model
+  review で客観検出できるが、ADR の「owner の実際の意図への忠実さ」は test で検証不能で reviewer も
+  直接文脈を持たない ── ADR の dispatch は固有にリスクが高い。
+- **dispatch 可**: 実装 (code / scaffold 機械作業)、および owner 意思決定を含まない routine な
+  catalog-doc (ER 図・設計書系)。project-coordinator でも coordinator assistant でも可。
+- **review は常に別 party (cross-model)**。自作を自分でレビューしない。reviewer が捕まえられるのは
+  構造・整合・portability までで、意図への忠実さの最終確認は owner の ratify である (ADR は
+  「coordinator 執筆 → cross-model が構造 review → owner が意図 ratify」の三点で守る)。
 
 ## 背景
 
