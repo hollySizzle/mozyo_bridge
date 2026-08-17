@@ -690,6 +690,7 @@ class AlwaysRuleDigestTest(unittest.TestCase):
             "### Review Finding Verdict Obligation (迎合禁止)",
             "### 根拠出所分類",
             "### 回答前 Doc 解決 (Answer-Time Resolution)",
+            "### Proactive Decision Capture (能動的意思決定捕捉)",
         ):
             self._assert_section_heading_exists(preset_body, section, "preset")
 
@@ -725,6 +726,7 @@ class AlwaysRuleDigestTest(unittest.TestCase):
             "no-sycophancy-evidence-provenance",
             "answer-time-doc-resolution",
             "canonical-terminology-discipline",
+            "proactive-decision-capture",
         }
     )
 

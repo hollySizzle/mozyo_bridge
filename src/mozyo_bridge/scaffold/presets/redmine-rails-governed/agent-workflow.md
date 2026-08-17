@@ -787,6 +787,29 @@ claude_owner_question_bypass:
     - bypass が workflow / guardrail surface に影響した場合は `## Workflow Change Verification` に乗せる
 ```
 
+### Proactive Decision Capture (能動的意思決定捕捉)
+
+<!-- mozyo-bridge:activation:always id=proactive-decision-capture digest="discussion で architecturally significant な決定が生じたら、owner が「ADR」等と指示するのを待たず、その場で durable (active issue の journal に逐語 quote + text_snapshot) に捕捉する。正本: central preset `### Proactive Decision Capture (能動的意思決定捕捉)`。" -->
+
+coordinator は、architecturally significant な決定が discussion で生じたら、owner が「ADR」「記録して」等と指示するのを待たず、その場で durable に捕捉する。捕捉義務は「決定が生じたこと」で発火し、owner が format 名を口にすることでは発火しない。本規則は `### 既定役割` の coordinator 職務 (Redmine判断記録 / owner承認収集) の明文化であり、新しい authority は作らない。
+
+architecturally significant の基準 (いずれか該当):
+
+- 構造 / bounded context / 依存の方向を変える
+- role / model 配置 / 階層 (単層⇔多層 delegation) / process 境界を変える
+- version / release scope / 外部契約 (公開 API・schema・marker) を変える
+- 横断的な convention を新設・変更する
+- 覆すのが高コスト (書き直し相当) な選択
+
+捕捉の最小形 (durable record = active issue の journal):
+
+- exact owner quote と前後文脈 (要約でなく逐語。journal は後で編集・削除され得るため、引用元の text_snapshot も持つ)
+- 決定内容 / 適用範囲 / 検討した代替 (あれば)
+
+上記のうち architecturally significant なものは journal に ADR draft を書き、owner ratify 後に ADR 置き場 (例: `vibes/docs/adr/`) へ file する (既存 ADR practice)。迷ったら捕捉側へ倒す (捕捉のコストは低く、消失のコストは回復不能)。
+
+除外: routine な実装選択 (naming / 局所リファクタ等) は code / commit に残り、本規則の対象外。本規則は「決定を残す practice」であり、ADR 基盤ツール (plugin / MCP の build) の設計とは別レイヤである。
+
 ### LLM 実行契約
 
 ```plantuml
