@@ -420,19 +420,23 @@ adversarial_convergence:
         最大 1 行) の**両方**を claim と同じ journal に持つ。challenge_verdict=update_model の
         場合は valid (non-empty) な threat_model 行を更新して宣言し直す
       repair_record: |
-        **repair candidate** = `repairs_attempt` 行を **1 行以上**含む canonical review_request
-        (行数・値の正否・他 key の有無を問わない母集合)。repair candidate は分類優先順位が
+        **repair candidate** = `repairs_attempt` 行を **1 行以上**含む **journal**
+        (canonical review_request に限らない。行数・値の正否・他 key の有無を問わない母集合 —
+        single-pass 分岐 (1) と同一定義)。repair candidate は分類優先順位が
         最初であり、ordinary の challenge 帰属判定・resumption 母集団には**恒久的に入らない**
         (後続の valid repair が blocker を除去しても分類は single-pass 分類時に固定され、
         attempt へ復帰しない)。
-        **valid repair record** = repair candidate の closed subset — `repairs_attempt:
-        j#<U の journal id>` がちょうど 1 行、他の challenge key (challenge_attempt /
-        challenge_resolution) を一切持たず、target U (帰属不能な canonical request または
-        帰属不能な anchor candidate journal) が実在し、U < 自 journal id (後方参照)、
+        **valid repair record** = repair candidate の closed subset — canonical review_request
+        であり、`repairs_attempt: j#<U の journal id>` がちょうど 1 行、**challenge grammar の
+        他 key 全て (challenge_pending / challenge_attempt / challenge_resolution /
+        challenge_ref / challenge_verdict / supersedes_anchor) を一切持たず**、target U
+        (帰属不能な canonical request または帰属不能な anchor attempt journal) が実在し、
+        U < 自 journal id (後方参照)、
         かつ評価時点で U が outstanding blocker 集合の要素であるもの。effect は「U を集合から
         除去する」ことだけで、per-challenge の chain 判定には一切影響しない。
-        それ以外の repair candidate (重複行・値 malformed・dangling・前方参照・blocker でない
-        target・challenge key との混在・同一 U への 2 個目以降) はすべて **invalid repair** —
+        それ以外の repair candidate (非 request・重複行・値 malformed・dangling・前方参照・
+        blocker でない target・上記いずれかの key との混在 (anchor 系を含む)・同一 U への
+        2 個目以降) はすべて **invalid repair** —
         その record 自身が blocker 集合へ加わり、repair effect は 0
       resolution_entry: |
         challenge_verdict が defer / wontfix_by_policy の場合、再開 request の authoritative
@@ -443,10 +447,11 @@ adversarial_convergence:
       (canonical review_request に限らない)。journal id 昇順の**単一 pass** で決定的に構成し、
       各 journal は次の**優先順位付き完全分割**でちょうど 1 分岐に落ちる (fall-through も
       到達不能分岐も存在しない):
-      (1) **repair candidate** (`repairs_attempt` 行を 1 行以上含む journal): valid repair
-      record (canonical review_request であることを validity に含む) なら出現時に target U を
-      集合から除去、それ以外 (非 request・混在・重複行・malformed 等) は invalid repair として
-      出現時に自身を集合へ追加 (effect 0)。
+      (1) **repair candidate** (`repairs_attempt` 行を 1 行以上含む journal — repair_record と
+      同一の母集合): valid repair record (canonical review_request であること・challenge
+      grammar の他 key 全て (pending / attempt / resolution / anchor 系) の不在を validity に
+      含む) なら出現時に target U を集合から除去、それ以外 (非 request・key 混在・重複行・
+      malformed 等) は invalid repair として出現時に自身を集合へ追加 (effect 0)。
       (2) **ordinary challenge-key record** ((1) 以外で `challenge_attempt` /
       `challenge_resolution` 行を持つ journal): canonical review_request であり、anchor 系 key
       (challenge_ref / challenge_verdict / supersedes_anchor) と混在せず、既存の challenge
