@@ -437,10 +437,12 @@ adversarial_convergence:
         **valid repair record** = repair candidate の closed subset — canonical review_request
         であり、`repairs_attempt: j#<U の journal id>` がちょうど 1 行、**challenge grammar の
         他 key 全て (challenge_pending / challenge_attempt / challenge_resolution /
-        challenge_ref / challenge_verdict / supersedes_anchor) を一切持たず**、target U
-        (帰属不能な canonical request または帰属不能な anchor attempt journal) が実在し、
-        U < 自 journal id (後方参照)、
-        かつ評価時点で U が outstanding blocker 集合の要素であるもの。effect は「U を集合から
+        challenge_ref / challenge_verdict / supersedes_anchor) を一切持たず**、target U が
+        実在し、U < 自 journal id (後方参照)、
+        かつ**評価時点で U が outstanding blocker 集合の要素である journal** (種別を問わない —
+        帰属不能な ordinary challenge-key record / anchor attempt / pending attempt /
+        invalid repair record のいずれか。集合の要素であることが唯一の条件なので、分割へ
+        種別を追加しても本 union の同期漏れは起きない) であるもの。effect は「U を集合から
         除去する」ことだけで、per-challenge の chain 判定には一切影響しない。
         それ以外の repair candidate (非 request・重複行・値 malformed・dangling・前方参照・
         blocker でない target・上記いずれかの key との混在 (anchor 系を含む)・同一 U への
@@ -457,7 +459,8 @@ adversarial_convergence:
       到達不能分岐も存在しない):
       (1) **repair candidate** (`repairs_attempt` 行を 1 行以上含む journal — repair_record と
       同一の母集合): valid repair record (canonical review_request であること・challenge
-      grammar の他 key 全て (pending / attempt / resolution / anchor 系) の不在を validity に
+      grammar の他 key 全て (pending / attempt / resolution / anchor 系) の不在・target が
+      評価時点の集合要素 (種別不問) であることを validity に
       含む) なら出現時に target U を集合から除去、それ以外 (非 request・key 混在・重複行・
       malformed 等) は invalid repair として出現時に自身を集合へ追加 (effect 0)。
       (2) **ordinary challenge-key record** ((1) 以外で `challenge_attempt` /
