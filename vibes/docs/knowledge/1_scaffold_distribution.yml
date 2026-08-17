@@ -1,0 +1,32 @@
+id: 1
+title: scaffold 配布同期の正しい手順と stale CLI の落とし穴
+date: 2026-08-17
+scope: mozyo-bridge scaffold / rules / governed preset 配布
+
+findings:
+  - id: stale_path_cli
+    area: mozyo-bridge CLI 実行
+    problem: PATH の mozyo-bridge が stale な ~/.local site-packages install から動き、rules install / scaffold apply が古い package の preset を読んで mis-sync する
+    solution: scaffold 配布系は worktree source を使う `PYTHONPATH=src python3 -m mozyo_bridge` で実行する
+    detail: scaffold status / scaffold canonical --check は disk 上の source 比較なので stale CLI でも正しく読む。preset 内容を package から引く rules install / scaffold apply のみ worktree source 必須
+    caveat: pip install -e . で editable 再install すれば PATH binary が source と一致し PYTHONPATH prefix 不要になる
+
+  - id: distribution_sequence
+    area: preset 配布手順
+    problem: canonical source を変えても repo-local install / router / manifest に伝播しない
+    solution: |
+      1. PYTHONPATH=src python3 -m mozyo_bridge scaffold canonical
+      2. PYTHONPATH=src python3 -m mozyo_bridge rules install --repo-local .
+      3. PYTHONPATH=src python3 -m mozyo_bridge scaffold apply <preset> --repo-local --force
+      4. PYTHONPATH=src python3 -m mozyo_bridge scaffold status --target .
+
+  - id: always_digest_activation_tag
+    area: always-digest / canonical render
+    problem: router の always-digest 行は自由文でなく source rule の activation tag から導出される
+    solution: canonical body に activation:always tag (id と digest 付き) を追加し、id を EXPECTED_TAG_IDS に、section を pointer-target pin に追加する
+    caveat: entry cap がある (現状 10)。test_docs_canonical_workspace.py が契約を強制する
+
+constraints:
+  - name: preset 変更は high-blast
+    detail: governed preset は全 adopter へ配布される。canonical source を変えたら canonical --check と scaffold status の両方を clean にする
+    workaround: 検証は full `mozyo-bridge tests run` + scaffold canonical --check + scaffold status --target .

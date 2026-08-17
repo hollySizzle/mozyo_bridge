@@ -1,0 +1,31 @@
+id: 3
+title: MCP public projection の情報漏えい review が多 round 化する構造と収束の当て方
+date: 2026-08-17
+scope: MCP mutation tool の public projection (#15152)
+
+findings:
+  - id: fix_class_not_instance
+    area: public projection の secret 漏えい修正
+    problem: flagged された field だけ塞ぐと、次 round で兄弟 field や別クラスの漏えいが出て review round が伸びる
+    solution: projection 全体を型付きカテゴリで網羅する (producer 閉集合 / 厳密 bool / caller-input / presence / 再構成)。field が分類を逃れられない exhaustiveness test で封じる
+    caveat: 型注釈 (Literal 等) は静的ヒントでランタイム保証ではない。公開境界では runtime 検証が要る
+
+  - id: source_independent_seal
+    area: caller-echo の source
+    problem: raw input と raw outcome を往復しても漏えいが残る (どちらも runtime validator の無い未検証文字列を運ぶ)
+    solution: source を問わず projection 側で語彙・grammar・相関を検証して封をする。mismatch は drop
+    detail: marker は validated な anchor/kind/receiver から canonical に再構成し、outcome の marker と相関一致したときだけ公開する
+
+  - id: bool_truthiness
+    area: bool projection
+    problem: bool(value) は bool("false") が True になり文字列を成功状態へ誤変換する
+    solution: 厳密 bool のみ受理 (isinstance(value, bool))、非 bool は omit する
+
+constraints:
+  - name: same-model subagent は目を増やさない
+    detail: native subagent は同一モデルで盲点を共有する。収束修正を投げても cross-model reviewer の代替にならない (手は増えるが目は増えない)
+    workaround: 収束修正は coordinator 直接実装 + cross-model (codex) review
+
+  - name: mock は実経路を証明しない
+    detail: run_handoff を mock して期待 outcome を直接作る回帰は、実共有経路が effective 値 / canonical marker / refusal None を供給することを証明しない
+    workaround: mock なしで real run_handoff を通す回帰 (omitted-kind success / pre-envelope refusal) を持つ

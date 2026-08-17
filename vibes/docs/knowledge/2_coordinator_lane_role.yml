@@ -1,0 +1,19 @@
+id: 2
+title: この repo の Claude default lane は coordinator (role の確認方法)
+date: 2026-08-17
+scope: mozyo-bridge workflow role / provider binding
+
+findings:
+  - id: role_is_coordinator
+    area: role 自認
+    problem: 自役割を実装者と誤認しやすい (central preset の既定例が coordinator=codex のため)
+    solution: role は .mozyo-bridge/config.yaml の coordination.provider と .mozyo-bridge/workflow-role-bindings.json の default lane role で確認する。live は `mozyo-bridge workflow role-authority --json`
+    detail: giken-3800-mozyo-bridge では default lane = coordinator (source Redmine #15098)、coordination.provider は claude
+    caveat: CLAUDE.md は抽象語 provider_binding で role config を指すが実キーは coordination.provider。provider_binding を grep して空振り→preset 既定へ倒すと role を誤認する
+
+  - id: coordinator_dispatch_boundary
+    area: 誰が書くか / dispatch
+    problem: ADR や owner 決定 doc を subagent へ dispatch すると owner 意図が relay で劣化する
+    solution: ADR と owner が直接言った決定 doc (かつ catalog 登録レベル) は coordinator が直接書く。実装 (code/scaffold) と owner 決定を含まない routine doc は dispatch 可
+    detail: 実装エラーは test + cross-model review で客観検出できるが、ADR の owner 意図忠実性は test 検証不能で reviewer も直接文脈を持たない
+    caveat: review は常に別 party (cross-model)。native subagent は同一モデルで盲点を共有するので review の代替にならない
