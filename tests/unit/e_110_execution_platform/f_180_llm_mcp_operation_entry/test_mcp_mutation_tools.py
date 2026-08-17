@@ -354,48 +354,130 @@ class R5HandoffAnchorSourceTests(unittest.TestCase):
             )
 
 
-class R5NoCallerAuthenticationOverclaimTests(unittest.TestCase):
-    """#15152 R5 (review j#106995 finding_callerauthorityoverclaim): no shipped
-    tool description or SERVER_INSTRUCTIONS may claim the caller's own identity is
-    authenticated / verified as authority — ADR-0006 / j#106959 fixed the trust
-    boundary at the runtime perimeter and the sender check as a weak signal."""
+class R6CallerAuthDisclaimerTests(unittest.TestCase):
+    """#15152 R6 (review j#107004 finding_overclaimguardopen): the R5 guard was a
+    4-phrase denylist a synonym bypassed. The trust boundary is now stated by ONE
+    canonical disclaimer that every mutating surface CONTAINS (positive structural
+    assertion), and NO surface states caller-auth anywhere else — so a synonym
+    over-claim added alongside the disclaimer is still caught."""
 
-    def _texts(self):
+    def _mutating_texts(self):
         from collections.abc import Mapping
 
-        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mcp_server import (  # noqa: E501
-            SERVER_INSTRUCTIONS,
-        )
-
-        texts = [SERVER_INSTRUCTIONS]
-        for definition in TOOL_CATALOG.values():
-            texts.append(definition.description)
-            # The frozen schema uses MappingProxyType, so match on Mapping — a
-            # `dict`-only check silently skipped every property description
-            # (the exact hole the mutant `--` exposed).
+        texts = []
+        for name in sorted(MUTATING_TOOL_NAMES):
+            definition = TOOL_CATALOG[name]
+            texts.append(("description", name, definition.description))
+            # Frozen schema properties are MappingProxyType — match on Mapping,
+            # not dict (the R5 hole).
             props = definition.input_schema.get("properties", {})
             if isinstance(props, Mapping):
-                for prop in props.values():
+                for prop_name, prop in props.items():
                     if isinstance(prop, Mapping) and isinstance(
                         prop.get("description"), str
                     ):
-                        texts.append(prop["description"])
+                        texts.append((f"property:{prop_name}", name, prop["description"]))
         return texts
 
-    def test_no_description_claims_caller_authentication(self) -> None:
-        # Phrases that would assert the caller's own identity is authenticated /
-        # verified as authority. "authenticated here" is allowed ONLY in the
-        # explicit negation "NOT ... authenticated".
-        forbidden = [
-            "verifies the caller",
-            "caller's sender authority",
-            "verify caller",
-            "authenticates the caller",
-        ]
-        for text in self._texts():
-            lowered = text.lower()
-            for phrase in forbidden:
-                self.assertNotIn(phrase.lower(), lowered, f"overclaim: {phrase!r}")
+    def test_every_mutating_surface_contains_the_canonical_disclaimer(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mcp_server import (  # noqa: E501
+            SERVER_INSTRUCTIONS,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.tool_catalog import (  # noqa: E501
+            CALLER_AUTH_DISCLAIMER,
+        )
+
+        # Positive assertion: the tool description of every mutating tool and the
+        # server instructions carry the ONE canonical disclaimer.
+        self.assertIn(CALLER_AUTH_DISCLAIMER, SERVER_INSTRUCTIONS)
+        for name in sorted(MUTATING_TOOL_NAMES):
+            self.assertIn(
+                CALLER_AUTH_DISCLAIMER, TOOL_CATALOG[name].description, name
+            )
+
+    def test_no_caller_auth_claim_outside_the_canonical_disclaimer(self) -> None:
+        # Robust negative: strip the ONE canonical disclaimer, then no remaining
+        # text may pair an authentication/authority verb with a caller/sender/
+        # identity subject. This is broader than a fixed phrase list and catches
+        # the synonym "verified as coordinator authority" the R5 guard missed.
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mcp_server import (  # noqa: E501
+            SERVER_INSTRUCTIONS,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.tool_catalog import (  # noqa: E501
+            CALLER_AUTH_DISCLAIMER,
+        )
+
+        subjects = ("caller", "sender", "coordinator identity", "caller identity")
+        claim_verbs = ("authenticat", "authority", "verified as", "verifies")
+        surfaces = [("SERVER_INSTRUCTIONS", "", SERVER_INSTRUCTIONS)] + list(
+            self._mutating_texts()
+        )
+        for where, name, text in surfaces:
+            remainder = text.replace(CALLER_AUTH_DISCLAIMER, " ").lower()
+            for subject in subjects:
+                for verb in claim_verbs:
+                    # A subject and a claim-verb co-occurring within ~60 chars is
+                    # an auth claim; the disclaimer is the only sanctioned one and
+                    # was removed above.
+                    idx = remainder.find(subject)
+                    while idx != -1:
+                        window = remainder[idx : idx + 60]
+                        self.assertNotIn(
+                            verb,
+                            window,
+                            f"{where} {name}: caller-auth claim "
+                            f"({subject!r}+{verb!r}) outside the disclaimer",
+                        )
+                        idx = remainder.find(subject, idx + 1)
+
+
+class R6PublicVocabularyDriftTests(unittest.TestCase):
+    """#15152 R6 (finding_projectionvocabopen): the closed public vocabularies
+    used to sanitize blocked_reasons are IMPORTED from the producing registries,
+    and these tests pin the two hand-listed sets to their producers so a new
+    producer token cannot silently start mapping to the unclassified fallback."""
+
+    def test_missing_field_names_match_the_request_producer(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+            _MISSING_FIELD_NAMES,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+            SublaneCreateRequest,
+        )
+
+        produced = set(
+            SublaneCreateRequest(
+                issue="", lane_label="", branch="", worktree_path=""
+            ).missing_fields(is_git=True)
+        )
+        self.assertEqual(produced, set(_MISSING_FIELD_NAMES))
+
+    def test_a_launcher_verdict_reason_maps_to_fallback(self) -> None:
+        # A gate_reason string (launcher capability verdict) is NOT in any closed
+        # registry, so it must fall to the unclassified token even when it is
+        # identifier-shaped (the R5 grammar would have let it through).
+        from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
+            _UNCLASSIFIED_BLOCKER,
+            _public_blocker_token,
+        )
+
+        self.assertEqual(
+            _UNCLASSIFIED_BLOCKER,
+            _public_blocker_token("attestation_store_schema_mismatch_v3"),
+        )
+        # A hostile identifier-shaped sentinel also falls to the fallback.
+        self.assertEqual(
+            _UNCLASSIFIED_BLOCKER, _public_blocker_token("secret_workspace_key_abc")
+        )
+        # Legit registry tokens and namespaced forms survive.
+        self.assertEqual("missing_identity", _public_blocker_token("missing_identity"))
+        self.assertEqual(
+            "missing_field:issue", _public_blocker_token("missing_field:issue")
+        )
+        # A prefixed form with an out-of-registry value falls to the fallback.
+        self.assertEqual(
+            _UNCLASSIFIED_BLOCKER, _public_blocker_token("missing_field:secret_path")
+        )
 
 
 class MutatingDeclarationGuardTests(unittest.TestCase):

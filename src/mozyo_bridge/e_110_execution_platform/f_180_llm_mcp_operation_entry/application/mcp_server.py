@@ -55,6 +55,7 @@ from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.
     success_response,
 )
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.tool_catalog import (  # noqa: E501
+    CALLER_AUTH_DISCLAIMER,
     catalog_surface_violations,
     list_tools_payload,
 )
@@ -85,11 +86,8 @@ SERVER_INSTRUCTIONS = (
     "`sublane_start`) run the same shared application gates the CLI runs — "
     "durable anchor's Redmine ownership, the receiver / role / lane "
     "vocabulary, and the workspace geometry are verified and a gap refuses "
-    "with a typed reason BEFORE any side effect. The CALLER's own coordinator "
-    "identity is NOT cryptographically authenticated here (ADR-0006): the "
-    "trust boundary is the runtime perimeter — this server is meant to run on "
-    "the operator's host inside an attested pane, and the sender-identity "
-    "check is a weak signal, not forgery-proof authority. No tool accepts a "
+    "with a typed reason BEFORE any side effect. " + CALLER_AUTH_DISCLAIMER
+    + " No tool accepts a "
     "pane locator, a tmux target, or a command string; receivers are roles and "
     "lanes are identities, resolved through managed durable authority only. "
     "`sublane_start` is a plan unless `actuate` is true. Treat `delivered: "

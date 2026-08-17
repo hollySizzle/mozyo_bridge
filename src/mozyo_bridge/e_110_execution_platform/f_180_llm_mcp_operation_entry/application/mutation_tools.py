@@ -27,7 +27,6 @@ say where things live.
 
 from __future__ import annotations
 
-import re
 from typing import Any, Mapping
 
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.read_plan_tools import (  # noqa: E501
@@ -79,30 +78,99 @@ SUBLANE_OUTCOME_PUBLIC_FIELDS = (
     "gateway_ready",
 )
 
-#: The public grammar for a blocker reason token (#15152 R5, review j#106995
-#: finding_blockedreasonleak). `blocked_reasons` is only type-hinted
-#: ``Tuple[str, ...]`` — its producers append registry tokens (`missing_identity`)
-#: but ALSO dynamic values (`missing_field:<field>`, `unattested:<role>`, a
-#: launcher capability verdict's free-text `gate_reason`), so it is NOT a
-#: validated closed vocabulary. R4 published it verbatim, which just moved the
-#: leak. A blocker reason is published only if it matches this grammar — a
-#: lowercase identifier, optionally namespaced with ONE `:identifier` — which the
-#: whole registry and the `<prefix>:<identifier>` forms satisfy, but a path
-#: (`/`), a pane id (`%`), or exception prose (spaces / punctuation / capitals)
-#: cannot. Anything else maps to :data:`_UNCLASSIFIED_BLOCKER`.
-_PUBLIC_BLOCKER_TOKEN = re.compile(r"^[a-z0-9_]+(:[a-z0-9_]+)?$")
+# The CLOSED public vocabulary for a blocker token (#15152 R6, review j#107004
+# finding_projectionvocabopen). R5 used a lowercase-identifier REGEX, which is an
+# infinite grammar — an identifier-shaped internal detail (no `/` `%` space) still
+# leaked. The doc requires a FINITE closed vocabulary, so the public set is
+# IMPORTED from the producing registries (never hand-duplicated) and a token is
+# published only if it is an exact member, or a `<prefix>:<value>` form whose
+# prefix AND value both belong to a closed registry. Everything else — including a
+# launcher verdict's free-text `gate_reason` — maps to _UNCLASSIFIED_BLOCKER.
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+    ACTUATE_STATES,
+    BLOCKED_REASONS,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.work_unit_granularity import (  # noqa: E501
+    WORK_UNIT_EXPLICIT_DECISION_RECORDED,
+    WORK_UNIT_EXPLICIT_DECISION_REQUIRED,
+    WORK_UNIT_LEAF_DECISION_RECORDED,
+    WORK_UNIT_LEAF_DECISION_REQUIRED,
+    WORK_UNIT_LEAF_STANDALONE,
+    WORK_UNIT_STANDARD,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_fill_decision import (  # noqa: E501
+    FILL_DECISIONS,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_target_resolution import (  # noqa: E501
+    AGENT_PROVIDERS,
+)
 
-#: The fixed disposition for a blocker token that fails the public grammar.
+#: The exact blocker tokens producers append that are NOT in ``BLOCKED_REASONS``.
+#: Pinned to their producers by :mod:`sublane_actuator_gates` /
+#: :mod:`sublane_actuator_use_case`; a drift test asserts the union stays complete.
+_EXTRA_BLOCKER_TOKENS = frozenset(
+    {"sender_attestation", "sender_authority_capability_missing", "base_ref_unpinnable"}
+)
+
+#: The work-unit decision diagnostics that ride in blocked_reasons.
+_WORK_UNIT_DIAGNOSTICS = frozenset(
+    {
+        WORK_UNIT_STANDARD,
+        WORK_UNIT_LEAF_STANDALONE,
+        WORK_UNIT_LEAF_DECISION_RECORDED,
+        WORK_UNIT_LEAF_DECISION_REQUIRED,
+        WORK_UNIT_EXPLICIT_DECISION_RECORDED,
+        WORK_UNIT_EXPLICIT_DECISION_REQUIRED,
+    }
+)
+
+#: The exact closed public blocker vocabulary (imported, not duplicated).
+_PUBLIC_BLOCKER_TOKENS = (
+    frozenset(BLOCKED_REASONS)
+    | frozenset(FILL_DECISIONS)
+    | _WORK_UNIT_DIAGNOSTICS
+    | _EXTRA_BLOCKER_TOKENS
+)
+
+#: The identity fields a `missing_field:<name>` blocker may name (#13432). Pinned
+#: to ``SublaneCreateRequest.missing_fields`` by a drift test.
+_MISSING_FIELD_NAMES = frozenset({"issue", "lane_label", "branch", "worktree_path"})
+
+#: `<prefix>:<value>` blocker forms: the value must belong to the mapped registry.
+_PREFIXED_BLOCKER_REGISTRIES = {
+    "missing_field": _MISSING_FIELD_NAMES,
+    "unattested": frozenset(AGENT_PROVIDERS),
+}
+
+#: The closed public status vocabulary and the fixed unknown fallbacks.
+_PUBLIC_STATUSES = frozenset(ACTUATE_STATES)
 _UNCLASSIFIED_BLOCKER = "unclassified_blocker"
+_UNKNOWN_STATUS = "unknown_status"
+
+
+def _public_blocker_token(token: str) -> str:
+    """One blocker token validated against the closed public vocabulary."""
+    if token in _PUBLIC_BLOCKER_TOKENS:
+        return token
+    prefix, sep, value = token.partition(":")
+    if sep:
+        allowed = _PREFIXED_BLOCKER_REGISTRIES.get(prefix)
+        if allowed is not None and value in allowed:
+            return token
+    return _UNCLASSIFIED_BLOCKER
+
+
+def _public_status(status: str) -> str:
+    """The actuation status validated against ``ACTUATE_STATES`` (#15152 R6)."""
+    return status if status in _PUBLIC_STATUSES else _UNKNOWN_STATUS
 
 
 def _public_blocked_reasons(outcome: Any) -> list:
-    """The blocked_reasons validated to the closed public grammar (#15152 R5)."""
-    out: list = []
-    for raw in getattr(outcome, "blocked_reasons", ()) or ():
-        token = str(raw)
-        out.append(token if _PUBLIC_BLOCKER_TOKEN.match(token) else _UNCLASSIFIED_BLOCKER)
-    return out
+    """The blocked_reasons validated to the closed public vocabulary (#15152 R6)."""
+    return [
+        _public_blocker_token(str(raw))
+        for raw in getattr(outcome, "blocked_reasons", ()) or ()
+    ]
 
 #: Fixed refusal sentence for a fail-closed handoff run. The gate's own message
 #: is NOT forwarded (it is operator prose that can name panes and paths); the
@@ -323,11 +391,14 @@ def _public_sublane_outcome(outcome: Any) -> dict:
             value = list(value)
         if value is not None:
             payload[name] = value
+    # #15152 R6 (finding_projectionvocabopen): status is validated against the
+    # closed ACTUATE_STATES vocabulary too, not published verbatim (the field is
+    # a plain str with no runtime invariant).
+    status = _public_status(str(getattr(outcome, "status", "") or ""))
+    payload["status"] = status
     blocked = _public_blocked_reasons(outcome)
     payload["blocked_reasons"] = blocked
-    payload["reason"] = _reconstructed_sublane_reason(
-        str(getattr(outcome, "status", "") or ""), blocked
-    )
+    payload["reason"] = _reconstructed_sublane_reason(status, blocked)
     return payload
 
 
@@ -388,21 +459,24 @@ def run_sublane_start_tool(
         )
 
     outcome = result.outcome
+    projected = _public_sublane_outcome(outcome)
+    # #15152 R6: the top-level status uses the SAME validated value as the
+    # projection — never the raw outcome.status.
     payload = {
-        "status": outcome.status,
+        "status": projected["status"],
         "executed": bool(outcome.executed),
         "exit_code": int(result.exit_code),
         "refusal_reason": "",
         "refusal": "",
-        "outcome": _public_sublane_outcome(outcome),
+        "outcome": projected,
     }
-    # #15152 R4/R5 (finding_reasonproseleak / finding_blockedreasonleak): the
-    # summary uses the SAME validated blocker tokens the projection publishes —
-    # never the raw outcome.reason (private-path detail) nor an unvalidated
-    # blocked_reasons value.
-    blocked = payload["outcome"].get("blocked_reasons", [])
+    # #15152 R4/R5/R6 (finding_reasonproseleak / blockedreasonleak /
+    # projectionvocabopen): the summary uses the SAME validated status and blocker
+    # tokens the projection publishes — never the raw outcome.reason (private-path
+    # detail) nor an unvalidated status / blocked_reasons value.
+    blocked = projected.get("blocked_reasons", [])
     summary = (
-        f"sublane_start: {outcome.status} "
+        f"sublane_start: {projected['status']} "
         f"(executed={str(bool(outcome.executed)).lower()}"
         + (f", blocked {', '.join(blocked)}" if blocked else "")
         + ")"

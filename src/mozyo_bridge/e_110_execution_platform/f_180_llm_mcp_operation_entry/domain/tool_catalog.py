@@ -48,6 +48,19 @@ from mozyo_bridge.core.state.lane_kind import LANE_KINDS
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     KIND_LABELS,
 )
+
+#: The ONE canonical statement of the caller-auth trust boundary (#15152 R6,
+#: review j#107004 finding_overclaimguardopen). Every mutating tool description
+#: and SERVER_INSTRUCTIONS CONTAINS this exact string and states the boundary
+#: NOWHERE ELSE — re-listing an independent auth sentence per surface is how the
+#: wording drifted back into an over-claim (R4/R5). A guard test asserts each
+#: mutating surface contains it and that no other auth-capability claim survives.
+CALLER_AUTH_DISCLAIMER = (
+    "The caller's own identity is not authenticated here; the trust boundary is "
+    "the runtime perimeter (attested host / pane), and any sender-identity check "
+    "is a weak signal, not forgery-proof authority (ADR-0006; real "
+    "authentication is deferred to #15579)."
+)
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.domain.unit_selector import (  # noqa: E501
     REQUIRED_SELECTOR_FIELDS,
 )
@@ -531,13 +544,11 @@ _HANDOFF_MUTATION_DESCRIPTION = (
     "(in-process, #15149): the receiver / role vocabulary, gateway-route and "
     "send-safety gates apply and refuse with typed reasons before any side "
     "effect, and the Redmine anchor is verified to EXIST and BELONG to its "
-    "issue. What is NOT verified (#15152 R5 / ADR-0006): the caller's own "
-    "coordinator identity is not authenticated (trust boundary = runtime "
-    "perimeter), and whether the anchor journal authorizes the requested kind "
-    "(kind/gate join) is not checked here (#15595). Delivery is reported from "
-    "the shared injection-stage authority; `delivered: false` with status "
-    "`completed` means the send terminated without confirmed submission — never "
-    "assume delivery from exit alone."
+    "issue. Whether the anchor journal authorizes the requested kind (kind/gate "
+    "join) is NOT checked here (#15595). " + CALLER_AUTH_DISCLAIMER + " Delivery "
+    "is reported from the shared injection-stage authority; `delivered: false` "
+    "with status `completed` means the send terminated without confirmed "
+    "submission — never assume delivery from exit alone."
 )
 
 _HANDOFF_SEND = ToolDefinition(
@@ -579,12 +590,10 @@ _SUBLANE_START = ToolDefinition(
         "project gateway is durably declared AND verified), the provider "
         "launchability preflight, and every actuation gate (identity, the "
         "durable anchor's Redmine ownership, fill admission) — all decided "
-        "BEFORE any worktree / pair / dispatch side effect. The caller's own "
-        "coordinator identity is NOT cryptographically authenticated (ADR-0006, "
-        "deferred to #15579): the sender check is a weak signal and the trust "
-        "boundary is the runtime perimeter (attested host / pane). Launching "
-        "goes only through the managed creator rail that assigns durable "
-        "identity; no raw pane creation is expressible."
+        "BEFORE any worktree / pair / dispatch side effect. "
+        + CALLER_AUTH_DISCLAIMER + " Launching goes only through the managed "
+        "creator rail that assigns durable identity; no raw pane creation is "
+        "expressible."
     ),
     input_schema=_freeze(
         {
@@ -662,11 +671,8 @@ _SUBLANE_START = ToolDefinition(
                     "description": (
                         "With actuate, also dispatch the "
                         "implementation_request. false still requires the "
-                        "durable anchor before any mutation (#15152 R2). The "
-                        "caller's own coordinator identity is NOT authenticated "
-                        "either way (ADR-0006, deferred to #15579): the "
-                        "sender-identity check is a weak signal, not "
-                        "forgery-proof authority."
+                        "durable anchor before any mutation (#15152 R2). "
+                        + CALLER_AUTH_DISCLAIMER
                     ),
                 },
                 "target_repo": {
@@ -893,6 +899,7 @@ def resolve_arguments(
 
 __all__ = (
     "FORBIDDEN_PROPERTY_TOKENS",
+    "CALLER_AUTH_DISCLAIMER",
     "MUTATING_TOOL_NAMES",
     "SUPPORTED_SCHEMA_KEYWORDS",
     "TOOL_CATALOG",
