@@ -4598,6 +4598,16 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             "drift from the gate); names no marker token itself, renders none, and "
             "reads no durable note — it declares tool schemas",
         ),
+        "src/mozyo_bridge/e_110_execution_platform/f_180_llm_mcp_operation_entry/application/mutation_tools.py": (
+            ['handoff'],
+            "inherits via a used import of handoff for the `Status` / `Reason` / "
+            "`NextActionOwner` Literal types whose `get_args` builds the #15152 R7 "
+            "closed handoff projection (review j#107037 finding_handoffprojectionopen: "
+            "the Literal annotations are static hints, so the MCP boundary validates "
+            "producer-owned handoff fields against them at runtime); names no marker "
+            "token itself, renders none, and reads no durable note — it projects the "
+            "handoff outcome to the public MCP response",
+        ),
         "src/mozyo_bridge/application/handoff_transport_wiring.py": (
             ['handoff'],
             "inherits via a used import of handoff for the pure `is_explicit_pane_target` "
