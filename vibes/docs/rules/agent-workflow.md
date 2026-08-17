@@ -372,7 +372,13 @@ adversarial_convergence:
         `### Threat-model challenge (owner decision pending)` 見出し配下に記録する
         (1 result につき最大 1 個。identity = その result journal id)
       pending_record: |
-        implementer の判断待ち journal は `challenge_pending: j#<challenge result id>` を持つ
+        **pending attempt** = `challenge_pending` 行を 1 行以上含む journal (validity 判定前の
+        母集合)。**valid pending record** = closed subset — challenge_pending がちょうど 1 行、
+        実在の challenge result C を指し、id > C、かつ challenge grammar の他 key
+        (repairs_attempt / challenge_attempt / challenge_resolution / challenge_ref /
+        challenge_verdict / supersedes_anchor) を一切持たない。重複行・dangling・混在の
+        pending attempt は帰属不能 record として outstanding blocker 集合へ入る
+        (repairs_attempt で修復可能)
       owner_anchor: |
         **anchor attempt** = `challenge_ref` / `challenge_verdict` / `supersedes_anchor` の
         **いずれか**を 1 行以上含む journal (validity 判定前の母集合 — identity key を欠く
@@ -389,8 +395,10 @@ adversarial_convergence:
         新しい valid candidate の append のみ
     authoritative_chain: |
       challenge result C ごとに、history 全体から一意に選ぶ:
-      (a) pending record = `challenge_pending: j#C` を持つ journal のうち **id > C の最小 id** の
-      1 個 (chain の必須要素。C より前の journal は選択対象外)。
+      (a) pending authority = **valid pending record** (pending_record 参照) のうち **id > C の
+      最小 id** の 1 個 (chain の必須要素。malformed / mixed な pending attempt は選択母集合に
+      入らず blocker になる。valid pending record が存在しない間は predicate (i) 不成立 =
+      blocked で、回復は新しい valid pending record の append のみ)。
       (b) authoritative anchor の解決は二段階: まず C へ帰属する anchor candidate の**最大 id**
       が valid であること (invalid なら C の chain は close blocked — 旧 valid terminal へ
       fallback しない)。その上で、valid candidate 全部の supersession 連鎖の末端 1 個を
@@ -454,14 +462,18 @@ adversarial_convergence:
       malformed 等) は invalid repair として出現時に自身を集合へ追加 (effect 0)。
       (2) **ordinary challenge-key record** ((1) 以外で `challenge_attempt` /
       `challenge_resolution` 行を持つ journal): canonical review_request であり、anchor 系 key
-      (challenge_ref / challenge_verdict / supersedes_anchor) と混在せず、既存の challenge
-      result へ一意に帰属できる場合のみ blocker にならない。非 request・anchor 系 key との
+      (challenge_ref / challenge_verdict / supersedes_anchor) とも `challenge_pending` とも
+      混在せず、既存の challenge
+      result へ一意に帰属できる場合のみ blocker にならない。非 request・他 key との
       混在・帰属不能 (typo・dangling・前方参照・duplicate 等) は出現時に集合へ追加。
       (3) **anchor attempt** ((1)(2) 以外で anchor 系 key を 1 行以上持つ journal): owner_anchor
-      の帰属規則で C へ一意帰属できない (challenge_ref 欠落・重複行・dangling) 場合は出現時に
-      集合へ追加。帰属可能な candidate は authoritative_chain の規則 (latest 検証 → 線形
-      supersession) で評価する。
-      (4) いずれの key も持たない journal は集合に関与しない。
+      の帰属規則で C へ一意帰属できない (challenge_ref 欠落・重複行・dangling・
+      `challenge_pending` との混在) 場合は出現時に集合へ追加。帰属可能な candidate は
+      authoritative_chain の規則 (latest 検証 → 線形 supersession) で評価する。
+      (4) **pending attempt** ((1)-(3) 以外で `challenge_pending` 行を持つ journal): valid
+      pending record (pending_record 参照) なら blocker にならず authoritative_chain (a) で
+      評価する。invalid (重複行・dangling) は出現時に集合へ追加。
+      (5) いずれの key も持たない journal は集合に関与しない。
       この pass の最終結果のみを判定に使う (評価順依存の非決定性を排除。fall-through する
       record は存在しない)。無関係な challenge の well-formed attempt が最大 id を更新しても
       集合は変化しない。集合が空でない間は、個別 chain の状態にかかわらず issue close blocked。
