@@ -68,11 +68,21 @@ def _delivery_outcome(**overrides):
 
 
 class HandoffProjectionTests(unittest.TestCase):
-    def _run_with_result(self, result):
+    # A coherent caller input; the projection sources receiver/kind/anchor/marker
+    # from THIS, never the producer outcome (#15152 R8 finding_callerechobindingopen).
+    _INPUT_ARGS = {
+        "to": "codex",
+        "source": "redmine",
+        "issue": "15152",
+        "journal": "1",
+        "kind": "review_request",
+    }
+
+    def _run_with_result(self, result, args=None):
         import mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service as api  # noqa: E501
 
         with patch.object(api, "run_handoff", return_value=result):
-            return run_handoff_send({"to": "codex", "issue": "1", "journal": "2"}, _context())
+            return run_handoff_send(dict(args or self._INPUT_ARGS), _context())
 
     def _fail_closed_result(self, outcome):
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service import (  # noqa: E501
@@ -101,15 +111,22 @@ class HandoffProjectionTests(unittest.TestCase):
         outcome = self._run_with_result(self._fail_closed_result(_delivery_outcome()))
 
         projected = outcome.payload["outcome"]
-        # Closed tokens and the caller-supplied anchor survive...
+        # Closed producer tokens (from the outcome) survive...
         self.assertEqual("blocked", projected["status"])
         self.assertEqual("invalid_anchor", projected["reason"])
+        # ...caller-echo comes from the INPUT, not the outcome...
         self.assertEqual("codex", projected["receiver"])
+        self.assertEqual("review_request", projected["kind"])
         self.assertEqual(
             {"source": "redmine", "issue": "15152", "journal": "1"},
             projected["anchor"],
         )
-        # ...pane evidence and producer prose do not.
+        # ...the marker is rebuilt canonically from the input anchor/kind/to...
+        self.assertEqual(
+            "[mozyo:handoff:source=redmine:issue=15152:journal=1:kind=review_request:to=codex]",
+            projected["notification_marker"],
+        )
+        # ...pane evidence and producer prose do not appear.
         self.assertNotIn("target", projected)
         self.assertNotIn("next_action", projected)
         self.assertNotIn("execution_root", projected)
@@ -179,6 +196,43 @@ class HandoffProjectionTests(unittest.TestCase):
         # Top-level result status and delivered are closed / exact-bool too.
         self.assertEqual("unknown_status", outcome.payload["status"])
         self.assertIs(False, outcome.payload["delivered"])
+
+    def test_caller_echo_ignores_a_hostile_producer_outcome(self) -> None:
+        # #15152 R8 (finding_callerechobindingopen): receiver / kind / anchor /
+        # notification_marker are sourced from the validated INPUT, never the
+        # producer outcome. Hostile drift on any of them must not leak.
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_application_service import (  # noqa: E501
+            HandoffResult,
+        )
+
+        hostile = _delivery_outcome(
+            status="sent",
+            reason="ok",
+            receiver="/private/runtime/evilrcv",
+            anchor={"source": "redmine", "issue": "/private/runtime/evilanchor", "journal": "%9"},
+            notification_marker="[mozyo:handoff:leaked /private/runtime/pane-%9]",
+        )
+        outcome = self._run_with_result(
+            HandoffResult(
+                operation="send", status="completed", exit_code=0, outcome=hostile, delivered=True
+            )
+        )
+
+        body = json.dumps(outcome.payload)
+        for sentinel in ("/private/runtime", "%9", "evilrcv", "evilanchor", "leaked"):
+            self.assertNotIn(sentinel, body, sentinel)
+            self.assertNotIn(sentinel, outcome.summary, sentinel)
+        projected = outcome.payload["outcome"]
+        # The clean INPUT values win on every caller-echo / anchor field.
+        self.assertEqual("codex", projected["receiver"])
+        self.assertEqual("review_request", projected["kind"])
+        self.assertEqual(
+            {"source": "redmine", "issue": "15152", "journal": "1"}, projected["anchor"]
+        )
+        self.assertEqual(
+            "[mozyo:handoff:source=redmine:issue=15152:journal=1:kind=review_request:to=codex]",
+            projected["notification_marker"],
+        )
 
 
 class SublaneProjectionTests(unittest.TestCase):
@@ -677,6 +731,45 @@ class R7ProducerFieldClosureTests(unittest.TestCase):
         self.assertIs(True, projected["durable_anchor_present"])
         self.assertNotIn("durable_anchor", projected)
 
+    def test_sublane_caller_echo_ignores_a_hostile_producer_outcome(self) -> None:
+        # #15152 R8 (finding_callerechobindingopen): issue / lane_label / branch are
+        # sourced from the validated command, never the producer outcome.
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_start_service as svc  # noqa: E501
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            SublaneActuationOutcome,
+        )
+
+        hostile = SublaneActuationOutcome(
+            status="ready",
+            execute=True,
+            reason="planned",
+            issue="/private/runtime/evilissue",
+            lane_label="/private/runtime/evillane",
+            branch="%9-evilbranch",
+        )
+        result = svc.SublaneStartResult(
+            status=svc.STATUS_COMPLETED, exit_code=0, outcome=hostile
+        )
+        with patch.object(svc, "run_sublane_start", return_value=result):
+            outcome = run_sublane_start_tool(
+                {
+                    "issue": "15152",
+                    "lane_label": "issue_15152_probe",
+                    "branch": "issue_15152_probe",
+                    "actuate": True,
+                },
+                _context(),
+            )
+
+        body = json.dumps(outcome.payload)
+        for sentinel in ("/private/runtime", "%9", "evilissue", "evillane", "evilbranch"):
+            self.assertNotIn(sentinel, body, sentinel)
+            self.assertNotIn(sentinel, outcome.summary, sentinel)
+        projected = outcome.payload["outcome"]
+        self.assertEqual("15152", projected["issue"])
+        self.assertEqual("issue_15152_probe", projected["lane_label"])
+        self.assertEqual("issue_15152_probe", projected["branch"])
+
     def test_valid_producer_tokens_survive(self) -> None:
         # A legitimate registry member is republished unchanged.
         from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
@@ -729,34 +822,34 @@ class R7ProducerFieldClosureTests(unittest.TestCase):
         self.assertNotIn("adopted", projected)
 
     def test_every_handoff_field_is_categorized_exactly_once(self) -> None:
-        # #15152 R7: the handoff projection is closed AS A CLASS too — a new field
-        # added to HANDOFF_OUTCOME_PUBLIC_FIELDS without a category fails here.
+        # #15152 R7/R8: the handoff projection is closed AS A CLASS — every published
+        # field is either a producer-owned closed token (from the outcome) or a
+        # caller-echo (sourced from the validated input). A new field without a
+        # category fails here.
         from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
             HANDOFF_OUTCOME_PUBLIC_FIELDS,
-            _HANDOFF_CALLER_ECHO_FIELDS,
             _HANDOFF_PRODUCER_REGISTRIES,
         )
 
-        producer = set(_HANDOFF_PRODUCER_REGISTRIES)
-        echo = set(_HANDOFF_CALLER_ECHO_FIELDS)
+        producer = set(_HANDOFF_PRODUCER_REGISTRIES)  # status/reason/next_action_owner/mode
+        caller_echo = {"receiver", "kind", "notification_marker"}  # sourced from input
         self.assertEqual(
-            set(HANDOFF_OUTCOME_PUBLIC_FIELDS), producer | echo, "handoff field uncategorized"
+            set(HANDOFF_OUTCOME_PUBLIC_FIELDS), producer | caller_echo, "handoff field uncategorized"
         )
-        self.assertEqual(set(), producer & echo, "handoff field in two categories")
+        self.assertEqual(set(), producer & caller_echo, "handoff field in two categories")
 
     def test_handoff_producer_registries_match_their_types(self) -> None:
-        # Pin each handoff producer registry to its source Literal / constants so a
-        # new member cannot silently start mapping to unknown_<field>.
+        # Pin each handoff producer registry to its source Literal / canonical set
+        # so a new member cannot silently start mapping to unknown_<field>. #15152 R8
+        # (finding_handoffmodevocabularypartial): mode MUST equal the canonical MODES
+        # (which includes `standard`), never a hand-picked subset.
         from typing import get_args
 
         from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (  # noqa: E501
+            MODES,
             NextActionOwner,
             Reason,
             Status,
-        )
-        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_send_semantics import (  # noqa: E501
-            MODE_PENDING,
-            MODE_QUEUE_ENTER,
         )
         from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application.mutation_tools import (  # noqa: E501
             _HANDOFF_PRODUCER_REGISTRIES,
@@ -768,9 +861,9 @@ class R7ProducerFieldClosureTests(unittest.TestCase):
             _HANDOFF_PRODUCER_REGISTRIES["next_action_owner"],
             frozenset(get_args(NextActionOwner)),
         )
-        self.assertEqual(
-            _HANDOFF_PRODUCER_REGISTRIES["mode"], frozenset({MODE_QUEUE_ENTER, MODE_PENDING})
-        )
+        self.assertEqual(_HANDOFF_PRODUCER_REGISTRIES["mode"], frozenset(MODES))
+        # `standard` is a canonical member and must be preserved, not unknown'd.
+        self.assertIn("standard", _HANDOFF_PRODUCER_REGISTRIES["mode"])
 
 
 class MutatingDeclarationGuardTests(unittest.TestCase):
