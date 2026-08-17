@@ -105,6 +105,15 @@ documents:
     related_document_refs:
       - rule-adr-index
 
+  - id: rule-adr-0009-one-layer-two-role-operating-model
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0009-one-layer-two-role-operating-model.md
+    purpose: "ADR-0009 (proposed, owner 文面 ratify 待ち): 小規模の既定運用モデルは 1 階層 / 2 役割、実装者とレビューアの分離は常時保つ (#15578)。"
+    audit_role: adr_0009_rule
+    related_document_refs:
+      - rule-adr-index
+
   - id: rule-release-distribution
     type: rule
     status: active
