@@ -75,6 +75,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     pair_attestation_admission,
     pair_split_admission,
     pre_mutation_admission,
+    sender_blocked_reasons,
     startup_health_admission,
 )
 
@@ -212,7 +213,7 @@ class SublaneActuateUseCase:
                         launch_action=None,
                         reason="dispatch sender attestation failed before actuation; "
                         f"{sender_detail}",
-                        reasons=(REASON_MISSING_IDENTITY, "sender_attestation"),
+                        reasons=sender_blocked_reasons(self.ops),
                         dispatch=dispatch,
                         fill_decision=fill_decision_token,
                         fill_override_reason=fill_override_reason,

@@ -370,6 +370,66 @@ class SenderAttestationPreflightTests(unittest.TestCase):
         outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 
+    def test_delegated_branch_token_reaches_the_public_blocked_reasons(self):
+        # #15706 (review j#108076 finding_typedreasonprojection): a delegated-sender
+        # refusal's typed branch token survives to blocked_reasons AFTER the pinned
+        # two-token prefix, and the payload maps it to the branch's own next action.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+            DELEGATED_SENDER_NEXT_ACTIONS,
+            SENDER_LANE_NOT_DELEGATED_COORDINATOR,
+        )
+
+        class DelegatedRefusedOps(FakeActuatorOps):
+            dispatch_sender_refusal_reason = SENDER_LANE_NOT_DELEGATED_COORDINATOR
+
+            def preflight_dispatch_sender(self):
+                return False, (
+                    f"{SENDER_LANE_NOT_DELEGATED_COORDINATOR}: sender lane "
+                    "'issue_x' is recorded with lane_kind 'implementation'"
+                )
+
+        ops = DelegatedRefusedOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertEqual(
+            outcome.blocked_reasons,
+            (
+                REASON_MISSING_IDENTITY,
+                "sender_attestation",
+                SENDER_LANE_NOT_DELEGATED_COORDINATOR,
+            ),
+        )
+        payload = outcome.as_payload()
+        self.assertEqual(
+            payload["next_action"]["action"],
+            DELEGATED_SENDER_NEXT_ACTIONS[SENDER_LANE_NOT_DELEGATED_COORDINATOR],
+        )
+        self.assertEqual(
+            payload["next_action"]["blocked_reason"],
+            SENDER_LANE_NOT_DELEGATED_COORDINATOR,
+        )
+
+    def test_legacy_sender_refusal_keeps_the_two_token_shape(self):
+        # #15706 byte-invariance: a legacy refusal (no stashed token) projects the
+        # EXACT pre-#15706 blocked_reasons pair and the coordinator-shell next action.
+        class LegacyRefusedOps(FakeActuatorOps):
+            dispatch_sender_refusal_reason = ""
+
+            def preflight_dispatch_sender(self):
+                return False, "sender lane 'issue_x' is not the coordinator default lane"
+
+        ops = LegacyRefusedOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertEqual(
+            outcome.blocked_reasons,
+            (REASON_MISSING_IDENTITY, "sender_attestation"),
+        )
+        self.assertEqual(
+            outcome.as_payload()["next_action"]["action"],
+            "restore_attested_coordinator_shell",
+        )
+
     def test_passing_ops_preflight_proceeds(self):
         class AttestedSenderOps(FakeActuatorOps):
             def preflight_dispatch_sender(self):

@@ -451,6 +451,23 @@ def pair_attestation_admission(
     )
 
 
+def sender_blocked_reasons(ops) -> tuple:
+    """The sender-refusal ``blocked_reasons`` tuple, typed-branch token included (#15706).
+
+    The pre-#15706 two-token prefix ``(missing_identity, sender_attestation)`` is the
+    pinned public shape and stays first; an admitted-extension refusal appends the typed
+    branch token the preflight stashed on ``ops`` (review j#108076
+    finding_typedreasonprojection), which the outcome payload / journal renderers map to
+    the branch's honest next action. Legacy refusals stash no token and stay byte-invariant.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
+        REASON_MISSING_IDENTITY,
+    )
+
+    token = (getattr(ops, "dispatch_sender_refusal_reason", "") or "").strip()
+    return (REASON_MISSING_IDENTITY, "sender_attestation") + ((token,) if token else ())
+
+
 def default_upstream_to_verified_parent(ops, request):
     """Route an admitted delegated-gateway create's callback at its parent (#15706).
 
@@ -473,5 +490,6 @@ __all__ = (
     "pair_attestation_admission",
     "pair_split_admission",
     "runtime_placement_gate",
+    "sender_blocked_reasons",
     "startup_health_admission",
 )
