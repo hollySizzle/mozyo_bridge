@@ -51,11 +51,13 @@ class _Target:
 
 class _FakeBinding:
     # Role-aware after the #13569 integration: the combined gate resolves BOTH the
-    # coordinator (gateway) and implementer (worker) providers and enforces the exact
-    # gateway head, so a receiver="codex" send must map coordinator->codex (else it is
-    # a third provider and blocks). Mirrors RoleProviderBinding.default().
+    # gateway (the #12670 ``project_gateway`` lane role since Redmine #15655; no longer
+    # the coordinator role) and implementer (worker) providers and enforces the exact
+    # gateway head, so a receiver="codex" send must map project_gateway->codex (else it
+    # is a third provider and blocks). Mirrors RoleProviderBinding.default():
+    # implementation-profile roles -> claude, coordination-profile roles -> codex.
     def provider_for(self, role):
-        return "codex" if role == "coordinator" else "claude"
+        return "claude" if role in ("implementer", "implementation_worker") else "codex"
 
 
 class _Die(Exception):

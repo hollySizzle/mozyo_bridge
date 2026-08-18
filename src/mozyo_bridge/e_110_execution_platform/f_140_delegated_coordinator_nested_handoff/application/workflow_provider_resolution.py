@@ -2,8 +2,10 @@
 
 Increment 2B rebinds the *runtime provider* the delegated-route / gateway / sublane
 actuation sites key on from a hard-coded ``claude`` / ``codex`` literal onto the
-workflow role's binding — the implementer / worker role's provider, the coordinator /
-gateway role's provider — resolved from the repo-local
+workflow role's binding — the implementer / worker role's provider, the lane gateway's
+``project_gateway`` role provider (#12670 lane vocabulary; deliberately NOT the
+``coordinator`` role, so rebinding the coordinator does not move the gateway — Redmine
+#15655) — resolved from the repo-local
 :class:`~..domain.role_provider_binding.RoleProviderBinding` (#12673 / #13157 config).
 
 The one rule this module enforces (Coordinator Answer j#76969 correction 4): a caller
@@ -31,10 +33,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     load_workflow_binding,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
+    ROLE_PROJECT_GATEWAY,
     RoleProviderBinding,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
-    ROLE_COORDINATOR,
     ROLE_IMPLEMENTER,
 )
 
@@ -102,11 +104,16 @@ def resolve_gateway_provider(
     *,
     binding: Optional[RoleProviderBinding] = None,
 ) -> str:
-    """The runtime provider bound to the coordinator (gateway) role, fail-closed.
+    """The runtime provider bound to the ``project_gateway`` role, fail-closed.
 
-    The lane gateway / coordinator pane's provider. Default: ``codex``.
+    The lane gateway pane's provider — resolved from the #12670 ``project_gateway``
+    lane role, NOT the ``coordinator`` role (Redmine #15655): rebinding the
+    coordinator (e.g. ``coordinator -> implementation`` profile) must not move the
+    sublane gateway onto the worker's provider, which would fail sublane pair
+    creation closed with a duplicate-slot error. Default: ``codex``
+    (coordination profile).
     """
-    return resolve_role_provider(ROLE_COORDINATOR, repo_root, binding=binding)
+    return resolve_role_provider(ROLE_PROJECT_GATEWAY, repo_root, binding=binding)
 
 
 __all__ = (

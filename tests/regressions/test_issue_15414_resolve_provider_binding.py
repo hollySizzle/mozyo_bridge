@@ -66,6 +66,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (  # noqa: E402,E501
     ROLE_COORDINATOR,
     ROLE_IMPLEMENTER,
+    ROLE_PROJECT_GATEWAY,
     RoleProviderBinding,
 )
 
@@ -515,11 +516,14 @@ class DeclareRouteFollowsBindingTest(unittest.TestCase):
             workflow_binding_source,
         )
 
+        # The gateway slot resolves via the ``project_gateway`` lane role, not
+        # the coordinator role (Redmine #15655), so the drift is expressed on
+        # the roles the pair actually reads.
         all_claude = RoleProviderBinding.default().with_overrides(
-            {ROLE_COORDINATOR: "claude", ROLE_IMPLEMENTER: "claude"}
+            {ROLE_PROJECT_GATEWAY: "claude", ROLE_IMPLEMENTER: "claude"}
         )
         all_codex = RoleProviderBinding.default().with_overrides(
-            {ROLE_COORDINATOR: "codex", ROLE_IMPLEMENTER: "codex"}
+            {ROLE_PROJECT_GATEWAY: "codex", ROLE_IMPLEMENTER: "codex"}
         )
         loads: list = []
 
