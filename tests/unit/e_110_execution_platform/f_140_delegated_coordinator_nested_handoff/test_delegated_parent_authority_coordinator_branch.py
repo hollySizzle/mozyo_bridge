@@ -9,24 +9,20 @@ exactly-one policy). Pinned here, module-isolated:
 - the pure branch decision in ``domain.delegated_parent_authority`` — the earned
   pass and every typed refusal, with the probe injected;
 - the declared-gateway topology NEVER consulting the coordinator probe (no silent
-  fallback in either direction — design constraint 1);
-- the live gate composition in ``application.delegated_parent_authority_gate``,
-  with the coordinator proxy rail's reads faked at their import site.
+  fallback in either direction — design constraint 1).
 
-The operator-facing command acceptance (both entry points succeeding end to end)
+Module-isolated and I/O-free: every collaborator is an injected fake. The live
+gate composition (real temp repo + real bindings loader) lives in
+``tests/integration/.../test_delegated_parent_authority_gate``; the
+operator-facing command acceptance (both entry points succeeding end to end)
 lives in ``tests/scenarios/test_single_workspace_delegated_coordinator_acceptance``.
 """
 
 from __future__ import annotations
 
-import contextlib
-import json
-import subprocess
 import sys
-import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -232,153 +228,6 @@ class DeclaredGatewayNeverFallsBackTest(unittest.TestCase):
         self.assertEqual(PARENT_GATEWAY_UNVERIFIED, verdict.reason)
         self.assertEqual(PARENT_KIND_PROJECT_GATEWAY, verdict.parent_kind)
         self.assertEqual([], calls)
-
-
-_PROXY_SEND = (
-    "mozyo_bridge.e_110_execution_platform."
-    "f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send"
-)
-
-
-@contextlib.contextmanager
-def attested_coordinator_reads():
-    """Patch the gate probe's reads to a resolved, live, attested coordinator."""
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
-        ProxyTarget,
-    )
-
-    with patch(
-        f"{_PROXY_SEND}.resolve_default_lane_authority",
-        return_value=("resolved", "coordinator", "proj-a", ""),
-    ), patch(
-        f"{_PROXY_SEND}.resolve_expected_provider", return_value="codex"
-    ), patch(
-        f"{_PROXY_SEND}.live_workspace_id", return_value="a" * 32
-    ), patch(
-        f"{_PROXY_SEND}.live_agent_rows", return_value=()
-    ), patch(
-        f"{_PROXY_SEND}.resolve_proxy_target",
-        return_value=ProxyTarget(
-            status="ok",
-            assigned_name="mzb1-attested-coordinator",
-            locator="%7",
-            live=1,
-            with_locator=1,
-            attestation_state="attested",
-        ),
-    ):
-        yield
-
-
-class _TempRepo(unittest.TestCase):
-    def _repo(self, bindings=None) -> Path:
-        tmp = tempfile.TemporaryDirectory()
-        self.addCleanup(tmp.cleanup)
-        repo = Path(tmp.name).resolve()
-        subprocess.run(["git", "init", "-q"], cwd=repo, check=True)
-        (repo / ".mozyo-bridge").mkdir()
-        (repo / ".mozyo-bridge" / "workspace-anchor.json").write_text(
-            json.dumps(
-                {
-                    "schema_version": 1,
-                    "workspace_id": "a" * 32,
-                    "canonical_session": "mozyo-test",
-                    "project_name": "test",
-                    "created_at": "2026-08-16T00:00:00+00:00",
-                    "updated_at": "2026-08-16T00:00:00+00:00",
-                }
-            )
-        )
-        if bindings is not None:
-            (repo / ".mozyo-bridge" / "workflow-role-bindings.json").write_text(
-                json.dumps(
-                    {
-                        "schema": "mozyo.workflow-role-bindings",
-                        "version": 1,
-                        "bindings": bindings,
-                    }
-                )
-            )
-        return repo
-
-
-class LiveGateCompositionTest(_TempRepo):
-    """The gate composes the coordinator branch from the proxy rail's own reads."""
-
-    def test_the_live_gate_admits_a_single_workspace_with_a_live_coordinator(
-        self,
-    ) -> None:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.delegated_parent_authority_gate import (  # noqa: E501
-            delegated_parent_authority_refusal,
-            delegated_parent_authority_verdict,
-        )
-
-        repo = self._repo(bindings=[dict(COORDINATOR_ENTRY)])
-
-        with attested_coordinator_reads():
-            verdict = delegated_parent_authority_verdict(
-                repo, "delegated_coordinator"
-            )
-            refusal = delegated_parent_authority_refusal(
-                repo, "delegated_coordinator"
-            )
-
-        self.assertIsNotNone(verdict)
-        self.assertTrue(verdict.ok)
-        self.assertEqual(PARENT_KIND_DEFAULT_COORDINATOR, verdict.parent_kind)
-        self.assertEqual(
-            "mzb1-attested-coordinator", verdict.verified_coordinator
-        )
-        self.assertIsNone(refusal)
-
-    def test_an_unattested_live_coordinator_refuses_through_the_gate(self) -> None:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
-            ProxyTarget,
-        )
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.delegated_parent_authority_gate import (  # noqa: E501
-            delegated_parent_authority_verdict,
-        )
-
-        repo = self._repo(bindings=[dict(COORDINATOR_ENTRY)])
-
-        with attested_coordinator_reads():
-            with patch(
-                f"{_PROXY_SEND}.resolve_proxy_target",
-                return_value=ProxyTarget(
-                    status="unattested",
-                    live=1,
-                    with_locator=1,
-                    attestation_state="stale",
-                    attestation_reason="generation mismatch",
-                ),
-            ):
-                verdict = delegated_parent_authority_verdict(
-                    repo, "delegated_coordinator"
-                )
-
-        self.assertIsNotNone(verdict)
-        self.assertFalse(verdict.ok)
-        self.assertEqual(PARENT_COORDINATOR_UNATTESTED, verdict.reason)
-        self.assertIn("stale", verdict.detail)
-
-    def test_a_broken_probe_read_fails_closed(self) -> None:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.delegated_parent_authority_gate import (  # noqa: E501
-            delegated_parent_authority_verdict,
-        )
-
-        repo = self._repo(bindings=[dict(COORDINATOR_ENTRY)])
-
-        with patch(
-            f"{_PROXY_SEND}.resolve_default_lane_authority",
-            side_effect=RuntimeError("registry unreadable"),
-        ):
-            verdict = delegated_parent_authority_verdict(
-                repo, "delegated_coordinator"
-            )
-
-        self.assertIsNotNone(verdict)
-        self.assertFalse(verdict.ok)
-        self.assertEqual(PARENT_COORDINATOR_BLOCKED, verdict.reason)
 
 
 if __name__ == "__main__":  # pragma: no cover
