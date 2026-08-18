@@ -15,12 +15,14 @@ import unittest
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.herdr_auto_target_root import (  # noqa: E501
     BASIS_LANE_WORKTREE,
     BASIS_SENDER_LANE,
+    BASIS_WORKSPACE_CANONICAL,
     REFUSE_FOREIGN_WORKSPACE,
     REFUSE_IDENTITY_UNATTESTED,
     REFUSE_LANE_BINDING_ABSENT,
     REFUSE_LANE_BINDING_UNBOUND,
     REFUSE_LANE_WORKTREE_UNRESOLVED,
     classify_auto_target_basis,
+    decide_default_lane_root,
     decide_lane_worktree_root,
 )
 
@@ -143,6 +145,83 @@ class LaneWorktreeDecisionTest(unittest.TestCase):
             self.assertEqual(decided.root, "", decided.reason)
             self.assertFalse(decided.ok, decided.reason)
             self.assertTrue(decided.reason)
+
+
+_LIVE_MAIN = {"exists": True, "is_dir": True, "is_git": True, "is_main_worktree": True}
+
+
+def _decide_default(**over):
+    kwargs = {
+        "target_lane_id": "default",
+        "canonical_root": "/registry/canonical",
+        "liveness": dict(_LIVE_MAIN),
+        "scope_matches": True,
+    }
+    kwargs.update(over)
+    return decide_default_lane_root(**kwargs)
+
+
+class DefaultLaneDecisionTest(unittest.TestCase):
+    """#15707 (b): the coordinator (default) lane answers from the VERIFIED registry canonical.
+
+    The default lane structurally owns no lifecycle row (only ``sublane create`` writes rows),
+    so the row-based decision above systematically refused every gateway->coordinator callback
+    with ``lane_binding_absent`` (#15701 j#107992 / #15704 j#108011). The registry fallback is
+    admitted only fully verified; every partial fact keeps the same refusal.
+    """
+
+    def test_a_fully_verified_canonical_is_the_default_lane_root(self) -> None:
+        decided = _decide_default()
+        self.assertTrue(decided.ok)
+        self.assertEqual(decided.root, "/registry/canonical")
+        self.assertEqual(decided.basis, BASIS_WORKSPACE_CANONICAL)
+
+    def test_a_non_default_lane_never_gets_the_registry_answer(self) -> None:
+        decided = _decide_default(target_lane_id=TARGET_LANE)
+        self.assertFalse(decided.ok)
+        self.assertEqual(decided.reason, REFUSE_LANE_BINDING_ABSENT)
+
+    def test_a_registry_with_no_canonical_keeps_the_refusal(self) -> None:
+        decided = _decide_default(canonical_root="")
+        self.assertFalse(decided.ok)
+        self.assertEqual(decided.reason, REFUSE_LANE_BINDING_ABSENT)
+
+    def test_a_linked_worktree_canonical_refuses(self) -> None:
+        # The #13152 shape: a registry hijacked by a linked worktree must not answer.
+        decided = _decide_default(liveness={**_LIVE_MAIN, "is_main_worktree": False})
+        self.assertFalse(decided.ok)
+        self.assertEqual(decided.reason, REFUSE_LANE_BINDING_ABSENT)
+
+    def test_a_dead_or_non_git_canonical_refuses(self) -> None:
+        for liveness in (
+            None,
+            {**_LIVE_MAIN, "exists": False},
+            {**_LIVE_MAIN, "is_dir": False},
+            {**_LIVE_MAIN, "is_git": False},
+            {**_LIVE_MAIN, "is_main_worktree": None},
+        ):
+            decided = _decide_default(liveness=liveness)
+            self.assertFalse(decided.ok, liveness)
+            self.assertEqual(decided.reason, REFUSE_LANE_BINDING_ABSENT, liveness)
+
+    def test_a_scope_mismatch_refuses(self) -> None:
+        # A same-named registry row for a DIFFERENT repo must never answer this workspace.
+        decided = _decide_default(scope_matches=False)
+        self.assertFalse(decided.ok)
+        self.assertEqual(decided.reason, REFUSE_LANE_BINDING_ABSENT)
+
+    def test_no_default_lane_refusal_carries_a_root_or_a_path(self) -> None:
+        refusals = [
+            _decide_default(canonical_root=""),
+            _decide_default(liveness=None),
+            _decide_default(scope_matches=False),
+            _decide_default(target_lane_id=TARGET_LANE),
+        ]
+        for decided in refusals:
+            self.assertEqual(decided.root, "")
+            self.assertFalse(decided.ok)
+            self.assertTrue(decided.reason)
+            self.assertNotIn("/registry", decided.detail)  # detail stays path-free
 
 
 if __name__ == "__main__":

@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Mapping, Optional
 
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+    DEFAULT_LANE,
     _norm_lane,
 )
 
@@ -56,6 +57,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 BASIS_SENDER_LANE = "sender_lane"
 #: The target is another lane of this workspace: its canonical worktree is the root.
 BASIS_LANE_WORKTREE = "lane_worktree"
+#: The target is the workspace's DEFAULT lane (the coordinator lane, which lives in the main
+#: checkout and structurally owns no lifecycle row — only ``sublane create`` writes rows), so
+#: its root is the workspace registry's verified canonical checkout (Redmine #15707 b).
+BASIS_WORKSPACE_CANONICAL = "workspace_canonical"
 
 #: No unit to reason with: the sender / target herdr identity is not fully attested, or this
 #: repo resolves no workspace identity to scope the target lane's lifecycle row by.
@@ -230,6 +235,113 @@ def decide_lane_worktree_root(
     )
 
 
+def decide_default_lane_root(
+    *,
+    target_lane_id: str,
+    canonical_root: str,
+    liveness: Optional[Mapping[str, object]],
+    scope_matches: bool,
+) -> AutoTargetRoot:
+    """Pure: the DEFAULT-lane (coordinator) answer from the registry's verified facts (#15707 b).
+
+    The default lane is the coordinator lane: it lives in the workspace's main checkout and
+    structurally owns no lifecycle row (only ``sublane create`` writes rows), so the row-based
+    cross-lane resolution above can never answer it — measured as the systematic
+    ``lane_binding_absent`` callback refusals #15701 j#107992 / #15704 j#108011. Its root is
+    instead the workspace registry's ``canonical_path``, admitted ONLY when every stated fact
+    verifies (authority is not weakened — an unverified registry answer refuses exactly like
+    the absent binding did):
+
+    - ``canonical_root`` non-empty (the registry knows this workspace's checkout);
+    - ``liveness`` proves it is a live git MAIN worktree (``exists`` / ``is_dir`` / ``is_git``
+      / ``is_main_worktree`` all true — the #13152 "registry hijacked by a linked worktree /
+      dead path" shape refuses);
+    - ``scope_matches``: the checkout re-derives this workspace's own scope identity, so a
+      same-named registry row for a different repo can never answer.
+
+    Every refusal keeps :data:`REFUSE_LANE_BINDING_ABSENT` (the wire reason and the durable
+    subreason vocabulary are unchanged); the detail stays a fixed, path-free sentence
+    (j#95911 finding 2). A non-default lane never reaches this decision.
+    """
+    lane = _norm_lane(target_lane_id)
+    absent = f"no lifecycle row owns lane {lane!r}"
+    if lane != DEFAULT_LANE:
+        return AutoTargetRoot(reason=REFUSE_LANE_BINDING_ABSENT, detail=absent)
+    if not (canonical_root or "").strip():
+        return AutoTargetRoot(
+            reason=REFUSE_LANE_BINDING_ABSENT,
+            detail=absent + "; the workspace registry names no canonical checkout either",
+        )
+    live = liveness or {}
+    verified = (
+        live.get("exists") is True
+        and live.get("is_dir") is True
+        and live.get("is_git") is True
+        and live.get("is_main_worktree") is True
+    )
+    if not verified:
+        return AutoTargetRoot(
+            reason=REFUSE_LANE_BINDING_ABSENT,
+            detail=(
+                absent
+                + "; the registry's canonical checkout could not be verified as a live "
+                "main worktree"
+            ),
+        )
+    if not scope_matches:
+        return AutoTargetRoot(
+            reason=REFUSE_LANE_BINDING_ABSENT,
+            detail=(
+                absent
+                + "; the registry's canonical checkout does not re-derive this "
+                "workspace's identity"
+            ),
+        )
+    return AutoTargetRoot(
+        root=canonical_root,
+        basis=BASIS_WORKSPACE_CANONICAL,
+        detail=(
+            f"lane {lane!r} is the coordinator lane; the workspace registry's canonical "
+            "checkout verified as this workspace's live main worktree"
+        ),
+    )
+
+
+def _resolve_default_lane_root(scope: str, lane: str) -> AutoTargetRoot:
+    """Live composition for the DEFAULT-lane fallback: read-only registry + liveness probe.
+
+    Supplies :func:`decide_default_lane_root`'s stated facts. Every read is tolerant and
+    read-only (registry opens ``mode=ro``; the liveness probe only classifies), so this
+    fallback can refuse but never mutate or create state.
+    """
+    from mozyo_bridge.core.state.workspace_registry import (
+        load_workspace_by_id,
+        probe_canonical_liveness,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        repo_scope_workspace_id,
+    )
+
+    try:
+        record = load_workspace_by_id(scope)
+    except Exception:  # noqa: BLE001 - an unreadable registry refuses like an absent one (read-only path)
+        record = None
+    canonical = str(getattr(record, "canonical_path", "") or "").strip()
+    liveness = probe_canonical_liveness(canonical) if canonical else None
+    scope_matches = False
+    if canonical and liveness and liveness.get("is_main_worktree") is True:
+        try:
+            scope_matches = repo_scope_workspace_id(Path(canonical)) == scope
+        except Exception:  # noqa: BLE001 - an unresolvable identity is a refusal, never a crash
+            scope_matches = False
+    return decide_default_lane_root(
+        target_lane_id=lane,
+        canonical_root=canonical,
+        liveness=liveness,
+        scope_matches=scope_matches,
+    )
+
+
 def resolve_herdr_auto_target_repo(
     repo_root: Path, target_info: Mapping[str, str]
 ) -> AutoTargetRoot:
@@ -322,6 +434,12 @@ def resolve_herdr_auto_target_repo(
         None,
     )
     if row is None:
+        if lane == DEFAULT_LANE:
+            # Redmine #15707 (b): the default lane is the coordinator lane — main-checkout
+            # resident, structurally row-less — so the absent binding is answered from the
+            # workspace registry's VERIFIED canonical checkout instead of refusing outright.
+            # Anything unverified keeps the exact `lane_binding_absent` refusal below.
+            return _resolve_default_lane_root(scope, lane)
         return decide_lane_worktree_root(
             target_lane_id=lane, lane_binding=None, lane_worktree=""
         )
@@ -342,6 +460,7 @@ def resolve_herdr_auto_target_repo(
 __all__ = (
     "BASIS_LANE_WORKTREE",
     "BASIS_SENDER_LANE",
+    "BASIS_WORKSPACE_CANONICAL",
     "REFUSE_FOREIGN_WORKSPACE",
     "REFUSE_IDENTITY_UNATTESTED",
     "REFUSE_LANE_BINDING_ABSENT",
@@ -351,6 +470,7 @@ __all__ = (
     "AutoTargetBasis",
     "AutoTargetRoot",
     "classify_auto_target_basis",
+    "decide_default_lane_root",
     "decide_lane_worktree_root",
     "resolve_herdr_auto_target_repo",
 )

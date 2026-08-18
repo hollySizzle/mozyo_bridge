@@ -16,16 +16,21 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_send_port import (
+    RECEIVER_PROVIDER_UNRESOLVED,
     HandoffCallbackSendPort,
 )
 
 
-def _row(route="coordinator", workspace_id=""):
+def _row(route="coordinator", workspace_id="", target_receiver="codex"):
+    # target_receiver defaults to a stamped provider token so these hermetic tests never fall
+    # through to the live coordinator role-authority resolver (#15707); the receiver-derivation
+    # tests below override it explicitly.
     return CallbackOutboxRow(
         source="redmine", issue="13518", journal="75094",
         normalized_gate="implementation_done", callback_route=route, state="inflight",
         attempts=0, max_attempts=3, send_attempted=True, notification_kind="implementation_done",
         notification_summary="", gate_mismatch=False, detail="", payload="", workspace_id=workspace_id,
+        target_receiver=target_receiver,
     )
 
 
@@ -133,6 +138,85 @@ class HandoffCallbackSendPortTest(unittest.TestCase):
         result = port(_row(workspace_id=""))
         self.assertEqual((result.status, result.reason), ("blocked", "workspace_unattested_row"))
         self.assertEqual(calls, [])  # nothing was fired for the unattested row
+
+
+class CoordinatorReceiverDerivationTest(unittest.TestCase):
+    """#15707 (a): a coordinator-route row derives ``--to`` from the role authority.
+
+    j#108012 measured the hardcoded ``--to codex`` contradicting the claude pane the same
+    ``coordinator`` route resolved to after the coordinator rebind (#13229) — refused as
+    ``invalid_args`` by the receiver-binding fence. The port now derives the token: stamped
+    ``target_receiver`` first, else the injected coordinator role-authority resolver,
+    fail-closed (never a silent ``codex`` guess) when neither yields a provider token.
+    """
+
+    def _capture_port(self, **kwargs):
+        calls = []
+        port = HandoffCallbackSendPort(
+            runner=lambda argv: calls.append(argv) or (0, '{"status": "sent", "reason": "ok"}'),
+            **kwargs,
+        )
+        return port, calls
+
+    def _to_value(self, argv):
+        return argv[argv.index("--to") + 1]
+
+    def test_stamped_claude_receiver_wins(self):
+        port, calls = self._capture_port()
+        result = port(_row(target_receiver="claude"))
+        self.assertEqual(result.status, "sent")
+        self.assertEqual(self._to_value(calls[0]), "claude")
+
+    def test_stamped_codex_receiver_wins(self):
+        port, calls = self._capture_port()
+        port(_row(target_receiver="codex"))
+        self.assertEqual(self._to_value(calls[0]), "codex")
+
+    def test_blank_stamp_falls_back_to_role_authority_resolver(self):
+        port, calls = self._capture_port(coordinator_provider_resolver=lambda: "claude")
+        result = port(_row(target_receiver=""))
+        self.assertEqual(result.status, "sent")
+        self.assertEqual(self._to_value(calls[0]), "claude")
+
+    def test_non_provider_stamp_falls_back_to_resolver(self):
+        # A semantic role token (not a provider) is not a valid --to; the role authority answers.
+        port, calls = self._capture_port(coordinator_provider_resolver=lambda: "codex")
+        port(_row(target_receiver="coordinator"))
+        self.assertEqual(self._to_value(calls[0]), "codex")
+
+    def test_resolver_failure_is_a_typed_pre_send_refusal(self):
+        def unresolved():
+            raise RuntimeError("role authority unavailable")
+
+        port, calls = self._capture_port(coordinator_provider_resolver=unresolved)
+        result = port(_row(target_receiver=""))
+        self.assertEqual(
+            (result.status, result.reason), ("blocked", RECEIVER_PROVIDER_UNRESOLVED)
+        )
+        # The port refused before invoking the handoff: a deterministic zero-send, so the
+        # producer stage token classifies it as bounded-retry not_sent (never uncertain).
+        self.assertEqual(result.injection_stage, "not_sent")
+        self.assertEqual(calls, [])
+
+    def test_resolver_returning_non_provider_token_refuses(self):
+        port, calls = self._capture_port(coordinator_provider_resolver=lambda: "gpt")
+        result = port(_row(target_receiver=""))
+        self.assertEqual(
+            (result.status, result.reason), ("blocked", RECEIVER_PROVIDER_UNRESOLVED)
+        )
+        self.assertEqual(calls, [])
+
+    def test_non_coordinator_route_keeps_the_codex_literal(self):
+        # #13758 R2-F2 disposition preserved: a worker row's provider flows via the
+        # resolver-backed background sender, never this port — even a stamped claude
+        # target_receiver does not flip this port's token for a non-coordinator route.
+        port, calls = self._capture_port(
+            coordinator_provider_resolver=lambda: (_ for _ in ()).throw(AssertionError(
+                "the coordinator resolver must not be consulted for a non-coordinator route"
+            ))
+        )
+        port(_row(route="implementation_worker", target_receiver="claude"))
+        self.assertEqual(self._to_value(calls[0]), "codex")
 
 
 if __name__ == "__main__":

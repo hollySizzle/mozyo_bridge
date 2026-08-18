@@ -48,10 +48,50 @@ from typing import Callable, Optional
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.handoff_callback_sender import (
     HandoffDeliveryResult,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.reconcile_delivery_route import (
+    PROVIDER_CLAUDE,
+    PROVIDER_CODEX,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workspace_supervisor import (
+    COORDINATOR_ROUTE,
+)
 from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
 
 #: The runner seam: given an argv list, returns ``(returncode, stdout)``. Injectable for tests.
 CallbackSendRunner = Callable[[list], "tuple[int, str]"]
+
+#: The two valid ``--to`` receiver tokens a callback may be delivered with (the handoff CLI's
+#: public receiver vocabulary). A coordinator-route receiver derivation that lands outside this
+#: set refuses to send rather than shipping an unresolvable token.
+_PROVIDER_TOKENS = frozenset({PROVIDER_CLAUDE, PROVIDER_CODEX})
+
+#: The port's own pre-send refusal: the coordinator route's receiver provider could not be
+#: derived (no stamped ``target_receiver``, and the role-authority resolution failed). A
+#: deterministic zero-send — nothing was typed — so it bounded-retries rather than poisoning
+#: the row to ``uncertain``. Allowlisted in
+#: :data:`...domain.callback_delivery.ZERO_SEND_REASON_ALLOWLIST` (Redmine #15707).
+RECEIVER_PROVIDER_UNRESOLVED = "receiver_provider_unresolved"
+
+#: The producer's own injection-stage token for the port's pre-send refusals (#14232 j#95333
+#: F1 semantics): the port refused before invoking the handoff CLI, so zero bytes were typed.
+_STAGE_NOT_SENT = "not_sent"
+
+
+def _default_coordinator_provider() -> str:
+    """Resolve the coordinator role's bound provider from the repo-local role authority.
+
+    The same resolution the ``coordinator`` pseudo-target route uses
+    (:func:`...main_lane_guard_gate.resolve_coordinator_provider`, #15655 j#107777 finding_1),
+    so the ``--to`` token and the pane the route resolves can no longer contradict each other
+    after a coordinator rebind (Redmine #15707 — j#108012 measured exactly that contradiction
+    as an ``invalid_args`` fail-closed refusal). Imported lazily: the port stays importable
+    without the role-authority composition.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (  # noqa: E501
+        resolve_coordinator_provider,
+    )
+
+    return resolve_coordinator_provider()
 
 
 def _default_runner(argv: list) -> "tuple[int, str]":
@@ -130,6 +170,11 @@ class HandoffCallbackSendPort:
 
     runner: CallbackSendRunner = _default_runner
     mozyo_bridge_bin: str = "mozyo-bridge"
+    #: The coordinator role->provider resolution seam (#15707). Production resolves through the
+    #: repo-local role authority (:func:`_default_coordinator_provider`); a test injects a fake.
+    #: Consulted ONLY for a coordinator-route row whose ``target_receiver`` is not already a
+    #: valid provider token — never for any other route.
+    coordinator_provider_resolver: Callable[[], str] = _default_coordinator_provider
     #: The workspace this sender is attested for (#13520 review R2-F5 / #13518 review R3-F3). When
     #: attested (non-blank), the sender routes a row ONLY when the row's workspace id EXACTLY
     #: matches — a foreign row OR a row with no workspace id is refused (fail-closed), rather than
@@ -138,6 +183,37 @@ class HandoffCallbackSendPort:
     #: single-workspace / explicit-migration bucket, reachable in production only behind the CLI's
     #: --allow-unpartitioned-callbacks surface.
     attested_workspace_id: str = ""
+
+    def _receiver_token(self, row: CallbackOutboxRow) -> "tuple[str, str]":
+        """The ``--to`` receiver for this row: ``(token, "")`` or ``("", refusal_reason)``.
+
+        Redmine #15707 (a): a coordinator-route row derives its receiver from the coordinator
+        role authority instead of a hardcoded literal — j#108012 measured the literal ``codex``
+        contradicting the claude pane the same route resolved to (a coordinator rebind,
+        #13229), which the ``binds_receiver`` fence correctly refused as ``invalid_args``.
+        Precedence: the row's stamped ``target_receiver`` (the binding-resolved provider
+        :func:`...workspace_callback_review_return.coordinator_target_tuple` wrote at enqueue)
+        when it is already a valid provider token; else the injected role-authority resolver.
+        A derivation that fails or lands outside the provider vocabulary refuses (fail-closed)
+        rather than silently defaulting to ``codex``.
+
+        Every NON-coordinator route keeps the literal ``codex`` — the #13758 R2-F2 disposition
+        (a worker row's provider flows via the resolver-backed background sender, not this
+        port) is deliberately preserved.
+        """
+        route = str(getattr(row, "callback_route", "") or "").strip()
+        if route != COORDINATOR_ROUTE:
+            return PROVIDER_CODEX, ""
+        stamped = str(getattr(row, "target_receiver", "") or "").strip()
+        if stamped in _PROVIDER_TOKENS:
+            return stamped, ""
+        try:
+            resolved = str(self.coordinator_provider_resolver() or "").strip()
+        except Exception:  # noqa: BLE001 - an unresolved role authority is a typed refusal, never a guess
+            return "", RECEIVER_PROVIDER_UNRESOLVED
+        if resolved in _PROVIDER_TOKENS:
+            return resolved, ""
+        return "", RECEIVER_PROVIDER_UNRESOLVED
 
     def __call__(self, row: CallbackOutboxRow) -> HandoffDeliveryResult:
         row_ws = str(getattr(row, "workspace_id", "") or "").strip()
@@ -149,9 +225,15 @@ class HandoffCallbackSendPort:
             # workspace's sender (never delivered here, never mis-sent on ambient env).
             reason = "workspace_mismatch" if row_ws else "workspace_unattested_row"
             return HandoffDeliveryResult("blocked", reason)
+        receiver, refusal = self._receiver_token(row)
+        if refusal:
+            # A deterministic pre-send refusal: the coordinator route's receiver could not be
+            # derived, so nothing is typed. Carrying the producer stage token classifies it as
+            # a bounded-retry not-sent (#14232 j#95333 F1), never an uncertain terminal.
+            return HandoffDeliveryResult("blocked", refusal, injection_stage=_STAGE_NOT_SENT)
         argv = [
             self.mozyo_bridge_bin, "handoff", "send",
-            "--to", "codex",
+            "--to", receiver,
             "--target", row.callback_route,
             "--source", "redmine",
             "--issue", row.issue,
@@ -196,4 +278,5 @@ class HandoffCallbackSendPort:
 __all__ = (
     "CallbackSendRunner",
     "HandoffCallbackSendPort",
+    "RECEIVER_PROVIDER_UNRESOLVED",
 )
