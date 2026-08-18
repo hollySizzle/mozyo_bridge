@@ -188,6 +188,57 @@ class FreshCreateAnchorFenceTests(unittest.TestCase):
         self.assertIn(REASON_LIFECYCLE_ANCHOR_REQUIRED, BLOCKED_REASONS)
 
 
+class ReviewRound2FindingRegressionTests(unittest.TestCase):
+    """Review j#108110 findings f1 / f2 — both reproduced status=executed pre-fix."""
+
+    def test_f1_vanished_adoptable_pair_blocks_before_fresh_append(self):
+        # finding_f1 TOCTOU: the pre-mutation gate observes an adoptable pair and
+        # exempts the anchorless execute, but the pair is gone by the time _execute
+        # re-reads for its adopt decision. The fresh append must then be refused on
+        # that decision's own branch — never an anchorless owner-rowless birth.
+        ops = FakeOps(git=True, worktree_exists=True, lanes=[_lane(), None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(), execute=True, dispatch=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_LIFECYCLE_ANCHOR_REQUIRED, outcome.blocked_reasons)
+        self.assertNotIn("append_lane_column", ops._mutations())
+
+    def test_f2_non_decimal_journal_blocks_pre_mutation(self):
+        # finding_f2: a merely non-empty journal ('j#108107') used to pass the gate
+        # and the declare then skipped as invalid_anchor. Declarability is the
+        # canonical is_redmine_id test, refused before any mutation.
+        ops = FakeOps(git=True, worktree_exists=False, lanes=[None])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(journal="j#108107"), execute=True, dispatch=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_LIFECYCLE_ANCHOR_REQUIRED, outcome.blocked_reasons)
+        self.assertEqual(ops._mutations(), [])
+
+    def test_f2_non_decimal_issue_blocks_pre_mutation(self):
+        # The DecisionPointer needs BOTH ids decimal; a malformed issue is the same
+        # undeclarable-anchor birth and is refused by the same shared validator.
+        ops = FakeOps(git=True, worktree_exists=False, lanes=[None])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(issue="US-15703", journal="107966"), execute=True, dispatch=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_LIFECYCLE_ANCHOR_REQUIRED, outcome.blocked_reasons)
+        self.assertEqual(ops._mutations(), [])
+
+    def test_f2_non_decimal_journal_with_adoptable_pair_still_adopts(self):
+        # The adopt exemption is unchanged by the declarability tightening: an
+        # existing live matching pair adopts (its owner row is the adopt gate's
+        # responsibility), malformed anchor or not.
+        ops = FakeOps(git=True, worktree_exists=True, lanes=[_lane(), _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(journal="j#108107"), execute=True, dispatch=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        self.assertTrue(outcome.adopted)
+
+
 class ExistingBehaviorRegressionTests(unittest.TestCase):
     """The adopt / anchored / plan-only shapes keep their pre-#15703 behavior."""
 

@@ -72,6 +72,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_gates import (  # noqa: E501
     default_upstream_to_verified_parent,
+    fresh_append_anchor_admission,
     pair_attestation_admission,
     pair_split_admission,
     pre_mutation_admission,
@@ -532,6 +533,17 @@ class SublaneActuateUseCase:
                 )
             )
         else:
+            # No pair will be adopted — a FRESH column is about to be born, so the
+            # anchor must be declarable HERE, on the adopt decision's own read: the
+            # pre-mutation gate's adoptable-pair exemption is a separate observation
+            # a vanished pair invalidates (review j#108110 finding_f1 TOCTOU).
+            anchor_block = fresh_append_anchor_admission(
+                self, request, launch_action=launch.action, dispatch=dispatch,
+                steps=steps, fill_decision=fill_decision,
+                fill_override_reason=fill_override_reason,
+            )
+            if anchor_block is not None:
+                return anchor_block
             try:
                 startup = self.ops.append_lane_column(lane_runtime_root)
             except SublaneLauncherIncompatibleError as exc:

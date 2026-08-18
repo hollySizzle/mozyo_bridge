@@ -1482,7 +1482,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator_use_case.py
-    lines: 1090
+    lines: 1102
     reason: >-
       Backend-agnostic sublane actuation choreography (create / adopt / confirm /
       dispatch). Already at 999 lines before #13810; the #13809 review (j#78890
@@ -1504,7 +1504,11 @@ allowlist:
       sender-authority follow-through (defaulting an admitted delegated-gateway
       create's upstream to its verified parent lane, and the typed sender-refusal
       blocked_reasons projection; both decision bodies live in
-      `sublane_actuator_gates`) — 1086 -> 1090.
+      `sublane_actuator_gates`) — 1086 -> 1090. Redmine #15703 (review j#108110
+      finding_f1) requires the fresh-append anchor re-check on the adopt decision's
+      own branch — the TOCTOU-free point only this module owns; the refusal body
+      lives in `sublane_actuator_gates.fresh_append_anchor_admission`, only the
+      call-and-return control flow lands here — 1090 -> 1102.
     owner_issue: "#13847"
     resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
     expires: "2027-10-08"

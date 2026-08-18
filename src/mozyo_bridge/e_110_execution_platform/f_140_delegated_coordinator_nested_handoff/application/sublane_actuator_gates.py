@@ -58,6 +58,75 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     SUBLANE_STATE_PAIR_SPLIT,
 )
+from mozyo_bridge.core.state.lane_lifecycle_model import is_redmine_id
+
+
+def declarable_create_anchor(request) -> bool:
+    """Whether the request carries a DECLARABLE lifecycle decision anchor (#15703).
+
+    The lifecycle owner declaration constructs a ``DecisionPointer``, which requires
+    BOTH the issue and the journal to be positive ASCII-decimal Redmine ids. A merely
+    non-empty token (``'j#108107'``) passes a presence check but skips the declare as
+    ``invalid_anchor`` — the same owner-rowless birth the anchor gate exists to refuse
+    (review j#108110 finding_f2). Validity is asked through the canonical
+    :func:`...lane_lifecycle_model.is_redmine_id`, never a second local spelling, so
+    the gate and the declare can only ever disagree by that module changing.
+    """
+    return is_redmine_id(
+        (getattr(request, "journal", "") or "").strip()
+    ) and is_redmine_id((getattr(request, "issue", "") or "").strip())
+
+
+def fresh_append_anchor_admission(
+    use_case,
+    request,
+    *,
+    launch_action,
+    dispatch: bool,
+    steps: list,
+    fill_decision,
+    fill_override_reason,
+) -> Optional[SublaneActuationOutcome]:
+    """Re-verify the anchor at the fresh-append boundary (review j#108110 finding_f1).
+
+    :func:`create_lifecycle_anchor_gate` exempts an anchorless execute when it observes
+    an adoptable pair — but that observation is a separate ``read_lane`` from the one
+    ``_execute`` bases its adopt decision on, so a pair that vanishes between the two
+    reads (TOCTOU) used to fall through to an anchorless fresh ``append_lane_column``:
+    exactly the owner-rowless birth the gate refuses. This admission runs ON the adopt
+    decision's own branch — the execute has just resolved that NO pair will be adopted
+    and a fresh lane column is about to be born — so there is no second read to race:
+    an undeclarable anchor here is refused before the append, and the lane (column,
+    panes, owner row) is never born. A prior ``git worktree add`` in the degenerate
+    pair-vanished create shape may remain; the blocked outcome is replayable with
+    ``--journal`` through the reuse path.
+    """
+    if declarable_create_anchor(request):
+        return None
+    steps.append(
+        ActuationStep(
+            order=2,
+            title="append lane column",
+            status=STEP_BLOCKED,
+            detail="no adoptable pair resolved and the request carries no declarable "
+            "durable anchor (--journal / --issue must be positive decimal Redmine "
+            "ids); refusing to append an owner-rowless fresh lane column",
+            command=None,
+        )
+    )
+    return use_case._blocked(
+        request,
+        launch_action=launch_action,
+        reason="a fresh lane column would be born without a declarable lifecycle "
+        "owner anchor (the adoptable pair the anchor exemption observed is no "
+        "longer resolvable, or the anchor is not a decimal Redmine id); refusing "
+        "before the append — re-run with --journal <decision journal id>",
+        reasons=(REASON_LIFECYCLE_ANCHOR_REQUIRED,),
+        dispatch=dispatch,
+        steps=tuple(steps),
+        fill_decision=fill_decision,
+        fill_override_reason=fill_override_reason,
+    )
 
 
 def create_lifecycle_anchor_gate(
@@ -85,9 +154,17 @@ def create_lifecycle_anchor_gate(
     gate (#13810 R3-F3), so an anchorless self-heal / adopt re-run keeps its existing
     behavior. The exemption requires a POSITIVELY identified adoptable pair: an
     unreadable inventory (``read_lane`` fail-safe ``None``) or an identity mismatch is
-    treated as a fresh-lane birth and refused, never adopted-over.
+    treated as a fresh-lane birth and refused, never adopted-over. The exemption is an
+    OBSERVATION, not a binding — the execute re-reads the lane for its adopt decision,
+    and if the pair vanished by then, :func:`fresh_append_anchor_admission` re-refuses
+    on that decision's own branch (review j#108110 finding_f1).
+
+    "Has an anchor" means DECLARABLE, not non-empty: a malformed journal / issue id
+    would pass a presence check and then skip the declare as ``invalid_anchor`` — the
+    same owner-rowless lane (review j#108110 finding_f2) — so the test is the shared
+    :func:`declarable_create_anchor`.
     """
-    if (getattr(request, "journal", "") or "").strip():
+    if declarable_create_anchor(request):
         return None
     existing = use_case.ops.read_lane(
         resolve_lane_runtime_root(
@@ -556,7 +633,9 @@ def default_upstream_to_verified_parent(ops, request):
 
 __all__ = (
     "create_lifecycle_anchor_gate",
+    "declarable_create_anchor",
     "default_upstream_to_verified_parent",
+    "fresh_append_anchor_admission",
     "pair_attestation_admission",
     "pair_split_admission",
     "runtime_placement_gate",
