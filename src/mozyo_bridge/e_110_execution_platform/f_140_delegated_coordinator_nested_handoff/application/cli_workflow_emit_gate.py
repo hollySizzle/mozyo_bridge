@@ -12,9 +12,11 @@ Boundaries are unchanged from the parent module:
 - **opt-in / fail-closed writes.** A write lands only through the credential-gated
   ``MOZYO_REDMINE_DELIVERY_WRITE`` transport; opt-in unset is a recorded, non-zero-exit refusal.
 - **producer refusals are typed data**, never tracebacks; a not-recorded gate never exits 0.
-- **#15699 render-only is not a write.** ``--render-note-only`` shares every producer grammar
-  validation and prints the canonical note for hand-posting; it skips only the write-time
-  generation lease / admission fence (no write happens) and emits no supervisor wake.
+- **#15699 render-only posts nothing itself, but refuses like the writer.** ``--render-note-only``
+  runs the FULL write-path refusal chain — producer grammar and, for an approval, the
+  generation-admission fence (observation + consumer, identity exact-match, single-consumer
+  lease + reread) — then prints the canonical note for hand-posting and emits no supervisor wake
+  (#15699 review j#107904).
 """
 
 from __future__ import annotations
@@ -60,20 +62,19 @@ def run_emit_gate(
     )
     # Redmine #15699: --render-note-only is the render half alone, for a write-incapable
     # environment (opt-in unset) whose reviewer must hand-post the canonical note — the #14971
-    # manifest sidecar is not hand-computable. It shares every producer validation above; only
-    # the WRITE-time fences (generation lease + pre-write admission reread) are skipped, because
-    # no write happens here and acquiring the durable lease for a note that is not being posted
-    # would block the eventual writer. Posting the output stays governed by the preset's
-    # hand-written-journal obligations; the consume-time fences are unchanged.
+    # manifest sidecar is not hand-computable. The refusal chain is IDENTICAL to the write path,
+    # including the approval generation-admission fence (#15699 review j#107904
+    # finding_approvalfencebypass): the role profile sanctions pasting this output as the approval
+    # journal, so the render step is the only mechanical place admission can be enforced for that
+    # flow — an approval note is rendered only after the observation/consumer inputs, the
+    # observation↔marker identity exact-match, and the single-consumer generation lease + reread
+    # fence all admit. The rendering consumer holds the lease; their hand-post is that consumer's
+    # write. Explicit non-approval decisions stay unfenced exactly as on the write path.
     render_note_only = bool(getattr(args, "render_note_only", False))
     refusal = (
         marker_refusal
         or finding_refusal
-        or (
-            None
-            if render_note_only
-            else review_approval_refusal(args, issue, gate, marker_fields)
-        )
+        or review_approval_refusal(args, issue, gate, marker_fields)
     )
     if refusal is not None:
         payload = {"action": "emit-gate", "issue": issue, "gate": gate,

@@ -798,8 +798,11 @@ class EmitGateReviewApprovalFenceTest(_CliTestCase):
 class EmitGateRenderNoteOnlyTest(_CliTestCase):
     """Redmine #15699: --render-note-only renders the exact canonical note (marker + #14971
     finding prose + review-finding-manifest sidecar) WITHOUT writing, for hand-posting in a
-    write-incapable environment. Producer grammar refusals are identical to the write path; only
-    the write-time generation lease / admission fence is skipped (nothing is written)."""
+    write-incapable environment. The refusal chain is IDENTICAL to the write path — including the
+    approval generation-admission fence (review j#107904 finding_approvalfencebypass): the role
+    profile sanctions pasting the output as the approval journal, so an approval note is rendered
+    only after the observation/consumer inputs, identity exact-match and single-consumer lease
+    admit. Explicit non-approval decisions stay unfenced exactly as on the write path."""
 
     _HEAD = "b" * 40
 
@@ -813,6 +816,17 @@ class EmitGateRenderNoteOnlyTest(_CliTestCase):
         )
         base.update(over)
         return _args(**base)
+
+    def _obs(self, decisions=None, source_request_seq=107848, *, name="reviewgen.json", **top):
+        base = {
+            "issue": "15692", "review_request_journal": "107848", "target_head": self._HEAD,
+            "source_request_seq": source_request_seq,
+            "decisions": [] if decisions is None else decisions,
+        }
+        base.update(top)
+        p = Path(self._tmp.name) / name
+        p.write_text(_json.dumps(base), encoding="utf-8")
+        return str(p)
 
     def _findings_json(self, identities=("1",), *, name="findings.json"):
         p = Path(self._tmp.name) / name
@@ -837,11 +851,19 @@ class EmitGateRenderNoteOnlyTest(_CliTestCase):
             rc = cli.cmd_workflow_callbacks(ns)
         return rc, _json.loads(buf.getvalue())
 
-    def test_approved_render_needs_no_observation_and_writes_nothing(self):
-        # The write path refuses this exact invocation with
-        # approval_requires_generation_observation_and_consumer (see the fence test above); the
-        # render half succeeds because no write happens — and it must touch neither the transport
-        # nor the supervisor wake.
+    def test_approved_render_without_observation_is_refused_like_the_writer(self):
+        # Review j#107904 finding_approvalfencebypass: the hand-post flow is the sanctioned
+        # approval write for a write-incapable environment, so an approval NOTE must never be
+        # obtainable outside the generation-admission fence — same token as the write path.
+        rc, out = self._run_json(self._emit_args(review_decision="approval"))
+        self.assertEqual(rc, 1)
+        self.assertFalse(out["recorded"])
+        self.assertNotIn("note", out)
+        self.assertEqual(out["reason"], "approval_requires_generation_observation_and_consumer")
+
+    def test_admitted_approved_render_writes_nothing(self):
+        # A fence-admitted approval render succeeds, and still touches neither the transport nor
+        # the supervisor wake — rendering remains not-a-write even when fenced.
         from unittest.mock import patch
 
         def _explode():
@@ -854,7 +876,10 @@ class EmitGateRenderNoteOnlyTest(_CliTestCase):
             _explode,
         ), patch.object(cli, "_best_effort_emit_supervisor_wake",
                         lambda args, issue: wakes.append(issue)):
-            rc, out = self._run_json(self._emit_args(review_decision="approval"))
+            rc, out = self._run_json(self._emit_args(
+                review_decision="approval",
+                review_generation_json=self._obs(), consumer_id="reviewer-A",
+            ))
         self.assertEqual(rc, 0)
         self.assertFalse(out["recorded"])
         self.assertTrue(out["rendered"])
@@ -865,6 +890,34 @@ class EmitGateRenderNoteOnlyTest(_CliTestCase):
             out["note"],
         )
 
+    def test_duplicate_consumer_approved_render_is_refused_by_the_lease(self):
+        first = self._run_json(self._emit_args(
+            review_decision="approval",
+            review_generation_json=self._obs(), consumer_id="reviewer-A",
+        ))
+        self.assertEqual(first[0], 0)
+        rc, out = self._run_json(self._emit_args(
+            review_decision="approval",
+            review_generation_json=self._obs(name="reviewgen-b.json"),
+            consumer_id="reviewer-B",
+        ))
+        self.assertEqual(rc, 1)
+        self.assertNotIn("note", out)
+        self.assertEqual(out["reason"], REASON_LEASE_HELD_BY_OTHER_REASON)
+
+    def test_stale_approved_render_predating_newer_blocking_finding_is_refused(self):
+        obs = self._obs(
+            [{"kind": "finding", "seq": 107905, "blocking": True, "disposition": "unresolved"}],
+            source_request_seq=107848,
+        )
+        rc, out = self._run_json(self._emit_args(
+            review_decision="approval",
+            review_generation_json=obs, consumer_id="reviewer-A",
+        ))
+        self.assertEqual(rc, 1)
+        self.assertNotIn("note", out)
+        self.assertEqual(out["reason"], "newer_unresolved_blocking_finding")
+
     def test_approved_note_round_trips_the_strict_manifest_reader(self):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
             RedmineJournalEntry,
@@ -873,7 +926,10 @@ class EmitGateRenderNoteOnlyTest(_CliTestCase):
             read_review_finding_manifest,
         )
 
-        rc, out = self._run_json(self._emit_args(review_decision="approval"))
+        rc, out = self._run_json(self._emit_args(
+            review_decision="approval",
+            review_generation_json=self._obs(), consumer_id="reviewer-A",
+        ))
         self.assertEqual(rc, 0)
         facts = read_review_finding_manifest(
             RedmineJournalEntry(issue_id="15692", journal_id="200001", notes=out["note"])
@@ -927,13 +983,20 @@ class EmitGateRenderNoteOnlyTest(_CliTestCase):
         import contextlib
         import io
 
-        rc, json_out = self._run_json(self._emit_args(review_decision="approval"))
+        # Same consumer re-rendering the same admitted generation: the lease re-admits its own
+        # holder, so both invocations pass the fence.
+        rc, json_out = self._run_json(self._emit_args(
+            review_decision="approval",
+            review_generation_json=self._obs(), consumer_id="reviewer-A",
+        ))
         self.assertEqual(rc, 0)
         buf = io.StringIO()
         with contextlib.redirect_stdout(buf):
-            rc = cli.cmd_workflow_callbacks(
-                self._emit_args(review_decision="approval", json=False)
-            )
+            rc = cli.cmd_workflow_callbacks(self._emit_args(
+                review_decision="approval", json=False,
+                review_generation_json=self._obs(name="reviewgen-2.json"),
+                consumer_id="reviewer-A",
+            ))
         self.assertEqual(rc, 0)
         self.assertEqual(buf.getvalue(), json_out["note"] + "\n")
 

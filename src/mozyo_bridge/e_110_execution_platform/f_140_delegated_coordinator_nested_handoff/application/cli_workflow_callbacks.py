@@ -828,9 +828,10 @@ def register_callbacks(sub) -> None:
              "review_result the #14971 finding prose + review-finding-manifest sidecar) to stdout "
              "WITHOUT posting to Redmine. For write-incapable environments (opt-in unset) whose "
              "reviewer hand-posts the exact output as ONE journal note; the manifest set_digest is "
-             "not hand-computable. Grants no write authority; skips only the write-time generation "
-             "lease / admission fence (no write happens); every producer grammar refusal is "
-             "identical to the write path.",
+             "not hand-computable. Grants no write authority; the refusal chain is IDENTICAL to "
+             "the write path, including the approval generation-admission fence (an approval "
+             "render requires --review-generation-json + --consumer-id and passes the identity "
+             "exact-match, single-consumer lease and reread fence before any note is printed).",
     )
     p.add_argument(
         "--review-findings-json", dest="review_findings_json",
