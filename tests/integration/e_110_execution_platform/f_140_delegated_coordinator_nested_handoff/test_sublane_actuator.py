@@ -379,6 +379,62 @@ class SenderAttestationPreflightTests(unittest.TestCase):
         outcome = SublaneActuateUseCase(ops).run(_req(), execute=True)
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 
+    def test_delegated_gateway_pass_defaults_upstream_to_verified_parent_lane(self):
+        # #15706: a create admitted through the delegated-gateway sender authority
+        # hangs the child's callback route off its VERIFIED parent lane — an omitted
+        # --upstream-coordinator defaults to that lane, not the workspace `coordinator`
+        # route (which would skip the parent tier).
+        class DelegatedGatewayOps(FakeActuatorOps):
+            verified_parent_lane_id = "issue_15693_l2_trial"
+
+            def preflight_dispatch_sender(self):
+                return True, "sender is the attested delegated_coordinator gateway"
+
+        ops = DelegatedGatewayOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(upstream_coordinator=None), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(dispatch["upstream_coordinator"], "issue_15693_l2_trial")
+
+    def test_delegated_gateway_pass_keeps_an_explicit_upstream(self):
+        # #15706: an explicit --upstream-coordinator always wins over the parent-lane
+        # default — the operator's route decision is never overwritten.
+        class DelegatedGatewayOps(FakeActuatorOps):
+            verified_parent_lane_id = "issue_15693_l2_trial"
+
+            def preflight_dispatch_sender(self):
+                return True, "sender is the attested delegated_coordinator gateway"
+
+        ops = DelegatedGatewayOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(upstream_coordinator="%9"), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(dispatch["upstream_coordinator"], "%9")
+
+    def test_default_coordinator_pass_keeps_the_stable_route_default(self):
+        # #15706 byte-invariance: the default-lane coordinator pass carries no verified
+        # parent lane, so an omitted --upstream-coordinator keeps resolving to the
+        # #13476 stable `coordinator` route token.
+        class AttestedCoordinatorOps(FakeActuatorOps):
+            verified_parent_lane_id = ""
+
+            def preflight_dispatch_sender(self):
+                return True, "sender identity matches the coordinator binding"
+
+        ops = AttestedCoordinatorOps(git=True, lanes=[None, _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(upstream_coordinator=None), execute=True
+        )
+        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
+        dispatch = next(c[1] for c in ops.calls if c[0] == "dispatch")
+        self.assertEqual(
+            dispatch["upstream_coordinator"], DEFAULT_UPSTREAM_COORDINATOR_ROUTE
+        )
+
     def test_no_dispatch_is_not_gated_by_sender(self):
         # --no-dispatch creates/adopts but dispatches no worker, so the sender gate does not arm.
         class ExplodingSenderOps(FakeActuatorOps):

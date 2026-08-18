@@ -94,6 +94,7 @@ def _record(row: Sequence[object]) -> LaneLifecycleRecord:
         # R11-F1): a decoder that manufactures a canonical value defeats every byte-exact
         # classifier downstream.
         lane_epoch=row[26],
+        parent_lane_id=str(row[27] or ""),
     )
 
 
@@ -119,6 +120,7 @@ def _insert_active_row(
     lane_generation: int = 1,
     declared_slots: str = "",
     lane_kind: str = "",
+    parent_lane_id: str = "",
 ) -> None:
     """INSERT a fresh ``active`` / ``not_requested`` lane row (one column vocabulary).
 
@@ -177,6 +179,9 @@ def _insert_active_row(
             # int bind would store storage class INTEGER and every later read would
             # classify the row malformed (#14756 j#96911 F2).
             encode_lane_epoch(LANE_EPOCH_UNMINTED),
+            # v12 (#15706): the verified delegated-parent lane binding, written only when the
+            # creating caller's sender-authority verdict verified it; '' declares no parent.
+            parent_lane_id,
         ),
     )
 

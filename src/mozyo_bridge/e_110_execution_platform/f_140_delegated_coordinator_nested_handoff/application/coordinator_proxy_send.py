@@ -199,6 +199,7 @@ def live_attestation_join(
     terminal_id: object,
     workspace_id: str,
     provider: str,
+    lane_id: str = DEFAULT_LANE,
 ):
     """Join the live slot with its generation-bound startup self-attestation record.
 
@@ -207,6 +208,11 @@ def live_attestation_join(
     could drift from it. Returns ``(ok, state, reason)``; an unreadable store yields
     ``(False, "unavailable", …)`` so a missing store fails closed instead of decaying to a
     name-only match (review j#89878 finding 2).
+
+    ``lane_id`` (Redmine #15706) is the expected lane of the slot being joined — the
+    coordinator proxy rail's own default-lane join is byte-invariant (the default), and the
+    delegated-gateway sender authority joins the SAME policy against its sublane slot rather
+    than a second implementation that could drift from it.
     """
     try:
         from mozyo_bridge.core.state.herdr_identity_attestation import (
@@ -221,7 +227,7 @@ def live_attestation_join(
             live_terminal_id=terminal_id,
             expected_workspace_id=workspace_id,
             expected_role=provider,
-            expected_lane=DEFAULT_LANE,
+            expected_lane=(lane_id or "").strip() or DEFAULT_LANE,
         )
     except Exception:  # noqa: BLE001 - an unreadable attestation store is never an attestation
         return False, "unavailable", "the startup self-attestation store could not be read"
@@ -234,6 +240,7 @@ def resolve_proxy_target(
     workspace_id: str,
     provider: str,
     attestation_join: Optional[Callable[..., "tuple[bool, str, str]"]] = None,
+    lane_id: str = DEFAULT_LANE,
 ) -> ProxyTarget:
     """Resolve the single live, **attested** default-lane coordinator target (pure over ``rows``).
 
@@ -248,6 +255,14 @@ def resolve_proxy_target(
     a record that is absent / stale (a different process generation) / conflicting / missing yields
     :data:`TARGET_UNATTESTED` rather than a target. ``attestation_join`` is injectable; the live
     default is :func:`live_attestation_join`.
+
+    ``lane_id`` (Redmine #15706) selects WHICH lane's slot the exactly-one live-attested policy
+    resolves: the default (byte-invariant for every existing caller) is the coordinator's default
+    lane; the delegated-gateway sender authority resolves its sublane gateway slot through this
+    SAME policy rather than a second scan that could drift. A non-default lane is threaded into
+    the attestation join as its expected lane; the default-lane call keeps the join invocation
+    byte-identical (no extra kwarg), so injected joins written to the pre-#15706 seam contract
+    keep working unchanged.
     """
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
         AGENT_KEY_NAME,
@@ -259,6 +274,7 @@ def resolve_proxy_target(
 
     ws = (workspace_id or "").strip()
     want_provider = (provider or "").strip()
+    want_lane = (lane_id or "").strip() or DEFAULT_LANE
     if not ws or not want_provider:
         return ProxyTarget(status=target_status_from_cardinality(0, 0))
 
@@ -276,7 +292,7 @@ def resolve_proxy_target(
         identity = decode.identity
         if identity.workspace_id != ws or identity.role != want_provider:
             continue
-        if _norm_lane(identity.lane_id) != DEFAULT_LANE:
+        if _norm_lane(identity.lane_id) != want_lane:
             continue
         live += 1
         row_locator = _agent_locator(row) or ""
@@ -296,12 +312,17 @@ def resolve_proxy_target(
     attestation_reason = ""
     if live == 1 and with_locator == 1:
         join = attestation_join or live_attestation_join
+        # The default-lane call stays byte-identical (no extra kwarg) so injected joins
+        # written to the pre-#15706 seam contract keep working; only a non-default lane
+        # threads its expected lane into the join (Redmine #15706).
+        join_kwargs = {} if want_lane == DEFAULT_LANE else {"lane_id": want_lane}
         attested, attestation_state, attestation_reason = join(
             assigned_name,
             locator=locator,
             terminal_id=terminal_id,
             workspace_id=ws,
             provider=want_provider,
+            **join_kwargs,
         )
     status = target_status_from_cardinality(live, with_locator, attested=attested)
     return ProxyTarget(

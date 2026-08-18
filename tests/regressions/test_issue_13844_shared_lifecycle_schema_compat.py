@@ -153,6 +153,8 @@ def _seed_v5(home: Path, *, disposition: str = DISPOSITION_ACTIVE) -> Path:
         # v11 (#15227) added the generation-bound reconcile owed-close pin. A faithful v5
         # rewind cannot retain a column introduced six schema generations later.
         conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
+        # v12 (#15706) added parent_lane_id; a faithful pre-v12 rewind drops it too.
+        conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN parent_lane_id")
         conn.execute(
             "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
             (LANE_LIFECYCLE_COMPONENT,),
@@ -996,6 +998,8 @@ class UniversalWriteGateTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             # v11 (#15227) added the generation-bound reconcile owed-close pin.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
+            # v12 (#15706) added parent_lane_id; a faithful pre-v12 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN parent_lane_id")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1197,6 +1201,8 @@ class RealCommandMigrationAdvisoryTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             # v11 (#15227) added the generation-bound reconcile owed-close pin.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
+            # v12 (#15706) added parent_lane_id; a faithful pre-v12 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN parent_lane_id")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1291,6 +1297,8 @@ class PreMigrationAdvisoryTimingTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             # v11 (#15227) added the generation-bound reconcile owed-close pin.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
+            # v12 (#15706) added parent_lane_id; a faithful pre-v12 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN parent_lane_id")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -1377,6 +1385,8 @@ class ComposingStoreMigrationSurfaceTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
             # v11 (#15227) added the generation-bound reconcile owed-close pin.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
+            # v12 (#15706) added parent_lane_id; a faithful pre-v12 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN parent_lane_id")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),

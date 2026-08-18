@@ -622,7 +622,8 @@ class SchemaV5MigrationTest(unittest.TestCase):
             for col in ("binding_kind", "project_scope", "lane_generation", "declared_slots",
                         "reconcile_phase", "reconcile_close_pin", "lane_kind", "hibernated_at",
                         "release_observation",
-                        "lane_epoch"):  # v10 (#14756)
+                        "lane_epoch",  # v10 (#14756)
+                        "parent_lane_id"):  # v12 (#15706)
                 conn.execute(f"ALTER TABLE lane_lifecycle_records DROP COLUMN {col}")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 4 WHERE component = ?",
@@ -678,6 +679,8 @@ class SchemaV5MigrationTest(unittest.TestCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
             # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
+            # v12 (#15706) added parent_lane_id; a faithful pre-v12 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN parent_lane_id")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),

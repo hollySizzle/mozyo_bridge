@@ -6,6 +6,10 @@ by the adapter's thin port methods:
 
 * :func:`evaluate_dispatch_sender` — the command shell must be the attested coordinator on
   the default lane (Redmine #13613), so a lane is never mutated by an unattested sender;
+* :func:`evaluate_dispatch_sender_authority` — the same contract extended (Redmine #15706)
+  with exactly one additional admission: a launch-time attested delegated_coordinator
+  lane's gateway slot creating a child implementation lane under itself, verified against
+  the lifecycle store / attestation store durable records (never the caller env alone);
 * :func:`evaluate_runtime_placement` — the action-time runtime must not be a source /
   installed skew that would place the pair incorrectly (Redmine #13705 R1-F1);
 * :func:`evaluate_launcher_compatibility` — the selected managed-launch launcher must be
@@ -28,8 +32,9 @@ established is a refusal, never a pass.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Optional
+from typing import Callable, Mapping, Optional, Sequence
 
 from mozyo_bridge.core.state.workspace_registry import read_anchor
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_integration import (  # noqa: E501
@@ -91,6 +96,288 @@ def evaluate_dispatch_sender(
             f"default lane {DEFAULT_LANE!r}"
         )
     return True, "sender identity matches the coordinator binding and default lane"
+
+
+# --- delegated-gateway sender authority (Redmine #15706) ----------------------- #
+
+#: The sender verified as the workspace's default-lane coordinator (the pre-#15706 pass).
+SENDER_KIND_DEFAULT_COORDINATOR = "default_lane_coordinator"
+#: The sender verified as the launch-time attested gateway slot of a delegated_coordinator
+#: lane, creating a child implementation lane under itself.
+SENDER_KIND_DELEGATED_GATEWAY = "delegated_coordinator_gateway"
+
+# Typed refusal tokens for the delegated-gateway branch (closed vocabulary; every
+# branch is typed and fail-closed — Redmine #15706 design constraint 4).
+SENDER_LANE_LIFECYCLE_UNREADABLE = "sender_lane_lifecycle_unreadable"
+SENDER_LANE_UNESTABLISHED = "sender_lane_unestablished"
+SENDER_LANE_NOT_DELEGATED_COORDINATOR = "sender_lane_not_delegated_coordinator"
+SENDER_PROVIDER_NOT_GATEWAY = "sender_provider_not_gateway"
+SENDER_GATEWAY_LIVE_MISSING = "sender_gateway_live_missing"
+SENDER_GATEWAY_LIVE_AMBIGUOUS = "sender_gateway_live_ambiguous"
+SENDER_GATEWAY_LOCATOR_MISSING = "sender_gateway_locator_missing"
+SENDER_GATEWAY_UNATTESTED = "sender_gateway_unattested"
+
+
+@dataclass(frozen=True)
+class DispatchSenderAuthority:
+    """The typed verdict of :func:`evaluate_dispatch_sender_authority`.
+
+    ``ok`` / ``detail`` carry the exact contract :func:`evaluate_dispatch_sender`
+    reports (byte-identical texts on every pre-#15706 branch). ``sender_kind`` names
+    which authority admitted (:data:`SENDER_KIND_DEFAULT_COORDINATOR` /
+    :data:`SENDER_KIND_DELEGATED_GATEWAY`; empty on refusal). ``parent_lane_id`` is the
+    VERIFIED sender lane when the delegated-gateway branch admitted — the value the
+    child lane's lifecycle declaration records as its parent binding — and empty
+    otherwise, so a caller can never bind a parent the verdict did not verify.
+    """
+
+    ok: bool
+    detail: str
+    sender_kind: str = ""
+    parent_lane_id: str = ""
+
+
+def evaluate_dispatch_sender_authority(
+    env: Mapping[str, str],
+    repo_root: Path,
+    *,
+    requested_lane_kind: str = "",
+    lifecycle_record_reader: Optional[Callable[[str], object]] = None,
+    gateway_provider_resolver: Optional[Callable[[], str]] = None,
+    agent_rows_reader: Optional[Callable[[], Sequence[Mapping]]] = None,
+    inventory_workspace_resolver: Optional[Callable[[], str]] = None,
+    lane_target_resolver: Optional[Callable[..., object]] = None,
+) -> DispatchSenderAuthority:
+    """The #15706 sender-authority contract: coordinator pass OR delegated-gateway pass.
+
+    Every pre-#15706 case reports the EXACT :func:`evaluate_dispatch_sender` outcome
+    (same texts), so the default-lane coordinator path and every legacy refusal are
+    byte-invariant. The single extension (Redmine #15706 design constraint 1): a
+    NON-default-lane sender creating a CHILD IMPLEMENTATION lane
+    (``requested_lane_kind == "implementation"``) is admitted iff durable records —
+    never the caller env alone — verify it as the launch-time attested gateway slot of
+    a ``delegated_coordinator`` lane:
+
+    1. the lane lifecycle store holds an ACTIVE, positive-generation row for
+       ``(workspace scope, sender lane)`` whose generation-bound ``lane_kind`` is
+       ``delegated_coordinator`` (the durable geometry fact, #13647);
+    2. the sender's provider is the workspace's configured GATEWAY provider (the
+       delegated_coordinator lane's gateway slot, #13569);
+    3. exactly one live, launch-time attested occupant of that ``(workspace, gateway
+       provider, sender lane)`` slot exists — resolved through the coordinator proxy
+       rail's own :func:`~...coordinator_proxy_send.resolve_proxy_target` policy
+       (attestation store v4 join: identity + locator + terminal identity + verdict),
+       not a second scan that could drift.
+
+    A non-default-lane sender whose request is NOT a child implementation lane keeps
+    the legacy refusal byte-for-byte (acceptance condition 2: the pre-#15706
+    refusals are unchanged). Every new branch refuses with its own typed token; every
+    read failure verifies nothing (fail-closed).
+
+    The ``*_reader`` / ``*_resolver`` seams are test injections; ``None`` builds the
+    live reads (lifecycle store / provider binding / herdr inventory).
+    """
+    try:
+        anchor = read_anchor(repo_root)
+    except Exception as exc:  # noqa: BLE001 — fail closed at the external read boundary.
+        return DispatchSenderAuthority(False, f"workspace anchor unreadable ({exc})")
+    anchor_workspace_id = _norm(
+        anchor.get("workspace_id") if isinstance(anchor, Mapping) else ""
+    )
+    result = resolve_sender_identity(env, anchor_workspace_id=anchor_workspace_id or None)
+    if not result.ok or result.identity is None:
+        return DispatchSenderAuthority(False, f"{result.reason}: {result.detail}")
+    try:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.main_lane_guard_gate import (  # noqa: E501
+            resolve_coordinator_provider,
+        )
+
+        coordinator_provider = resolve_coordinator_provider(str(repo_root))
+    except Exception as exc:  # noqa: BLE001 — config/binding IO is fail-closed here.
+        return DispatchSenderAuthority(
+            False, f"coordinator provider binding is unreadable ({exc})"
+        )
+    sender_lane = result.identity.lane_id
+    if sender_lane == DEFAULT_LANE:
+        if result.identity.role != coordinator_provider:
+            return DispatchSenderAuthority(
+                False,
+                (
+                    f"sender provider {result.identity.role!r} is not the configured "
+                    f"coordinator provider {coordinator_provider!r}"
+                ),
+            )
+        return DispatchSenderAuthority(
+            True,
+            "sender identity matches the coordinator binding and default lane",
+            sender_kind=SENDER_KIND_DEFAULT_COORDINATOR,
+        )
+
+    legacy_refusal = (
+        f"sender lane {sender_lane!r} is not the coordinator "
+        f"default lane {DEFAULT_LANE!r}"
+    )
+    from mozyo_bridge.core.state.lane_kind import (
+        LANE_KIND_DELEGATED_COORDINATOR,
+        LANE_KIND_IMPLEMENTATION,
+    )
+
+    if (requested_lane_kind or "").strip() != LANE_KIND_IMPLEMENTATION:
+        # Not a child implementation lane: the extension does not apply and the
+        # pre-#15706 refusal is reported byte-for-byte (acceptance condition 2).
+        return DispatchSenderAuthority(False, legacy_refusal)
+
+    # 1. Durable geometry: the SENDER lane must be an active delegated_coordinator lane
+    # of this workspace, read from the lifecycle authority (never the caller env).
+    if lifecycle_record_reader is None:
+
+        def lifecycle_record_reader(lane: str) -> object:
+            from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+            from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+                repo_scope_workspace_id,
+            )
+
+            scope = repo_scope_workspace_id(Path(repo_root)) or ""
+            if not scope:
+                # An unresolved workspace scope cannot scope the authority read: report
+                # UNREADABLE (fail-closed), never "no row" (which claims a resolved read).
+                raise LookupError("workspace scope unresolved")
+            return LaneLifecycleStore().get(LaneLifecycleKey(scope, lane))
+
+    try:
+        record = lifecycle_record_reader(sender_lane)
+    except Exception:  # noqa: BLE001 — an unreadable lifecycle authority verifies nothing.
+        return DispatchSenderAuthority(
+            False,
+            f"{SENDER_LANE_LIFECYCLE_UNREADABLE}: the lane lifecycle authority for "
+            f"sender lane {sender_lane!r} could not be read; {legacy_refusal}",
+        )
+    if record is None or getattr(record, "lane_disposition", "") != "active" or int(
+        getattr(record, "lane_generation", 0) or 0
+    ) <= 0:
+        return DispatchSenderAuthority(
+            False,
+            f"{SENDER_LANE_UNESTABLISHED}: sender lane {sender_lane!r} owns no active "
+            f"positive-generation lifecycle row in this workspace; {legacy_refusal}",
+        )
+    stored_kind = str(getattr(record, "lane_kind", "") or "")
+    if stored_kind != LANE_KIND_DELEGATED_COORDINATOR:
+        return DispatchSenderAuthority(
+            False,
+            f"{SENDER_LANE_NOT_DELEGATED_COORDINATOR}: sender lane {sender_lane!r} is "
+            f"recorded with lane_kind {stored_kind!r}, not "
+            f"{LANE_KIND_DELEGATED_COORDINATOR!r}; {legacy_refusal}",
+        )
+
+    # 2. The gateway slot: the sender's provider must be the workspace's configured
+    # gateway provider (the slot a delegated_coordinator lane's gateway runs as).
+    if gateway_provider_resolver is None:
+
+        def gateway_provider_resolver() -> str:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
+                resolve_gateway_provider,
+            )
+
+            return resolve_gateway_provider(str(repo_root))
+
+    try:
+        gateway_provider = _norm(gateway_provider_resolver())
+    except Exception as exc:  # noqa: BLE001 — an unresolved gateway binding admits nothing.
+        return DispatchSenderAuthority(
+            False, f"{SENDER_PROVIDER_NOT_GATEWAY}: gateway provider unresolved ({exc})"
+        )
+    if not gateway_provider or result.identity.role != gateway_provider:
+        return DispatchSenderAuthority(
+            False,
+            f"{SENDER_PROVIDER_NOT_GATEWAY}: sender provider {result.identity.role!r} "
+            f"is not the configured gateway provider {gateway_provider!r}",
+        )
+
+    # 3. Launch-time attestation: exactly one live attested occupant of the sender
+    # lane's gateway slot, through the coordinator proxy rail's own policy.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
+        live_agent_rows,
+        live_workspace_id,
+        resolve_proxy_target,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
+        TARGET_AMBIGUOUS,
+        TARGET_LOCATOR_MISSING,
+        TARGET_MISSING,
+        TARGET_OK,
+        TARGET_UNATTESTED,
+    )
+
+    try:
+        inventory_ws = _norm(
+            inventory_workspace_resolver()
+            if inventory_workspace_resolver is not None
+            else live_workspace_id(repo_root)
+        )
+        rows = (
+            agent_rows_reader() if agent_rows_reader is not None else live_agent_rows(env)
+        )
+        resolver = lane_target_resolver or resolve_proxy_target
+        target = resolver(
+            rows,
+            workspace_id=inventory_ws,
+            provider=gateway_provider,
+            lane_id=sender_lane,
+        )
+    except Exception:  # noqa: BLE001 — an unreadable inventory attests nothing.
+        return DispatchSenderAuthority(
+            False,
+            f"{SENDER_GATEWAY_UNATTESTED}: the live inventory / attestation join for "
+            f"sender lane {sender_lane!r} could not be read",
+        )
+    if target.status != TARGET_OK:
+        refusal = {
+            TARGET_MISSING: SENDER_GATEWAY_LIVE_MISSING,
+            TARGET_AMBIGUOUS: SENDER_GATEWAY_LIVE_AMBIGUOUS,
+            TARGET_LOCATOR_MISSING: SENDER_GATEWAY_LOCATOR_MISSING,
+            TARGET_UNATTESTED: SENDER_GATEWAY_UNATTESTED,
+        }.get(target.status, SENDER_GATEWAY_UNATTESTED)
+        return DispatchSenderAuthority(
+            False,
+            f"{refusal}: sender lane {sender_lane!r} has no single live, launch-time "
+            f"attested {gateway_provider!r} gateway slot (live={target.live} "
+            f"with_locator={target.with_locator}"
+            + (
+                f" attestation={target.attestation_state}"
+                f" ({target.attestation_reason})"
+                if target.attestation_state
+                else ""
+            )
+            + ")",
+        )
+    return DispatchSenderAuthority(
+        True,
+        (
+            f"sender is the launch-time attested gateway slot of delegated_coordinator "
+            f"lane {sender_lane!r}, creating a child implementation lane under it"
+        ),
+        sender_kind=SENDER_KIND_DELEGATED_GATEWAY,
+        parent_lane_id=sender_lane,
+    )
+
+
+def run_dispatch_sender_preflight(ops) -> tuple[bool, str]:
+    """The ops adapter's sender gate (#13613), on the #15706 authority contract.
+
+    The adapter's thin ``preflight_dispatch_sender`` delegate calls this (module-health
+    leaf, like every other body in this module). It runs
+    :func:`evaluate_dispatch_sender_authority` with the CREATE REQUEST's lane kind
+    (``ops.lane_kind``) as the requested child kind, and stashes the admitted verdict's
+    VERIFIED parent lane on ``ops.verified_parent_lane_id`` — cleared on every refusal
+    and on the default-lane coordinator pass — so the child lane's lifecycle declaration
+    and dispatch read the parent binding from the verdict, never from raw caller env.
+    """
+    verdict = evaluate_dispatch_sender_authority(
+        ops.env, ops.repo_root, requested_lane_kind=ops.lane_kind
+    )
+    ops.verified_parent_lane_id = verdict.parent_lane_id if verdict.ok else ""
+    return verdict.ok, verdict.detail
 
 
 def evaluate_runtime_placement(
@@ -295,8 +582,21 @@ def evaluate_launcher_compatibility(
 
 
 __all__ = (
+    "DispatchSenderAuthority",
+    "SENDER_GATEWAY_LIVE_AMBIGUOUS",
+    "SENDER_GATEWAY_LIVE_MISSING",
+    "SENDER_GATEWAY_LOCATOR_MISSING",
+    "SENDER_GATEWAY_UNATTESTED",
+    "SENDER_KIND_DEFAULT_COORDINATOR",
+    "SENDER_KIND_DELEGATED_GATEWAY",
+    "SENDER_LANE_LIFECYCLE_UNREADABLE",
+    "SENDER_LANE_NOT_DELEGATED_COORDINATOR",
+    "SENDER_LANE_UNESTABLISHED",
+    "SENDER_PROVIDER_NOT_GATEWAY",
     "evaluate_dispatch_sender",
+    "evaluate_dispatch_sender_authority",
     "evaluate_launcher_compatibility",
     "evaluate_runtime_placement",
     "read_lane_target_config_text",
+    "run_dispatch_sender_preflight",
 )

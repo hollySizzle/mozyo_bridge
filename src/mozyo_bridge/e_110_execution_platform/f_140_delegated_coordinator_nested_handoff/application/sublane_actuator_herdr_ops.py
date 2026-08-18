@@ -86,9 +86,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 from mozyo_bridge.core.state.herdr_session_start_gate import session_start_gate
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_herdr_preflight import (  # noqa: E501
-    evaluate_dispatch_sender,
     evaluate_launcher_compatibility,
     evaluate_runtime_placement,
+    run_dispatch_sender_preflight,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
@@ -167,6 +167,9 @@ class HerdrSublaneActuatorOps:
     #: Historical target-only vocabulary retained for decoding old recovery intent.
     #: Current launch admission still requires v4/v2 terminal-bound authority.
     replacement_target_only: bool = False
+    #: The VERIFIED delegated-parent lane stashed by the sender preflight (#15706) —
+    #: the ONLY source the child's lifecycle declaration binds a parent from.
+    verified_parent_lane_id: str = ""
 
     # -- git probes / additive worktree add (backend-agnostic, reused verbatim) -----
 
@@ -241,8 +244,8 @@ class HerdrSublaneActuatorOps:
     # #14258): with them extracted, this adapter is back under the threshold.
 
     def preflight_dispatch_sender(self) -> tuple[bool, str]:
-        """Verify the command-shell sender before any lane mutation (#13613)."""
-        return evaluate_dispatch_sender(self.env, self.repo_root)
+        """Verify the command-shell sender before any lane mutation (#13613 / #15706)."""
+        return run_dispatch_sender_preflight(self)
 
     def preflight_runtime_placement_gate(self) -> tuple[bool, str]:
         """Action-time runtime fingerprint gate — the mutation front door (#13705 R1-F1)."""
@@ -465,24 +468,17 @@ class HerdrSublaneActuatorOps:
     ) -> None:
         """Declare this lane's owner binding via the create-declaration leaf (#13681 W1).
 
-        The body moved to
-        :func:`...sublane_create_lifecycle_declaration.declare_created_lane_lifecycle`
-        unchanged (module-health leaf extraction, Redmine #13647 T1b); this stays as the
-        adapter's call seam and supplies the create-time governance facts it owns —
-        including ``lane_kind``, the delegation-geometry kind (親 / 子 / 孫) the creating
-        caller resolved and this create stores generation-bound as the heal authority.
+        The body lives in :func:`...sublane_create_lifecycle_declaration.
+        declare_created_lane_lifecycle_for` (module-health leaf extraction, #13647 T1b /
+        #15706), which reads the create-time governance facts — ``lane_kind`` and the
+        verdict-verified ``verified_parent_lane_id`` — off this adapter.
         """
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_create_lifecycle_declaration import (  # noqa: E501
-            declare_created_lane_lifecycle,
+            declare_created_lane_lifecycle_for,
         )
 
-        declare_created_lane_lifecycle(
-            repo_workspace_id=repo_workspace_id,
-            lane_label=self.lane_label,
-            issue=self.issue,
-            journal=self.journal,
-            worktree_identity=worktree_identity,
-            lane_kind=self.lane_kind,
+        declare_created_lane_lifecycle_for(
+            self, repo_workspace_id, worktree_identity=worktree_identity
         )
 
     def declare_adopted_lane_lifecycle(

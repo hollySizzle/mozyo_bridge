@@ -924,6 +924,8 @@ class ReconcileOrchestrationTests(unittest.TestCase):
             conn.execute(
                 "ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin"
             )
+            # v12 (#15706) added parent_lane_id; a faithful pre-v12 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN parent_lane_id")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),

@@ -865,7 +865,7 @@ class LiveOfflineRolloutExecutionPort:
             return live
         stores = self._fresh_store_records()
         targets = {
-            "attestation": 4, "lane_lifecycle": 11,
+            "attestation": 4, "lane_lifecycle": 12,
             "launch_generation": 2, "startup_transaction": 2,
         }
         if any(stores[n]["state"] != "recognized" or type(stores[n]["version"]) is not int

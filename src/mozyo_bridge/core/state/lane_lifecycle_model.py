@@ -658,6 +658,13 @@ class LaneLifecycleRecord:
     #: untouched so a corrupt / foreign value can never be coerced into a plausible
     #: threshold, and :mod:`...lane_epoch` is total over whatever arrives.
     lane_epoch: object = 0
+    #: v12 (Redmine #15706): the VERIFIED parent delegated_coordinator lane this lane was
+    #: created under — written once at declare time from the admitted sender-authority
+    #: verdict, so the child gateway's callback route (child -> parent -> workspace
+    #: coordinator) is replayable from the durable row. ``''`` for every lane created by
+    #: the default-lane coordinator / a declared project gateway, and for every pre-v12
+    #: row — an ordinary "no delegated parent" fact, never a guessed binding.
+    parent_lane_id: str = ""
 
     @property
     def key(self) -> LaneLifecycleKey:
@@ -734,6 +741,7 @@ class LaneLifecycleRecord:
             "hibernated_at": self.hibernated_at,
             "release_observation": self.release_observation,
             "lane_epoch": self.lane_epoch,
+            "parent_lane_id": self.parent_lane_id,
         }
 
 
