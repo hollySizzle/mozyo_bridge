@@ -1,8 +1,8 @@
 id = "mozyo.unit-board"
 name = "mozyo Unit board"
-version = "0.2.0"
+version = "0.3.0"
 min_herdr_version = "0.8.0"
-description = "Shows managed Unit responsibilities and offers preview-first pair placement"
+description = "Shows managed Unit responsibilities, offers preview-first pair placement, and exposes a read-only cockpit status action"
 platforms = ["linux", "macos"]
 
 [[startup]]
@@ -13,6 +13,17 @@ id = "sync"
 title = "Refresh mozyo Unit labels"
 contexts = ["workspace"]
 command = ["mozyo-bridge", "herdr", "unit-board", "sync"]
+
+# Read-only, operator-invoked status view (Redmine #15642). Every hook in this
+# manifest stays inside the `mozyo-bridge herdr unit-board` command surface;
+# destructive cockpit actions (recreate / re-arrange) are NOT wired here — a
+# one-click manifest button cannot carry `--confirm` authority under the
+# current plugin policy. See COCKPIT_GAPS.md.
+[[actions]]
+id = "status"
+title = "Show mozyo cockpit status"
+contexts = ["workspace"]
+command = ["mozyo-bridge", "herdr", "unit-board", "show"]
 
 [[events]]
 on = "pane.created"
