@@ -19,10 +19,12 @@ required acceptance):
 
 from __future__ import annotations
 
+import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -123,6 +125,15 @@ class _CapturingTransport:
 class ReviewReturnScenarioTest(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(tempfile.mkdtemp())
+        # Pin the process home to this scenario's own temp home: the send edge's retirement
+        # authority resolves through ``home or mozyo_bridge_home()``, and without this pin a raw
+        # ``python -m unittest`` run reads the operator's real global store (phantom zero-send
+        # "retirement authority unreadable / unsafe owner, mode, or file type"; Redmine #15631
+        # j#107289). ``addCleanup`` keeps restore correct across the mid-test ``self.setUp()``
+        # re-invocation below (LIFO unwinds to the original environment).
+        env = patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False)
+        env.start()
+        self.addCleanup(env.stop)
         self.store_path = workflow_runtime_store_path(self.home)
         self.store = WorkflowRuntimeStore(path=self.store_path)
         self.outbox = CallbackOutbox(path=self.store_path)
