@@ -227,6 +227,32 @@ class ReviewRound2FindingRegressionTests(unittest.TestCase):
         self.assertIn(REASON_LIFECYCLE_ANCHOR_REQUIRED, outcome.blocked_reasons)
         self.assertEqual(ops._mutations(), [])
 
+    def test_r3_f1_create_worktree_with_vanishing_pair_stays_zero_mutation(self):
+        # Review j#108116 finding_f1: the create_worktree launch used to run
+        # `git worktree add` BEFORE the adopt-decision read, so an observed pair
+        # that vanished by then left mutations=['create_worktree'] behind the
+        # blocked outcome. The anchorless create_worktree launch is now refused
+        # outright by the pre-mutation gate — zero mutations, pair or no pair.
+        ops = FakeOps(git=True, worktree_exists=False, lanes=[_lane(), None])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(), execute=True, dispatch=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_LIFECYCLE_ANCHOR_REQUIRED, outcome.blocked_reasons)
+        self.assertEqual(ops._mutations(), [])
+
+    def test_r3_anchorless_create_worktree_blocks_even_with_stable_pair(self):
+        # The adopt exemption is restricted to launch states that create no
+        # worktree: a live pair whose worktree is MISSING recovers via the
+        # anchored path (--journal), never via an anchorless worktree creation.
+        ops = FakeOps(git=True, worktree_exists=False, lanes=[_lane(), _lane()])
+        outcome = SublaneActuateUseCase(ops).run(
+            _req(), execute=True, dispatch=False
+        )
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_LIFECYCLE_ANCHOR_REQUIRED, outcome.blocked_reasons)
+        self.assertEqual(ops._mutations(), [])
+
     def test_f2_non_decimal_journal_with_adoptable_pair_still_adopts(self):
         # The adopt exemption is unchanged by the declarability tightening: an
         # existing live matching pair adopts (its owner row is the adopt gate's

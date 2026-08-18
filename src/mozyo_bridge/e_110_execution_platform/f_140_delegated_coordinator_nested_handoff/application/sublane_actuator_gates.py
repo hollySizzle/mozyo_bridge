@@ -97,9 +97,11 @@ def fresh_append_anchor_admission(
     decision's own branch — the execute has just resolved that NO pair will be adopted
     and a fresh lane column is about to be born — so there is no second read to race:
     an undeclarable anchor here is refused before the append, and the lane (column,
-    panes, owner row) is never born. A prior ``git worktree add`` in the degenerate
-    pair-vanished create shape may remain; the blocked outcome is replayable with
-    ``--journal`` through the reuse path.
+    panes, owner row) is never born. It is also the FIRST mutation boundary an
+    anchorless run can reach: the ``create_worktree`` launch (which would mutate
+    earlier) is refused outright by the pre-mutation gate (review j#108116
+    finding_f1), so a pair-vanished anchorless run ends here with zero mutations,
+    replayable with ``--journal``.
     """
     if declarable_create_anchor(request):
         return None
@@ -159,6 +161,16 @@ def create_lifecycle_anchor_gate(
     and if the pair vanished by then, :func:`fresh_append_anchor_admission` re-refuses
     on that decision's own branch (review j#108110 finding_f1).
 
+    The exemption is further RESTRICTED to launch states that create no worktree
+    (review j#108116 finding_f1): a ``create_worktree`` launch mutates (``git worktree
+    add``) BEFORE the adopt-decision read, so an observed pair that vanishes by then
+    would leave that mutation behind — and no re-verification can close the window,
+    because the create itself sits inside it. An anchorless ``create_worktree`` execute
+    is therefore refused outright, pair or no pair; a live pair whose worktree is
+    missing recovers by re-running with ``--journal`` (the anchored path). The reuse /
+    non-git launches mutate nothing before the adopt decision, so for them the
+    observation plus the append-boundary re-check IS zero-mutation.
+
     "Has an anchor" means DECLARABLE, not non-empty: a malformed journal / issue id
     would pass a presence check and then skip the declare as ``invalid_anchor`` — the
     same owner-rowless lane (review j#108110 finding_f2) — so the test is the shared
@@ -166,6 +178,19 @@ def create_lifecycle_anchor_gate(
     """
     if declarable_create_anchor(request):
         return None
+    if launch_action == LAUNCH_CREATE_WORKTREE:
+        return use_case._blocked(
+            request,
+            launch_action=launch_action,
+            reason="a fresh-worktree create requires a declarable durable-anchor "
+            "journal id (--journal): the worktree mutation would precede the adopt "
+            "decision, so no adoptable-pair observation can keep an anchorless run "
+            "zero-mutation; re-run with --journal <decision journal id>",
+            reasons=(REASON_LIFECYCLE_ANCHOR_REQUIRED,),
+            dispatch=dispatch,
+            fill_decision=fill_decision,
+            fill_override_reason=fill_override_reason,
+        )
     existing = use_case.ops.read_lane(
         resolve_lane_runtime_root(
             use_case.ops,
