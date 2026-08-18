@@ -337,11 +337,14 @@ ZERO_SEND_REASON_ALLOWLIST = frozenset(
         # Not a handoff outcome reason: the background_service's own pre-send sender-identity
         # refusal, so it stays literal alongside the other application-layer tokens.
         "missing_sender_env",
-        # The callback send port's own pre-send refusal (#15707): a coordinator-route row whose
-        # receiver provider could not be derived from the role authority. Application-layer
-        # token (``callback_send_port.RECEIVER_PROVIDER_UNRESOLVED``; drift-guarded), so it
-        # stays literal here for the same layering reason as the tokens above.
+        # The callback send port's own pre-send refusals (#15707): a coordinator-route row
+        # whose receiver provider could not be derived from the role authority, and one whose
+        # non-blank stamped receiver is not a provider token (j#108062 finding_receiverstamp).
+        # Application-layer tokens (``callback_send_port.RECEIVER_PROVIDER_UNRESOLVED`` /
+        # ``RECEIVER_STAMP_INVALID``; drift-guarded), so they stay literal here for the same
+        # layering reason as the tokens above.
         "receiver_provider_unresolved",
+        "receiver_stamp_invalid",
     }
 )
 

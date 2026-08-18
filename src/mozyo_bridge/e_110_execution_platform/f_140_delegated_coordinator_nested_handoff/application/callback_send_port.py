@@ -72,6 +72,14 @@ _PROVIDER_TOKENS = frozenset({PROVIDER_CLAUDE, PROVIDER_CODEX})
 #: :data:`...domain.callback_delivery.ZERO_SEND_REASON_ALLOWLIST` (Redmine #15707).
 RECEIVER_PROVIDER_UNRESOLVED = "receiver_provider_unresolved"
 
+#: The port's second pre-send refusal (review j#108062 finding_receiverstamp): the row DOES
+#: carry a non-blank ``target_receiver``, but it is not a provider token. That stamp is the
+#: row's durable intended-target expectation (#13683 R4-F2) — a broken one signals a row whose
+#: expectation cannot be honored, and silently substituting the CURRENT role authority could
+#: mis-route against what was recorded (the background sender refuses the analogous shape as
+#: ``target_tuple_mismatch``). Deterministic zero-send; also allowlisted.
+RECEIVER_STAMP_INVALID = "receiver_stamp_invalid"
+
 #: The producer's own injection-stage token for the port's pre-send refusals (#14232 j#95333
 #: F1 semantics): the port refused before invoking the handoff CLI, so zero bytes were typed.
 _STAGE_NOT_SENT = "not_sent"
@@ -193,8 +201,10 @@ class HandoffCallbackSendPort:
         #13229), which the ``binds_receiver`` fence correctly refused as ``invalid_args``.
         Precedence: the row's stamped ``target_receiver`` (the binding-resolved provider
         :func:`...workspace_callback_review_return.coordinator_target_tuple` wrote at enqueue)
-        when it is already a valid provider token; else the injected role-authority resolver.
-        A derivation that fails or lands outside the provider vocabulary refuses (fail-closed)
+        when it is a valid provider token; the injected role-authority resolver ONLY when the
+        stamp is BLANK (review j#108062 finding_receiverstamp: a non-blank non-provider stamp
+        is a broken durable expectation and refuses typed, never silently re-derived); and a
+        resolver that fails or answers outside the provider vocabulary refuses (fail-closed)
         rather than silently defaulting to ``codex``.
 
         Every NON-coordinator route keeps the literal ``codex`` — the #13758 R2-F2 disposition
@@ -205,8 +215,10 @@ class HandoffCallbackSendPort:
         if route != COORDINATOR_ROUTE:
             return PROVIDER_CODEX, ""
         stamped = str(getattr(row, "target_receiver", "") or "").strip()
-        if stamped in _PROVIDER_TOKENS:
-            return stamped, ""
+        if stamped:
+            if stamped in _PROVIDER_TOKENS:
+                return stamped, ""
+            return "", RECEIVER_STAMP_INVALID
         try:
             resolved = str(self.coordinator_provider_resolver() or "").strip()
         except Exception:  # noqa: BLE001 - an unresolved role authority is a typed refusal, never a guess
@@ -279,4 +291,5 @@ __all__ = (
     "CallbackSendRunner",
     "HandoffCallbackSendPort",
     "RECEIVER_PROVIDER_UNRESOLVED",
+    "RECEIVER_STAMP_INVALID",
 )

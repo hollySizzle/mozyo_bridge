@@ -17,6 +17,7 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.core.state.callback_outbox import CallbackOutboxRow
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_send_port import (
     RECEIVER_PROVIDER_UNRESOLVED,
+    RECEIVER_STAMP_INVALID,
     HandoffCallbackSendPort,
 )
 
@@ -178,11 +179,20 @@ class CoordinatorReceiverDerivationTest(unittest.TestCase):
         self.assertEqual(result.status, "sent")
         self.assertEqual(self._to_value(calls[0]), "claude")
 
-    def test_non_provider_stamp_falls_back_to_resolver(self):
-        # A semantic role token (not a provider) is not a valid --to; the role authority answers.
-        port, calls = self._capture_port(coordinator_provider_resolver=lambda: "codex")
-        port(_row(target_receiver="coordinator"))
-        self.assertEqual(self._to_value(calls[0]), "codex")
+    def test_non_provider_stamp_is_a_typed_pre_send_refusal(self):
+        # j#108062 finding_receiverstamp: a NON-BLANK non-provider stamp is a broken durable
+        # expectation — it refuses typed, and the resolver is never consulted to paper over it.
+        port, calls = self._capture_port(
+            coordinator_provider_resolver=lambda: (_ for _ in ()).throw(AssertionError(
+                "the resolver must not be consulted for an invalid non-blank stamp"
+            ))
+        )
+        result = port(_row(target_receiver="coordinator"))
+        self.assertEqual(
+            (result.status, result.reason), ("blocked", RECEIVER_STAMP_INVALID)
+        )
+        self.assertEqual(result.injection_stage, "not_sent")
+        self.assertEqual(calls, [])
 
     def test_resolver_failure_is_a_typed_pre_send_refusal(self):
         def unresolved():

@@ -39,6 +39,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     EXIT_INVALID_ARGS,
     EXIT_OK,
     EXIT_STATE_MISMATCH,
+    EXIT_STORE_UNREADABLE,
     cmd_workflow_callback_redrive,
 )
 
@@ -135,6 +136,14 @@ class CallbackRedriveCommandAcceptanceTest(unittest.TestCase):
         code, stdout = self._run(_args(store_path=str(self.store_path), issue="99999"))
         self.assertEqual(code, EXIT_OK)
         self.assertEqual(json.loads(stdout)["dead_letter"], [])
+
+    def test_dry_run_on_an_unreadable_store_is_exit_seven(self) -> None:
+        # finding_dryrunmigration: an unanswerable question must not look answered (nor
+        # migrate the store to find out) — the dry-run refuses with its own typed exit code.
+        broken = Path(self._tmp.name) / "broken.sqlite"
+        broken.write_bytes(b"this is not a sqlite database at all........")
+        code, _ = self._run(_args(store_path=str(broken)))
+        self.assertEqual(code, EXIT_STORE_UNREADABLE)
 
     def test_unresolved_workspace_fails_closed_without_the_explicit_surface(self) -> None:
         cli._resolve_workspace_id = lambda args: ""

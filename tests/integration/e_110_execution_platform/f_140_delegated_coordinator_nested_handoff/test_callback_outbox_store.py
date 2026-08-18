@@ -245,6 +245,12 @@ class ConcurrentClaimFencingTest(unittest.TestCase):
 class DeadLetterRedriveTest(_OutboxTestCase):
     """#15707 (c): the explicit, fingerprint-gated dead-letter redrive (compare-and-swap)."""
 
+    def setUp(self) -> None:
+        super().setUp()
+        from mozyo_bridge.core.state.callback_outbox_redrive import CallbackRedriveStore
+
+        self.redrive = CallbackRedriveStore(self.outbox)
+
     def _dead_letter(self, journal="75094", max_attempts=1):
         k = _key(journal)
         self.outbox.enqueue(k, max_attempts=max_attempts)
@@ -253,9 +259,7 @@ class DeadLetterRedriveTest(_OutboxTestCase):
         return k
 
     def _fingerprint_of(self, key):
-        from mozyo_bridge.core.state.callback_outbox_redrive import dead_letter_fingerprints
-
-        pairs = dead_letter_fingerprints(self.outbox)
+        pairs = self.redrive.dead_letter_fingerprints()
         for row, fingerprint in pairs:
             if row.key.as_row() == key.as_row():
                 return fingerprint
@@ -266,13 +270,12 @@ class DeadLetterRedriveTest(_OutboxTestCase):
         from mozyo_bridge.core.state.callback_outbox_redrive import (
             REDRIVE_DETAIL,
             REDRIVE_REQUEUED,
-            requeue_dead_letter,
         )
 
         k = self._dead_letter()
         fingerprint = self._fingerprint_of(k)
         self.assertEqual(
-            requeue_dead_letter(self.outbox, k, expect_fingerprint=fingerprint),
+            self.redrive.requeue_dead_letter(k, expect_fingerprint=fingerprint),
             REDRIVE_REQUEUED,
         )
         row = self.outbox.read()[0]
@@ -289,12 +292,11 @@ class DeadLetterRedriveTest(_OutboxTestCase):
     def test_fingerprint_mismatch_is_a_zero_write(self):
         from mozyo_bridge.core.state.callback_outbox_redrive import (
             REDRIVE_FINGERPRINT_MISMATCH,
-            requeue_dead_letter,
         )
 
         k = self._dead_letter()
         self.assertEqual(
-            requeue_dead_letter(self.outbox, k, expect_fingerprint="stale-token"),
+            self.redrive.requeue_dead_letter(k, expect_fingerprint="stale-token"),
             REDRIVE_FINGERPRINT_MISMATCH,
         )
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_DEAD_LETTER)
@@ -303,7 +305,6 @@ class DeadLetterRedriveTest(_OutboxTestCase):
         from mozyo_bridge.core.state.callback_outbox_redrive import (
             REDRIVE_STATE_MISMATCH,
             redrive_fingerprint,
-            requeue_dead_letter,
         )
 
         k = _key("75094")
@@ -312,19 +313,16 @@ class DeadLetterRedriveTest(_OutboxTestCase):
         self.outbox.mark_uncertain(k)  # uncertain is terminal: a redrive must not touch it
         token = redrive_fingerprint(k, state=CALLBACK_UNCERTAIN, attempts=0, updated_at="x")
         self.assertEqual(
-            requeue_dead_letter(self.outbox, k, expect_fingerprint=token),
+            self.redrive.requeue_dead_letter(k, expect_fingerprint=token),
             REDRIVE_STATE_MISMATCH,
         )
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_UNCERTAIN)
 
     def test_an_absent_key_is_typed(self):
-        from mozyo_bridge.core.state.callback_outbox_redrive import (
-            REDRIVE_ABSENT,
-            requeue_dead_letter,
-        )
+        from mozyo_bridge.core.state.callback_outbox_redrive import REDRIVE_ABSENT
 
         self.assertEqual(
-            requeue_dead_letter(self.outbox, _key("99999"), expect_fingerprint="t"),
+            self.redrive.requeue_dead_letter(_key("99999"), expect_fingerprint="t"),
             REDRIVE_ABSENT,
         )
 
@@ -332,7 +330,6 @@ class DeadLetterRedriveTest(_OutboxTestCase):
         from mozyo_bridge.core.state.callback_outbox_redrive import (
             REDRIVE_FINGERPRINT_MISMATCH,
             REDRIVE_REQUEUED,
-            requeue_dead_letter,
         )
 
         k = self._dead_letter()
@@ -341,7 +338,7 @@ class DeadLetterRedriveTest(_OutboxTestCase):
         # budget fails): same state, but the attempts history moved monotonically, so the
         # stale observation must not actuate — even within the same wall-clock second.
         self.assertEqual(
-            requeue_dead_letter(self.outbox, k, expect_fingerprint=observed), REDRIVE_REQUEUED
+            self.redrive.requeue_dead_letter(k, expect_fingerprint=observed), REDRIVE_REQUEUED
         )
         for _ in range(64):  # bounded: the granted budget is CALLBACK_DEFAULT_MAX_ATTEMPTS
             self.outbox.claim_pending()
@@ -349,16 +346,14 @@ class DeadLetterRedriveTest(_OutboxTestCase):
                 break
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_DEAD_LETTER)
         self.assertEqual(
-            requeue_dead_letter(self.outbox, k, expect_fingerprint=observed),
+            self.redrive.requeue_dead_letter(k, expect_fingerprint=observed),
             REDRIVE_FINGERPRINT_MISMATCH,
         )
 
     def test_fingerprints_are_partition_scoped(self):
-        from mozyo_bridge.core.state.callback_outbox_redrive import dead_letter_fingerprints
-
         self._dead_letter()
-        self.assertEqual(dead_letter_fingerprints(self.outbox, workspace_id="other"), ())
-        self.assertEqual(len(dead_letter_fingerprints(self.outbox, workspace_id="")), 1)
+        self.assertEqual(self.redrive.dead_letter_fingerprints(workspace_id="other"), ())
+        self.assertEqual(len(self.redrive.dead_letter_fingerprints(workspace_id="")), 1)
 
 
 class CursorTest(_OutboxTestCase):
