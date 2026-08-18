@@ -92,6 +92,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REBIND_SLOT_LIVE_PROVIDER_MISMATCH,
     REBIND_SLOT_NOT_DRIFTED,
     REBIND_SLOT_PROVIDER_MISMATCH,
+    REBIND_SLOT_STALE,
     REBIND_SLOT_UNATTESTED,
     RebindSlotPlan,
     RestoredPairRebindPlan,
@@ -104,6 +105,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _norm,
     _norm_lane,
     terminal_identity_of_live_slot,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
+    SLOT_LIVE,
+    classify_named_slot,
 )
 
 _PIN_ROLE_GATEWAY = "gateway"
@@ -223,6 +228,16 @@ class LiveRestoredPairRebindOps:
             reasons.append(slot_reason(REBIND_SLOT_LIVE_ABSENT, slot_role))
         else:
             row = named[0]
+            if classify_named_slot(row) != SLOT_LIVE:
+                # A positively-signalled shell residue (blank detected-agent
+                # field, or an unknown runtime status with no detected agent) is
+                # never rebind evidence, even when the locator / terminal
+                # identity and the stored attestation survived the restore
+                # around the dead shell. Liveness is a required conjunct
+                # INDEPENDENT of the attestation join — the same
+                # `classify_named_slot` gate the live adopt applies (#15656
+                # review j#107780 finding_1).
+                reasons.append(slot_reason(REBIND_SLOT_STALE, slot_role))
             live_locator = _norm(_agent_locator(row))
             live_revision = _norm(row.get("runtime_revision"))
             if not live_locator:

@@ -102,6 +102,23 @@ def _row(
     return row
 
 
+def _residue_row(name: str, locator: str, terminal: str) -> dict:
+    """The measured post-restore shell-residue row shape (#15656 j#107780 finding_1).
+
+    The durable name, a canonical locator AND terminal identity survive the
+    restore, but herdr positively reports no managed agent: the detected-agent
+    field is present-but-blank and the runtime status is ``unknown`` — the
+    `classify_named_slot` SLOT_STALE shape.
+    """
+    return {
+        "name": name,
+        "pane_id": locator,
+        "terminal_id": terminal,
+        "agent": "",
+        "agent_status": "unknown",
+    }
+
+
 def _restored_rows() -> list[dict]:
     return [
         _row(GW_NAME, GW_NEW, "term-gw-2", GW_PROVIDER),
@@ -431,6 +448,39 @@ class RestoredPairRebindFailClosedTests(_Base):
         pins = decode_declared_slots(record.declared_slots)
         self.assertEqual(
             sorted(pin.locator for pin in pins), sorted([GW_OLD, WK_OLD])
+        )
+
+    def test_single_stale_shell_residue_slot_is_zero_write(self):
+        # #15656 review j#107780 finding_1 adversarial shape: the worker's
+        # locator / terminal identity AND its stored attestation survived the
+        # restore around a dead shell. Liveness must refuse independently of
+        # the attestation join, and all-or-nothing keeps the pair zero-write.
+        self.declare()
+        self.attest_restored_pair()
+        rows = [
+            _row(GW_NAME, GW_NEW, "term-gw-2", GW_PROVIDER),
+            _residue_row(WK_NAME, WK_NEW, "term-wk-2"),
+        ]
+        outcome = self._blocked(
+            _TestOps(self.home, rows), "stale_named_slot:worker"
+        )
+        # The other slot is genuinely live and ready — the refusal is the
+        # residue slot's, proving the conjunct is slot-scoped and independent.
+        self.assertTrue(outcome.plan.gateway.ready)
+        self.assertFalse(outcome.plan.worker.ready)
+
+    def test_both_stale_shell_residue_slots_are_zero_write(self):
+        self.declare()
+        self.attest_restored_pair()
+        rows = [
+            _residue_row(GW_NAME, GW_NEW, "term-gw-2"),
+            _residue_row(WK_NAME, WK_NEW, "term-wk-2"),
+        ]
+        outcome = self._blocked(
+            _TestOps(self.home, rows), "stale_named_slot:gateway"
+        )
+        self.assertIn(
+            "stale_named_slot:worker", ",".join(outcome.plan.blocked_reasons)
         )
 
     def test_declared_locator_still_live_is_zero_write(self):
