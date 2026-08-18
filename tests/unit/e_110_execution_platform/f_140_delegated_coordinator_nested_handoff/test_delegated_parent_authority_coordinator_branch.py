@@ -1,35 +1,25 @@
-"""Redmine #15700 — a single workspace earns a delegated_coordinator lane.
+"""The single-workspace coordinator-parent branch of the #15146 admission (Redmine #15700).
 
-The #15146 admission made ``--lane-kind delegated_coordinator`` assert a parent
-project gateway, which a single workspace (a project-subdir anchor with no monorepo
-tier) can never establish — measured as ``parent_gateway_binding_missing`` on
-#15693 (j#107824). The coordinator decision (#15693 j#107868, option b) adds a
-single-workspace path WITHOUT weakening the monorepo claim: when NO
-``project_gateway`` binding is declared at all, the lane's parent is the
-workspace's own default-lane coordinator, and it must be DECLARED (``coordinator``
-bound, provider bound) and LIVE (exactly one live attested default-lane occupant —
-the coordinator proxy rail's own exactly-one policy). Every gap refuses typed
-before any side effect, and the taken branch is observable (``parent_kind``),
-never a silent fallback.
+A workspace that declares NO ``project_gateway`` binding may create a
+``delegated_coordinator`` lane by hanging it from its own default-lane coordinator:
+the ``coordinator`` role must resolve (declaration + provider binding) and exactly
+one live attested default-lane occupant must exist (the coordinator proxy rail's own
+exactly-one policy). Pinned here, module-isolated:
 
-Pinned here:
+- the pure branch decision in ``domain.delegated_parent_authority`` — the earned
+  pass and every typed refusal, with the probe injected;
+- the declared-gateway topology NEVER consulting the coordinator probe (no silent
+  fallback in either direction — design constraint 1);
+- the live gate composition in ``application.delegated_parent_authority_gate``,
+  with the coordinator proxy rail's reads faked at their import site.
 
-- the coordinator branch's admission and each typed refusal (pure domain);
-- the declared-gateway topology NEVER consults the coordinator probe — declared
-  and verified admits as before, declared and unverified refuses as before, even
-  with a perfectly live coordinator (no silent fallback, either direction);
-- the live gate composition admits through both entry points with the probe's
-  reads patched, and surfaces ``parent_kind=default_lane_coordinator``;
-- the L2 rails this lane hangs from are the EXISTING ones (#15700 design D4): the
-  coordinator's forward leg to delegated_coordinator, the fixed L2->L3 role
-  profile chain, and the ``coordinator`` callback route identity.
+The operator-facing command acceptance (both entry points succeeding end to end)
+lives in ``tests/scenarios/test_single_workspace_delegated_coordinator_acceptance``.
 """
 
 from __future__ import annotations
 
-import argparse
 import contextlib
-import io
 import json
 import subprocess
 import sys
@@ -38,7 +28,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-ROOT = Path(__file__).resolve().parents[2]
+ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_parent_authority import (  # noqa: E402,E501
@@ -244,6 +234,42 @@ class DeclaredGatewayNeverFallsBackTest(unittest.TestCase):
         self.assertEqual([], calls)
 
 
+_PROXY_SEND = (
+    "mozyo_bridge.e_110_execution_platform."
+    "f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send"
+)
+
+
+@contextlib.contextmanager
+def attested_coordinator_reads():
+    """Patch the gate probe's reads to a resolved, live, attested coordinator."""
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
+        ProxyTarget,
+    )
+
+    with patch(
+        f"{_PROXY_SEND}.resolve_default_lane_authority",
+        return_value=("resolved", "coordinator", "proj-a", ""),
+    ), patch(
+        f"{_PROXY_SEND}.resolve_expected_provider", return_value="codex"
+    ), patch(
+        f"{_PROXY_SEND}.live_workspace_id", return_value="a" * 32
+    ), patch(
+        f"{_PROXY_SEND}.live_agent_rows", return_value=()
+    ), patch(
+        f"{_PROXY_SEND}.resolve_proxy_target",
+        return_value=ProxyTarget(
+            status="ok",
+            assigned_name="mzb1-attested-coordinator",
+            locator="%7",
+            live=1,
+            with_locator=1,
+            attestation_state="attested",
+        ),
+    ):
+        yield
+
+
 class _TempRepo(unittest.TestCase):
     def _repo(self, bindings=None) -> Path:
         tmp = tempfile.TemporaryDirectory()
@@ -276,42 +302,6 @@ class _TempRepo(unittest.TestCase):
         return repo
 
 
-_PROXY_SEND = (
-    "mozyo_bridge.e_110_execution_platform."
-    "f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send"
-)
-
-
-@contextlib.contextmanager
-def _attested_coordinator_reads():
-    """Patch the probe's reads to a resolved, live, attested coordinator."""
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
-        ProxyTarget,
-    )
-
-    with patch(
-        f"{_PROXY_SEND}.resolve_default_lane_authority",
-        return_value=("resolved", "coordinator", "proj-a", ""),
-    ), patch(
-        f"{_PROXY_SEND}.resolve_expected_provider", return_value="codex"
-    ), patch(
-        f"{_PROXY_SEND}.live_workspace_id", return_value="a" * 32
-    ), patch(
-        f"{_PROXY_SEND}.live_agent_rows", return_value=()
-    ), patch(
-        f"{_PROXY_SEND}.resolve_proxy_target",
-        return_value=ProxyTarget(
-            status="ok",
-            assigned_name="mzb1-attested-coordinator",
-            locator="%7",
-            live=1,
-            with_locator=1,
-            attestation_state="attested",
-        ),
-    ):
-        yield
-
-
 class LiveGateCompositionTest(_TempRepo):
     """The gate composes the coordinator branch from the proxy rail's own reads."""
 
@@ -325,7 +315,7 @@ class LiveGateCompositionTest(_TempRepo):
 
         repo = self._repo(bindings=[dict(COORDINATOR_ENTRY)])
 
-        with _attested_coordinator_reads():
+        with attested_coordinator_reads():
             verdict = delegated_parent_authority_verdict(
                 repo, "delegated_coordinator"
             )
@@ -351,7 +341,7 @@ class LiveGateCompositionTest(_TempRepo):
 
         repo = self._repo(bindings=[dict(COORDINATOR_ENTRY)])
 
-        with _attested_coordinator_reads():
+        with attested_coordinator_reads():
             with patch(
                 f"{_PROXY_SEND}.resolve_proxy_target",
                 return_value=ProxyTarget(
@@ -389,118 +379,6 @@ class LiveGateCompositionTest(_TempRepo):
         self.assertIsNotNone(verdict)
         self.assertFalse(verdict.ok)
         self.assertEqual(PARENT_COORDINATOR_BLOCKED, verdict.reason)
-
-
-class BothEntryPointsAdmitIdenticallyTest(_TempRepo):
-    """Plan and dry-run actuator surface the SAME admission and the taken branch."""
-
-    def _plan_only(self, repo: Path):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
-            cmd_sublane_create,
-        )
-
-        args = argparse.Namespace(
-            repo=str(repo),
-            issue="15700",
-            lane_label="issue_15700_probe",
-            branch="issue_15700_probe",
-            worktree="",
-            journal="1",
-            lane_kind="delegated_coordinator",
-            json=False,
-        )
-        out, err = io.StringIO(), io.StringIO()
-        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-            code = cmd_sublane_create(args)
-        return code, out.getvalue(), err.getvalue()
-
-    def test_the_plan_only_surface_admits_and_names_the_branch(self) -> None:
-        repo = self._repo(bindings=[dict(COORDINATOR_ENTRY)])
-
-        with _attested_coordinator_reads():
-            code, out, err = self._plan_only(repo)
-
-        # The admission passed: whatever the plan itself decides downstream, the
-        # typed parent observation is on stderr and no refusal text appeared.
-        self.assertIn(
-            "parent_kind=" + PARENT_KIND_DEFAULT_COORDINATOR, err
-        )
-        self.assertNotIn("sublane create refused", out + err)
-        # Zero side effect from the plan-only surface.
-        self.assertFalse((repo / ".worktrees").exists())
-
-    def test_the_dry_run_actuator_reaches_past_the_parent_admission(self) -> None:
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (  # noqa: E501
-            cmd_sublane_start,
-        )
-
-        repo = self._repo(bindings=[dict(COORDINATOR_ENTRY)])
-        args = argparse.Namespace(
-            repo=str(repo),
-            issue="15700",
-            lane_label="issue_15700_probe",
-            branch="issue_15700_probe",
-            worktree="",
-            journal="1",
-            lane_kind="delegated_coordinator",
-            execute=False,
-            dry_run=True,
-            json=False,
-        )
-        out, err = io.StringIO(), io.StringIO()
-        with _attested_coordinator_reads():
-            with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
-                cmd_sublane_start(args)
-
-        text = err.getvalue()
-        self.assertIn("parent_kind=" + PARENT_KIND_DEFAULT_COORDINATOR, text)
-        self.assertNotIn("sublane create refused", out.getvalue() + text)
-        self.assertFalse((repo / ".worktrees").exists())
-
-
-class ExistingRailsSmokeTest(unittest.TestCase):
-    """Design D4: the lane hangs from EXISTING rails — none of them moved.
-
-    Minimal smoke for acceptance condition 3; the live end-to-end proof runs in
-    the #15693 trial, not here.
-    """
-
-    def test_the_coordinator_forward_leg_reaches_delegated_coordinator(self) -> None:
-        # L1 -> L2 in a single workspace: the coordinator's own forward leg.
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_forward_route import (  # noqa: E501
-            plan_forward_route,
-        )
-
-        route = plan_forward_route("coordinator", "")
-
-        self.assertEqual("delegated_coordinator", route.to_role)
-
-    def test_the_l2_to_l3_role_profile_chain_is_unchanged(self) -> None:
-        # L2 -> L3: the fixed nested-handoff profile chain (f_140), reused as-is.
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_coordinator_route_plan import (  # noqa: E501
-            ROUTE_HOPS,
-        )
-
-        self.assertEqual(
-            (
-                ("parent_to_child", "delegated_coordinator"),
-                ("child_to_gateway", "implementation_gateway"),
-                ("gateway_to_worker", "implementation_worker"),
-            ),
-            tuple((hop, role) for hop, role in ROUTE_HOPS),
-        )
-
-    def test_the_upstream_callback_route_identity_is_the_coordinator_lane(
-        self,
-    ) -> None:
-        # L2 -> L1: the callback outbox rail's default route names the workspace
-        # coordinator lane — in a single workspace, that IS the L1 parent the
-        # admission just verified live.
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_runtime import (  # noqa: E501
-            DEFAULT_CALLBACK_ROUTE,
-        )
-
-        self.assertEqual("coordinator", DEFAULT_CALLBACK_ROUTE)
 
 
 if __name__ == "__main__":  # pragma: no cover
