@@ -339,8 +339,13 @@ def _parse_tab_created_prepared(stdout: object) -> "tuple[str, PreparedPane] | N
         return None
     tab_id = _norm(tab.get("tab_id"))
     locator = _norm(root_pane.get("pane_id"))
-    workspace_id = _norm(root_pane.get("workspace_id")) or _workspace_prefix(locator)
-    root_tab_id = _norm(root_pane.get("tab_id")) or tab_id
+    # Explicit-only identity (review j#107914 finding_1): the root pane must DECLARE
+    # its own workspace_id / tab_id — herdr 0.8.0 always does (measured). Backfilling
+    # a missing field from the locator prefix / the envelope tab would make the
+    # coherence checks below trivially true for exactly the payloads they exist to
+    # reject, so an absent field is malformed, never inferred.
+    workspace_id = _norm(root_pane.get("workspace_id"))
+    root_tab_id = _norm(root_pane.get("tab_id"))
     terminal_id = root_pane.get("terminal_id")
     if (
         not valid_target(tab_id)
