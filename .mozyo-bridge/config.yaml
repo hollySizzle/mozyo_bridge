@@ -15,14 +15,14 @@ agents:
         - --model
         - claude-fable-5
     coordination:
-      provider: claude
+      provider: codex
       launch_argv:
         default:
-        - --model
-        - claude-fable-5
+        - --config
+        - model_reasoning_effort=xhigh
         sublane:
-        - --model
-        - claude-fable-5
+        - --config
+        - model_reasoning_effort=high
 presentation:
   project_group_presentation: project_group_tmux_window
   project_groups:
