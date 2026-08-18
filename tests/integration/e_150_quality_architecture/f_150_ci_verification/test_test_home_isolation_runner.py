@@ -622,6 +622,39 @@ class WritesAreRefusedBeforeTheyLandTest(unittest.TestCase):
         # asserted here rather than leaked to the parent terminal.
         self.assertIn("FAILED (failures=1)", err)
 
+    def test_a_quota_failure_inside_the_suite_is_flagged_environmental(
+        self,
+    ) -> None:
+        """Redmine #15710: a suite dying on EDQUOT stays red, but the verdict
+        carries the typed environmental note so dozens of quota errors are not
+        misread as regressions of the change under test."""
+        fixture = _Fixture(
+            self,
+            "import errno, unittest\n"
+            "class Quota(unittest.TestCase):\n"
+            "    def test_write(self):\n"
+            "        raise OSError(errno.EDQUOT, 'Disk quota exceeded')\n",
+        )
+        code, out, err = _run_cli(
+            ["tests", "run", "--repo", str(fixture.repo), "--format", "json"],
+            guarded_home=fixture.guarded_home,
+        )
+        self.assertEqual(code, 1, f"nested CLI exited {code}\n--- stdout ---\n{out}\n--- stderr ---\n{err}")
+        payload = json.loads(out)
+        self.assertFalse(payload["success"])
+        self.assertFalse(payload["suite_success"])
+        self.assertIsNotNone(payload["disk_pressure"])
+        self.assertTrue(payload["disk_pressure"]["suspected"])
+        self.assertEqual(payload["disk_pressure"]["stage"], "suite-stderr")
+        self.assertIn("EDQUOT", " ".join(payload["disk_pressure"]["markers"]))
+        self.assertIn(
+            "environmental disk pressure suspected",
+            " ".join(payload["reasons"]),
+        )
+        # The fixture's intentional traceback is still streamed through to
+        # stderr; asserted here rather than leaked to the parent terminal.
+        self.assertIn("Errno 122", err)
+
     def test_the_json_verdict_separates_the_two_halves(self) -> None:
         fixture = _Fixture(self, _PASS_MODULE)
         code, out, err = _run_cli(

@@ -46,6 +46,12 @@ from __future__ import annotations
 import hashlib
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:  # pragma: no cover - annotation only, no runtime cycle
+    from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_disk_pressure import (
+        DiskPressureDiagnosis,
+    )
 
 #: Live cockpit-session pins removed from a fenced test process, so a test can
 #: never attach to or act on the operator's running lane. Shared with the
@@ -82,6 +88,14 @@ FENCE_SUBDIRS = {
 #: The operator default home, spelled as the resolver spells it. Denied in every
 #: fenced process in addition to whatever ambient home the runner observed.
 OPERATOR_DEFAULT_HOME = "~/.mozyo_bridge"
+
+#: Operator-declared base directory for the runner's ``mozyo-tests-home-*``
+#: task roots (Redmine #15710): a declarative escape from a quota-pressured
+#: /tmp. Read by the *outer* runner only, and stripped from the fenced child
+#: env below — a nested guarded run inside the fence must land in the pinned
+#: fenced tmp, not escape to the operator's declared base (where the OS write
+#: boundary would refuse it anyway).
+TESTS_TEMP_BASE_ENV = "MOZYO_TESTS_TMPDIR"
 
 
 @dataclass(frozen=True)
@@ -174,6 +188,9 @@ def apply_isolation(
     env.update(pins)
     for key in LIVE_LANE_ENV_KEYS:
         env.pop(key, None)
+    # See TESTS_TEMP_BASE_ENV: the declared temp base is the outer runner's
+    # setting, never the fenced child's.
+    env.pop(TESTS_TEMP_BASE_ENV, None)
     return env
 
 
@@ -516,6 +533,11 @@ class IsolatedRunOutcome:
     os_backend: str = ""
     os_backend_verified: bool = False
     reasons: tuple[str, ...] = field(default_factory=tuple)
+    #: Environmental annotation (Redmine #15710), never part of the verdict:
+    #: a run that saw EDQUOT/ENOSPC markers is still red, but its reasons say
+    #: the failure looks environmental instead of letting dozens of quota
+    #: errors read as regressions of the change under test.
+    disk_pressure: "DiskPressureDiagnosis | None" = None
 
     @property
     def homes_unchanged(self) -> bool:
@@ -538,6 +560,8 @@ class IsolatedRunOutcome:
                 f"operator shared home changed during the run -- {reason}"
                 for reason in guard.reasons
             ]
+        if self.disk_pressure is not None and self.disk_pressure.suspected:
+            reasons += list(self.disk_pressure.reasons)
         return tuple(reasons)
 
     def as_dict(self, *, reveal_paths: bool = False) -> dict:
@@ -556,6 +580,11 @@ class IsolatedRunOutcome:
             "home_guards": [
                 guard.as_dict(reveal_paths=reveal_paths) for guard in self.guards
             ],
+            "disk_pressure": (
+                None
+                if self.disk_pressure is None
+                else self.disk_pressure.as_dict(reveal_paths=reveal_paths)
+            ),
             "reasons": list(self.all_reasons),
         }
 
@@ -567,6 +596,7 @@ __all__ = (
     "GUARDED_TIERS",
     "LIVE_LANE_ENV_KEYS",
     "OPERATOR_DEFAULT_HOME",
+    "TESTS_TEMP_BASE_ENV",
     "HomeDelta",
     "HomeGuardVerdict",
     "HomeSnapshot",

@@ -318,6 +318,50 @@ process 境界で覆う**方式なので、この増加は rail の前提を壊�
 `home=` 明示化は本 issue の scope 外である (#14757 non-goals: test 期待値を ambient
 operator state へ合わせること)。
 
+## temp root の disk pressure 診断と宣言的退避 (#15710)
+
+2026-08-18 に full `tests run` が 3 回、`/tmp/mozyo-tests-home-*` への書込で
+`OSError: [Errno 122] Disk quota exceeded` により間欠失敗し、48 件 / 41 件の偽 test error を
+生んだ。`df` は /tmp 3% blocks / 1% inodes で、原因は per-user tmpfs quota か一時的
+pressure (operator 環境事象)。残骸 root の掃除 + 再実行で毎回回復した。runner はこれを
+diff 起因の failure と識別可能にする。
+
+### typed 診断 (annotation であって verdict ではない)
+
+- **suite 段**: `tests run` の fenced child の stderr を chunk 単位で pass-through しながら
+  走査し (`domain/test_disk_pressure.py` の `MarkerScanner`)、`[Errno 122]` /
+  `Disk quota exceeded` / `[Errno 28]` / `No space left on device` を数える。検出時は
+  verdict を変えずに `IsolatedRunOutcome.disk_pressure` へ
+  `environmental disk pressure suspected` の typed 注記を載せる: marker 種別と回数、
+  temp base の blocks / inodes 使用率、`mozyo-tests-home-*` root の残存数 (削除しない)。
+  text の reasons と `--format json` の `disk_pressure` key の両方に出る。
+- **setup 段**: runner 自身が task root 生成中に EDQUOT / ENOSPC を受けたら、suite を
+  1 件も走らせず typed 環境 refusal (`TempRootUnavailable`) で停止する。EACCES 等の
+  非容量 errno は環境事象と呼ばず、そのまま propagate する。
+- 診断は red を green にしない、retry しない、何も削除しない。挙動を変えるのは
+  「red の読み方」だけである。
+
+### 掃除ではなく宣言的退避を採る
+
+耐性策は issue #15710 の (a) orphan cleanup / (b) 宣言的 temp root のうち **(b)** を採用した。
+既存の `mozyo-tests-home-*` root は所有 process の marker を持たず、「live / foreign な
+利用が無い」ことを positive に証明できない。証明できない root に触らない fail-closed 原則の
+下では (a) の安全な発火域が実質空になり、破壊的経路だけが増える。残存 root は**数えて
+報告するだけ**で、掃除は attribution できる operator に残す。
+
+- `MOZYO_TESTS_TMPDIR` (正本: `domain/test_home_isolation.py` の `TESTS_TEMP_BASE_ENV`) が
+  既存の書込可能 directory を指すとき、3 入口共通の `guarded_isolated_run` は task root を
+  その配下に作る。未設定なら従来どおり system temp dir。
+- 使えない宣言 (不存在 / file / 書込不可) は **fail-closed** で refuse する。宣言が退避
+  しようとしている当の /tmp へ黙って fallback しない。
+- fenced child env からは `MOZYO_TESTS_TMPDIR` を **除去**する (`apply_isolation`)。fence 内の
+  nested guarded run は pin 済みの fenced tmp に着地すべきで、operator の宣言先へ脱出しては
+  ならない (OS write boundary はどのみち拒否するが、宣言 leak 自体を作らない)。
+- quota の根本原因 (systemd / per-user tmpfs 設定) は operator 環境事項であり、runner は
+  診断と退避だけを提供する。切り分けは「残存 root を掃除して再実行 → 再発するなら
+  `MOZYO_TESTS_TMPDIR` で別 filesystem へ退避 → それでも再発するなら環境の quota 設定を
+  確認」の順。
+
 ## 本 rail が緩めないもの
 
 - **test 集合と verdict は serial `python -m unittest discover -s tests` が正本。** `tests run`
@@ -345,6 +389,10 @@ operator state へ合わせること)。
 - resolver 側 fence: `src/mozyo_bridge/shared/paths.py` (`HomeFence` /
   `OperatorHomeFenceViolation` / `mozyo_bridge_home`)。
 - I/O: `.../application/test_home_fence.py` (task root 生成 / consistent snapshot / re-exec)。
+- disk pressure 診断 pure core: `.../domain/test_disk_pressure.py` (errno 分類 / stderr marker
+  scanner / typed 注記。#15710)。
+- temp base 解決と計測: `.../application/test_temp_root.py` (`MOZYO_TESTS_TMPDIR` fail-closed
+  解決 / statvfs・残存 root 計測。#15710)。
 - handler: `.../application/commands_test_run.py` (`cmd_tests_run` / `guarded_isolated_run` /
   `isolate_self`)。
 - registrar: `.../application/cli_test_run.py` (`tests run` と共有 isolation flag)。
@@ -356,7 +404,11 @@ operator state へ合わせること)。
 - `mozyo-bridge tests parallel`
 - regression: `tests/regressions/test_issue_14757_test_process_home_isolation.py`
   (negative probe を含む)
+- regression: `tests/regressions/test_issue_15710_tests_tmp_quota_flake.py`
+  (setup 段 EDQUOT refusal / stderr scan pass-through / `MOZYO_TESTS_TMPDIR` fail-closed と
+  fenced-env strip)
 - unit: `tests/unit/e_150_quality_architecture/f_150_ci_verification/test_test_home_isolation.py`
+- unit: `tests/unit/e_150_quality_architecture/f_150_ci_verification/test_test_disk_pressure.py`
 - integration: `tests/integration/e_150_quality_architecture/f_150_ci_verification/test_test_home_isolation_runner.py`
 - `mozyo-bridge docs validate --repo .` / `--check-file-coverage` /
   `docs generate-file-conventions --repo . --check`

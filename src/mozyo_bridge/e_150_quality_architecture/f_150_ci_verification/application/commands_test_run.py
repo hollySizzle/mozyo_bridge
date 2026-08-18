@@ -27,6 +27,8 @@ fence.
 from __future__ import annotations
 
 import argparse
+import dataclasses
+import errno as _errno
 import json as _json
 import subprocess
 import sys
@@ -36,6 +38,13 @@ from pathlib import Path
 
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_audit_hook import (
     AuditHookInstallError,
+)
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_temp_root import (
+    TESTS_HOME_PREFIX,
+    TempRootUnavailable,
+    diagnose_disk_pressure,
+    effective_temp_base,
+    resolve_tests_temp_base,
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_home_os_fence import (
     OsFence,
@@ -50,6 +59,10 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.t
     read_deny_ledger,
     reexec_isolated,
     snapshot_home,
+)
+from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_disk_pressure import (
+    MarkerScanner,
+    is_disk_pressure_errno,
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (
     IsolatedRunOutcome,
@@ -67,11 +80,44 @@ DEFAULT_UNITTEST_ARGS = ("discover", "-s", "tests")
 #: spawning a third generation. The fence env is the second, independent guard.
 ISOLATED_FLAG = "--already-isolated"
 
-_TEMP_PREFIX = "mozyo-tests-home-"
+_TEMP_PREFIX = TESTS_HOME_PREFIX
 
 
 def _repo_root(args: argparse.Namespace) -> Path:
     return resolve_repo_root(getattr(args, "repo", None))
+
+
+def _make_task_root() -> tempfile.TemporaryDirectory:
+    """The task temp root, under the operator's declared base when given.
+
+    ``MOZYO_TESTS_TMPDIR`` (Redmine #15710) is the declarative escape from a
+    quota-pressured ``/tmp``; an unusable declaration raises out of
+    :func:`resolve_tests_temp_base` rather than silently landing back in the
+    environment the declaration exists to avoid.
+    """
+    base = resolve_tests_temp_base()
+    return tempfile.TemporaryDirectory(
+        prefix=_TEMP_PREFIX, dir=None if base is None else str(base)
+    )
+
+
+def _pressure_refusal(exc: OSError) -> TempRootUnavailable:
+    """Wrap a capacity refusal during setup into the typed environmental error.
+
+    The observed incident (#15710): ``[Errno 122] Disk quota exceeded`` under
+    a /tmp that ``df`` showed 3% full — per-user tmpfs quota, not a defect of
+    the change under test. The message must make that distinction readable.
+    """
+    diagnosis = diagnose_disk_pressure(
+        effective_temp_base(),
+        markers=(_errno.errorcode.get(exc.errno or 0, f"errno {exc.errno}"),),
+        stage="temp-root-setup",
+    )
+    return TempRootUnavailable(
+        f"could not materialise the task temp root ({exc}); "
+        + "; ".join(diagnosis.reasons),
+        diagnosis,
+    )
 
 
 def guarded_isolated_run(
@@ -97,10 +143,25 @@ def guarded_isolated_run(
     """
     denied = ambient_homes() if guarded_homes is None else tuple(guarded_homes)
     before = {home: snapshot_home(home) for home in denied}
-    with tempfile.TemporaryDirectory(prefix=_TEMP_PREFIX) as tmp:
-        layout, env, interpreter, ledger, os_fence = isolated_env(
-            Path(tmp), denied_homes=denied
-        )
+    # A capacity refusal here (EDQUOT under a per-user /tmp quota, ENOSPC) is
+    # an environment condition, not a fence failure and not a suite verdict:
+    # surface it as the typed environmental refusal (#15710). Any other OSError
+    # propagates unchanged.
+    try:
+        task_root = _make_task_root()
+    except OSError as exc:
+        if is_disk_pressure_errno(exc.errno):
+            raise _pressure_refusal(exc) from exc
+        raise
+    with task_root as tmp:
+        try:
+            layout, env, interpreter, ledger, os_fence = isolated_env(
+                Path(tmp), denied_homes=denied
+            )
+        except OSError as exc:
+            if is_disk_pressure_errno(exc.errno):
+                raise _pressure_refusal(exc) from exc
+            raise
         returncode = child(layout, env, interpreter, os_fence)
         fence_root = str(layout.home)
         backend = os_fence.backend
@@ -123,8 +184,41 @@ def guarded_isolated_run(
     )
 
 
+def _scanned_run(
+    command: list[str],
+    *,
+    cwd: str,
+    env: dict[str, str],
+    scanner: MarkerScanner,
+) -> int:
+    """Run ``command``, streaming its stderr through while scanning it.
+
+    The quota errors of #15710 happen inside the *child* suite, where this
+    process otherwise sees only a non-zero exit code. Stderr is pumped chunk
+    by chunk to the parent's stderr — output stays visible in real time, the
+    transcript is never buffered whole — and each chunk is fed to the marker
+    scanner. Stdout is untouched.
+    """
+    proc = subprocess.Popen(command, cwd=cwd, env=env, stderr=subprocess.PIPE)
+    stream = proc.stderr
+    assert stream is not None  # stderr=PIPE above
+    try:
+        while True:
+            chunk = stream.read1(65536)
+            if not chunk:
+                break
+            sys.stderr.buffer.write(chunk)
+            sys.stderr.buffer.flush()
+            scanner.feed(chunk)
+    finally:
+        stream.close()
+    return proc.wait()
+
+
 def _unittest_child(
-    repo_root: Path, unittest_args: tuple[str, ...]
+    repo_root: Path,
+    unittest_args: tuple[str, ...],
+    scanner: MarkerScanner,
 ) -> Callable[[IsolationLayout, dict[str, str], Path, OsFence], int]:
     """A child that runs the authoritative ``python -m unittest`` command.
 
@@ -139,12 +233,12 @@ def _unittest_child(
         interpreter: Path,
         os_fence: OsFence,
     ) -> int:
-        proc = subprocess.run(
+        return _scanned_run(
             os_fence.wrap([str(interpreter), "-m", "unittest", *unittest_args]),
             cwd=str(repo_root),
             env=env,
+            scanner=scanner,
         )
-        return proc.returncode
 
     return run
 
@@ -175,16 +269,34 @@ def cmd_tests_run(args: argparse.Namespace) -> int:
         )
         return proc.returncode
 
+    scanner = MarkerScanner()
     try:
         outcome = guarded_isolated_run(
-            repo_root=repo_root, child=_unittest_child(repo_root, unittest_args)
+            repo_root=repo_root,
+            child=_unittest_child(repo_root, unittest_args, scanner),
         )
+    except TempRootUnavailable as exc:
+        # Environmental / configuration refusal (#15710): the task temp root is
+        # unusable. The message already carries the typed diagnosis, so a red
+        # exit here is readable as environment, never as a diff failure.
+        print(f"tests run: {exc}", file=sys.stderr)
+        return 1
     except (AuditHookInstallError, OsFenceUnavailable) as exc:
         # Fail closed and run nothing: a suite executed without the refusal layer
         # would produce a verdict that looks isolated and is not.
         print(f"tests run: refusing to run without the write fence -- {exc}",
               file=sys.stderr)
         return 1
+    if scanner.suspected:
+        # Annotate, never repair: the verdict is unchanged, but the summary says
+        # the failures look environmental (quota / pressure) and measures the
+        # temp base so the reader can triage without re-deriving #15710.
+        outcome = dataclasses.replace(
+            outcome,
+            disk_pressure=diagnose_disk_pressure(
+                effective_temp_base(), scanner.markers, stage="suite-stderr"
+            ),
+        )
     _render(args, outcome, unittest_args)
     return 0 if outcome.success else 1
 
@@ -349,6 +461,11 @@ def isolate_self(args: argparse.Namespace, *, label: str) -> int | None:
 
     try:
         outcome = guarded_isolated_run(repo_root=repo_root, child=child)
+    except TempRootUnavailable as exc:
+        # Environmental / configuration refusal (#15710); same shape as the
+        # `tests run` handler so all three entry points read alike.
+        print(f"tests {label}: {exc}", file=sys.stderr)
+        return 1
     except (AuditHookInstallError, OsFenceUnavailable) as exc:
         print(f"tests {label}: refusing to run without the write fence -- {exc}",
               file=sys.stderr)

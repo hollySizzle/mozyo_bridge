@@ -88,7 +88,10 @@ def register_run(tests_sub) -> None:
             "runs the authoritative full discovery (`discover -s tests`); pass "
             "focused targets after `--`. HOME is left alone; the home contract, "
             "TMPDIR/TMP/TEMP and the XDG roots are pinned into one task-specific "
-            "temp root and the live cockpit-session env is dropped."
+            "temp root and the live cockpit-session env is dropped. The task "
+            "root lives under the system temp dir, or under MOZYO_TESTS_TMPDIR "
+            "when that names an existing writable directory (declarative escape "
+            "from a quota-pressured /tmp, Redmine #15710)."
         ),
     )
     add_repo_option(run)
