@@ -413,7 +413,7 @@ def verify_vanished_gateway_attestation_evidence(
     """Verify the joined live generation's canonical startup/action attestation.
 
     Reads the selected main identity-attestation exactly once from the canonical mozyo
-    home, then delegates current v4 direct-action binding to the shared authority. Legacy
+    home, then delegates current direct-action binding to the shared authority. Legacy
     v1-v3 side records are diagnostic-only. It performs no write, send, ledger read, CAS, or
     completion transition. The typed evidence exposes only the exact record's timestamp;
     the general proof wrapper below exposes neither the stored record nor that timestamp.

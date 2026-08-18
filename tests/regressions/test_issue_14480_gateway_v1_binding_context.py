@@ -399,7 +399,7 @@ class ExactBindingContextTests(_CurrentLaunchCase):
         # would start the gateway beside an unreserved sibling.
         self.assertIsNone(call["providers"])
         # Legacy side bindings stay absent for both participants; they are never current
-        # replacement authority even when a current v4 launch succeeds.
+        # replacement authority even when a current v5 launch succeeds.
         from mozyo_bridge.core.state.herdr_identity_attestation_replacement_binding import (
             HerdrIdentityReplacementBindingStore,
         )

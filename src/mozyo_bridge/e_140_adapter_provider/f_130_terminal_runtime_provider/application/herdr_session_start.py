@@ -6,7 +6,8 @@ herdr name before this (the #13175 PoC did ``agent rename`` by hand); this comma
 mints them so the herdr-native target resolution (#13261 read side) has stable
 identities to resolve against.
 
-Flow (per requested provider agent, ``claude`` / ``codex``):
+Flow (per requested provider agent, ``claude`` / ``codex``; default coordinator-unit
+launches also carry the separately resolved workflow role):
 
 1. resolve the herdr binary from the **trusted environment** — the explicit
    ``MOZYO_HERDR_BINARY`` then an executable ``herdr`` on the trusted ``PATH``
@@ -21,7 +22,8 @@ Flow (per requested provider agent, ``claude`` / ``codex``):
    agent) is classified :data:`SLOT_STALE` and surfaced read-only, never blind-adopted. A
    duplicated assigned name (more than one live agent) fails closed rather than corrupting;
 5. otherwise launch the agent as a herdr-managed pane with the durable name applied
-   **at start** and the self-identity vars injected via ``--env``.
+   **at start** and the provider identity vars plus optional ``MOZYO_WORKFLOW_ROLE``
+   injected via ``--env``.
 
 Duplicate requested ``(provider, lane)`` slots fail closed **before any side effect**
 (spec §5 slot-uniqueness) so the same durable name is never minted twice.
@@ -307,6 +309,8 @@ def prepare_session(
     dry_run: bool = False,
     claude_permission_mode_default: Optional[str] = None,
     agent_launch: "Optional[AgentLaunchConfig]" = None,
+    workflow_role_by_provider: "Optional[Mapping[str, str]]" = None,
+    launch_argv_by_provider: "Optional[Mapping[str, Sequence[str]]]" = None,
     lane_placement: "Optional[LanePlacementConfig]" = None,
     launch_context: "Optional[LaneLaunchContext]" = None,
     coordinator_placement_mode: str = DEFAULT_COORDINATOR_PLACEMENT_MODE,
@@ -347,6 +351,8 @@ def _prepare_session_locked(
     dry_run: bool = False,
     claude_permission_mode_default: Optional[str] = None,
     agent_launch: "Optional[AgentLaunchConfig]" = None,
+    workflow_role_by_provider: "Optional[Mapping[str, str]]" = None,
+    launch_argv_by_provider: "Optional[Mapping[str, Sequence[str]]]" = None,
     lane_placement: "Optional[LanePlacementConfig]" = None,
     launch_context: "Optional[LaneLaunchContext]" = None,
     coordinator_placement_mode: str = DEFAULT_COORDINATOR_PLACEMENT_MODE,
@@ -427,6 +433,8 @@ def _prepare_session_locked(
         error_type=HerdrSessionStartError,
         launch_context=launch_context,
         pair_order=pair_order,
+        workflow_role_by_provider=workflow_role_by_provider,
+        launch_argv_by_provider=launch_argv_by_provider,
     )
     binary = _resolve_binary_or_die(env)
     runner = runner or subprocess.run
@@ -589,6 +597,9 @@ def _prepare_session_locked(
     plans: list = []
     for provider in providers:
         assigned_name = encode_assigned_name(workspace_id, provider, lane)
+        workflow_role = (
+            (workflow_role_by_provider or {}).get(provider, "") or ""
+        ).strip()
         # Rows whose durable name equals assigned_name (fail-closed on duplicates below).
         existing = [
             row for row in rows
@@ -604,7 +615,15 @@ def _prepare_session_locked(
             if classify_named_slot(existing[0]) == LIVENESS_STALE:
                 # Composite liveness (Redmine #13518 j#75329): a host-restart shell residue
                 # (name matches, no detected agent) is stale and surfaced, never blind-adopted.
-                plans.append(_SlotPlan(provider, assigned_name, "stale", live_locator))
+                plans.append(
+                    _SlotPlan(
+                        provider,
+                        assigned_name,
+                        "stale",
+                        live_locator,
+                        workflow_role=workflow_role,
+                    )
+                )
             else:
                 # Startup self-attestation gate (Redmine #13637, Design Answer j#76462):
                 # adopt a live name-match ONLY when a `present` self-attestation is
@@ -618,17 +637,37 @@ def _prepare_session_locked(
                     expected_workspace_id=workspace_id,
                     expected_role=provider,
                     expected_lane=lane,
+                    expected_workflow_role=workflow_role,
                 )
                 kind = "adopt" if join.ok else "unattested"
                 plans.append(
                     _SlotPlan(
-                        provider, assigned_name, kind, live_locator, detail=join.reason
+                        provider,
+                        assigned_name,
+                        kind,
+                        live_locator,
+                        detail=join.reason,
+                        workflow_role=workflow_role,
                     )
                 )
         elif dry_run:
-            plans.append(_SlotPlan(provider, assigned_name, "planned"))
+            plans.append(
+                _SlotPlan(
+                    provider,
+                    assigned_name,
+                    "planned",
+                    workflow_role=workflow_role,
+                )
+            )
         else:
-            plans.append(_SlotPlan(provider, assigned_name, "launch"))
+            plans.append(
+                _SlotPlan(
+                    provider,
+                    assigned_name,
+                    "launch",
+                    workflow_role=workflow_role,
+                )
+            )
 
     if coordinator_placement_mode == ROLE_GROUPED_SPACE:
         validate_role_grouped_inventory(
@@ -899,11 +938,14 @@ def _prepare_session_locked(
     # Execute each adopt/plan/launch decision. Occupancy grows after every launch.
     for plan in plans:
         # Resolve provider-specific argv once per slot from the project config.
-        launch_argv_extra = (
-            agent_launch.resolve_launch_argv(plan.provider, lane_class)
-            if agent_launch is not None
-            else []
-        )
+        if launch_argv_by_provider is not None and plan.provider in launch_argv_by_provider:
+            launch_argv_extra = list(launch_argv_by_provider[plan.provider])
+        else:
+            launch_argv_extra = (
+                agent_launch.resolve_launch_argv(plan.provider, lane_class)
+                if agent_launch is not None
+                else []
+            )
         slot_split, slot_focus, order_deferred = slot_placement(
             plan.kind,
             plan.provider,

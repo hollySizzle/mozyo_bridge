@@ -40,6 +40,7 @@ import yaml
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile_config import (
     ROLE_COORDINATOR,
+    ROLE_COORDINATOR_ASSISTANT,
     ROLE_DELEGATED_COORDINATOR,
     ROLE_IMPLEMENTATION_GATEWAY,
     ROLE_IMPLEMENTATION_WORKER,
@@ -275,6 +276,7 @@ __all__: Iterable[str] = (
     "ROLE_PROFILE_VERSION",
     "ROLE_PROFILE_SOURCE",
     "ROLE_COORDINATOR",
+    "ROLE_COORDINATOR_ASSISTANT",
     "ROLE_DELEGATED_COORDINATOR",
     "ROLE_IMPLEMENTATION_GATEWAY",
     "ROLE_IMPLEMENTATION_WORKER",

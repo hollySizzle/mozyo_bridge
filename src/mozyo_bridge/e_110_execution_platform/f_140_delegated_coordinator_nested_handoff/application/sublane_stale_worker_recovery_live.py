@@ -466,7 +466,7 @@ class LiveRecoveryActuatorPort:
         - fresh AND exact action binding -> :data:`ATTEST_BOUND`.
 
         The historical side-binding shape remains readable only to explain old debt. It
-        cannot satisfy this method: current authority requires the direct v4 action field,
+        cannot satisfy this method: current authority requires the direct action field,
         exact terminal identity, and the matching generation-v2 startup action.
 
         The judgement itself is NOT re-implemented here — it is
@@ -475,8 +475,8 @@ class LiveRecoveryActuatorPort:
         the point: a second local copy is how they would drift.
 
         ``verify_fresh_receiver`` supplies the fresh locator; the same snapshot supplies the
-        globally unique server-owned terminal identity. v1-v3 rows and side bindings remain
-        diagnostic-only and cannot satisfy this current-authority join.
+        globally unique server-owned terminal identity. Historical rows and side bindings
+        remain diagnostic-only and cannot satisfy this current-authority join.
         """
         from mozyo_bridge.core.state.herdr_identity_attestation import (
             HerdrIdentityAttestationStore,

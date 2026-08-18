@@ -52,7 +52,9 @@
 
 ## モデル配置の更新 (ADR-0009 の向きを更新)
 
-owner 決定 (2026-08-18): **第1層コーディネーター = Codex (X-High、高推論)**、**その補佐 (assistant) = Fable5 (Claude 系)**。これは ADR-0009 が draft で記録していた「coordinator = Claude 系統 / Opus5 は coordinator 席に置かない」という**向きを更新**する (ADR-0009 は未 ratify のため衝突はしない)。意図は「この project でこの配置がどうなるか」を見る期間限定トライアル。ADR-0009 を最終化する際に本更新と整合させる。起動設定: codex の X-High は launch_argv `["--config", "model_reasoning_effort=xhigh"]` (default) / `model_reasoning_effort=high` (sublane)。第3層のレビュー役は第1層 (Codex) と別系統である必要があるため、レビュー系統は Claude 側 (Fable5) に置く。
+owner 更新決定 (2026-08-18): **第1層コーディネーター = Claude Fable5**、**その隣接補佐 (`coordinator_assistant`) = Codex GPT-5.6 Sol XHigh**。同日の先行案 (coordinator=Codex / assistant=Fable5) はこの更新で supersede された。これは `coordinator_assistant` を第2層へ昇格させる決定ではなく、3階層の外側で第1層を補助する非権威的 actor の provider/model binding である。
+
+repo-local 起動設定は `coordinator` → profile `coordinator_primary` → `claude --model claude-fable-5`、`coordinator_assistant` → profile `coordinator_assistance` → `codex --model gpt-5.6-sol --config model_reasoning_effort=xhigh` とする。sublane の既存 binding (`implementation_worker` via Claude Fable5 / coordination-side role via Codex high) はこの default-unit swap では変更しない。assistant は review authority を持たないため、第3層の「実装役と別モデル系統レビュー役」という不変条件を assistant で満たしたことにはしない。
 
 ## 影響
 

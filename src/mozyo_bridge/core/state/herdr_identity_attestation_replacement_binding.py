@@ -1,9 +1,10 @@
 """Legacy action-bound replacement receipt diagnostics (#13933).
 
-The v1-v3 attestation shapes cannot bind the server-owned terminal identity required by
-the current v4 authority contract.  Their historical side records remain readable for
-diagnosis and rollback-debt projection, but never make a live process current or green.
-Managed launches write only v4 after the approved four-store offline rollout.
+The v1-v3 attestation shapes cannot bind the server-owned terminal identity required since
+v4, and v4 lacks the independent workflow-role axis required by the current v5 contract.
+Historical rows and side records remain readable for diagnosis and rollback-debt
+projection, but never make a live process current or green. Managed launches write only
+the current schema after the approved four-store offline rollout.
 
 The file contains identity tokens and timestamps only.  It has no argv, environment,
 credential, message, or pane-content field.  Initial publication is atomic and mode
@@ -689,9 +690,9 @@ def replacement_action_bound_after_identity_join(
     accepts either a native direct action or the exact legacy side record.  Callers must not
     be able to turn a stale direct-action row green by claiming they joined it earlier.
 
-    Current v4 rows carry ``replacement_action_id`` directly and must also match the live
-    terminal.  Older v1-v3 rows and their side records remain readable diagnostics only;
-    because they cannot prove the current server-owned terminal, they are never green.
+    Current rows carry ``replacement_action_id`` directly and must also match the live
+    terminal. Older rows and their side records remain readable diagnostics only; because
+    they cannot prove the complete current identity contract, they are never green.
 
     Both post-launch verifications call THIS function — the bound-pair convergence rail and
     the #13806 actuator port that ``recover-stale`` and ``recover-gateway`` share — so the two

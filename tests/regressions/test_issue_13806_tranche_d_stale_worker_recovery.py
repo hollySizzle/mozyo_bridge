@@ -334,7 +334,7 @@ class CurrentLaunchAuthorityTests(_RecoveryCase):
         self.assertEqual(self.port.launched, [])
 
     def test_a_terminal_bound_legacy_capability_recovers_byte_invariantly(self):
-        """The pre-#14741 receipt path is safe only with current v4/v2 identity proof."""
+        """The pre-#14741 receipt path is safe only with current v5/v2 identity proof."""
         outcome = self._use_case(FakeRecoveryOps(_all_clear())).run(
             self._request(), execute=True
         )

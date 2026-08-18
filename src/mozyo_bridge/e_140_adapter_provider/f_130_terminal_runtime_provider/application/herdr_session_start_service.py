@@ -12,7 +12,11 @@ from collections.abc import Callable, Mapping, Sequence
 from mozyo_bridge.application.repo_local_config_loader import load_repo_local_config
 from mozyo_bridge.core.state.lane_kind import LANE_KIND_COORDINATOR
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (  # noqa: E501
+    REPO_LOCAL_CONFIG_V2,
     RepoLocalConfigError,
+)
+from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.agents_topology import (  # noqa: E501
+    AgentsTopologyError,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
     herdr_session_start as _use_case,
@@ -74,6 +78,40 @@ def prepare_configured_session(
         if lane_id
         else LaneLaunchContext(lane_kind=LANE_KIND_COORDINATOR)
     )
+    workflow_role_by_provider = None
+    launch_argv_by_provider = None
+    if not lane_id:
+        try:
+            coordinator_slots = repo_config.agents.resolve_coordinator_unit()
+        except AgentsTopologyError as exc:
+            raise HerdrSessionStartError(
+                f"invalid configured coordinator unit: {exc}"
+            ) from exc
+        by_provider = {slot.provider: slot for slot in coordinator_slots}
+        unknown = [provider for provider in agents if provider not in by_provider]
+        if unknown:
+            raise HerdrSessionStartError(
+                "default-lane provider request is outside the configured coordinator "
+                f"unit: {unknown!r}; configured providers are {sorted(by_provider)}"
+            )
+        workflow_role_by_provider = {
+            provider: by_provider[provider].workflow_role for provider in agents
+        }
+        if repo_config.schema_version >= REPO_LOCAL_CONFIG_V2:
+            launch_argv_by_provider = {
+                provider: by_provider[provider].launch_argv for provider in agents
+            }
+        else:
+            # v1 has no role-profile launch argv. Preserve its provider-keyed default
+            # launch contract while adding only the new, separate workflow-role axis.
+            # Reading argv from the empty built-in ``agents`` topology here would silently
+            # discard a v1 ``agent_launch.<provider>.default`` model pin.
+            launch_argv_by_provider = {
+                provider: tuple(
+                    repo_config.agent_launch.resolve_launch_argv(provider, "default")
+                )
+                for provider in agents
+            }
     prepare = session_preparer or _use_case.prepare_session
     call = dict(
         repo_root=repo_root,
@@ -84,6 +122,8 @@ def prepare_configured_session(
         dry_run=dry_run,
         claude_permission_mode_default=claude_permission_mode_default,
         agent_launch=repo_config.agent_launch,
+        workflow_role_by_provider=workflow_role_by_provider,
+        launch_argv_by_provider=launch_argv_by_provider,
         lane_placement=repo_config.lane_placement,
         coordinator_placement_mode=coordinator_placement.mode,
         coordinator_top_workspace_id=coordinator_placement.top_workspace_id,

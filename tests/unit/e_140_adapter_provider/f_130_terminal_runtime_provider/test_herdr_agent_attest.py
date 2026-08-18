@@ -222,6 +222,26 @@ class PerformSelfAttestationTest(unittest.TestCase):
             self.assertEqual(got.locator, "wY:p2")
             self.assertEqual(got.terminal_id, TERMINAL_ID)
 
+    def test_role_aware_boot_attests_observed_workflow_role(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            rec = perform_self_attestation(
+                assigned_name=NAME,
+                workspace_id="ws1",
+                role="claude",
+                lane="default",
+                workflow_role="coordinator",
+                env={**_GOOD_ENV, "MOZYO_WORKFLOW_ROLE": "coordinator"},
+                runner=_runner(_agent_row()),
+                home=home,
+            )
+            self.assertEqual(rec.verdict, VERDICT_PRESENT)
+            self.assertEqual(rec.workflow_role, "coordinator")
+            self.assertEqual(
+                HerdrIdentityAttestationStore(home=home).read(NAME).workflow_role,
+                "coordinator",
+            )
+
     def test_native_identity_resolves_short_row_and_records_logical_authority(self) -> None:
         native = native_name_for(NAME)
         with tempfile.TemporaryDirectory() as tmp:

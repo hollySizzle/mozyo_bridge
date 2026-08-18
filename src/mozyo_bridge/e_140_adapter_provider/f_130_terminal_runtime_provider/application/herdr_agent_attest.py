@@ -60,6 +60,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     MOZYO_HERDR_NATIVE_NAME_ENV,
     MOZYO_PROVIDER_ARGV0_ENV,
     MOZYO_STARTUP_ACTION_ID_ENV,
+    MOZYO_WORKFLOW_ROLE_ENV,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     AGENT_KEY_NAME,
@@ -314,6 +315,7 @@ def perform_self_attestation(
     workspace_id: str,
     role: str,
     lane: str,
+    workflow_role: str = "",
     env: Mapping[str, str],
     lane_epoch: str = "",
     replacement_action_id: str = "",
@@ -355,6 +357,7 @@ def perform_self_attestation(
         expected_workspace_id=workspace_id,
         expected_role=role,
         expected_lane=lane,
+        expected_workflow_role=workflow_role,
         env=env,
     )
     emit(STAGE_SELF_LOOKUP_STARTED)
@@ -459,6 +462,7 @@ def perform_self_attestation(
         replacement_action_id=_norm(replacement_action_id),
         lane_epoch=observed_epoch,
         terminal_id=terminal_id,
+        workflow_role=_norm(env.get(MOZYO_WORKFLOW_ROLE_ENV, "")),
     )
     persisted = record_identity_attestation(record, home=home)
     if persisted is None:
@@ -570,6 +574,7 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
         workspace_id=_norm(getattr(args, "workspace_id", "")),
         role=_norm(getattr(args, "role", "")),
         lane=_norm(getattr(args, "lane", "")),
+        workflow_role=_norm(getattr(args, "workflow_role", "")),
         env=env,
         # Redmine #14756: the launcher-EXPECTED epoch (absent on a lane with no minted epoch
         # and on every pre-#14756 launcher, which is the byte-invariant path).

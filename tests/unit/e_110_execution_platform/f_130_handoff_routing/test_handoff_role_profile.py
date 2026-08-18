@@ -47,6 +47,12 @@ class ResolveRoleProfileTest(unittest.TestCase):
         with self.assertRaises(RoleProfileError):
             resolve_role_profile("bogus_role", {})
 
+    def test_coordinator_assistant_resolves_without_authority_placeholders(self) -> None:
+        resolution = resolve_role_profile("coordinator_assistant", {})
+        self.assertEqual(resolution.unresolved_placeholders, ())
+        self.assertIn("inputでありevidenceではない", resolution.resolved_text)
+        self.assertIn("実装diffを作らない", resolution.resolved_text)
+
     def test_coordinator_roles_pin_effective_work_unit_contract(self) -> None:
         for token in ("coordinator", "delegated_coordinator", "implementation_gateway"):
             text = resolve_role_profile(token, {}).resolved_text

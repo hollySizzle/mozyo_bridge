@@ -1,6 +1,6 @@
 """Generation-bound capture and close execution for offline rollout (#15227).
 
-Every destructive close is licensed by the same fresh full-inventory + v4
+Every destructive close is licensed by the same fresh full-inventory + current
 attestation + completed generation-v2 join used by current runtime retire rails.
 The server-owned terminal id remains in memory and in its canonical stores; the
 sealed offline action persists only the non-secret startup action token.
@@ -65,7 +65,7 @@ def _identity_exact(agent, pin: OfflineRolloutClosePin) -> bool:
     )
 
 
-def _attestation_is_v4(record: object) -> bool:
+def _attestation_is_current(record: object) -> bool:
     return bool(
         record is not None
         and type(getattr(record, "schema_version", None)) is int
@@ -107,7 +107,7 @@ def _present_pin_join(
         terminal_id=terminal_id,
     )
     return bool(
-        _attestation_is_v4(attestation)
+        _attestation_is_current(attestation)
         and joined.ok
         and token == pin.startup_action_id
     )
@@ -198,7 +198,7 @@ def _positive_absence(
     )
     return bool(
         (
-            (_attestation_is_v4(attestation) and joined.ok)
+            (_attestation_is_current(attestation) and joined.ok)
             or (not require_assigned_name_absent and pinned_action_exact)
         )
         and token == pin.startup_action_id
@@ -286,7 +286,7 @@ def capture_close_authority(
             locator=agent.locator,
             terminal_id=agent.terminal_id,
         )
-        if not (_attestation_is_v4(attestation) and joined.ok and token):
+        if not (_attestation_is_current(attestation) and joined.ok and token):
             return _fail("close_authority_generation_unverified", agent.name)
         pins.append(
             OfflineRolloutClosePin(

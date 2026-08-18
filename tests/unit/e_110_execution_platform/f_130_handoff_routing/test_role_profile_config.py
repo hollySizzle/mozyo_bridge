@@ -1,6 +1,6 @@
 """Tests for the role profile template config schema + packaged artifact (#12952).
 
-US #12388 pinned the four role profile template bodies as inline Python
+US #12388 pinned the delegation role profile template bodies as inline Python
 constants; #12952 externalizes them to a wheel-packaged, schema-validated config
 artifact (``role_profile_templates.yaml``) that the resolver loads at import.
 These tests pin the fail-closed schema (unknown / missing role, empty template,
@@ -29,7 +29,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_pro
 
 
 def _valid_record():
-    """A minimal-but-complete valid config record (all four roles present)."""
+    """A minimal-but-complete valid config record (all runtime roles present)."""
     return {
         "version": "2026-06-21",
         "source": "vibes/docs/specs/delegated-coordinator-role-profile.md",
@@ -37,6 +37,10 @@ def _valid_record():
             "coordinator": {
                 "template": "# role profile: coordinator\n- <project> / <redmine_project>",
                 "placeholders": ["project", "redmine_project"],
+            },
+            "coordinator_assistant": {
+                "template": "# role profile: coordinator_assistant\n- input, not evidence",
+                "placeholders": [],
             },
             "delegated_coordinator": {
                 "template": "# role profile: delegated_coordinator\n- <parent_project>",
@@ -226,6 +230,12 @@ class PackagedConfigTest(unittest.TestCase):
 
     def test_packaged_config_is_valid_and_complete(self) -> None:
         self.assertEqual(tuple(self.config.templates.keys()), KNOWN_ROLE_TOKENS)
+
+    def test_assistant_contract_is_non_authoritative_and_non_implementing(self) -> None:
+        text = self.config.templates["coordinator_assistant"]
+        self.assertIn("inputでありevidenceではない", text)
+        self.assertIn("実装diffを作らない", text)
+        self.assertIn("owner approval", text)
 
     def test_packaged_version_and_source_match_module_pointers(self) -> None:
         self.assertEqual(self.config.version, rp.ROLE_PROFILE_VERSION)

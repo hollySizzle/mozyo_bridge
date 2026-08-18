@@ -1,6 +1,6 @@
 """Role profile template config schema boundary (Redmine #12952).
 
-US #12388 pinned the four fixed role profile template *bodies* as inline Python
+US #12388 pinned the original four fixed role profile template *bodies* as inline Python
 constants in :mod:`mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile`.
 #12952 moves those bodies to a packaged config artifact
 (``role_profile_templates.yaml``) that is the runtime source of truth, and this
@@ -18,8 +18,9 @@ delegation config boundaries (:mod:`mozyo_bridge.e_130_governance_distribution.f
   ``role_profile_templates.yaml`` yields). It reads no file and imports no YAML;
   the packaged-resource read lives in the resolver module so this schema stays
   pure and unit-testable without touching the filesystem.
-- **Fixed role vocabulary.** The config must define *exactly* the four known role
-  tokens — no unknown token, and none missing. An unknown role token fails closed
+- **Fixed role vocabulary.** The config must define *exactly* the five known role
+  tokens (the four delegation roles plus adjacent ``coordinator_assistant``) — no
+  unknown token, and none missing. An unknown role token fails closed
   (never silently accepted as an extra template) and a dropped role fails closed
   (never silently treated as "no template" at send time).
 - **Fail-closed, closed schema.** A non-mapping record, an unknown top-level or
@@ -47,10 +48,13 @@ class RoleProfileConfigError(ValueError):
     """The role profile template config is malformed or unsafe (fail-closed)."""
 
 
-# The fixed role profile vocabulary (US #12387 ``## role 語彙``). Kept as code
-# constants — the *vocabulary* is a code invariant; only the template *bodies*
-# are externalized to the packaged config.
+# The fixed delegation role profile vocabulary (US #12387 ``## role 語彙``) plus
+# the adjacent, non-authoritative coordinator assistant runtime profile (#15687).
+# The assistant is deliberately NOT a fifth delegation layer; it is a distinct
+# runtime actor beside the top coordinator. Kept as code constants — the
+# *vocabulary* is a code invariant; only the template *bodies* are externalized.
 ROLE_COORDINATOR = "coordinator"
+ROLE_COORDINATOR_ASSISTANT = "coordinator_assistant"
 ROLE_DELEGATED_COORDINATOR = "delegated_coordinator"
 ROLE_IMPLEMENTATION_GATEWAY = "implementation_gateway"
 ROLE_IMPLEMENTATION_WORKER = "implementation_worker"
@@ -60,6 +64,7 @@ ROLE_IMPLEMENTATION_WORKER = "implementation_worker"
 # order so it never depends on mapping iteration / file ordering.
 KNOWN_ROLE_TOKENS: tuple[str, ...] = (
     ROLE_COORDINATOR,
+    ROLE_COORDINATOR_ASSISTANT,
     ROLE_DELEGATED_COORDINATOR,
     ROLE_IMPLEMENTATION_GATEWAY,
     ROLE_IMPLEMENTATION_WORKER,
@@ -215,6 +220,7 @@ __all__ = (
     "RoleProfileConfigError",
     "RoleProfileConfig",
     "ROLE_COORDINATOR",
+    "ROLE_COORDINATOR_ASSISTANT",
     "ROLE_DELEGATED_COORDINATOR",
     "ROLE_IMPLEMENTATION_GATEWAY",
     "ROLE_IMPLEMENTATION_WORKER",

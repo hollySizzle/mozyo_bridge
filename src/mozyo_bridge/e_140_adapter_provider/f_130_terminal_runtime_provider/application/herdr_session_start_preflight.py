@@ -108,6 +108,8 @@ def validate_session_request(
     error_type: type,
     launch_context: object = None,
     pair_order: "Sequence[str] | None" = None,
+    workflow_role_by_provider: object = None,
+    launch_argv_by_provider: object = None,
 ) -> None:
     """Reject a malformed session request BEFORE any side effect (pure; raises ``error_type``).
 
@@ -164,6 +166,84 @@ def validate_session_request(
     _validate_slot_plan(
         providers=providers, lane_id=lane_id, launch_context=launch_context, error_type=error_type
     )
+    _validate_runtime_role_projection(
+        providers=providers,
+        lane_id=lane_id,
+        workflow_role_by_provider=workflow_role_by_provider,
+        launch_argv_by_provider=launch_argv_by_provider,
+        error_type=error_type,
+    )
+
+
+def _validate_runtime_role_projection(
+    *,
+    providers: Sequence[str],
+    lane_id: str,
+    workflow_role_by_provider: object,
+    launch_argv_by_provider: object,
+    error_type: type,
+) -> None:
+    """Validate the configured default-unit role/argv projection before writes."""
+    if workflow_role_by_provider is None and launch_argv_by_provider is None:
+        return
+    if _norm(lane_id):
+        raise error_type(
+            "workflow-role runtime projection is valid only for the default coordinator "
+            "unit; a sublane keeps its delegated coordinator / implementation roles"
+        )
+    if not isinstance(workflow_role_by_provider, Mapping) or not isinstance(
+        launch_argv_by_provider, Mapping
+    ):
+        raise error_type(
+            "workflow-role runtime projection requires both provider->role and "
+            "provider->argv mappings"
+        )
+    requested = set(providers)
+    if set(workflow_role_by_provider) != requested or set(launch_argv_by_provider) != requested:
+        raise error_type(
+            "workflow-role runtime projection must describe exactly the requested "
+            f"providers {sorted(requested)}"
+        )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (  # noqa: E501
+        ROLE_COORDINATOR,
+        ROLE_COORDINATOR_ASSISTANT,
+    )
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.agent_launch_argv import (  # noqa: E501
+        AgentLaunchArgvError,
+        _reject_reserved_managed_flags,
+        _validate_launch_argv_token,
+    )
+
+    allowed_roles = {ROLE_COORDINATOR, ROLE_COORDINATOR_ASSISTANT}
+    seen_roles: set[str] = set()
+    for provider in providers:
+        role = workflow_role_by_provider[provider]
+        if not isinstance(role, str) or role not in allowed_roles:
+            raise error_type(
+                f"default coordinator-unit provider {provider!r} has invalid workflow "
+                f"role {role!r}; expected one of {sorted(allowed_roles)}"
+            )
+        if role in seen_roles:
+            raise error_type(
+                f"default coordinator-unit workflow role {role!r} is assigned twice"
+            )
+        seen_roles.add(role)
+        argv = launch_argv_by_provider[provider]
+        if isinstance(argv, (str, bytes)) or not isinstance(argv, (list, tuple)):
+            raise error_type(
+                f"default coordinator-unit launch argv for {provider!r} must be an "
+                "ordered token sequence"
+            )
+        try:
+            for token in argv:
+                _validate_launch_argv_token(
+                    token, source=f"coordinator-unit role {role!r}"
+                )
+            _reject_reserved_managed_flags(
+                provider, tuple(argv), source=f"coordinator-unit role {role!r}"
+            )
+        except AgentLaunchArgvError as exc:
+            raise error_type(str(exc)) from exc
 
 
 def validate_coordinator_placement_request(

@@ -387,8 +387,8 @@ class SkillWorkflowSemanticAnchorsTest(unittest.TestCase):
         # without blocking wait / poll after a dispatch, raw herdr wait/read/list
         # + pane/tmux ops are operator-debug primitives (not agent tools), the
         # 45–55s cadence is re-homed to the background watcher / operator layer,
-        # and the four role profiles carry the mozyo-facade-only + zero-wait/yield
-        # discipline.
+        # and the delegation role profiles carry the mozyo-facade-only +
+        # zero-wait/yield discipline.
         "blocking wait も poll も実行せず、turn を終了 (yield) する",
         "`herdr agent wait` / `herdr agent read` / `herdr agent list` / raw pane・tmux 操作は adapter test と operator debug のための primitive",
         "watcher / operator 側の観測周期である",

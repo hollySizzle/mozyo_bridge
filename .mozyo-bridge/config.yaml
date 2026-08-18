@@ -8,21 +8,32 @@ agents:
     implementation:
       provider: claude
       launch_argv:
-        default:
-        - --model
-        - claude-fable-5
         sublane:
         - --model
         - claude-fable-5
     coordination:
       provider: codex
       launch_argv:
-        default:
-        - --config
-        - model_reasoning_effort=xhigh
         sublane:
         - --config
         - model_reasoning_effort=high
+    coordinator_primary:
+      provider: claude
+      launch_argv:
+        default:
+        - --model
+        - claude-fable-5
+    coordinator_assistance:
+      provider: codex
+      launch_argv:
+        default:
+        - --model
+        - gpt-5.6-sol
+        - --config
+        - model_reasoning_effort=xhigh
+  roles:
+    coordinator: coordinator_primary
+    coordinator_assistant: coordinator_assistance
 presentation:
   project_group_presentation: project_group_tmux_window
   project_groups:

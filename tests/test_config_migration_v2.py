@@ -68,6 +68,9 @@ class SchemaV2Test(unittest.TestCase):
         cfg = RepoLocalConfig.from_record({"version": 2})
         self.assertEqual(cfg.schema_version, REPO_LOCAL_CONFIG_V2)
         self.assertEqual(cfg.agents.resolve_provider_for_role("coordinator"), "codex")
+        self.assertEqual(
+            cfg.agents.resolve_provider_for_role("coordinator_assistant"), "claude"
+        )
         self.assertEqual(cfg.agents.resolve_provider_for_role("implementer"), "claude")
         # default profiles carry no launch argv -> byte-for-byte historical launch.
         self.assertEqual(cfg.agents.resolve_launch_argv_for_role("coordinator", "default"), [])

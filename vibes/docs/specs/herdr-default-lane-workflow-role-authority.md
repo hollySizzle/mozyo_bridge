@@ -14,16 +14,20 @@ authority の正本であり、`spec-herdr-native-identity`（mzb1 identity mode
 委譲）を前提にする。Design Consultation は Redmine #13583 j#75780、Answer は j#75782、独立検証
 verdict は j#75808。
 
-ここで `coordinator_assistant` は authority を説明する文書語彙であり、現行 runtime の role profile
-token / `provider_binding` role / launch identity には未配線である。したがって本 contract は
-`coordinator_assistant` を CLI / config 入力として受理するとは主張しない。正式な安全境界と互換表記は
-skill `references/workflow.md` の **`coordinator_assistant` の安全使用境界**を正本とする。
+`coordinator_assistant` は #15687 で role profile token、repo-local `agents.roles`、default
+coordinator-unit launch、startup self-attestation に配線された。ただしこれは本書が扱う durable
+**coordinator workflow-step authority**とは別軸である。assistant の runtime role が attest されても、
+`grandparent_coordinator` / `project_gateway` / `coordinator` の routing authority を得るわけではない。
+正式な安全境界は skill `references/workflow.md` の **`coordinator_assistant` の安全使用境界**を正本とする。
 
 ## 1. 原則（provider / placement を role authority に昇格しない）
 
 - mzb1 の `role` segment は runtime **provider** token（`claude` / `codex`）であり workflow role
   ではない（`spec-herdr-native-identity` §1）。default lane であること・pane 配置・provider を
   workflow-role authority へ昇格しない（`logic-workflow-step-command-design` 設計原則4）。
+- `MOZYO_WORKFLOW_ROLE` / startup attestation の `workflow_role` は、起動時に割り当てた責務を
+  provider identity と別に検証する軸である。ただしそれ自体を本書の routing declaration や
+  workflow-step authority の代替にはしない。
 - caller role は **explicit な durable binding** からのみ解く。binding が無い lane は既存分類を
   維持する（通常 non-default: codex→`delegated_coordinator` / claude→`implementation_worker`；
   binding 無し default → 従来どおり `ambiguous_default_coordinator_role`）。

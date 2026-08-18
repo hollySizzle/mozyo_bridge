@@ -97,6 +97,7 @@ def _execute_slot(
     if plan.kind == "adopt":
         return SlotResult(
             provider=plan.provider,
+            workflow_role=plan.workflow_role,
             assigned_name=plan.assigned_name,
             outcome=SLOT_ADOPTED,
             locator=plan.locator,
@@ -105,6 +106,7 @@ def _execute_slot(
     if plan.kind == "planned":
         return SlotResult(
             provider=plan.provider,
+            workflow_role=plan.workflow_role,
             assigned_name=plan.assigned_name,
             outcome=SLOT_PLANNED,
             detail="would launch (dry-run)",
@@ -115,6 +117,7 @@ def _execute_slot(
         # and relaunch the same slot — this run performs no destructive side effect.
         return SlotResult(
             provider=plan.provider,
+            workflow_role=plan.workflow_role,
             assigned_name=plan.assigned_name,
             outcome=SLOT_STALE,
             locator=plan.locator,
@@ -132,6 +135,7 @@ def _execute_slot(
         # destructive repair here.
         return SlotResult(
             provider=plan.provider,
+            workflow_role=plan.workflow_role,
             assigned_name=plan.assigned_name,
             outcome=SLOT_UNATTESTED,
             locator=plan.locator,
@@ -178,6 +182,7 @@ def _execute_slot(
     lane_epoch = resolve_launch_lane_epoch(workspace_id, lane, store_home=store_home)
     pane_env = build_pane_launch_env(
         provider=plan.provider,
+        workflow_role=plan.workflow_role,
         native_name=binding.native_name,
         workspace_id=workspace_id,
         lane=lane,
@@ -254,6 +259,7 @@ def _execute_slot(
         native_name=binding.native_name,
         pane_locator=prepared.locator,
         provider=plan.provider,
+        workflow_role=plan.workflow_role,
         workspace_id=workspace_id,
         lane=lane,
         attest_launcher=attest_launcher,
@@ -341,6 +347,7 @@ def _execute_slot(
         detail += "; order_deferred_until_full_relaunch (no swap/bounce)"
     return SlotResult(
         provider=plan.provider,
+        workflow_role=plan.workflow_role,
         assigned_name=plan.assigned_name,
         outcome=SLOT_LAUNCHED,
         locator=locator,

@@ -60,8 +60,13 @@ def _render_text(result: SessionStartResult) -> str:
         # because an operator reading back a terminal cannot re-derive it.
         lines[0] += f" action={result.action_id}"
     for slot in result.slots:
+        actor = (
+            f"{slot.workflow_role} via {slot.provider}"
+            if slot.workflow_role
+            else slot.provider
+        )
         line = (
-            f"  - {slot.provider}: {slot.outcome} name={slot.assigned_name}"
+            f"  - {actor}: {slot.outcome} name={slot.assigned_name}"
             + (f" locator={slot.locator}" if slot.locator else "")
         )
         # Redmine #13948: the outcome is what the launcher did; the health is what is

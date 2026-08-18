@@ -51,7 +51,7 @@ def _plan() -> dict:
     top = "mzb1_ws__codex__default"
     supervisor_label = "org.mozyo-bridge.callback-supervisor"
     return {
-        "schema_version": 4,
+        "schema_version": 5,
         "candidate_artifact": {
             "distribution": "testpypi",
             "version": "0.15.0a4",
@@ -110,7 +110,7 @@ def _plan() -> dict:
             "attestation": {
                 "state": "recognized",
                 "version": 1,
-                "target_version": 4,
+                "target_version": 5,
                 "upgrade_required": False,
                 "content_digest": "1" * 64,
                 "migration_plan_digest": "",
@@ -156,7 +156,7 @@ def _plan() -> dict:
         "stop_order": [top],
         "restore_order": [top],
         "schema_transitions": [
-            {"store": "attestation", "from_version": 1, "to_version": 4},
+            {"store": "attestation", "from_version": 1, "to_version": 5},
             {"store": "lane_lifecycle", "from_version": 10, "to_version": 11},
             {"store": "launch_generation", "from_version": 1, "to_version": 2},
             {"store": "startup_transaction", "from_version": 1, "to_version": 2},
@@ -171,7 +171,7 @@ def _plan() -> dict:
             {"phase": "top_workspace_stop", "assigned_names": [top]},
             {"phase": "consumer_zero", "required_readback": "zero"},
             {"phase": "verified_backup", "stores": ["attestation"]},
-            {"phase": "migrate_attestation", "target_version": 4},
+            {"phase": "migrate_attestation", "target_version": 5},
             {"phase": "migrate_lane_lifecycle", "target_version": 11},
             {"phase": "migrate_startup_transaction", "target_version": 2},
             {"phase": "rebuild_launch_generation", "target_version": 2},
@@ -364,6 +364,21 @@ def _historical_v3_plan() -> dict:
     return plan
 
 
+def _historical_v4_plan() -> dict:
+    """The exact pre-workflow-role attestation target written by schema v4."""
+
+    plan = json.loads(json.dumps(_plan()))
+    plan["schema_version"] = 4
+    plan["stores"]["attestation"]["target_version"] = 4
+    for transition in plan["schema_transitions"]:
+        if transition["store"] == "attestation":
+            transition["to_version"] = 4
+    for phase in plan["phase_order"]:
+        if phase["phase"] == "migrate_attestation":
+            phase["target_version"] = 4
+    return plan
+
+
 class FakeOps:
     def __init__(self, *, fail_once: str = ""):
         self.fail_once = fail_once
@@ -538,7 +553,7 @@ class OfflineRolloutActionTests(unittest.TestCase):
     def test_plan_numeric_versions_require_exact_int_not_bool_or_float(self) -> None:
         mutations = (
             lambda plan: plan.__setitem__("schema_version", True),
-            lambda plan: plan.__setitem__("schema_version", 4.0),
+            lambda plan: plan.__setitem__("schema_version", 5.0),
             lambda plan: plan["stores"]["lane_lifecycle"].__setitem__(
                 "target_version", 11.0
             ),
@@ -698,6 +713,9 @@ class OfflineRolloutActionTests(unittest.TestCase):
         from mozyo_bridge.core.state.herdr_session_start_gate import (
             require_session_start_gate,
         )
+        from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (  # noqa: E501
+            RepoLocalConfig,
+        )
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application import (  # noqa: E501
             herdr_session_start as use_case,
             herdr_session_start_entry as entry,
@@ -780,9 +798,7 @@ class OfflineRolloutActionTests(unittest.TestCase):
             patch.object(
                 service,
                 "load_repo_local_config",
-                return_value=SimpleNamespace(
-                    agent_launch=None, lane_placement=None
-                ),
+                return_value=RepoLocalConfig.default(),
             ),
             patch.object(
                 service,
@@ -1223,6 +1239,42 @@ class OfflineRolloutActionTests(unittest.TestCase):
         tampered["active_phase"] = "migrate_lane_lifecycle"
         with self.assertRaises(OfflineRolloutActionError):
             validate_action(tampered)
+
+    def test_historical_v4_is_status_only_and_never_execution_authority(self) -> None:
+        historical = _historical_v4_plan()
+        historical_digest = canonical_digest(historical)
+        action_id = "offline_" + "7" * 32
+        action = new_action(
+            action_id=action_id,
+            plan=self.plan,
+            plan_digest=self.digest,
+            approval_pointer="14838:97999",
+            private_bindings={},
+            now="2026-08-18T00:00:00+00:00",
+        )
+        action.update(
+            plan=historical,
+            plan_digest=historical_digest,
+            state="delegated",
+        )
+        store = OfflineRolloutActionStore(self.home)
+        directory = store.action_directory(action_id, create=True)
+        record = directory / "action.json"
+        store._write_path(record, action)  # noqa: SLF001 - frozen archival fixture
+
+        status = status_offline_rollout_action(action_id=action_id, home=self.home)
+        self.assertTrue(status.ok, status.as_payload())
+        with self.assertRaisesRegex(
+            OfflineRolloutActionStoreError, "plan_schema_unsupported"
+        ):
+            store.load(action_id)
+        before = record.read_bytes()
+        blocked = run_offline_rollout_action(
+            action_id=action_id, home=self.home, ops=FakeOps()
+        )
+        self.assertFalse(blocked.ok)
+        self.assertEqual(blocked.reason, "plan_schema_unsupported")
+        self.assertEqual(record.read_bytes(), before)
 
     def test_historical_v3_is_status_only_through_the_same_sealed_reader(self) -> None:
         sentinel = "/private/historical-v3/nonce-or-path"

@@ -1077,9 +1077,9 @@ project は、staging branch を持たず `origin/main` を新規 lane の base�
 
 この境界は**観測された workflow 上の risk から引かれたものであり、特定 model の能力についての固定的な判断ではない**。model や tooling が変わったら provider binding は見直してよいが、守っている構造は変えない: main unit は owner 窓口 / audit / routing の正本に最も近いため、隣接 actor が黙って gate 判断や owner 判断を下すと multi-lane model 全体の分離が崩壊する。
 
-### runtime 実装状況 (語彙先行、未配線)
+### runtime 実装状況 (Redmine #15687)
 
-`coordinator_assistant` は現時点では**文書上の actor / authority 語彙**であり、packaged role profile token、handoff `role_profile`、repo-local `provider_binding` role、launch profile、runtime identity としては未実装である。したがって、`mozyo-bridge` command や config にこの token を渡せると記述してはならない。runtime 対応が別 issue で実装されるまでは、具体の default-lane provider / command は既存設定で起動し、本節の contract を運用上適用する。文書上の正式化を runtime 配線完了の証拠にしない。
+`coordinator_assistant` は packaged role profile token、handoff `role_profile`、repo-local `agents.roles`、default coordinator-unit launch、startup self-attestation に配線済みである。default unit は `coordinator` と `coordinator_assistant` を role→profile→provider→argv で別解決し、`MOZYO_WORKFLOW_ROLE` と attestation store の `workflow_role` で provider identity とは別に readback する。mzb1 assigned name と `MOZYO_AGENT_ROLE` は引き続き provider token (`claude` / `codex`) であり、assistant role を routing / owner / close authority へ昇格しない。同じ provider に両 role を bind すると別 actor として attest できないため launch 前に fail-closed する。
 
 ### `coordinator_assistant` は並列 coordinator ではない
 
@@ -1125,20 +1125,22 @@ assistant provider に渡された依頼はこれを変えない。`## Claude / 
 
 ## 委譲コーディネータ role model (delegated coordinator)
 
-親 project の coordinator から子 project へ作業を委譲すると、子が coordinator なのか implementation worker なのかが handoff ごとに曖昧になり、責務境界と callback 経路が崩れる。本節は、その委譲を監査可能に保つ最小 role 語彙 (4 role)、責務境界、固定 role profile template、そして孫 (grandchild) dispatch の判断基準を固定する。無限階層は目指さない — 扱うのは監査可能な shallow delegation のみである。custom instruction = 固定 role profile、handoff = structured fields として分離する。これは repo-local spec の portable な抽出である (Redmine #13029; `mozyo_bridge` では `vibes/docs/specs/delegated-coordinator-role-profile.md` が採用記録と packaged runtime 設定 (`role_profile_templates.yaml`) の同期 anchor を repo 固有差分として保持する)。
+親 project の coordinator から子 project へ作業を委譲すると、子が coordinator なのか implementation worker なのかが handoff ごとに曖昧になり、責務境界と callback 経路が崩れる。本節は、その委譲を監査可能に保つ委譲 4 role と隣接する `coordinator_assistant`、責務境界、固定 role profile template、そして孫 (grandchild) dispatch の判断基準を固定する。無限階層は目指さない — 扱うのは監査可能な shallow delegation のみである。custom instruction = 固定 role profile、handoff = structured fields として分離する。これは repo-local spec の portable な抽出である (Redmine #13029 / #15687; `mozyo_bridge` では `vibes/docs/specs/delegated-coordinator-role-profile.md` が採用記録と packaged runtime 設定 (`role_profile_templates.yaml`) の同期 anchor を repo 固有差分として保持する)。
 
 各 role は固定 profile token である。pane 配置や window 名から推測せず、handoff の structured field と本節の定義で解決する。
 
-### role 語彙 (最小 4 role)
+### role 語彙 (委譲 4 role + coordinator assistant)
 
-- **`coordinator`** — 最上位 (親) project の coordinator。owner-facing actor。owner への質問・owner approval 回収、親 issue / US の Review Gate 解釈と close、release / publish coordination、子 lane への委譲 dispatch を持つ。すべての owner-approval-waiting state は最終的にここへ集約する (`## Owner 承認の集約`)。単一 project model の main coordinator lane Codex に対応する。
+- **`coordinator`** — 最上位 (親) project の coordinator。owner-facing actor。owner への質問・owner approval 回収、親 issue / US の Review Gate 解釈と close、release / publish coordination、子 lane への委譲 dispatch を持つ。すべての owner-approval-waiting state は最終的にここへ集約する (`## Owner 承認の集約`)。provider binding は authority を変更しない。
+- **`coordinator_assistant`** — coordinator に隣接する非権威的 actor。read-only 調査、要約、候補抽出、scratch、draft、Design Consultation 準備のみを担い、出力は input-not-evidence。owner-facing、review verdict、routing、gate、close、integration、実装 diff は担わない。階層の第4層ではない。
 - **`delegated_coordinator`** — 親 coordinator から委譲された子 project の coordinator。子 project 内では coordinator として振る舞うが、authority は委譲範囲に限定される: 子 project 内の dispatch / audit / 子 issue (子 project の Task / Test / Bug、必要なら子 US) の close、孫 implementation lane への shallow downstream dispatch。**親 issue は close せず、owner approval を自 lane で solicit / collect / ratify しない** — owner-approval-waiting は親 coordinator route へ callback して戻す。handoff-worthy state (implementation_done / review_request / review_result / owner_close_approval_waiting / blocked) を親 coordinator route へ callback し、孫からの callback を受けて必要分を親へ集約する。単一 project model には存在しない新 role である。
 - **`implementation_gateway`** — lane の gateway actor (target-lane Codex)。cross-lane / cross-session handoff の受け口。durable anchor を読み、自 lane に属する request か確認し、same-lane の `implementation_worker` へ submit 完結で route し、blocked / review-ready / owner-action-needed を上位 (coordinator または delegated_coordinator) へ callback する。実装 diff を直接作らず、owner approval 回収・parent close をしない。
 - **`implementation_worker`** — bounded 実装者 (sublane Claude)。durable anchor (pane scrollback ではなく ticket journal) から実装し、implementation_done / review_request / verification / residual risk を再現可能に記録する。1 UserStory 内に閉じる local implementation detail を決める。owner approval 回収、issue close、coordinator-owned 仕様決定の自己確定 (`## 仕様決定 routing`) はしない。仕様矛盾・scope 不足・invariant 衝突に当たったら停止し、design consultation / blocked / owner-action-needed を記録して上位へ callback する。
 
 | role token | 対応 actor | parent close | owner approval 回収 | 実装 diff |
 | --- | --- | --- | --- | --- |
-| `coordinator` | 管制塔 Codex (main lane) | 可 | 可 (単一集約点) | 不可 |
+| `coordinator` | 最上位 coordinator | 可 | 可 (単一集約点) | 不可 |
+| `coordinator_assistant` | coordinator 隣接補助 actor | 不可 | 不可 | 不可 |
 | `delegated_coordinator` | 子 project 管制塔 Codex | 不可 | 不可 (親へ戻す) | 不可 |
 | `implementation_gateway` | target-lane Codex | 不可 | 不可 | 不可 |
 | `implementation_worker` | sublane Claude | 不可 | 不可 | 可 (bounded) |
@@ -1158,7 +1160,7 @@ template 本文が名指しする durable gate heading の canonical literal (`#
 
 ```text
 # role profile: coordinator
-- あなたは <project> の最上位 coordinator (管制塔 Codex) である。
+- あなたは <project> の最上位 coordinator である。provider名はauthorityを変更しない。
 - owner-facing 判断、owner approval 回収、親 issue / US の Review Gate と close を担う。
 - 実装 diff は自分で作らず、子 lane / sublane へ委譲する。
 - implementation dispatch 前に effective work unit を per-dispatch override > repo-local `work_unit.granularity` > built-in `user_story` fallback の順で解決する。`user_story` では 1 US 配下の Task / Test / Bug を同一 lane の 1 dispatch で一気通貫に扱う。
@@ -1167,6 +1169,18 @@ template 本文が名指しする durable gate heading の canonical literal (`#
 - 通常運用は mozyo semantic facade (`workflow step` / `handoff` 等) のみを使う。raw Herdr / tmux command は adapter test / operator debug に限り、通常 turn では使わない。
 - dispatch / handoff / callback を送信したら blocking wait / poll をせず turn を終了 (zero-wait / yield) し、進捗再開は durable callback による新 turn に委ねる。
 - durable record: <redmine_project> の issue / journal。
+```
+
+```text
+# role profile: coordinator_assistant
+- あなたは最上位 coordinator に隣接する非権威的な coordinator_assistant である。provider名はauthorityを変更しない。
+- read-only調査、長いjournal/diff/logの要約、候補抽出、scratch、draft wording、Design Consultationの準備だけを行う。
+- 出力はcoordinatorへのinputでありevidenceではない。source file、durable record、command outputとの照合と最終判断はcoordinatorに残す。
+- ownerへの質問・回答、owner approvalの収集/確定、review verdict、routing決定、gate進行、issue close、integration dispositionを行わない。
+- 実装diffを作らない。implementation-shaped workは専用laneへ移し、そのlaneのimplementation_workerとして再受任されるまで停止する。
+- delegated_coordinator / implementation_gateway / implementation_workerを名乗らず、それらのauthorityを代行しない。
+- 通常運用はmozyo semantic facadeのみを使う。raw Herdr / tmux commandはadapter test / operator debugに限る。
+- 依頼を処理したらblocking wait / pollをせずturnを終了し、結果をcoordinatorへ返す。
 ```
 
 ```text
@@ -1186,7 +1200,7 @@ template 本文が名指しする durable gate heading の canonical literal (`#
 
 ```text
 # role profile: implementation_gateway
-- あなたは <lane> の implementation_gateway (target-lane Codex) である。
+- あなたは <lane> の implementation_gateway である。provider名はauthorityを変更しない。
 - cross-lane handoff を受け、durable anchor <durable_anchor> を読み、自 lane の request か確認する。same-lane ownership を確認したら main coordinator に重複 review を要求しない (durable Review Result が正本)。
 - durable anchor の `work_unit` 宣言を per-dispatch override > repo-local `work_unit.granularity` > built-in `user_story` fallback で解決した effective work unit と照合する。`user_story` では 1 US 配下の Task / Test / Bug を同一 lane の 1 dispatch で一気通貫に扱う。
 - 親 US を持つ `leaf_issue` dispatch は独立した durable owner/operator decision anchor を確認し、task-level review の必要性を leaf dispatch の根拠にしない。
@@ -1204,7 +1218,7 @@ template 本文が名指しする durable gate heading の canonical literal (`#
 
 ```text
 # role profile: implementation_worker
-- あなたは <lane> の implementation_worker (sublane Claude) である。
+- あなたは <lane> の implementation_worker である。provider名はauthorityを変更しない。
 - durable anchor <durable_anchor> から実装し、implementation_done / review_request / verification / residual risk を記録する。
 - durable gate heading は canonical literal に固定する (`## Gate: implementation_done` / `## Gate: review_request`)。round・説明は gate token 本体へ埋め込まず、bounded qualifier (` — R3`) か body field へ置く。gate token を言い換えると `workflow glance` が anchor を失う。
 - implementation / review finding verdict / correction を durable 記録し、same-lane gateway (<gateway_callback_target>) へ返す。
@@ -1268,7 +1282,7 @@ project ごとの policy knob (delegation の有無、孫 dispatch の許可範�
 
 - **cross-lane / cross-session の direct Claude send 禁止は委譲下でも緩まない。** 委譲階層がどれだけあっても、lane 横断は Codex-to-Codex のままである (`## Workspace 横断 handoff` / `## 自然名 target への handoff`)。
 - **durable record が正本であり続ける。** role は handoff structured field と本節の定義から解決し、pane title / window 名から推測しない。委譲判断・孫 dispatch 判断・callback outcome はすべて ticket journal に記録する。
-- **operator 固有の構成を OSS default に入れない。** どの具体 project family を委譲でつなぐか、子 coordinator の window / cockpit 配置、private な delegation policy は operator の runtime に属する (採用 repo の public / private 境界規約を参照。`mozyo_bridge` では `vibes/docs/rules/public-private-boundary.md`)。portable な部分は*4 role の固定語彙と権限対応表、階層を 1 段ずつ上る callback、`purpose: preserve_coordinator_context` を軸とする孫 dispatch 判断、通常運用 = mozyo facade only / dispatch 後 zero-wait / raw Herdr・tmux は operator debug 限定という運用規律、そして固定 safety invariant* である。
+- **operator 固有の構成を OSS default に入れない。** どの具体 project family を委譲でつなぐか、子 coordinator の window / cockpit 配置、private な delegation policy は operator の runtime に属する (採用 repo の public / private 境界規約を参照。`mozyo_bridge` では `vibes/docs/rules/public-private-boundary.md`)。portable な部分は*委譲 4 role と隣接 assistant の固定語彙・権限対応表、階層を 1 段ずつ上る callback、`purpose: preserve_coordinator_context` を軸とする孫 dispatch 判断、通常運用 = mozyo facade only / dispatch 後 zero-wait / raw Herdr・tmux は operator debug 限定という運用規律、そして固定 safety invariant* である。
 
 ## Durable record の根拠出所 (Evidence Provenance)
 

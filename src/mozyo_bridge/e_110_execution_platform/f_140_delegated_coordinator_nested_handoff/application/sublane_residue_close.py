@@ -73,7 +73,7 @@ RESIDUE_LAUNCH_IN_FLIGHT = "launch_in_flight"
 #: slots that looked like residue moments ago, and reporting "no residue" would be the
 #: unproven-no-op misread this surface exists to avoid.
 RESIDUE_IDENTITY_MOVED = "residue_identity_moved"
-#: Planned residue lacks a current v4/completed-v2 destructive license.
+#: Planned residue lacks a current-attestation/completed-v2 destructive license.
 RESIDUE_GENERATION_UNVERIFIED = "residue_generation_unverified"
 #: Advisory file locking is unavailable, so the launch/close exclusion cannot be honored.
 RESIDUE_EXCLUSION_UNAVAILABLE = "exclusion_unavailable"

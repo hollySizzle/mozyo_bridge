@@ -193,6 +193,15 @@ def register_herdr_group(
     herdr_agent_attest.add_argument("--role", dest="role", default="")
     herdr_agent_attest.add_argument("--lane", dest="lane", default="")
     herdr_agent_attest.add_argument(
+        "--workflow-role",
+        dest="workflow_role",
+        default="",
+        help=(
+            "Governed runtime responsibility observed independently from the provider "
+            "identity (empty for a legacy role-unaware launch)."
+        ),
+    )
+    herdr_agent_attest.add_argument(
         "--replacement-action-id",
         dest="replacement_action_id",
         default="",

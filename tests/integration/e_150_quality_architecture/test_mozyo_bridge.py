@@ -1072,7 +1072,7 @@ class SharedSkillWorkflowTest(unittest.TestCase):
     def test_coordinator_assistant_safe_use_section_present(self) -> None:
         """Redmine #11858 / #14240: the shared skill carries one provider-neutral
         coordinator-assistant boundary, including why the abstraction exists,
-        compatibility wording, and the explicit runtime gap."""
+        compatibility wording, and the explicit runtime identity wiring."""
         section_start = self.workflow.index("## `coordinator_assistant` の安全使用境界")
         section_end = self.workflow.index(
             "\n## 委譲コーディネータ role model", section_start
@@ -1090,10 +1090,10 @@ class SharedSkillWorkflowTest(unittest.TestCase):
         self.assertIn("provider の差し替えを authority の変更にしない", section)
         self.assertIn("`coordinator_assistant via claude`", section)
         self.assertIn("actor の canonical name ではない", section)
-        self.assertIn("### runtime 実装状況 (語彙先行、未配線)", section)
+        self.assertIn("### runtime 実装状況 (Redmine #15687)", section)
         self.assertIn("packaged role profile token", section)
         self.assertIn(
-            "`mozyo-bridge` command や config にこの token を渡せると記述してはならない",
+            "`MOZYO_WORKFLOW_ROLE` と attestation store の `workflow_role`",
             section,
         )
         # Output is input/draft, never evidence the coordinator can act on

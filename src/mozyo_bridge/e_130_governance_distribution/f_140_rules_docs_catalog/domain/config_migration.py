@@ -39,6 +39,7 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
     DEFAULT_PROFILE_PROVIDERS,
     DEFAULT_ROLE_PROFILES,
+    ROLE_COORDINATOR_ASSISTANT,
     RoleProviderBinding,
 )
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (
@@ -123,7 +124,14 @@ def migrate_record(
 
     # 1. Effective role -> provider (default merged with v1 overrides). The default binding
     #    is itself the projection of the canonical role -> profile -> provider topology.
-    effective = config.provider_binding.binding.as_mapping()
+    # v1 never had a coordinator-assistant runtime role. Do not manufacture an explicit
+    # assistant -> legacy implementation profile override while migrating old semantics;
+    # the new v2 built-in default supplies the assistant binding independently.
+    effective = {
+        role: provider
+        for role, provider in config.provider_binding.binding.as_mapping().items()
+        if role != ROLE_COORDINATOR_ASSISTANT
+    }
     default_binding = RoleProviderBinding.default()
     for role, provider in sorted(config.provider_binding.overrides):
         if provider == default_binding.provider_for(role):

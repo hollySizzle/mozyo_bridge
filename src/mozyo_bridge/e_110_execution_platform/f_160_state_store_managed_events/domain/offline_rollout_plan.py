@@ -19,7 +19,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 
 
-OFFLINE_ROLLOUT_PLAN_SCHEMA_VERSION = 4
+OFFLINE_ROLLOUT_PLAN_SCHEMA_VERSION = 5
 
 PLAN_READY = "planned"
 PLAN_REFUSED = "refused"
@@ -44,7 +44,7 @@ STORE_NAMES = frozenset(
      STORE_STARTUP_TRANSACTION}
 )
 STORE_TARGET_VERSIONS = {
-    STORE_ATTESTATION: 4,
+    STORE_ATTESTATION: 5,
     STORE_LANE_LIFECYCLE: 11,
     STORE_LAUNCH_GENERATION: 2,
     STORE_STARTUP_TRANSACTION: 2,
@@ -620,7 +620,10 @@ def build_offline_rollout_plan(
             {"phase": "top_workspace_stop", "assigned_names": [top_name]},
             {"phase": "consumer_zero", "required_readback": "zero"},
             {"phase": "verified_backup", "stores": sorted(stores)},
-            {"phase": "migrate_attestation", "target_version": 4},
+            {
+                "phase": "migrate_attestation",
+                "target_version": STORE_TARGET_VERSIONS[STORE_ATTESTATION],
+            },
             {"phase": "migrate_lane_lifecycle", "target_version": 11},
             {"phase": "migrate_startup_transaction", "target_version": 2},
             {"phase": "rebuild_launch_generation", "target_version": 2},

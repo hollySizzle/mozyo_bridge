@@ -64,14 +64,14 @@ sender env** に置き換える。
   malformed row混在はいずれもnon-greenである。
 - **global offline rolloutのdestructive pin** (#15227 j#104067) はprivate `close_authority` v2へ
   workspace/lane/role/assigned-name/locator/`startup_action_id`を保存し、terminal値そのものは保存しない。
-  delegate captureと各close直前に、保存tokenをfresh full inventoryのterminal、v4 attestation、completed
+  delegate captureと各close直前に、保存tokenをfresh full inventoryのterminal、current attestation、completed
   generation-v2へexact再joinする。first non-replayでtarget absentならclose 0、active-phase replayと各close後は
   同じgenerationが指すterminalのpositive absenceだけを許可し、name/locator/terminal reclaimまたはstore不読は
   後続close 0で拒否する。Herdr 0.8のlocator-only mutationにatomic conditional closeが無い制約は残る。
 - **absent legacy recoveryの非破壊pin** は`close_authority`へ混ぜず、別のprivate closed
   `legacy_absence_authority` v1へworkspace/lane/provider/name/old locator/old `startup_action_id`を保存する。
   raw terminalは保存・公開・repr描画しない。captureは同じfresh agent+pane snapshotでcurrent generation-v2、
-  completed pair action、`pane_bound_v2` receipt、v4 attestationへexact joinし、name/locator/terminalのpositive
+  completed pair action、`pane_bound_v2` receipt、current attestationへexact joinし、name/locator/terminalのpositive
   absenceとpairの同一old container + passive root exact 1件を要求する。各effect edgeでも再検証し、明示的な
   generation rebuild完了後、expected restore generationがcurrent rowを置換した場合だけcompleted startup
   receiptをold terminalのfallback authorityにする。row欠落やforeign generationはfallbackしない。このpinは
@@ -83,7 +83,7 @@ sender env** に置き換える。
   terminal値は保存しない。restore前は全original generationのpositive absence、restore中は
   「completed exact expected actionのnew terminal-bound generation」または「expected action absent」の
   2 stateだけをcumulative exact rosterとして許可し、それ以外をatomic residualとして追加launchなしで
-  拒否する。restore後は全nameがexpected new action + v4 attestation + completed generation-v2へexact join
+  拒否する。restore後は全nameがexpected new action + current attestation + completed generation-v2へexact join
   することを各supervisor/final edgeで再確認する。completed-successのexact groupだけはcrash replayでfoldし、
   planned / partial / rollback / foreign / missing / extraを自動cleanupやfresh nonceへ畳まない。nonceは
   public CLI/argv/stdout/provider env/status/reprへ出さず、exact candidate runnerがshared typed session-start
@@ -820,7 +820,7 @@ binding を持たない (provider の選択ではなく split の配分である
 #### ratio actuation (Redmine #14569、実測 j#91140)
 
 herdr 0.7.4 `agent start` は **`--ratio` を持たない** (`pane split` / `pane move` は持つ)。したがって
-`ratio` は launch argv には乗らず、**全 launch 成功 + v4 attestation / completed generation-v2確定 + root pane保存判定の後**に herdr-native
+`ratio` は launch argv には乗らず、**全 launch 成功 + current attestation / completed generation-v2確定 + root pane保存判定の後**に herdr-native
 `pane resize --amount` で 1 度だけ actuate し、`pane layout` で **測って** 判定する。正本実装は
 `herdr_pair_split_ratio.finalize_container_geometry`。generation-unbound rootは閉じず、後続のcolumn /
 ratioもrootをagent generationとして数えない。rootの存在自体はfailureではない。terminal-bound managed
@@ -988,7 +988,7 @@ kind 層が参照されるのは **durable な lane_kind が解決でき、か�
   lane の lifecycle row を **launch が返った後**に declare するため、初回 launch 時点に stored kind は
   存在しない。context を渡さないと「pane を実際に作る launch」だけが `lane_class` 幾何になり、以後の
   heal だけ設定どおりになるという逆転が起きる。よって actuator は `prepare_actuator_lane_session`
-  (create / heal / current v4 replacement が通る唯一の funnel) へ pre-launch に context を渡す。
+  (create / heal / current replacement が通る唯一の funnel) へ pre-launch に context を渡す。
   v1-v3 side-binding は診断専用で、この funnel の current launch authorityにはならない。
 - **heal** = lane lifecycle authority row の generation-bound `lane_kind` (schema v7、
   `managed-state-model.md`)。launch chokepoint が **network 無し / display cache 無し**で offline 読解する。
@@ -1113,17 +1113,24 @@ launch 側は単一の `except` でそれを typed zero-start に変換するた
 
 ### 境界
 
-- `workflow_role` / `profile_id` は **plan-only**。mzb1 assigned name /
-  `MOZYO_AGENT_ROLE` (= provider token) / route / attestation / retire identity へ昇格しない
-  (j#84266)。
+- 本節の `LaneLaunchContext.slot_specs` に含まれる `workflow_role` / `profile_id` は
+  **plan-only**。mzb1 assigned name / `MOZYO_AGENT_ROLE` (= provider token) / route / retire
+  identity へ昇格しない (j#84266)。一方、#15687 の default coordinator-unit 配線は別の
+  canonical config rail で `coordinator` / `coordinator_assistant` を role→profile→provider→argv
+  に解決し、`MOZYO_WORKFLOW_ROLE` と startup attestation の `workflow_role` へ合成する。
+  `profile_id` は runtime identity にしない。
 - role は**推測しない**。durable governance から一意に解決した caller だけが供給し、供給された
-  が未登録なら fallback せず zero-start。`coordinator_assistant` を偽の `implementer` へ写像
-  しない (本 US non-goal、別 issue)。
+  が未登録なら fallback せず zero-start。`coordinator_assistant` は正式な隣接 role として
+  登録されたが、`implementation_worker` / `implementer` へ写像せず、routing / owner / close
+  authority も得ない。
 - anchor 語彙は lifecycle authority record と同じ `DecisionPointer` を再利用する (並行語彙を
   作らない)。
-- **本 tranche の gate は「拒否」しかしない**: plan を argv 構築へ合成するのは後続 tranche で
-  あり、valid な plan を渡しても launch argv は plan 無しと byte 一致する。
-- `slot_specs` 未指定 (既存の全 caller) は検証自体を行わず、pre-#13647 と byte 一致。
+- **本 tranche の `slot_specs` gate は「拒否」しかしない**: その plan 自体は argv 構築へ
+  合成せず、valid な `slot_specs` を渡しても launch argv は同 rail の plan 無しと byte 一致する。
+  default coordinator-unit の role-specific argv 合成は #15687 の別 rail であり、この主張の例外では
+  なく別契約である。
+- `slot_specs` 未指定の caller は本 gate の検証を行わない。ただし default coordinator-unit service
+  は #15687 の canonical config rail を独立に適用する。
 
 ## 5.1.1 coordinator placement mode — operator-scoped 配置 (Redmine #14139)
 
@@ -1329,7 +1336,7 @@ relayout を承認し、**推測ではなく実測で検証すること**を条�
 - 列数 `N` はHerdrが表現できる最小ratio `0.1`から最大10とする。11組目以降は最初のpane move前に
   fail-closedする。各resizeは指定paneの最近RIGHT軸ancestorが「現在列からtab右端まで」のrectであることを
   再確認し、command成功ではなく再読したratioのstrict progressと最終幅差で判定する。
-- generation-unbound cosmetic rootはcloseせず、column authorityにも数えない。全managed paneのv4 attestation
+- generation-unbound cosmetic rootはcloseせず、column authorityにも数えない。全managed paneのcurrent attestation
   + completed generation-v2を確定してから、managed paneだけがexact tilingする一意なsplit subtreeを作る。
   root/外側paneはsubtreeと非交差でなければならず、そのpane rectと外側split fingerprint、managed authority、
   phaseごとのinternal topologyを各detach/attach/resize直前にfresh readで再照合する。rootが安全に分離できる

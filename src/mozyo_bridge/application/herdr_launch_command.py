@@ -168,7 +168,12 @@ def render_herdr_session_block(
         f"herdr session-start: workspace={result.workspace_id} lane={result.lane_id}"
     ]
     for slot in result.slots:
-        line = f"  - {slot.provider}: {slot.outcome} name={slot.assigned_name}"
+        actor = (
+            f"{slot.workflow_role} via {slot.provider}"
+            if slot.workflow_role
+            else slot.provider
+        )
+        line = f"  - {actor}: {slot.outcome} name={slot.assigned_name}"
         if slot.locator:
             line += f" locator={slot.locator}"
         lines.append(line)
@@ -255,16 +260,6 @@ class LiveHerdrLaunchOps:
         # tokens — byte-for-byte unchanged ON THAT BLOCK only. It is not a statement about
         # the launch as a whole: the `lane_placement` block right below resolves geometry
         # for an unconfigured repo too (Redmine #14568).
-        from mozyo_bridge.application.repo_local_config_loader import (
-            load_repo_local_config,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.coordinator_placement_loader import (  # noqa: E501
-            load_coordinator_placement_for_launch,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
-            CoordinatorPlacementError,
-        )
-
         # Config-driven pane placement (Redmine #13646): the bare `mozyo` coordinator pair
         # is the `default` lane_class, so the config's `lane_placement.default` split /
         # order decides the pair's geometry and which provider occupies first.
@@ -273,37 +268,23 @@ class LiveHerdrLaunchOps:
         # with `order: (codex, claude)` — so this pair lands vertically with the coordinator
         # on top even though `LAUNCH_PROVIDERS` below is claude-first. A repo rolls that
         # back with an explicit `lane_placement.default.split: right`.
-        repo_config = load_repo_local_config(repo_root)
-        # Operator-scoped coordinator placement mode (Redmine #14139): read from the
-        # mozyo-bridge HOME (never a repo-committed value), so the coordinator pair lands
-        # in a per-project workspace (default) or the shared coordinators space per this
-        # operator's choice. A broken operator file fails closed with an actionable refusal.
-        try:
-            coordinator_placement = load_coordinator_placement_for_launch()
-        except CoordinatorPlacementError as exc:
-            self.die(f"mozyo launch failed: invalid operator coordinator placement: {exc}")
-            raise AssertionError("unreachable")
         # Lane-role placement (Redmine #13647): the bare `mozyo` pair IS the 親 —
         # `lane_kind: coordinator` is true by construction of this entry point, not
         # inferred from a display cache or pane proximity, so it is the caller-supplied
         # fresh-launch authority the launch chokepoint keys `by_lane_kind` on. A repo with
         # no `by_lane_kind.coordinator` block keeps its `lane_placement.default` geometry.
-        from mozyo_bridge.core.state.lane_kind import LANE_KIND_COORDINATOR
-        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_lane_launch_context import (  # noqa: E501
-            LaneLaunchContext,
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start_service import (  # noqa: E501
+            prepare_configured_session,
         )
 
-        return prepare_session(
+        return prepare_configured_session(
             repo_root=repo_root,
-            providers=list(LAUNCH_PROVIDERS),
+            agents=list(LAUNCH_PROVIDERS),
             lane_id="",
-            launch_context=LaneLaunchContext(lane_kind=LANE_KIND_COORDINATOR),
             env=self._env,
+            dry_run=False,
             claude_permission_mode_default=COCKPIT_CLAUDE_PERMISSION_MODE_DEFAULT,
-            agent_launch=repo_config.agent_launch,
-            lane_placement=repo_config.lane_placement,
-            coordinator_placement_mode=coordinator_placement.mode,
-            coordinator_top_workspace_id=coordinator_placement.top_workspace_id,
+            session_preparer=prepare_session,
         )
 
     def attach(self, argv: list[str]) -> NoReturn:

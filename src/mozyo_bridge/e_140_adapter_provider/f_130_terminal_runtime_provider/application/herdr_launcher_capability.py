@@ -5,12 +5,12 @@ The #13748 launcher preflight (:func:`...herdr_pane_lifecycle
 ``herdr agent-attest`` subcommand by matching :data:`...herdr_launch_argv
 .ATTEST_CAPABILITY_MARKER` (``--assigned-name``) in its ``--help`` output. That is a
 **subcommand-marker** check only. It cannot see the failure #13847 closes: the source
-runtime's startup self-attestation store is schema v4
+runtime's startup self-attestation store is the current schema
 (:data:`...herdr_identity_attestation.HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION`), but a
 managed launch may be wrapped through an *older installed* launcher whose attestation
 store is v1. Both launchers carry ``agent-attest`` and ``--assigned-name`` — so the
 subcommand-marker probe passes — yet the v1 launcher, injected with the source runtime's
-shared ``MOZYO_BRIDGE_HOME``, opens the v4 store, hits the exact-version write guard
+shared ``MOZYO_BRIDGE_HOME``, opens the newer store, hits the exact-version write guard
 (``_connect_rw``), silently drops the attestation, and ``exec``s the provider anyway. The
 pair boots **live but unattested / stale**, and every downstream verify (adopt, resume,
 recover) fails closed with no public recovery — the live evidence in the issue.

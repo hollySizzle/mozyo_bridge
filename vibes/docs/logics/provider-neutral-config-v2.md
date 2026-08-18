@@ -25,9 +25,11 @@ agents:
   profiles:                     # named runtime profile: provider + 起動 argv を持つ唯一の面
     coordination: { provider: codex,  launch_argv: { default: [...], sublane: [...] } }
     implementation: { provider: claude, launch_argv: { sublane: ["--model", "claude-opus-4-8"] } }
+    coordinator_assistance: { provider: claude, launch_argv: { default: [...] } }
   roles:                        # role -> profile 名。role = authority、profile = adapter 属性
     coordinator: coordination
-    implementer: implementation
+    coordinator_assistant: coordinator_assistance
+    implementation_worker: implementation
 ```
 
 - `profiles.<name>.provider` は `agent_provider_ids()`（packaged trusted registry）に登録された
@@ -43,36 +45,44 @@ agents:
 
 default（`agents` 無し）は role-canonical な canonical default topology へ解決する。正本は
 `role_provider_binding.py` の `DEFAULT_ROLE_PROFILES`（role→profile）+ `DEFAULT_PROFILE_PROVIDERS`
-（profile→provider; `coordination`=codex / `implementation`=claude）。`_DEFAULT_BINDING`（role→
+（profile→provider; `coordination`=codex / `implementation`=claude /
+`coordinator_assistance`=claude）。`_DEFAULT_BINDING`（role→
 provider）と `DEFAULT_EXPECTED_AGENTS`（launch expected pair）は両方この canonical の **projection**
 であり、二重定義しない。expected topology は provider registry から導出しない（known ≠ expected）。
+この built-in default は製品既定であり、各 repo は named profile と role binding で上書きできる。
 
 ## 3. canonical resolution と current-launch compatibility adapter
 
 - **canonical semantics** = `role → profile → (provider, launch_argv[lane_class])`
   （`AgentsTopologyConfig.resolve_profile_for_role` / `resolve_provider_for_role` /
   `resolve_launch_argv_for_role`）。config semantics の正本はこれ。
-- 現行の herdr launch chokepoint は **provider-unit**（pane を provider 単位で起動し、mzb1
-  identity の role segment は provider token。起動時に workflow role は存在しない）。よって
-  launch は canonical から派生した **current-launch compatibility adapter**
-  （`to_resolved_launch_argv_triples` → provider-keyed `AgentLaunchConfig`）を消費する。この
-  provider-keyed fold は **canonical ではなく projection** であり、canonical と称さない
-  （Redmine #14148 Design Consultation Answer j#84267 条件1）。
+- default coordinator unit は #15687 で `coordinator` / `coordinator_assistant` を canonical に
+  role→profile→provider→default argv へ別解決する。workflow role は `MOZYO_WORKFLOW_ROLE` と
+  startup self-attestation の `workflow_role` で provider identity と別に readback する。mzb1
+  identity の role segment と `MOZYO_AGENT_ROLE` は引き続き provider token であり、role authority
+  には昇格しない。
+- general sublane launch は引き続き **provider-unit** なので、canonical から派生した
+  **current-launch compatibility adapter**（`to_resolved_launch_argv_triples` → provider-keyed
+  `AgentLaunchConfig`）を消費する。この provider-keyed fold は **canonical ではなく projection**
+  である（Redmine #14148 Design Consultation Answer j#84267 条件1）。
 
 ### runtime limitation（条件4）
 
-- 同一 provider の複数 named profile を role で区別する構成は **config authority の概念**であり、
-  現行の provider-unit launch はまだ反映できない。#14148 は「任意の role 別 profile がすでに
-  launch へ反映される」とは主張しない。
+- default coordinator unit では role 別 profile が launch へ反映される。ただし
+  `coordinator` と `coordinator_assistant` を同じ provider に bind すると、Herdr の1 provider =
+  1 durable physical slot という形では別 actor として attest できないため side effect 前に
+  fail-closed する。
+- default coordinator unit 以外で同一 provider の複数 named profile を role で区別する構成は
+  **config authority の概念**に留まり、general provider-unit launch はまだ任意の role 別 profile
+  を反映できない。
 - 同一 `(provider, lane_class)` を異なる argv へ束ねる 2 profile は provider-unit launch では
   1 pane に 2 argv を要求する **本質的に launch 不能**な構成であり、**config load 時**
   （最早 side-effect 前境界）に colliding profile 名を明示して fail-closed する。silent な
   select / merge / lane 間継承はしない。
-- launch-time の role 別 profile 選択は後続 **Redmine #13647**（launch-time lane-role vocabulary）
-  で導入する。そこでは transient launch slot/plan へ `workflow_role + profile_id + provider +
-  resolved argv` を whole-plan preflight で固定し、mzb1 durable identity / sender env / target
-  authority は provider token のまま維持する。role が一意に解決できない場合は guess せず facade
-  または typed fail-closed とする。
+- general sublane の role 別 profile 選択を追加する場合は、transient launch slot/plan へ
+  `workflow_role + profile_id + provider + resolved argv` を whole-plan preflight で固定し、mzb1
+  durable provider identity と workflow role attestation を混同しない。role が一意に解決できない
+  場合は guess せず typed fail-closed とする。
 
 ## 4. migration（`config migrate`）
 
@@ -82,9 +92,10 @@ provider）と `DEFAULT_EXPECTED_AGENTS`（launch expected pair）は両方こ�
 - `--check`（既定）: dry-run。plan と生成される v2 document を表示し **write 0**。
 - `--write`: `.bak` backup + temp file + `os.replace` の **atomic write**。書く前に生成 record を
   再検証する。
-- **idempotent**: v2 入力は「already v2」で no-op。**lossless**: v1 の effective role→provider と
+- **idempotent**: v2 入力は「already v2」で no-op。**lossless for v1 vocabulary**: v1 の effective role→provider と
   provider×lane_class launch argv を v2 の role→profile→launch へ完全保存する（migration 後は
-  profile 名でなく resolved role/provider/argv の意味論で比較する）。redundant な既定重複 binding
+  profile 名でなく resolved role/provider/argv の意味論で比較する）。v1 に存在しなかった
+  `coordinator_assistant` override は捏造せず、v2 built-in default から新規に得る。redundant な既定重複 binding
   （例 `coordinator: codex`）は drop する。
 - **registered-adapter 要件**（finding 5）: v1 は open provider を受理するが v2 profile は
   registered adapter id のみ。未登録 provider は silent drop / guess せず
@@ -121,5 +132,6 @@ provider）と `DEFAULT_EXPECTED_AGENTS`（launch expected pair）は両方こ�
 1. 既存 v1 config は `mozyo-bridge config migrate --check` で v2 plan を確認し、`--write` で移行する。
 2. provider を差し替えるときは role を編集せず、profile の `provider` を変える（または role を別
    profile へ束ね直す）。role authority は不変。
-3. 同一 provider で coordinator / gateway 等の起動 argv を分けたい場合、現行は lane_class で表現
-   できる範囲に限る。role 別の同一-provider profile 分岐は #13647 まで launch へは反映されない。
+3. default coordinator unit の coordinator / assistant は別 provider profile に bind する。同じ
+   provider にすると別 actor として durable に識別できず、launch は拒否される。general sublane
+   では同一 provider の role 別 argv 分岐をまだ表現できないため lane_class で表現できる範囲に限る。

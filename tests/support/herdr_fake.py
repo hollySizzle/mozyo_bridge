@@ -626,7 +626,7 @@ class FakeHerdr:
         )
         # A wrapped managed launch executes these writes before provider exec.
         # Model them at the same boundary so integration-style users of the
-        # canonical fake exercise current v4 + generation-v2 authority rather
+        # canonical fake exercise current v5 + generation-v2 authority rather
         # than silently degrading to an unwrapped legacy launch.
         action_id = parsed.env.get("MOZYO_STARTUP_ACTION_ID", "")
         store_home = parsed.env.get("MOZYO_BRIDGE_HOME", "")

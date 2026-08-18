@@ -93,10 +93,17 @@ HISTORICAL_V3_EXECUTION_PHASES = tuple(
 _READBACK_PHASES = {
     3: HISTORICAL_V3_EXECUTION_PHASES,
     4: EXECUTION_PHASES,
+    5: EXECUTION_PHASES,
 }
 _HISTORICAL_V3_STORE_TARGETS = {
     "attestation": 3,
     "lane_lifecycle": 10,
+    "startup_transaction": 2,
+}
+_HISTORICAL_V4_STORE_TARGETS = {
+    "attestation": 4,
+    "lane_lifecycle": 11,
+    "launch_generation": 2,
     "startup_transaction": 2,
 }
 
@@ -152,7 +159,7 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
         raise OfflineRolloutActionError("plan_invalid")
     if canonical_digest(plan) != digest:
         raise OfflineRolloutActionError("plan_digest_mismatch")
-    if type(plan.get("schema_version")) is not int or plan.get("schema_version") != 4:
+    if type(plan.get("schema_version")) is not int or plan.get("schema_version") != 5:
         raise OfflineRolloutActionError("plan_schema_unsupported")
     phases = plan.get("phase_order")
     if not isinstance(phases, list) or not phases:
@@ -204,7 +211,7 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
         raise OfflineRolloutActionError("artifact_distribution_unsupported")
     stores = plan.get("stores")
     targets = {
-        "attestation": 4, "lane_lifecycle": 11,
+        "attestation": 5, "lane_lifecycle": 11,
         "launch_generation": 2, "startup_transaction": 2,
     }
     if not isinstance(stores, Mapping) or set(stores) != set(targets):
@@ -285,7 +292,7 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
     ):
         raise OfflineRolloutActionError("plan_schema_transitions_invalid")
     for phase_name, target in (
-        ("migrate_attestation", 4),
+        ("migrate_attestation", 5),
         ("migrate_lane_lifecycle", 11),
         ("migrate_startup_transaction", 2),
         ("rebuild_launch_generation", 2),
@@ -589,10 +596,10 @@ def _readback_plan(
 ) -> tuple[Mapping[str, object], tuple[str, ...]]:
     """Decode only frozen plan generations safe for archival public status.
 
-    This is deliberately not execution compatibility.  Current v4 still traverses the
-    full strict verifier.  Historical v3 is admitted only with its frozen 15-phase order
-    and three old store targets, enough to validate the action prefix without reviving
-    the removed execution semantics.
+    This is deliberately not execution compatibility. Current v5 still traverses the
+    full strict verifier. Historical v4 and v3 are admitted only with their frozen phase
+    orders and store targets, enough to validate the action prefix without reviving the
+    removed execution semantics.
     """
 
     expected_digest = _token(digest, "plan_digest")
@@ -616,11 +623,64 @@ def _readback_plan(
     expected_phases = _READBACK_PHASES[version]
     if tuple(names) != expected_phases:
         raise OfflineRolloutActionError("plan_phase_order_unsupported")
-    if version == 4:
+    if version == 5:
         verify_plan(plan, expected_digest)
+    elif version == 4:
+        _verify_historical_v4_plan(plan)
     else:
         _verify_historical_v3_plan(plan)
     return plan, expected_phases
+
+
+def _verify_historical_v4_plan(plan: Mapping[str, object]) -> None:
+    """Validate frozen v4 bytes for status only, then reuse the current verifier.
+
+    v4 differs from v5 only in the attestation migration target. The synthetic copy is
+    never returned or persisted; it lets every unchanged authority invariant continue to
+    be checked by one maintained strict verifier.
+    """
+
+    stores = plan.get("stores")
+    if not isinstance(stores, Mapping) or set(stores) != set(
+        _HISTORICAL_V4_STORE_TARGETS
+    ):
+        raise OfflineRolloutActionError("plan_store_set_invalid")
+    for name, target in _HISTORICAL_V4_STORE_TARGETS.items():
+        record = stores.get(name)
+        if (
+            not isinstance(record, Mapping)
+            or type(record.get("target_version")) is not int
+            or record.get("target_version") != target
+        ):
+            raise OfflineRolloutActionError(f"plan_{name}_not_execution_ready")
+
+    expected_transitions = [
+        {
+            "store": name,
+            "from_version": stores[name].get("version"),
+            "to_version": target,
+        }
+        for name, target in sorted(_HISTORICAL_V4_STORE_TARGETS.items())
+    ]
+    if plan.get("schema_transitions") != expected_transitions:
+        raise OfflineRolloutActionError("plan_schema_transitions_invalid")
+    phases = plan["phase_order"]
+    attestation_phase = next(
+        phase for phase in phases if phase["phase"] == "migrate_attestation"
+    )
+    if attestation_phase.get("target_version") != 4:
+        raise OfflineRolloutActionError("plan_phase_target_version_invalid")
+
+    synthetic = json.loads(canonical_bytes(plan).decode("ascii"))
+    synthetic["schema_version"] = 5
+    synthetic["stores"]["attestation"]["target_version"] = 5
+    for transition in synthetic["schema_transitions"]:
+        if transition["store"] == "attestation":
+            transition["to_version"] = 5
+    for phase in synthetic["phase_order"]:
+        if phase["phase"] == "migrate_attestation":
+            phase["target_version"] = 5
+    verify_plan(synthetic, canonical_digest(synthetic))
 
 
 def _verify_historical_v3_plan(plan: Mapping[str, object]) -> None:
@@ -672,9 +732,9 @@ def _verify_historical_v3_plan(plan: Mapping[str, object]) -> None:
             raise OfflineRolloutActionError("plan_phase_target_version_invalid")
 
     synthetic = json.loads(canonical_bytes(plan).decode("ascii"))
-    synthetic["schema_version"] = 4
+    synthetic["schema_version"] = 5
     synthetic_stores = synthetic["stores"]
-    synthetic_stores["attestation"]["target_version"] = 4
+    synthetic_stores["attestation"]["target_version"] = 5
     synthetic_stores["lane_lifecycle"]["target_version"] = 11
     synthetic_stores["launch_generation"] = {
         "state": "absent",
@@ -692,7 +752,7 @@ def _verify_historical_v3_plan(plan: Mapping[str, object]) -> None:
         }
         for name, target in sorted(
             {
-                "attestation": 4,
+                "attestation": 5,
                 "lane_lifecycle": 11,
                 "launch_generation": 2,
                 "startup_transaction": 2,
@@ -702,7 +762,7 @@ def _verify_historical_v3_plan(plan: Mapping[str, object]) -> None:
     synthetic_phases = synthetic["phase_order"]
     for phase in synthetic_phases:
         if phase["phase"] == "migrate_attestation":
-            phase["target_version"] = 4
+            phase["target_version"] = 5
         elif phase["phase"] == "migrate_lane_lifecycle":
             phase["target_version"] = 11
     insert_at = HISTORICAL_V3_EXECUTION_PHASES.index("exact_runtime_install")

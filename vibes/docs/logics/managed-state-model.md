@@ -521,7 +521,7 @@ Table naming:
       (`lane_epoch_legacy_recovery_plan.CANONICAL_STEPS`): 旧 pair 両 slot を terminal close →
       attested-live intersection=0 の fresh 確認 → backup-first store migration + strict
       readback → launch-generation v1 backup/rebuild → lifecycle epoch `0→1` adoption →
-      v4 self-attestation + generation v2 / native epoch1 で fresh pair relaunch。
+      current self-attestation + generation v2 / native epoch1 で fresh pair relaunch。
       adoption を先に置くと crash 時に `epoch=1` + v1 store + live old pair が残り、上記の
       pre-effect fence が次の close を拒否する **自己 deadlock** になる。
       - ただし **この sequence を実行する rail は置かない**。j#96866 が実環境で計測した
@@ -560,14 +560,15 @@ Table naming:
       固定した内部actuation面であり、両mutation verbともliteral `--execute` がなければ
       zero-writeで拒否する。TestPyPI publishは本railの責務外で、既に存在するexact artifactだけを
       download/verify/installする。
-      - v4/4-store rolloutを生成・検証できない旧installed binaryでplanを作らない。bootstrapは
+      - v5/4-store rolloutを生成・検証できない旧installed binaryでplanを作らない。bootstrapは
         exact candidate artifactを隔離venvへ展開し、そのabsolute CLI pathとprovenanceをpinして旧homeを
         read-only capture → fresh owner approval → delegate/runする。旧schema v3 actionはeffect前にtyped
         refusalし、新candidateでの再planを要求する。ただしaction schema v1 + canonical plan schema v3の
         既存sealed recordは、共通のpermission/symlink/size/canonical JSON/payload seal検査を通る
         **status-only readback**では凍結済み15 phaseと3-store targetを読み続ける。strict `load` /
-        `load_locked` / `create` / `save_locked`はcurrent v4専用で、status readをexecution compatibilityや
-        backfillに昇格させない。plan v4でもprivate authorityが旧形なら同じくstatus-onlyである。
+        `load_locked` / `create` / `save_locked`はcurrent v5専用で、status readをexecution compatibilityや
+        backfillに昇格させない。plan v3/v4 は凍結済み旧targetを検証した status-only readback に限り、
+        execution compatibilityやbackfillへ昇格させない。plan v5でもprivate authorityが旧形なら同じくstatus-onlyである。
         candidateはold v1 generationを読むが通常launchへは
         書かず、consumer zero後のbackup/rebuild phaseだけがv2へ前進させる。
       - plan は home registry の **全 workspace id / project name**、global Herdr inventory の
@@ -584,7 +585,7 @@ Table naming:
         index を materialize しうる既知の bookkeeping 例外を除き、authority row / schema / process /
         worktree を変更しない。
       - canonical plan は top 以外を先に stop、top を最後に stopし、restore は top を最初にする。
-        schema transition は attestation `→v4`、lane lifecycle `→v11`、launch generation `v1→v2`
+        schema transition は attestation `→v5`、lane lifecycle `→v11`、launch generation `v1→v2`
         backup/rebuild、startup transaction `→v2`を明示する。artifactのsource SHA /
         `refs/heads/<branch>` / workflow run id / wheel SHA-256 /
         sdist SHA-256の5者がすべて揃う場合だけ `exact_pin_ready=true` とする。不足pinがあっても
@@ -611,9 +612,9 @@ Table naming:
         `close_authority={version:2,pins:[...]}` のclosed shapeへ分離し、各pinを
         workspace/lane/role/assigned-name/locator/`startup_action_id`へ束縛する。capture時に
         同一fresh full canonical inventory、name/locator/terminalのglobal uniqueness、exact target、
-        v4 attestation、completed launch-generation v2を全live plan targetについて連言できない場合は、
+        current attestation、completed launch-generation v2を全live plan targetについて連言できない場合は、
         action作成・runner準備より前にtyped zero-effectで拒否する。raw terminalはactionへ保存せず、
-        fresh join中だけ扱う。legacy attestation v1-v3 / launch-generation v1のlive fleetを本rail自身で
+        fresh join中だけ扱う。legacy attestation v1-v4 / launch-generation v1のlive fleetを本rail自身で
         停止してmigrationする例外は設けない（意図的zero-close）。必要ならidentity-bearing conditional
         global-stop primitiveを別Design Consultationで扱う。`${MOZYO_BRIDGE_HOME}/
         offline-rollout-actions-v1/<action-id>/` (0700、record 0600、payload SHA-256 seal、exclusive
@@ -667,7 +668,7 @@ Table naming:
         先取りしない。workspace idはpath componentに使わずhashしたprivate directoryへ格納する。
         stash/reset/checkoutは行わない。各close直前にfresh full snapshotを取り、sealed pinの
         assigned-name + locator + `startup_action_id`を全live rowのworkspace/lane/provider、in-memoryの
-        server-owned terminal、v4 attestation、completed generation-v2へ再joinする。duplicate・malformed・
+        server-owned terminal、current attestation、completed generation-v2へ再joinする。duplicate・malformed・
         unexpected row、token mismatch、store不読は当該close前にzero-closeで拒否する。ただしHerdr 0.8のmutationは
         locatorしか受け取らずatomic compare-and-closeを持たないため、fresh checkから`pane close`までの
         same-locator restore raceはprovider制約として残り、terminal値をpublic planへ出して補えない。
@@ -678,7 +679,7 @@ Table naming:
         consumer=0はfresh raw/projection countの連言で確認する。さらにconsumer-zero receiptを再利用せず、
         **各後続effect edge**で3-state fenceをfreshに評価する。(1) restore前のbackup/migration/rebuild/install/
         adoptionはfull raw/projection zero + 全original close pinのterminal-bound positive absence + schedulerの
-        positive stopped readback、(2) restore中はcompleted groupのexact current v4/generation-v2 rosterと
+        positive stopped readback、(2) restore中はcompleted groupのexact current-attestation/generation-v2 rosterと
         未restore groupのexpected action absent + original pin absence、(3) restore後のsupervisor/final phaseは
         全new generationのexact rosterを要求する。unmanaged/extra/malformed row、store/scheduler不読、name/
         locator/terminal reclaimはそのedge以降のeffectを0にする。phase handler入口だけでなく、store/hash等の
@@ -1179,7 +1180,7 @@ Table naming:
       （`declare_active`(existing)=`already_declared` zero-write、`declare_lane`=idempotent、実測）
       ため、live-zero read → terminal CAS の間に pair が起動すると live のまま `retired` になりえた。
       新 schema / durable claim は導入せず、既存の attestation-store exclusion lock を再利用して解決する:
-      全 managed launch（ordinary create/heal、current v4 replacement、quarantine `heal_receiver`、
+      全 managed launch（ordinary create/heal、current replacement、quarantine `heal_receiver`、
       lane identity を持たない bare / scratch / shared-space session start）は既に home の
       attestation-store lock を **shared 非 blocking** で「最初の attestation read 前から最後の
       actuation まで」保持するので、terminalizer が同 lock を **exclusive 非 blocking** で
@@ -1495,7 +1496,7 @@ Table naming:
         `startup_health_unconfirmed` として post-append inventory read-back / pair attestation / readiness / dispatch の前で
         zero-send にし、同 action の public rollback command を pointer として示すだけで auto rollback / auto close しない。
         `None` は startup result を持たない legacy non-Herdr adapter の互換値に限り、Herdr 成功の代用にしない。
-        **nested caller** (`sublane prepare-bound-pair --execute` の current v4 replacement 収束、#13948 R3) も同契約に従う:
+        **nested caller** (`sublane prepare-bound-pair --execute` の current replacement 収束、#13948 R3) も同契約に従う:
         fresh replacement participant が bounded startup health に達しないと adapter は `replacement_binding_launch_unhealthy` で
         fail-closed し、その **inner `SessionStartResult`** を catch site (`heal_lane_column`) で locator-free な startup observation
         (同一 startup `action_id` / role health / rollback debt) へ projection して outer の public `prepare-bound-pair` outcome まで
@@ -1507,7 +1508,7 @@ Table naming:
         adopted / foreign / newer / identity drift / duplicate / obligation-present / busy / unreadable は zero-close。
         normal participant の destructive close は、close 直前に 1 回取得した full inventory の全 row が
         canonical name / locator / terminal identity を持ち各軸 global unique であり、同一 snapshot の exact
-        name+locator+terminal が v4 attestation と finalized generation-v2 の **同じ rollback startup action**
+        name+locator+terminal が current attestation と finalized generation-v2 の **同じ rollback startup action**
         に一致し、provider がその native/terminal generation を server-side で条件付き close できる場合だけ許可する。
         `pane_bound_v2` prepared shell も receipt の exact native/terminal、full pane inventory の terminal global
         uniqueness、empty-input positive fact、同じ conditional-close capability の連言が必要。structured
@@ -1727,7 +1728,7 @@ generic backfill / `repair-pins` / standard dispatch の緩和では直さない
 `sublane reconcile-recovered-pair-pins` は、exact issue/lane/worktree、active revision、lane generation、
 lifecycle decision、old pair、`recover-pair` source revisionから再構成した action id、fresh pair の
 live/settled/attested/action-bound generation、および exact structured owner authorizationを連言した場合
-だけ、`declared_slots + revision + updated_at` を bounded CAS で更新する。current v4 direct action と
+だけ、`declared_slots + revision + updated_at` を bounded CAS で更新する。current direct action と
 generation-v2 の各 old locator も exact 照合する。legacy side-binding は診断専用である。disposition、lane generation、decision pointer、issue/worktree binding、
 release/replacement axes、process、worktree、branch、message delivery は変更しない。byte-equal new snapshot
 の replay だけを idempotent success とし、expected-old / expected-new のどちらでもない snapshot、
@@ -1825,16 +1826,16 @@ both refusing. 94 genuine v1 rows read as `absent`. The #13847 capability prefli
 *advertised* schema against the *source runtime's required* schema — both **code** — and never opens the store on disk.
 
 - **Reads never migrate and older shapes are diagnostic-only.** `readonly_compatible_select` may
-  project v1-v3 rows into the current vocabulary for status, rollback-debt diagnosis, and
-  explicit offline migration planning. Missing `terminal_id` is never synthesized; those
-  rows are non-green and cannot authorize adopt, recovery, send, resume, or replacement.
-- **Managed writes are v4-only.** A normal, replacement, or epoch-bearing managed launch
-  refuses every recognized v1-v3 store before registry/startup/generation/Herdr effects.
+  project v1-v4 rows into the current vocabulary for status, rollback-debt diagnosis, and
+  explicit offline migration planning. Missing `terminal_id` or `workflow_role` is never
+  synthesized as authority; those rows cannot satisfy a caller that requires the absent axis.
+- **Managed writes are v5-only.** A normal, replacement, or epoch-bearing managed launch
+  refuses every recognized v1-v4 store before registry/startup/generation/Herdr effects.
   `writable_projection` describes historical column shapes only; it is not launch admission.
 - **Legacy side bindings are not current authority.** The #13933 side store remains readable
   only to diagnose historical rollback debt. Exact side rows cannot compensate for the
   missing server-owned terminal identity and never make a live process current.
-- **Migration is one approved four-store offline action.** Attestation v1-v3 is rebuilt to v4
+- **Migration is one approved four-store offline action.** Attestation v1-v4 is rebuilt to v5
   and launch-generation v1 is backup-first rebuilt to v2 while consumers are zero; startup
   transaction and lifecycle stores are migrated in the same approval-bound plan. Old and new
   runtimes refuse mixed shapes rather than writing conservatively into them.

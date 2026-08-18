@@ -508,7 +508,7 @@ class CoordinatorPermissionParityTests(unittest.TestCase):
         placement = placement or CoordinatorPlacementConfig.default()
         loader = (
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
-            "application.coordinator_placement_loader."
+            "application.herdr_session_start_service."
             "load_coordinator_placement_for_launch"
         )
         with patch.object(mod, "prepare_session", _fake_prepare_session), patch(

@@ -21,6 +21,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     ATTEST_OK,
     ATTEST_STALE,
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
+    HerdrIdentityAttestationError,
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
     VERDICT_CONFLICT,
@@ -57,6 +58,43 @@ def _seed_v1_store(home: Path) -> Path:
     return path
 
 
+def _seed_v4_store(home: Path) -> Path:
+    """A terminal-bound pre-#15687 store without the workflow-role column."""
+    path = herdr_identity_attestation_path(home)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(str(path))
+    try:
+        conn.execute("PRAGMA user_version = 4")
+        conn.execute(
+            "CREATE TABLE herdr_identity_attestations ("
+            "assigned_name TEXT PRIMARY KEY, workspace_id TEXT NOT NULL, "
+            "role TEXT NOT NULL, lane_id TEXT NOT NULL, locator TEXT NOT NULL, "
+            "verdict TEXT NOT NULL, detail TEXT NOT NULL DEFAULT '', "
+            "observed_at TEXT NOT NULL, replacement_action_id TEXT NOT NULL DEFAULT '', "
+            "lane_epoch TEXT NOT NULL DEFAULT '', terminal_id TEXT NOT NULL DEFAULT '')"
+        )
+        conn.execute(
+            "INSERT INTO herdr_identity_attestations VALUES (?,?,?,?,?,?,?,?,?,?,?)",
+            (
+                "mzb1_ws1_claude_default",
+                "ws1",
+                "claude",
+                "default",
+                "wY:p2",
+                "present",
+                "",
+                "t",
+                "",
+                "",
+                "terminal-1",
+            ),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+    return path
+
+
 def _rec(**over) -> IdentityAttestationRecord:
     base = dict(
         assigned_name="mzb1_ws1_claude_default",
@@ -72,6 +110,22 @@ def _rec(**over) -> IdentityAttestationRecord:
 
 
 class ClassifyIdentityEnvTest(unittest.TestCase):
+    def test_role_aware_identity_requires_matching_workflow_role(self) -> None:
+        verdict, detail = classify_identity_env(
+            expected_workspace_id="ws1",
+            expected_role="claude",
+            expected_lane="default",
+            expected_workflow_role="coordinator",
+            env={
+                "MOZYO_WORKSPACE_ID": "ws1",
+                "MOZYO_AGENT_ROLE": "claude",
+                "MOZYO_LANE_ID": "default",
+                "MOZYO_WORKFLOW_ROLE": "coordinator_assistant",
+            },
+        )
+        self.assertEqual(verdict, VERDICT_CONFLICT)
+        self.assertEqual(detail, "MOZYO_WORKFLOW_ROLE")
+
     def test_all_present_matching_is_present(self) -> None:
         verdict, detail = classify_identity_env(
             expected_workspace_id="ws1",
@@ -130,6 +184,19 @@ class ClassifyIdentityEnvTest(unittest.TestCase):
 
 
 class EvaluateAttestationTest(unittest.TestCase):
+    def test_workflow_role_is_independently_joined(self) -> None:
+        join = evaluate_attestation(
+            _rec(workflow_role="coordinator"),
+            live_locator="wY:p2",
+            live_terminal_id="terminal-1",
+            expected_workspace_id="ws1",
+            expected_role="claude",
+            expected_lane="default",
+            expected_workflow_role="coordinator_assistant",
+        )
+        self.assertFalse(join.ok)
+        self.assertEqual(join.state, ATTEST_CONFLICT)
+
     def test_present_generation_matched_is_attested(self) -> None:
         join = evaluate_attestation(
             _rec(),
@@ -256,6 +323,15 @@ class StoreRoundTripTest(unittest.TestCase):
             self.assertEqual(got.locator, "wY:p2")
             self.assertEqual(got.verdict, VERDICT_PRESENT)
 
+    def test_workflow_role_round_trips_as_separate_identity_axis(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = HerdrIdentityAttestationStore(home=Path(tmp))
+            store.upsert(_rec(workflow_role="coordinator"))
+            self.assertEqual(
+                store.read("mzb1_ws1_claude_default").workflow_role,
+                "coordinator",
+            )
+
     def test_upsert_replaces_prior_generation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = HerdrIdentityAttestationStore(home=Path(tmp))
@@ -313,6 +389,8 @@ class StoreRoundTripTest(unittest.TestCase):
                     # v4 (#15227): server-owned generation identity; stored but never
                     # exposed by the public payload/repr surfaces.
                     "terminal_id",
+                    # v5 (#15687): governed responsibility, distinct from provider role.
+                    "workflow_role",
                 },
             )
 
@@ -359,6 +437,7 @@ class StoreRoundTripTest(unittest.TestCase):
             self.assertIsNotNone(got)
             self.assertEqual(got.locator, "wY:p2")
             self.assertEqual(got.verdict, VERDICT_PRESENT)
+            self.assertEqual(got.schema_version, 1)
             # Padded, not fabricated: the v1 writer had no replacement concept at all.
             self.assertEqual(got.replacement_action_id, "")
 
@@ -370,6 +449,27 @@ class StoreRoundTripTest(unittest.TestCase):
             path = _seed_v1_store(home)
             before = path.read_bytes()
             HerdrIdentityAttestationStore(home=home).read("mzb1_ws1_claude_default")
+            self.assertEqual(path.read_bytes(), before)
+
+    def test_v4_read_preserves_historical_schema_and_empty_workflow_role(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            _seed_v4_store(home)
+            got = HerdrIdentityAttestationStore(home=home).read(
+                "mzb1_ws1_claude_default"
+            )
+            self.assertIsNotNone(got)
+            self.assertEqual(got.schema_version, 4)
+            self.assertEqual(got.workflow_role, "")
+
+    def test_v4_store_is_read_only_even_for_a_role_unaware_record(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            path = _seed_v4_store(home)
+            before = path.read_bytes()
+            with self.assertRaises(HerdrIdentityAttestationError) as caught:
+                HerdrIdentityAttestationStore(home=home).upsert(_rec())
+            self.assertIn("managed writes require schema v5", str(caught.exception))
             self.assertEqual(path.read_bytes(), before)
 
     def test_unsupported_schema_version_is_fail_closed(self) -> None:

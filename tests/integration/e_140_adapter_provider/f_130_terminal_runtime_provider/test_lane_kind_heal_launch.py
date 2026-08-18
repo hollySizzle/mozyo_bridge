@@ -412,7 +412,7 @@ class WholePlanLaunchPreflightTest(LaneKindHealAuthorityLaunchTest):
                 launch_context=LaneLaunchContext(
                     anchors=(self.ANCHOR,),
                     slot_specs=self._pair(
-                        workflow_role="coordinator_assistant",
+                        workflow_role="foreign_role",
                         profile_id="profile.assistant",
                     ),
                 ),

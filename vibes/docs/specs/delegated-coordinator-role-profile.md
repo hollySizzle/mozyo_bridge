@@ -4,9 +4,9 @@ Redmine #12393 / US #12387 / Feature #12386 (`Delegated Coordinator / Nested Han
 
 ## 正本 (pointer)
 
-role 語彙 (最小 4 role: `coordinator` / `delegated_coordinator` / `implementation_gateway` / `implementation_worker`)、権限対応表、委譲の責務境界 (parent issue close / owner approval route / callback route / downstream dispatch 境界)、固定 role profile template (4 role の custom instruction 本文)、安全 invariant の正本は、#13029 により配布側 `skills/mozyo-bridge-agent/references/workflow.md` の `## 委譲コーディネータ role model (delegated coordinator)` にある。本書は再掲しない (#13029 で pointer 化)。孫 dispatch の context 保護判断も同節 `### 孫 dispatch / context 保護` を読む。
+role 語彙 (委譲 4 role: `coordinator` / `delegated_coordinator` / `implementation_gateway` / `implementation_worker` と、階層外で隣接する `coordinator_assistant`)、権限対応表、委譲の責務境界 (parent issue close / owner approval route / callback route / downstream dispatch 境界)、固定 role profile template、安全 invariant の正本は、#13029 / #15687 により配布側 `skills/mozyo-bridge-agent/references/workflow.md` の `## 委譲コーディネータ role model (delegated coordinator)` にある。本書は再掲しない (#13029 で pointer 化)。孫 dispatch の context 保護判断も同節 `### 孫 dispatch / context 保護` を読む。
 
-`coordinator_assistant` は skill `references/workflow.md` の **`coordinator_assistant` の安全使用境界**が定義する provider-neutral な**文書上の補助 actor**であり、この固定 4 role profile 語彙にはまだ含まれない。packaged `role_profile_templates.yaml`、handoff `role_profile`、`provider_binding` role、launch/runtime identity の追加は未実装であり、本書やskillの用語追加をruntime配線完了の証拠にしてはならない。runtime対応は別issueで4 role contractへの影響を設計して実装する。
+`coordinator_assistant` は skill `references/workflow.md` の **`coordinator_assistant` の安全使用境界**が定義する provider-neutral な非権威的補助 actor である。#15687 で packaged `role_profile_templates.yaml`、handoff `role_profile`、repo-local `agents.roles`、default coordinator-unit launch、startup self-attestation まで配線された。ただし委譲階層の第4層ではなく、owner-facing / review verdict / routing / gate / close / integration / 実装 diff の権限を持たない。
 
 ## scope の分担 (repo issue 履歴)
 
@@ -15,7 +15,7 @@ role 語彙 (最小 4 role: `coordinator` / `delegated_coordinator` / `implement
 
 ## 既存 spine との対応 (repo 固有)
 
-単一 project 内の coordinator / sublane 責務分担、帯域 / admission / pipeline fill、US close 権限、retirement の正本は `vibes/docs/logics/coordinator-sublane-development-flow.md` (spine) である。配布側 role model の spine actor 対応: `coordinator` = 管制塔 Codex (main coordinator lane Codex)、`delegated_coordinator` = 子 project の管制塔 Codex (単一 project model に存在しない新 role)、`implementation_gateway` = target-lane Codex、`implementation_worker` = sublane Claude。
+単一 project 内の coordinator / sublane 責務分担、帯域 / admission / pipeline fill、US close 権限、retirement の正本は `vibes/docs/logics/coordinator-sublane-development-flow.md` (spine) である。配布側 role model の spine actor 対応: `coordinator` = 管制塔、`coordinator_assistant` = 管制塔に隣接する非権威的補助 actor、`delegated_coordinator` = 子 project の管制塔 (単一 project model に存在しない委譲 role)、`implementation_gateway` = target-lane gateway、`implementation_worker` = sublane worker。Codex / Claude は repo-local `agents` による交換可能な provider binding であり、role 名ではない。
 
 ## Packaged runtime 設定の同期 anchor (repo 固有)
 

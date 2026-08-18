@@ -1463,7 +1463,7 @@ class RealLauncherCompositionTests(unittest.TestCase):
                     )
                     self.assertEqual(closes, [wk_old])  # the worker was closed exactly once
 
-                    # Run 2 crashes after the current v4 launch is durable but before the
+                    # Run 2 crashes after the current v5 launch is durable but before the
                     # outer participant can commit ``verify_owed``.
                     real_transition = store.transition_participant
                     def crash_before_outer_commit(*args, **kwargs):

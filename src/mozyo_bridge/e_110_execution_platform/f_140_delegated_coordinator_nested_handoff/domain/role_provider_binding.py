@@ -26,10 +26,11 @@ deliberately minimal (#12673 j#69034 scope: schema / default / override 境界�
   runtime adapter *today*; it is advisory, never an allowlist that would re-fix the binding
   to ``codex`` / ``claude`` (acceptance: workflow state / route identity must not become
   provider-fixed);
-- **default** — :meth:`RoleProviderBinding.default` is the compatibility baseline. It is the
-  exact same mapping the old private dict carried (gateway / coordination / audit / owner ->
-  ``codex``; implementation -> ``claude``), extended to the #12670 lane-role names, so
-  existing ``codex`` / ``claude`` operation is unchanged when no override is supplied;
+- **default** — :meth:`RoleProviderBinding.default` is the compatibility baseline. It keeps
+  the old private dict's gateway / coordination / audit / owner -> ``codex`` and
+  implementation -> ``claude`` mappings, extends them to the #12670 lane-role names, and
+  adds the adjacent ``coordinator_assistant`` -> ``claude`` product default. Repo-local v2
+  topology may rebind either coordinator-unit role without changing workflow authority;
 - **override** — :meth:`RoleProviderBinding.with_overrides` / :func:`parse_binding_overrides`
   merge caller-supplied bindings on top of the default, fail-closed on an unknown role or an
   empty provider. This is where an operator / config rebinds a role to a different surface
@@ -70,14 +71,17 @@ PROVIDER_CLAUDE: str = "claude"
 KNOWN_PROVIDERS: frozenset[str] = frozenset({PROVIDER_CODEX, PROVIDER_CLAUDE})
 
 # ---------------------------------------------------------------------------
-# Extended #12670 lane-role vocabulary. The #12857 runtime currently emits the
-# four roles imported above; #12670 names a broader lane vocabulary the binding is
-# forward-looking about (acceptance condition: define the role -> provider binding
-# for the named roles). Declared here as the abstract responsibilities they are.
+# Extended #12670 lane-role vocabulary. The delegation transition runtime emits
+# the four roles imported above. The default coordinator unit also attests the
+# adjacent, non-transition ``coordinator_assistant`` role. #12670 names the broader
+# lane vocabulary the binding is forward-looking about (acceptance condition:
+# define the role -> provider binding for the named roles). Declared here as the
+# abstract responsibilities they are.
 # ---------------------------------------------------------------------------
 ROLE_ROOT_COORDINATOR: str = "root_coordinator"
 ROLE_PROJECT_GATEWAY: str = "project_gateway"
 ROLE_IMPLEMENTATION_WORKER: str = "implementation_worker"
+ROLE_COORDINATOR_ASSISTANT: str = "coordinator_assistant"
 
 #: The CLOSED workflow-role vocabulary a binding may bind. A role outside this set
 #: cannot be bound (fail-closed) — the role space is workflow-canonical, the
@@ -92,6 +96,7 @@ WORKFLOW_ROLES: frozenset[str] = frozenset(
         ROLE_ROOT_COORDINATOR,
         ROLE_PROJECT_GATEWAY,
         ROLE_IMPLEMENTATION_WORKER,
+        ROLE_COORDINATOR_ASSISTANT,
     }
 )
 
@@ -112,11 +117,13 @@ WORKFLOW_ROLES: frozenset[str] = frozenset(
 # ---------------------------------------------------------------------------
 DEFAULT_PROFILE_COORDINATION: str = "coordination"
 DEFAULT_PROFILE_IMPLEMENTATION: str = "implementation"
+DEFAULT_PROFILE_COORDINATOR_ASSISTANCE: str = "coordinator_assistance"
 
 #: Built-in default profile name -> provider (a built-in adapter id).
 DEFAULT_PROFILE_PROVIDERS: "dict[str, str]" = {
     DEFAULT_PROFILE_COORDINATION: PROVIDER_CODEX,
     DEFAULT_PROFILE_IMPLEMENTATION: PROVIDER_CLAUDE,
+    DEFAULT_PROFILE_COORDINATOR_ASSISTANCE: PROVIDER_CLAUDE,
 }
 
 #: Built-in default workflow role -> profile name (the role-canonical topology).
@@ -128,6 +135,7 @@ DEFAULT_ROLE_PROFILES: "dict[str, str]" = {
     ROLE_PROJECT_GATEWAY: DEFAULT_PROFILE_COORDINATION,
     ROLE_IMPLEMENTER: DEFAULT_PROFILE_IMPLEMENTATION,
     ROLE_IMPLEMENTATION_WORKER: DEFAULT_PROFILE_IMPLEMENTATION,
+    ROLE_COORDINATOR_ASSISTANT: DEFAULT_PROFILE_COORDINATOR_ASSISTANCE,
 }
 
 #: The default launch / creation order of the expected agent pair, as *profiles*. The
@@ -135,7 +143,7 @@ DEFAULT_ROLE_PROFILES: "dict[str, str]" = {
 #: historical #13569 ``claude`` then ``codex`` order), NOT derived from the provider
 #: registry (known != expected, per plugin-ready-adapter-boundary).
 DEFAULT_EXPECTED_PROFILE_ORDER: "tuple[str, ...]" = (
-    DEFAULT_PROFILE_IMPLEMENTATION,
+    DEFAULT_PROFILE_COORDINATOR_ASSISTANCE,
     DEFAULT_PROFILE_COORDINATION,
 )
 
@@ -320,9 +328,11 @@ __all__ = (
     "ROLE_ROOT_COORDINATOR",
     "ROLE_PROJECT_GATEWAY",
     "ROLE_IMPLEMENTATION_WORKER",
+    "ROLE_COORDINATOR_ASSISTANT",
     "WORKFLOW_ROLES",
     "DEFAULT_PROFILE_COORDINATION",
     "DEFAULT_PROFILE_IMPLEMENTATION",
+    "DEFAULT_PROFILE_COORDINATOR_ASSISTANCE",
     "DEFAULT_PROFILE_PROVIDERS",
     "DEFAULT_ROLE_PROFILES",
     "DEFAULT_EXPECTED_PROFILE_ORDER",

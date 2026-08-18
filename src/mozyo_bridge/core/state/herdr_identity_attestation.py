@@ -1,7 +1,8 @@
 """herdr startup self-attestation store — generation-bound env observation (Redmine #13637).
 
-A herdr-managed agent's self-identity triplet (``MOZYO_WORKSPACE_ID`` /
-``MOZYO_AGENT_ROLE`` / ``MOZYO_LANE_ID``) is injected at ``herdr agent start``
+A herdr-managed agent's provider identity triplet (``MOZYO_WORKSPACE_ID`` /
+``MOZYO_AGENT_ROLE`` / ``MOZYO_LANE_ID``), plus the independent governed
+``MOZYO_WORKFLOW_ROLE`` axis when a launch assigns one, is injected at ``herdr agent start``
 via ``--env`` (spec ``vibes/docs/specs/herdr-native-identity.md`` §2/§5). Two
 facts make a launcher / doctor unable to *verify* that injection after the fact
 (Redmine #13637 Design Consultation j#76456, Answer j#76462):
@@ -33,7 +34,7 @@ identity captured at write time. Either mismatch is ``stale``; a locator is reus
 and therefore never sufficient by itself (Design Answer j#76462 refinement 2).
 
 **Privacy (refinement 3):** the record stores only the verdict token, the expected
-identity (workspace / role / lane / assigned name), the live locator, a
+identity (workspace / provider role / workflow role / lane / assigned name), the live locator, a
 detail token naming *which variable* was missing/conflicting (never a value), and a
 timestamp / schema version. Env **values**, credentials, and ambient env are never
 stored — the whitelist dataclass simply has no field for them.
@@ -69,11 +70,12 @@ schema authority, so the dependency never points core -> provider.
 written by launchers of different vintages at once, so schema policy lives in
 :mod:`.herdr_identity_attestation_schema` and this module never compares versions
 itself. Reads are **read-compatible**: an older recognized shape is projected up to
-:data:`COLUMNS_V4` inside one pinned read transaction, so v1-v3 rows remain diagnosable
+:data:`COLUMNS_V5` inside one pinned read transaction, so v1-v4 rows remain diagnosable
 instead of decoding as ``absent``. Writes are **conservative** in the opposite direction:
-only v4 can preserve the required terminal binding, so every older shape is read-only and
-managed launch refuses it before side effects. Forward migration is an explicit,
-backup-first offline rollout operation; mixed old/new runtimes never silently drop v4 data.
+only v5 can preserve both the required terminal binding and governed workflow-role axis,
+so every older shape is read-only and managed launch refuses it before side effects.
+Forward migration is an explicit, backup-first offline rollout operation; mixed old/new
+runtimes never silently drop v5 data.
 """
 
 from __future__ import annotations
@@ -86,11 +88,13 @@ from typing import Mapping, Optional
 
 from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     COLUMNS_V4,
+    COLUMNS_V5,
     AttestationStoreLockUnavailable,
     attestation_store_lock,
     HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY,
     HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION,
     RECOGNIZED_SCHEMA_VERSIONS,
+    WRITABLE_SCHEMA_VERSIONS,
     STORE_ABSENT,
     STORE_RECOGNIZED,
     create_schema,
@@ -101,6 +105,7 @@ from mozyo_bridge.core.state.herdr_identity_attestation_schema import (
     write_drops_lane_epoch,
     write_drops_replacement_action_id,
     write_drops_terminal_id,
+    write_drops_workflow_role,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
@@ -136,6 +141,7 @@ ATTEST_CONFLICT = "conflict"
 _WORKSPACE_VAR = "MOZYO_WORKSPACE_ID"
 _ROLE_VAR = "MOZYO_AGENT_ROLE"
 _LANE_VAR = "MOZYO_LANE_ID"
+_WORKFLOW_ROLE_VAR = "MOZYO_WORKFLOW_ROLE"
 
 #: The lane a launch injects when the requested lane is empty (spec §2: empty ->
 #: ``default``). Mirrors ``herdr_identity.DEFAULT_LANE`` as a literal (leaf purity).
@@ -195,6 +201,9 @@ class IdentityAttestationRecord:
     #: same pane id for a different terminal.  Empty is read-compatible legacy evidence
     #: only and can never produce an attested join.
     terminal_id: str = field(default="", repr=False)
+    #: Governed runtime responsibility observed by the process. Empty is legacy evidence;
+    #: it can satisfy only callers that make no workflow-role assertion.
+    workflow_role: str = ""
     schema_version: int = HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION
 
     def as_payload(self) -> dict:
@@ -209,6 +218,7 @@ class IdentityAttestationRecord:
             "observed_at": self.observed_at,
             "replacement_action_id": self.replacement_action_id,
             "lane_epoch": self.lane_epoch,
+            "workflow_role": self.workflow_role,
             "schema_version": self.schema_version,
         }
 
@@ -236,6 +246,7 @@ def classify_identity_env(
     expected_workspace_id: str,
     expected_role: str,
     expected_lane: str,
+    expected_workflow_role: str = "",
     env: Mapping[str, str],
 ) -> tuple[str, str]:
     """Classify an agent's OWN process env against the launcher-expected identity.
@@ -252,10 +263,14 @@ def classify_identity_env(
         (_ROLE_VAR, _norm(expected_role)),
         (_LANE_VAR, _norm(expected_lane) or _DEFAULT_LANE),
     )
+    expected_workflow_role_norm = _norm(expected_workflow_role)
+    if expected_workflow_role_norm:
+        expected += ((_WORKFLOW_ROLE_VAR, expected_workflow_role_norm),)
     actual = {
         _WORKSPACE_VAR: _norm(env.get(_WORKSPACE_VAR)),
         _ROLE_VAR: _norm(env.get(_ROLE_VAR)),
         _LANE_VAR: _norm(env.get(_LANE_VAR)) or _DEFAULT_LANE,
+        _WORKFLOW_ROLE_VAR: _norm(env.get(_WORKFLOW_ROLE_VAR)),
     }
     missing = [name for name, _ in expected if not actual[name]]
     if missing:
@@ -273,6 +288,7 @@ def evaluate_attestation(
     expected_workspace_id: str,
     expected_role: str,
     expected_lane: str,
+    expected_workflow_role: str = "",
     live_terminal_id: object,
 ) -> AttestationJoin:
     """Join a stored self-attestation with the live slot (pure; adopt + doctor share).
@@ -302,10 +318,15 @@ def evaluate_attestation(
             "launch, or the self-check never ran); the slot's identity env is unverified",
         )
     expected_lane_norm = _norm(expected_lane) or _DEFAULT_LANE
+    expected_workflow_role_norm = _norm(expected_workflow_role)
     if (
         _norm(record.workspace_id) != _norm(expected_workspace_id)
         or _norm(record.role) != _norm(expected_role)
         or (_norm(record.lane_id) or _DEFAULT_LANE) != expected_lane_norm
+        or (
+            expected_workflow_role_norm
+            and _norm(record.workflow_role) != expected_workflow_role_norm
+        )
     ):
         return AttestationJoin(
             False,
@@ -421,10 +442,11 @@ class HerdrIdentityAttestationStore:
         best-effort :func:`record_identity_attestation` wraps this so a store failure
         never blocks an agent boot.
 
-        Writes the store's own shape without implicit migration (Redmine #13882). A managed
-        v4 record always carries ``terminal_id``; therefore every v1-v3 store raises before
-        writing instead of landing a locator-only row. The backup-first offline rollout is
-        the sole supported forward-migration boundary.
+        Writes only the current shape without implicit migration (Redmine #13882). A
+        managed v5 record carries both ``terminal_id`` and the independent workflow-role
+        column; therefore every v1-v4 store raises before writing instead of landing an
+        incomplete identity row. The backup-first offline rollout is the sole supported
+        forward-migration boundary.
         """
         observed_at = record.observed_at or _utc_now()
         # Shared lock over the WHOLE write (Redmine #13882 j#80190 boundary 2), taken
@@ -451,6 +473,15 @@ class HerdrIdentityAttestationStore:
                     "Migrate the store first: `mozyo-bridge herdr attestation-store "
                     "migrate --write`."
                 )
+            if write_drops_workflow_role(version, record.workflow_role):
+                raise HerdrIdentityAttestationError(
+                    f"herdr identity attestation store {self.path} is schema v{version}, "
+                    "which cannot preserve this launch's `workflow_role`. Refusing to "
+                    "write a role-aware row that would collapse governed responsibility "
+                    "back into provider identity (the store is left untouched). Migrate "
+                    "the store first: `mozyo-bridge herdr attestation-store migrate "
+                    "--write`."
+                )
             if write_drops_replacement_action_id(version, record.replacement_action_id):
                 raise HerdrIdentityAttestationError(
                     f"herdr identity attestation store {self.path} is schema v{version}, "
@@ -476,6 +507,18 @@ class HerdrIdentityAttestationStore:
                     f"never be resumable. Migrate the store first: "
                     f"`mozyo-bridge herdr attestation-store migrate --write`."
                 )
+            if version not in WRITABLE_SCHEMA_VERSIONS:
+                # Preserve the field-specific diagnostics above for v1-v4 callers. This
+                # final guard is still required when every supplied field happens to fit
+                # an older shape: managed writers may emit only the current full schema.
+                raise HerdrIdentityAttestationError(
+                    f"herdr identity attestation store {self.path} is schema v{version}, "
+                    f"but managed writes require schema v"
+                    f"{HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION}. Refusing to write a "
+                    "row that an older shape cannot preserve completely (the store is "
+                    "left untouched). Migrate the store first: `mozyo-bridge herdr "
+                    "attestation-store migrate --write`."
+                )
             columns = writable_projection(version)
             assert columns is not None  # store_status() already proved it recognized
             values = {
@@ -490,6 +533,7 @@ class HerdrIdentityAttestationStore:
                 "replacement_action_id": record.replacement_action_id,
                 "lane_epoch": record.lane_epoch,
                 "terminal_id": record.terminal_id,
+                "workflow_role": record.workflow_role,
             }
             updatable = [c for c in columns if c != "assigned_name"]
             with conn:
@@ -514,6 +558,7 @@ class HerdrIdentityAttestationStore:
             replacement_action_id=record.replacement_action_id,
             lane_epoch=record.lane_epoch,
             terminal_id=record.terminal_id,
+            workflow_role=record.workflow_role,
         )
 
     def assigned_names(self) -> Optional[frozenset]:
@@ -577,6 +622,7 @@ class HerdrIdentityAttestationStore:
                 select = readonly_compatible_select(conn)
                 if select is None:
                     return None
+                version = int(recorded_version(conn))
                 row = conn.execute(
                     f"SELECT {select} FROM herdr_identity_attestations "
                     "WHERE assigned_name = ?",
@@ -600,6 +646,8 @@ class HerdrIdentityAttestationStore:
             replacement_action_id=row[8],
             lane_epoch=row[9],
             terminal_id=row[10],
+            workflow_role=row[11],
+            schema_version=version,
         )
 
 
@@ -628,6 +676,7 @@ def record_identity_attestation(
 
 __all__ = (
     "COLUMNS_V4",
+    "COLUMNS_V5",
     "HERDR_IDENTITY_ATTESTATION_FILENAME",
     "HERDR_IDENTITY_ATTESTATION_SCHEMA_VERSION",
     "HERDR_IDENTITY_ATTESTATION_RECOVERY_POLICY",

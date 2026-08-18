@@ -67,6 +67,8 @@ def prepare_session(
     dry_run: bool = False,
     claude_permission_mode_default: Optional[str] = None,
     agent_launch=None,
+    workflow_role_by_provider=None,
+    launch_argv_by_provider=None,
     lane_placement=None,
     launch_context=None,
     coordinator_placement_mode: str = DEFAULT_COORDINATOR_PLACEMENT_MODE,
@@ -104,6 +106,8 @@ def prepare_session(
         dry_run=dry_run,
         claude_permission_mode_default=claude_permission_mode_default,
         agent_launch=agent_launch,
+        workflow_role_by_provider=workflow_role_by_provider,
+        launch_argv_by_provider=launch_argv_by_provider,
         lane_placement=lane_placement,
         launch_context=launch_context,
         coordinator_placement_mode=coordinator_placement_mode,
@@ -130,6 +134,8 @@ def prepare_session(
         env=env,
         launch_context=launch_context,
         pair_order=pair_order,
+        workflow_role_by_provider=workflow_role_by_provider,
+        launch_argv_by_provider=launch_argv_by_provider,
         error_type=use_case.HerdrSessionStartError,
     )
     for provider in providers:

@@ -17,18 +17,20 @@ the product's authority expression from *provider brand* to *workflow role*:
   carries) is an exchangeable runtime attribute. Swapping which profile a role points at
   — or renaming a profile's ``provider`` — never changes a workflow gate.
 
-**Canonical resolution vs. current-launch compatibility adapter (Redmine #14148 j#84267).**
+**Canonical resolution vs. launch compatibility adapter (Redmine #14148 j#84267 / #15687).**
 The canonical v2 launch resolution is ``role -> profile -> (provider, launch_argv[lane_class])``
-(:meth:`AgentsTopologyConfig.resolve_launch_argv_for_role`). The existing herdr launch
-chokepoint is *provider-unit* (it launches panes by provider, not workflow role — the mzb1
-identity's role segment is the provider token), so it consumes a **compatibility adapter**,
-not the canonical semantics: :meth:`to_provider_binding_overrides` produces the ``role ->
-provider`` map the #13157 :class:`RoleProviderBinding` consumes, and
+(:meth:`AgentsTopologyConfig.resolve_launch_argv_for_role`). The default coordinator unit
+now resolves ``coordinator`` and ``coordinator_assistant`` canonically through
+:meth:`AgentsTopologyConfig.resolve_coordinator_unit` and attests workflow role separately
+from provider identity. General sublane launch remains *provider-unit* (mzb1's role segment
+is the provider token), so it consumes a **compatibility adapter**:
+:meth:`to_provider_binding_overrides` produces the ``role -> provider`` map the #13157
+:class:`RoleProviderBinding` consumes, and
 :meth:`to_resolved_launch_argv_triples` produces the ``(provider, lane_class, tokens)`` triples
 the #13425 ``AgentLaunchConfig`` consumes. The adapter is deliberately lossy — a same
 ``(provider, lane_class)`` argv collision fails closed at config load — and is explicitly not
-the canonical form. Launch-time per-role profile selection arrives with #13647; until then a
-role-distinct-but-provider-shared profile pair is a config concept the launch cannot reflect.
+the canonical form. Even on the default unit, two roles bound to one provider fail closed:
+Herdr exposes one durable physical slot per provider, so they cannot be independently attested.
 
 Boundary, kept enforced in code:
 
@@ -64,6 +66,8 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.role_provider_binding import (
     DEFAULT_PROFILE_PROVIDERS,
     DEFAULT_ROLE_PROFILES,
+    ROLE_COORDINATOR,
+    ROLE_COORDINATOR_ASSISTANT,
     WORKFLOW_ROLES,
     normalize_provider,
     normalize_role,
@@ -228,6 +232,21 @@ class RuntimeProfile:
             record.get("launch_argv"), provider=provider, source=f"{source} profile {name!r}"
         )
         return cls(name=name, provider=provider, launch_argv=launch_argv)
+
+
+@dataclass(frozen=True)
+class ResolvedCoordinatorUnitSlot:
+    """One role-aware slot in the default coordinator unit.
+
+    The provider remains the physical Herdr / mzb1 identity. ``workflow_role`` is the
+    independent governed responsibility carried by that process; it never becomes a
+    hierarchy level or a provider alias.
+    """
+
+    workflow_role: str
+    profile_id: str
+    provider: str
+    launch_argv: tuple[str, ...] = ()
 
 
 def _parse_profile_launch_argv(
@@ -415,6 +434,40 @@ class AgentsTopologyConfig:
                 return list(tokens)
         return []
 
+    def resolve_coordinator_unit(self) -> "tuple[ResolvedCoordinatorUnitSlot, ...]":
+        """Resolve the default unit as coordinator + non-authoritative assistant.
+
+        Herdr still gives one durable physical slot to each provider token. Therefore two
+        coordinator-unit roles resolving to the same provider cannot be represented as two
+        independently attestable processes and fail closed here instead of silently
+        collapsing into one pane.
+        """
+        slots: list[ResolvedCoordinatorUnitSlot] = []
+        seen_providers: dict[str, str] = {}
+        for role in (ROLE_COORDINATOR, ROLE_COORDINATOR_ASSISTANT):
+            profile = self.resolve_profile_for_role(role)
+            previous_role = seen_providers.get(profile.provider)
+            if previous_role is not None:
+                raise AgentsTopologyError(
+                    "coordinator-unit runtime collision: workflow roles "
+                    f"{previous_role!r} and {role!r} both resolve to provider "
+                    f"{profile.provider!r}. Herdr exposes one durable physical slot per "
+                    "provider, so these roles cannot attest as separate actors; bind them "
+                    "to distinct provider profiles"
+                )
+            seen_providers[profile.provider] = role
+            slots.append(
+                ResolvedCoordinatorUnitSlot(
+                    workflow_role=role,
+                    profile_id=profile.name,
+                    provider=profile.provider,
+                    launch_argv=tuple(
+                        self.resolve_launch_argv_for_role(role, "default")
+                    ),
+                )
+            )
+        return tuple(slots)
+
     def to_resolved_launch_argv_triples(
         self,
     ) -> "tuple[tuple[str, str, tuple[str, ...]], ...]":
@@ -555,5 +608,6 @@ __all__ = (
     "RUNTIME_PROFILE_KEYS",
     "AgentsTopologyError",
     "RuntimeProfile",
+    "ResolvedCoordinatorUnitSlot",
     "AgentsTopologyConfig",
 )

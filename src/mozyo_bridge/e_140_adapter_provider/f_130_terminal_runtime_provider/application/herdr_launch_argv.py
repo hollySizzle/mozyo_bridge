@@ -88,6 +88,10 @@ MOZYO_STARTUP_ACTION_ID_ENV = "MOZYO_STARTUP_ACTION_ID"
 #: own raw ``agent list`` row before recording the long logical identity.
 MOZYO_HERDR_NATIVE_NAME_ENV = "MOZYO_HERDR_NATIVE_NAME"
 
+#: The governed responsibility carried by the process. This is deliberately a second
+#: identity axis: ``MOZYO_AGENT_ROLE`` remains the provider token used by mzb1 routing.
+MOZYO_WORKFLOW_ROLE_ENV = "MOZYO_WORKFLOW_ROLE"
+
 #: The wrapper subcommand every managed launch execs the provider THROUGH (Redmine
 #: #13637): ``<launcher> herdr agent-attest ...``. Named once so the wrapper argv
 #: (:func:`build_agent_start_argv`) and the capability probe
@@ -261,6 +265,7 @@ def build_agent_start_argv(
     native_name: str,
     pane_locator: str,
     provider: str,
+    workflow_role: str = "",
     workspace_id: str,
     lane: str,
     attest_launcher: str,
@@ -304,6 +309,8 @@ def build_agent_start_argv(
             "--lane",
             lane,
         ]
+        if (workflow_role or "").strip():
+            run_cmd += ["--workflow-role", workflow_role.strip()]
         # Redmine #13806 tranche D R2-F2: a REPLACEMENT launch carries the exact transaction
         # action_id into the fresh process's startup self-attestation. Emitted ONLY when
         # non-empty, so a normal (non-replacement) launch stays byte-invariant.
@@ -343,6 +350,7 @@ def build_agent_start_argv(
 def build_pane_launch_env(
     *,
     provider: str,
+    workflow_role: str = "",
     native_name: str,
     workspace_id: str,
     lane: str,
@@ -369,6 +377,8 @@ def build_pane_launch_env(
         # is ever rejected.
         f"PATH={source_path}",
     ]
+    if (workflow_role or "").strip():
+        entries.append(f"{MOZYO_WORKFLOW_ROLE_ENV}={workflow_role.strip()}")
     if attest_launcher:
         entries.append(f"{MOZYO_HERDR_NATIVE_NAME_ENV}={native_name}")
         entries.append(f"MOZYO_BRIDGE_HOME={store_home}")
@@ -389,6 +399,7 @@ __all__ = (
     "MOZYO_LANE_EPOCH_ENV",
     "MOZYO_HERDR_NATIVE_NAME_ENV",
     "MOZYO_PROVIDER_ARGV0_ENV",
+    "MOZYO_WORKFLOW_ROLE_ENV",
     "build_agent_start_argv",
     "build_pane_launch_env",
     "CONFIG_PARSE_REJECTED_EXIT",

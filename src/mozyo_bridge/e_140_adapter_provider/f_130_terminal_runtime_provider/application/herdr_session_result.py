@@ -72,6 +72,7 @@ class _SlotPlan:
     kind: str  # "adopt" | "launch" | "planned" | "stale" | "unattested"
     locator: str = ""  # adopted live locator (kind == "adopt") / stale residue pane (kind == "stale"); else ""
     detail: str = ""  # fail-closed reason for kind == "unattested" (Redmine #13637); else ""
+    workflow_role: str = ""  # governed responsibility; separate from provider identity
 
 @dataclass(frozen=True)
 class SlotResult:
@@ -107,6 +108,9 @@ class SlotResult:
     #: Internal launch-generation evidence only: it is intentionally omitted from
     #: :meth:`as_payload` and never becomes durable route identity.
     launch_terminal_id: str = field(default="", repr=False)
+    #: Governed runtime responsibility. Empty for a legacy / role-unaware launch.
+    #: It supplements rather than replaces the provider-bound routing identity.
+    workflow_role: str = ""
 
     @property
     def disposition(self) -> str:
@@ -127,6 +131,7 @@ class SlotResult:
     def as_payload(self) -> dict:
         return {
             "provider": self.provider,
+            "workflow_role": self.workflow_role,
             "assigned_name": self.assigned_name,
             "outcome": self.outcome,
             "locator": self.locator,

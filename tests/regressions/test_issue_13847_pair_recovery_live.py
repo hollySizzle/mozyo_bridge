@@ -243,6 +243,20 @@ class GenerationFence(unittest.TestCase):
 class RedispatchExactlyOnce(unittest.TestCase):
     """redispatch_to_gateway uses the fence as the sole exactly-once authority."""
 
+    def setUp(self):
+        # These cases isolate the outbox exactly-once axis. The production redispatch edge
+        # also consults the operator-home scratch-retirement authority; letting that read the
+        # developer machine would make the fixture depend on unrelated historical attempts
+        # (and on which attestation schema the checked-out branch considers current).
+        retirement = patch(
+            "mozyo_bridge.e_110_execution_platform."
+            "f_140_delegated_coordinator_nested_handoff.application."
+            "herdr_dispatch_execution.target_is_retiring",
+            return_value=(False, ""),
+        )
+        retirement.start()
+        self.addCleanup(retirement.stop)
+
     def test_first_call_delivers_then_replay_is_already(self):
         with tempfile.TemporaryDirectory() as tmp:
             fence = DispatchOutboxFence(path=dispatch_outbox_fence_path(Path(tmp)))

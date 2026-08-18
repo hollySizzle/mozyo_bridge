@@ -1196,7 +1196,7 @@ convention + mapping type + re-bind procedure for later US's to build on.
   `HerdrAgentIdentity` has only `(workspace_id, lane_id, role)` fields — there is
   structurally no `pane_id` / `terminal_id` slot — so a caller cannot persist a
   session-local locator as logical identity. PoC E10 remains the handle contract. A later
-  hardening (#15227) persists server-owned `terminal_id` only in private attestation v4 and
+  hardening (#15227) persists server-owned `terminal_id` only in private attestation (v4+), and
   launch-generation v2 rows as generation-bound evidence joined to one fresh inventory;
   it is hidden from public payloads and never replaces assigned name as a key/handle.
 - **Consistent with the route-identity ledger (#12553).** The stable slot is the

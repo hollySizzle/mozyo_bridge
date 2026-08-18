@@ -14,9 +14,9 @@ Redmine #12396 / US #12388 / Feature #12386 (`Delegated Coordinator / Nested Han
 
 実装: `src/mozyo_bridge/domain/role_profile.py` (resolver) + `role_profile_config.py` (config schema) + packaged `role_profile_templates.yaml` (template 本文の runtime 正本; Redmine #12952)。
 
-- template registry: 4 role token (`coordinator` / `delegated_coordinator` / `implementation_gateway` / `implementation_worker`) の本文は、wheel に同梱される config artifact `role_profile_templates.yaml` を runtime 正本として持つ。本文の human-facing 正本は引き続き US #12387 spec であり、packaged YAML はその machine-readable 写しである。
+- template registry: 委譲 4 role token (`coordinator` / `delegated_coordinator` / `implementation_gateway` / `implementation_worker`) と隣接 actor `coordinator_assistant` の本文は、wheel に同梱される config artifact `role_profile_templates.yaml` を runtime 正本として持つ。本文の human-facing 正本は引き続き US #12387 / #15687 spec pointer であり、packaged YAML はその machine-readable 写しである。
 - config load: `role_profile.py` が import 時に一度だけ `importlib.resources` で packaged YAML を読み (cwd / worktree の path 探索はしない = package-anchored resource)、`RoleProfileConfig.from_record` で schema 検証してから registry を構成する。runtime で markdown を parse せず、path 推測もしない (self-contained / fail-closed)。malformed / missing artifact は import 時に `RoleProfileConfigError` で loud に fail-closed し、handoff 途中で partial contract を送らない。
-- config schema (`role_profile_config.py`): 固定 4 role 語彙を code invariant として持ち、config は「その 4 token を過不足なく定義する」ことを要求する。unknown role token / role 欠落 / 空 template / declared `placeholders` と template の `<...>` token 不一致 / 不明 key / 空 `version`・`source` はすべて `RoleProfileConfigError` で fail-closed する。`version` は `ROLE_PROFILE_VERSION`、`source` は `ROLE_PROFILE_SOURCE` の durable pointer を運ぶ。
+- config schema (`role_profile_config.py`): 上記 5 token の閉じた語彙を code invariant として持ち、config は全 token を過不足なく定義することを要求する。unknown role token / role 欠落 / 空 template / declared `placeholders` と template の `<...>` token 不一致 / 不明 key / 空 `version`・`source` はすべて `RoleProfileConfigError` で fail-closed する。`version` は `ROLE_PROFILE_VERSION`、`source` は `ROLE_PROFILE_SOURCE` の durable pointer を運ぶ。
 - `resolve_role_profile(role, fields)`: template を取得し、`<...>` placeholder を structured field 値で置換する。pure / deterministic。
 - `RoleProfileResolution`: 解決結果。structured pointer field (`role_profile` / `profile_source` / `profile_version` / `unresolved_placeholders`) と `resolved_text` を持つ。
   - `profile_source`: template 本文の正本への repo-relative pointer (spec path)。
@@ -39,7 +39,7 @@ pure template resolver (`role_profile.py`) は IO-free を保つ (cwd / worktree
   1. **valid な非空 explicit 値 > verified default**: `--profile-field redmine_project=<id>` に strip 後非空の値があれば、それを優先し default へ fallback しない。
   2. **explicit 省略時は verified workspace-local default で補完**: `redmine_project` が未指定なら、repo root の固定 defaults path (`<repo>/.mozyo-bridge/project-defaults.yaml`、legacy `workspace-defaults.yaml` は fallback) の **verified** default project identifier を補完する。読取は fixed path であり cwd / worktree の探索ではない。
   3. **fail-closed** (`RoleProfileError` → 配線側で `blocked` / `invalid_args`、pane send せず): explicit の空/空白値 (有効な identifier ではない)、および explicit 省略時に default が missing / unverified / conflict (new+legacy 両在) のとき。missing/unverified を fact として黙って送らない (workspace default-project resolution 契約と整合。`skills/mozyo-bridge-agent/references/workflow.md` `### Default project 解決`)。
-  4. **placeholder を持たない role は default を読まない**: `implementation_gateway` / `implementation_worker` は `redmine_project` を持たないため defaults 読取をせず、この gate も適用しない (missing default で send が壊れない)。
+  4. **placeholder を持たない role は default を読まない**: `coordinator_assistant` / `implementation_gateway` / `implementation_worker` は `redmine_project` を持たないため defaults 読取をせず、この gate も適用しない (missing default で send が壊れない)。
 
 runtime 実装詳細 (関数分割・error message 文言) は doc に複製しない。正本は上記 module と unit/integration test。
 

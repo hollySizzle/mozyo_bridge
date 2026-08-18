@@ -952,7 +952,7 @@ class OfflineRolloutExecutionRegressionTests(unittest.TestCase):
         migrated = port._fresh_store_records()  # noqa: SLF001
         self.assertEqual(
             {name: row["version"] for name, row in migrated.items()},
-            {"attestation": 4, "lane_lifecycle": 11,
+            {"attestation": 5, "lane_lifecycle": 11,
              "launch_generation": None, "startup_transaction": 2},
         )
         HerdrLaunchGenerationStore(home=self.home).reserve_pending(
