@@ -89,7 +89,11 @@ def _render_text(result: SessionStartResult) -> str:
         lines.append(f"base pane {result.base_pane_id}: {state}")
     if result.tab_pane_id:
         state = (
-            "reclaimed"
+            # Redmine #15702: the run-minted lane tab's root pane became the first
+            # launch's agent pane — no residue and nothing was closed.
+            "occupied (root_occupied_by_first_launch)"
+            if result.tab_pane_detail == "root_occupied_by_first_launch"
+            else "reclaimed"
             if result.tab_pane_reclaimed
             else (
                 "preserved (generation_unproven_root_preserved)"

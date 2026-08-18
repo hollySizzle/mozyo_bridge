@@ -48,14 +48,16 @@ Contract faithfulness (design §1.1, modelled faces A–F)
   backend-readable adopt authority the shared ``coordinators`` space keys on, so a
   create carrying ``--label coordinators`` is visible to a later project's adopt, and
   a vanished workspace is absent (residue verification, Redmine #14187).
-- **G ``tab create`` / ``pane split``** (Redmine #13411) —
+- **G ``tab create`` / ``pane split``** (Redmine #13411 / #15702) —
   ``tab create --workspace <id>`` mints a fresh ``<id>:t<n>`` tab born with one
-  empty ``root_pane`` (the tab analogue of D), returned in a ``tab_created``
-  envelope. ``pane split <pane_id> --direction right`` creates the exact launch
-  pane beside the tab's live pane before ``agent start --pane`` binds it. Each
-  ``agent list`` row
-  carries its ``tab_id`` (live rows expose it alongside ``workspace_id``),
-  so a heal reads the live slot's tab to rejoin it.
+  ``root_pane`` (the tab analogue of D), returned in a ``tab_created`` envelope
+  carrying the root's full identity (``workspace_id`` / ``tab_id`` /
+  ``terminal_id``, measured herdr 0.8.0); ``--cwd`` / ``--env K=V`` reach the
+  root pane's shell, so a lane's first launch occupies the born root instead of
+  splitting beside it (#15702). ``pane split <pane_id> --direction right``
+  creates the exact launch pane beside a live pane before ``agent start --pane``
+  binds it. Each ``agent list`` row carries its ``tab_id`` (live rows expose it
+  alongside ``workspace_id``), so a heal reads the live slot's tab to rejoin it.
 - **F ``agent wait --until``** — **change-semantics** (PoC E9): a wait returns only
   on a *change into* the requested status; already being in it does **not** return
   (it times out). Modelled deterministically with **no real time** — a pre-armed
@@ -545,13 +547,40 @@ class FakeHerdr:
         # one empty root pane (the tab analogue of `workspace create`). Fails closed
         # on an unknown workspace so the real code sees a create failure, never a
         # fabricated tab id.
+        # Redmine #15702 (measured herdr 0.8.0): `--cwd` / `--env K=V` reach the root
+        # pane's shell, and the `tab_created` payload returns the root pane's FULL
+        # identity — workspace_id / tab_id / terminal_id / cwd — so the real code can
+        # treat the born root as the first launch slot's prepared pane.
         wid = _flag_value(rest, "--workspace")
         ws = self._workspaces.get(wid)
         if ws is None:
             return _err(argv, f"unknown workspace: {wid}")
+        cwd = ""
+        pane_env: dict = {}
+        i = 2
+        while i < len(rest):
+            token = rest[i]
+            if token in {"--workspace", "--label", "--cwd"}:
+                if token == "--cwd":
+                    cwd = rest[i + 1]
+                i += 2
+            elif token == "--env":
+                key, separator, value = rest[i + 1].partition("=")
+                if not key or not separator:
+                    raise UnknownHerdrCommandError(
+                        f"tab create received a malformed environment entry: {rest!r}"
+                    )
+                pane_env[key] = value
+                i += 2
+            elif token in {"--focus", "--no-focus"}:
+                i += 1
+            else:
+                raise UnknownHerdrCommandError(
+                    f"tab create: unmodelled flag {token!r} in {rest!r}"
+                )
         ws.tab_seq += 1
         tab_id = f"{wid}:t{ws.tab_seq}"
-        root_pane = self._mint_pane(ws)
+        root_pane = self._mint_pane(ws, cwd=cwd, env=pane_env)
         ws.pane_tab[root_pane] = tab_id
         return _ok(
             argv,
@@ -559,7 +588,13 @@ class FakeHerdr:
                 "result": {
                     "type": "tab_created",
                     "tab": {"tab_id": tab_id},
-                    "root_pane": {"pane_id": root_pane},
+                    "root_pane": {
+                        "pane_id": root_pane,
+                        "workspace_id": ws.workspace_id,
+                        "tab_id": tab_id,
+                        "terminal_id": f"terminal-{root_pane}",
+                        "cwd": ws.pane_cwd[root_pane],
+                    },
                 }
             },
         )

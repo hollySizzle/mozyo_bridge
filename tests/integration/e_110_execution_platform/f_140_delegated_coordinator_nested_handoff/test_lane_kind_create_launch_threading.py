@@ -165,7 +165,9 @@ class FreshCreateLaunchThreadingTest(unittest.TestCase):
 
     @staticmethod
     def _second_split(herdr: FakeHerdr):
-        second = herdr.pane_split_argvs[1]
+        # #15702: a fresh lane tab's first slot occupies the born root (no split),
+        # so the splitting slot's `pane split` is the LAST one recorded.
+        second = herdr.pane_split_argvs[-1]
         return second[second.index("--direction") + 1]
 
     def test_fresh_create_places_the_first_launch_by_the_declared_kind(self) -> None:

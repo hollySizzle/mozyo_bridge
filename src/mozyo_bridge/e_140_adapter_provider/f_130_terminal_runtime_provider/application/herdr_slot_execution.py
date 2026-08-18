@@ -42,6 +42,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     resolve_launch_lane_epoch,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_bound_launch import (  # noqa: E501
+    PreparedPane,
     prepare_provider_shell_function,
     split_prepared_pane,
     start_agent_in_prepared_pane,
@@ -93,6 +94,7 @@ def _execute_slot(
     shim_dir: str = "",
     workspace_effect_fence: Optional[Callable[[], None]] = None,
     pane_owner=None,
+    occupy_prepared: Optional[PreparedPane] = None,
 ) -> SlotResult:
     if plan.kind == "adopt":
         return SlotResult(
@@ -176,30 +178,38 @@ def _execute_slot(
         )
     binding = native_binding
     lane_epoch = resolve_launch_lane_epoch(workspace_id, lane, store_home=store_home)
-    pane_env = build_pane_launch_env(
-        provider=plan.provider,
-        native_name=binding.native_name,
-        workspace_id=workspace_id,
-        lane=lane,
-        binary=binary,
-        source_path=str(env.get("PATH") or ""),
-        resolved=resolved,
-        attest_launcher=attest_launcher,
-        store_home=store_home,
-        action_id=action_id,
-        lane_epoch=lane_epoch,
-    )
-    prepared = split_prepared_pane(
-        binary=binary,
-        anchor_locator=anchor_locator,
-        direction=split or "right",
-        repo_root=repo_root,
-        env_entries=pane_env,
-        runner=runner,
-        timeout=timeout,
-        env=env,
-        effect_fence=workspace_effect_fence,
-    )
+    if occupy_prepared is not None:
+        # Redmine #15702: this run minted the lane tab first-slot-prepared, so the
+        # tab's born root pane — already carrying this slot's cwd / env and its
+        # create-time terminal receipt — IS the prepared pane. No split, no second
+        # pane, no empty root residue; every downstream identity check below joins
+        # on the exact same receipt a split pane would have produced.
+        prepared = occupy_prepared
+    else:
+        pane_env = build_pane_launch_env(
+            provider=plan.provider,
+            native_name=binding.native_name,
+            workspace_id=workspace_id,
+            lane=lane,
+            binary=binary,
+            source_path=str(env.get("PATH") or ""),
+            resolved=resolved,
+            attest_launcher=attest_launcher,
+            store_home=store_home,
+            action_id=action_id,
+            lane_epoch=lane_epoch,
+        )
+        prepared = split_prepared_pane(
+            binary=binary,
+            anchor_locator=anchor_locator,
+            direction=split or "right",
+            repo_root=repo_root,
+            env_entries=pane_env,
+            runner=runner,
+            timeout=timeout,
+            env=env,
+            effect_fence=workspace_effect_fence,
+        )
     if pane_owner is not None:
         pane_owner.own_pane(
             prepared.locator,
@@ -225,13 +235,13 @@ def _execute_slot(
     # split is still this run's side effect and must remain reachable by rollback.
     if prepared.workspace_id != target_workspace:
         raise HerdrSessionStartError(
-            "herdr pane split landed outside the requested workspace; the exact pane "
-            "was recorded and agent start was refused"
+            "the prepared launch pane landed outside the requested workspace; the "
+            "exact pane was recorded and agent start was refused"
         )
     if target_tab and prepared.tab_id != target_tab:
         raise HerdrSessionStartError(
-            "herdr pane split landed outside the requested tab; the exact pane was "
-            "recorded and agent start was refused"
+            "the prepared launch pane landed outside the requested tab; the exact "
+            "pane was recorded and agent start was refused"
         )
     # Herdr 0.8 submits the canonical provider name to the pane's interactive shell.
     # A macOS login shell may replace pane-split's PATH before that submission, so bind

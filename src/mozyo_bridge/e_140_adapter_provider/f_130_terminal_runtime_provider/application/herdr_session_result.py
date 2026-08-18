@@ -170,8 +170,12 @@ class SessionStartResult:
     - ``tab_pane_id`` — the ``root_pane.pane_id`` of the tab this run **created**
       (blank when no tab was created: default lane, all-adopt, or a heal that
       rejoined an existing tab). It is likewise observation, not close authority.
-    - ``tab_pane_reclaimed`` — historical observation; current unbound roots remain False.
-    - ``tab_pane_detail`` — the typed preservation reason, never provider stderr.
+    - ``tab_pane_reclaimed`` — True when the run-minted tab's root pane became the
+      FIRST launch's agent pane (Redmine #15702 first-slot-prepared tab, detail
+      ``root_occupied_by_first_launch``); occupation, never a close. False on any
+      other path (an unbound root stays preserved, #15227).
+    - ``tab_pane_detail`` — the typed reason (``root_occupied_by_first_launch`` /
+      ``generation_unproven_root_preserved``), never provider stderr.
     """
 
     workspace_id: str

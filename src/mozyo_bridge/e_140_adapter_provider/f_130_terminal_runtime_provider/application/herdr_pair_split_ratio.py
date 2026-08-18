@@ -577,13 +577,30 @@ def order_is_deferred(anchor_provider: str, effective_order: "Sequence[str]") ->
 def _reclaim_root_panes(
     result, *, binary: str, runner: Runner, timeout: float, env: Optional[Mapping[str, str]]
 ) -> None:
-    """Preserve generation-unbound cosmetic roots (#15227 j#103467)."""
+    """Preserve generation-unbound cosmetic roots (#15227 j#103467).
+
+    Redmine #15702: a lane tab root that the run's FIRST launch occupied (the tab was
+    minted first-slot-prepared) is no cosmetic residue — it is a live agent pane, so it
+    is recorded ``root_occupied_by_first_launch`` instead of preserved-empty. The join
+    is the strict launch identity ``_execute_slot`` already enforced (the started
+    locator equals the prepared root locator), never a scan. Nothing is closed on
+    either branch — occupation removed the empty pane without destructive authority.
+    """
     if result.base_pane_id:
         result.base_pane_reclaimed = False
         result.base_pane_detail = "generation_unproven_root_preserved"
     if result.tab_pane_id:
-        result.tab_pane_reclaimed = False
-        result.tab_pane_detail = "generation_unproven_root_preserved"
+        launched = {
+            slot.locator
+            for slot in result.slots
+            if getattr(slot, "outcome", "") == SLOT_LAUNCHED
+        }
+        if result.tab_pane_id in launched:
+            result.tab_pane_reclaimed = True
+            result.tab_pane_detail = "root_occupied_by_first_launch"
+        else:
+            result.tab_pane_reclaimed = False
+            result.tab_pane_detail = "generation_unproven_root_preserved"
 
 
 def _read_layout(

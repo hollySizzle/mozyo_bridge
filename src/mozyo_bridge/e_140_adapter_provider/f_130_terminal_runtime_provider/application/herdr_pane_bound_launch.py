@@ -302,6 +302,114 @@ def split_prepared_pane(
     return pane
 
 
+def _parse_tab_created_prepared(stdout: object) -> "tuple[str, PreparedPane] | None":
+    """``(tab_id, root PreparedPane)`` from a herdr ``tab create`` payload (fail-closed).
+
+    The prepared-root variant of ``herdr_lane_topology._parse_tab_created`` (Redmine
+    #15702): a lane tab created with ``--cwd`` / ``--env`` makes its born root pane the
+    first launch slot's prepared pane, so the parse must capture the FULL pane identity —
+    including the ``terminal_id`` the ``agent start`` identity check joins on — exactly
+    like the ``pane split`` parse (:func:`_parse_pane`). Measured herdr 0.8.0 shape::
+
+        {"result": {"type": "tab_created",
+                    "tab": {"tab_id": "w1:t4", ...},
+                    "root_pane": {"pane_id": "w1:p4", "workspace_id": "w1",
+                                  "tab_id": "w1:t4", "terminal_id": "term_...", ...}}}
+
+    Returns ``None`` (the caller fails closed and starts nothing in a guessed pane) when
+    the payload is not a ``tab_created`` envelope, any id is missing / malformed, the
+    root pane's ids do not cohere (workspace prefix, tab prefix, tab == envelope tab), or
+    the terminal identity is absent — a root without a terminal receipt must never become
+    a prepared launch pane.
+    """
+    if not isinstance(stdout, str):
+        return None
+    try:
+        payload = json.loads(stdout)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, Mapping) or result.get("type") != "tab_created":
+        return None
+    tab = result.get("tab")
+    root_pane = result.get("root_pane")
+    if not isinstance(tab, Mapping) or not isinstance(root_pane, Mapping):
+        return None
+    tab_id = _norm(tab.get("tab_id"))
+    locator = _norm(root_pane.get("pane_id"))
+    workspace_id = _norm(root_pane.get("workspace_id")) or _workspace_prefix(locator)
+    root_tab_id = _norm(root_pane.get("tab_id")) or tab_id
+    terminal_id = root_pane.get("terminal_id")
+    if (
+        not valid_target(tab_id)
+        or not valid_target(locator)
+        or not valid_target(workspace_id)
+        or _workspace_prefix(locator) != workspace_id
+        or not tab_id.startswith(f"{workspace_id}:t")
+        or tab_id == f"{workspace_id}:t"
+        or root_tab_id != tab_id
+        or type(terminal_id) is not str
+        or not terminal_id
+        or terminal_id.strip() != terminal_id
+    ):
+        return None
+    return tab_id, PreparedPane(locator, workspace_id, tab_id, terminal_id)
+
+
+def create_prepared_lane_tab(
+    *,
+    binary: str,
+    workspace_id: str,
+    label: str,
+    repo_root: Path,
+    env_entries: Sequence[str],
+    runner: Runner,
+    timeout: float,
+    env: Mapping[str, str],
+    effect_fence: "Callable[[], None] | None" = None,
+) -> "tuple[str, PreparedPane]":
+    """Mint a lane tab whose born root pane IS the first launch slot's prepared pane.
+
+    Redmine #15702: the pre-#15227 runtime closed the lane tab's empty root pane after
+    the launches; #15227 removed that close (a bare locator carries no terminal-generation
+    authority) and the root became a permanent empty shell beside every lane pair. This
+    creates the tab with the first slot's ``--cwd`` / ``--env`` so the root is born as a
+    fully prepared pane (measured herdr 0.8.0: both flags reach the root shell) and no
+    pane is ever closed — the empty-root problem is solved by occupation, not destruction.
+    The returned :class:`PreparedPane` carries the create-time ``terminal_id``, so the
+    downstream ``agent start`` identity checks join on the exact same receipt a
+    ``pane split`` pane gets. An unparseable / identity-incoherent response fails closed.
+    """
+    if not valid_target(workspace_id):
+        raise HerdrSessionStartError(
+            "prepared lane tab creation requires one exact valid workspace id"
+        )
+    argv = ["tab", "create", "--workspace", workspace_id]
+    if label:
+        argv.extend(["--label", label])
+    argv.extend(["--cwd", str(repo_root)])
+    for entry in env_entries:
+        if not isinstance(entry, str) or "=" not in entry or entry.startswith("="):
+            raise HerdrSessionStartError(
+                "tab create received a malformed environment entry"
+            )
+        argv.extend(["--env", entry])
+    argv.append("--no-focus")
+    if effect_fence is not None:
+        effect_fence()
+    completed = _invoke(binary, argv, runner, timeout, env=dict(env))
+    parsed = _parse_tab_created_prepared(completed.stdout)
+    if parsed is None:
+        raise HerdrSessionStartError(
+            "herdr tab create returned no parseable prepared root pane identity "
+            "(expected result.tab.tab_id + result.root_pane pane_id/terminal_id in a "
+            "tab_created payload); refuse to start an agent in an untracked pane"
+        )
+    return parsed
+
+
 def build_provider_shell_function_command(*, provider: str, shim_dir: str) -> str:
     """Define the canonical provider name only in the prepared pane's shell.
 
@@ -619,6 +727,7 @@ __all__ = (
     "build_pane_split_argv",
     "choose_split_anchor",
     "choose_workspace_pane_anchor",
+    "create_prepared_lane_tab",
     "list_workspace_panes",
     "prepare_complete_launch_shims",
     "prepared_pane_recorder",
