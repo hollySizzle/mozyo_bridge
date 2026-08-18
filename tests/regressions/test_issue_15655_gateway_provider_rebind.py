@@ -100,5 +100,36 @@ class GatewayProviderFollowsProjectGatewayRebind(unittest.TestCase):
         self.assertEqual(resolve_worker_provider(binding=default), PROVIDER_CLAUDE)
 
 
+class CoordinatorAuthorityStaysOnCoordinatorRole(unittest.TestCase):
+    """Review j#107777 finding_1: splitting the gateway off the coordinator role must
+    not detach the coordinator AUTHORITY surfaces (coordinator pseudo-target / callback
+    transport / coordinator pane resolution / sender preflight) from the coordinator
+    rebind — ``resolve_coordinator_provider`` resolves ``coordinator`` directly, never
+    through the ``project_gateway``-keyed gateway resolver."""
+
+    def test_coordinator_rebind_moves_coordinator_but_not_gateway(self) -> None:
+        # Under coordinator=claude / project_gateway=codex (the incident binding), BOTH
+        # must hold at once: the lane gateway stays codex AND the coordinator authority
+        # follows the rebind to claude.
+        from unittest import mock
+
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            main_lane_guard_gate,
+            workflow_provider_resolution,
+        )
+
+        with mock.patch.object(
+            workflow_provider_resolution,
+            "load_workflow_binding",
+            return_value=(COORDINATOR_REBOUND, ()),
+        ):
+            self.assertEqual(
+                resolve_gateway_provider(binding=COORDINATOR_REBOUND), PROVIDER_CODEX
+            )
+            self.assertEqual(
+                main_lane_guard_gate.resolve_coordinator_provider(), PROVIDER_CLAUDE
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
