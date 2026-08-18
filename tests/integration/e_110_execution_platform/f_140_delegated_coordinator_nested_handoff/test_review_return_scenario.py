@@ -19,12 +19,10 @@ required acceptance):
 
 from __future__ import annotations
 
-import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
@@ -77,6 +75,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     encode_assigned_name,
 )
+from tests.support.process_home_pin import pin_process_home
 
 NOW = "2026-07-13T00:00:00+00:00"
 WS = "wsReview"
@@ -125,15 +124,10 @@ class _CapturingTransport:
 class ReviewReturnScenarioTest(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(tempfile.mkdtemp())
-        # Pin the process home to this scenario's own temp home: the send edge's retirement
-        # authority resolves through ``home or mozyo_bridge_home()``, and without this pin a raw
-        # ``python -m unittest`` run reads the operator's real global store (phantom zero-send
-        # "retirement authority unreadable / unsafe owner, mode, or file type"; Redmine #15631
-        # j#107289). ``addCleanup`` keeps restore correct across the mid-test ``self.setUp()``
-        # re-invocation below (LIFO unwinds to the original environment).
-        env = patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)}, clear=False)
-        env.start()
-        self.addCleanup(env.stop)
+        # The send edge's retirement authority resolves the ambient process home; the shared
+        # pin (rationale in tests/support/process_home_pin.py, Redmine #15709) keeps this
+        # scenario hermetic, including across the mid-test ``self.setUp()`` re-invocation below.
+        pin_process_home(self, self.home)
         self.store_path = workflow_runtime_store_path(self.home)
         self.store = WorkflowRuntimeStore(path=self.store_path)
         self.outbox = CallbackOutbox(path=self.store_path)

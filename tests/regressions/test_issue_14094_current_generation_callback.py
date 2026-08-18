@@ -59,6 +59,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     OWNER_RESOLVED,
     OwningLaneBinding,
 )
+from tests.support.process_home_pin import pin_process_home
 
 ISSUE = "14094"
 LANE = "issue_14094_current_generation_callback_r1"
@@ -272,6 +273,8 @@ class SupervisorResumedLaneScenarioTest(unittest.TestCase):
 
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp())
+        # The supervisor deliver edge runs the ambient-home retirement gate (#15709).
+        pin_process_home(self, self.dir)
         self.store_path = self.dir / "workflow-runtime.sqlite"
         self.store = WorkflowRuntimeStore(path=self.store_path)
         self.outbox = CallbackOutbox(path=self.store_path)
