@@ -1026,5 +1026,58 @@ class HerdrLaneViewForWorktreeTest(unittest.TestCase):
         self.assertIsNone(view)
 
 
+class LaneKindJoinTest(unittest.TestCase):
+    """#15704: lifecycle-store lane kinds join into the herdr views (display-only)."""
+
+    def test_recorded_kind_joins_and_unrecorded_lane_degrades(self) -> None:
+        rows = [
+            _row("wsMain", "codex", "issue_15693_l2_trial", "w2:p4"),
+            _row("wsMain", "claude", "issue_15693_l2_trial", "w2:p5"),
+            _row("wsMain", "codex", "issue_100_a", "w2:p6"),
+        ]
+        views = project_herdr_sublanes(
+            rows,
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            repo_workspace_id="wsMain",
+            lane_kinds={("wsMain", "issue_15693_l2_trial"): "delegated_coordinator"},
+        )
+        by_lane = {v.lane_id: v for v in views}
+        trial = by_lane["issue_15693_l2_trial"]
+        self.assertEqual(trial.lane_kind, "delegated_coordinator")
+        self.assertEqual(trial.as_payload()["lane_kind"], "delegated_coordinator")
+        # A lane with no recorded kind keeps the pre-#15704 view (degrade).
+        self.assertEqual(by_lane["issue_100_a"].lane_kind, "")
+
+    def test_off_contract_kind_never_renders(self) -> None:
+        views = project_herdr_sublanes(
+            [_row("wsMain", "codex", "issue_100_a", "w2:p4")],
+            exclude_workspace_id="wsMain",
+            resolve_repo_root=lambda ws: None,
+            repo_workspace_id="wsMain",
+            lane_kinds={("wsMain", "issue_100_a"): "parent"},
+        )
+        self.assertEqual(views[0].lane_kind, "")
+
+    def test_vanished_shared_model_record_row_carries_kind(self) -> None:
+        gone = LaneMetadataRecord(
+            lane_workspace_token="wt_gone",
+            repo_workspace_id="wsMain",
+            issue_id="303",
+            lane_label="issue_303_gone",
+            lane_id="issue_303_gone",
+        )
+        views = project_herdr_sublanes(
+            [],
+            exclude_workspace_id="wsOther",
+            resolve_repo_root=lambda ws: None,
+            lane_records={"wt_gone": gone},
+            repo_workspace_id="wsMain",
+            lane_kinds={("wsMain", "issue_303_gone"): "implementation"},
+        )
+        self.assertEqual(len(views), 1)
+        self.assertEqual(views[0].lane_kind, "implementation")
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()

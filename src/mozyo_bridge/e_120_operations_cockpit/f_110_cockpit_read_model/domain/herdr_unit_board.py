@@ -19,6 +19,7 @@ import unicodedata
 from dataclasses import dataclass
 from typing import Iterable, Mapping, Sequence
 
+from mozyo_bridge.core.state.lane_kind import is_lane_kind
 from mozyo_bridge.e_120_operations_cockpit.f_110_cockpit_read_model.domain.public_safe_text import (
     MAX_PRESENTATION_TEXT,
     REDACTED_TEXT,
@@ -106,14 +107,30 @@ def _unit_public_id(
     return f"unit-{digest.hexdigest()[:32]}"
 
 
-def lane_work_label(lane_id: object, issue_id: object = "", label: object = "") -> str:
+def lane_work_label(
+    lane_id: object, issue_id: object = "", label: object = "", lane_kind: object = ""
+) -> str:
     """Return a readable work label without pretending it is a ticket subject.
 
     ``lane_metadata`` is display metadata, not durable ticket truth.  The label is
     therefore rendered as a lane label.  When it includes the conventional issue
     prefix, the readable suffix is kept beside the id so the UI never shows a bare
     ticket number as if that explained the work.
+
+    ``lane_kind`` (Redmine #15704) appends the lane's recorded delegation-geometry
+    kind — ``[delegated_coordinator]`` etc. — so a coordinator lane is visually
+    distinct on the board and in the pane title built from this label.  Only the
+    closed three-token vocabulary renders; anything else degrades to the plain
+    label.  Display decoration only, never workflow or routing authority.
     """
+    base = _lane_work_label_base(lane_id, issue_id, label)
+    kind = lane_kind.strip() if isinstance(lane_kind, str) else ""
+    if kind and is_lane_kind(kind):
+        return safe_text(f"{base} [{kind}]")
+    return base
+
+
+def _lane_work_label_base(lane_id: object, issue_id: object, label: object) -> str:
     lane = safe_text(lane_id, fallback="unknown-lane")
     if lane == "default":
         return "default lane"

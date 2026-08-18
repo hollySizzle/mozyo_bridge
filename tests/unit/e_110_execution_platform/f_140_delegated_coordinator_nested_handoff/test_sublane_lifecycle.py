@@ -171,6 +171,35 @@ class ProjectSublanesTests(unittest.TestCase):
         self.assertEqual(project_sublanes(rows)[0].repo_root, "/wt/x")
 
 
+class LaneKindDisplayTests(unittest.TestCase):
+    """#15704: the pane-row lane kind projects display-only into the lane view."""
+
+    def test_canonical_kind_is_projected_and_in_payload(self):
+        rows = [
+            _row(id="%1", agent_role="codex", lane_id="l1",
+                 lane_label="issue_15693_l2_trial",
+                 lane_kind="delegated_coordinator"),
+        ]
+        v = project_sublanes(rows)[0]
+        self.assertEqual(v.lane_kind, "delegated_coordinator")
+        self.assertEqual(v.as_payload()["lane_kind"], "delegated_coordinator")
+
+    def test_off_contract_kind_degrades_to_empty(self):
+        # The pane-row value is the @mozyo_lane_kind display cache; anything
+        # outside the closed three-token vocabulary must not leak into the view.
+        rows = [
+            _row(id="%1", agent_role="codex", lane_id="l1",
+                 lane_label="issue_100_a", lane_kind="grandchild"),
+        ]
+        self.assertEqual(project_sublanes(rows)[0].lane_kind, "")
+
+    def test_absent_kind_stays_empty(self):
+        v = project_sublanes(
+            [_row(id="%1", agent_role="codex", lane_id="l1")]
+        )[0]
+        self.assertEqual(v.lane_kind, "")
+
+
 class HostWindowProjectionTests(unittest.TestCase):
     """#13086: lane host-window identity from the shared pane-location vocabulary."""
 

@@ -462,5 +462,64 @@ class LatestGenerationAdmissibleResolutionTest(unittest.TestCase):
                                        latest_generation_admissible=True))
 
 
+class LaneKindListDisplayTests(unittest.TestCase):
+    """Redmine #15704: `sublane list` renders the recorded lane kind display-only."""
+
+    def _lane(self, **overrides):
+        base = dict(
+            workspace_id="ws", lane_id="issue_15693_l2_trial",
+            lane_label="issue_15693_l2_trial", issue="15693",
+            branch="issue_15693_l2_trial", repo_root=None,
+            gateway_pane="%1", worker_pane="%2", state=SUBLANE_STATE_ACTIVE,
+        )
+        base.update(overrides)
+        return SublaneLaneView(**base)
+
+    def test_recorded_kind_renders_and_lands_in_payload(self):
+        outcome = SublaneListOutcome(
+            lanes=(self._lane(lane_kind="delegated_coordinator"),)
+        )
+        text = format_list_text(outcome)
+        self.assertIn("kind=delegated_coordinator", text)
+        self.assertEqual(
+            outcome.as_payload()["sublanes"][0]["lane_kind"],
+            "delegated_coordinator",
+        )
+
+    def test_unrecorded_kind_keeps_the_row_byte_invariant(self):
+        recorded = format_list_text(SublaneListOutcome(lanes=(self._lane(),)))
+        self.assertNotIn("kind=", recorded)
+
+    def test_lifecycle_lane_kinds_reads_a_real_store_and_degrades_when_absent(self):
+        import tempfile
+
+        from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore
+        from mozyo_bridge.core.state.lane_lifecycle_model import LaneLifecycleKey
+        from mozyo_bridge.core.state.replacement_transaction_model import (
+            DecisionPointer,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+            lifecycle_lane_kinds,
+        )
+
+        with tempfile.TemporaryDirectory() as t:
+            home = Path(t)
+            # An absent store degrades to no kinds (display fail-open).
+            self.assertEqual(lifecycle_lane_kinds(home=home), {})
+            outcome = LaneLifecycleStore(home=home).declare_active(
+                LaneLifecycleKey("wsMain", "issue_15693_l2_trial"),
+                decision=DecisionPointer(
+                    source="redmine", issue_id="15693", journal_id="107914"
+                ),
+                issue_id="15693",
+                lane_kind="delegated_coordinator",
+            )
+            self.assertTrue(outcome.applied)
+            self.assertEqual(
+                lifecycle_lane_kinds(home=home),
+                {("wsMain", "issue_15693_l2_trial"): "delegated_coordinator"},
+            )
+
+
 if __name__ == "__main__":
     unittest.main()

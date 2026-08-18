@@ -38,6 +38,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
+from mozyo_bridge.core.state.lane_kind import is_lane_kind
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
     GATEWAY_ROLE,
     STALE_HINT_DUPLICATE_ISSUE_LANE,
@@ -272,6 +273,10 @@ class _LaneEntry:
     #: stale flag is ``False``), which keeps the ``*_slot_missing`` hint.
     gateway_stale: bool = False
     worker_stale: bool = False
+    #: The lane's recorded delegation-geometry kind, joined from the lane lifecycle
+    #: store for display only (Redmine #15704). "" when no canonical durable kind
+    #: fact resolves for the unit; never a routing / authority / liveness input.
+    lane_kind: str = ""
 
 
 def _managed_pair_for(
@@ -309,6 +314,7 @@ def project_herdr_sublanes(
     lane_records: Optional[Mapping[str, object]] = None,
     worktree_resolved: Optional[Callable[[str], Optional[bool]]] = None,
     repo_workspace_id: str = "",
+    lane_kinds: Optional[Mapping[tuple[str, str], str]] = None,
 ) -> tuple[SublaneLaneView, ...]:
     """Fold the live herdr inventory into one :class:`SublaneLaneView` per lane unit.
 
@@ -378,9 +384,22 @@ def project_herdr_sublanes(
     into this repo's list (fail-safe: unattributable lanes just carry no such hint).
     The LIVE row enumeration itself stays host-global per the #13331 contract.
 
+    Lane kind (Redmine #15704): ``lane_kinds`` is the caller-resolved
+    ``(repo_workspace_id, lane_id) -> lane_kind`` display join from the lane lifecycle
+    store, so a delegated-coordinator lane reads distinctly in ``sublane list``. Only
+    the closed three-token vocabulary is projected; an absent / off-contract entry
+    degrades to "" (the pre-#15704 row). Display-only — never routing, authority, or
+    liveness input, exactly like the lane metadata identity join.
+
     Pure over the injected rows + resolvers (no subprocess / config read); live lanes keep
     deterministic first-seen ordering.
     """
+    kinds = lane_kinds or {}
+
+    def _display_lane_kind(ws: str, lane: str) -> str:
+        kind = str(kinds.get((_norm(ws), _norm_lane(lane)), "") or "").strip()
+        return kind if is_lane_kind(kind) else ""
+
     if resolve_lane_record is None and lane_records is not None:
         resolve_lane_record = lane_records.get
     records_by_unit: dict[tuple[str, str], object] = {}
@@ -528,6 +547,7 @@ def project_herdr_sublanes(
                 repo_scoped=_record_repo_scoped(record),
                 gateway_stale=gateway_stale,
                 worker_stale=worker_stale,
+                lane_kind=_display_lane_kind(ws, lane),
             )
         )
 
@@ -574,6 +594,7 @@ def project_herdr_sublanes(
                     identity_hints=(),
                     slots_missing=True,
                     repo_scoped=True,
+                    lane_kind=_display_lane_kind(unit_ws or token, unit_lane),
                 )
             )
 
@@ -637,9 +658,40 @@ def project_herdr_sublanes(
                     worker_placement=entry.worker_placement,
                 ),
                 stale_hints=tuple(hints),
+                lane_kind=entry.lane_kind,
             )
         )
     return tuple(views)
+
+
+def lifecycle_lane_kinds(*, home: Optional[Path] = None) -> dict[tuple[str, str], str]:
+    """The ``(repo_workspace_id, lane_id) -> lane_kind`` display join (Redmine #15704).
+
+    Read from the lane lifecycle store via the non-creating, version-compatible
+    reader (#13844) — the durable home of the generation-bound ``lane_kind`` fact
+    (#13647 Tranche 1b). Fail-open for display: an absent / unreadable /
+    newer-schema store, or any row without a canonical three-token kind, simply
+    contributes no entry, so every consumer degrades to the pre-#15704 rendering.
+    Display material only — never routing, authority, or liveness input.
+    """
+    from mozyo_bridge.core.state.lane_lifecycle_readonly import (
+        load_lane_lifecycle_readonly,
+    )
+
+    try:
+        rows = load_lane_lifecycle_readonly(home=home)
+    except Exception:  # noqa: BLE001 — a display join never raises.
+        return {}
+    if rows is None:
+        return {}
+    kinds: dict[tuple[str, str], str] = {}
+    for row in rows:
+        ws = _norm(getattr(row, "repo_workspace_id", ""))
+        lane = _norm_lane(getattr(row, "lane_id", ""))
+        kind = str(getattr(row, "lane_kind", "") or "").strip()
+        if ws and lane and is_lane_kind(kind):
+            kinds[(ws, lane)] = kind
+    return kinds
 
 
 def herdr_sublane_views(
@@ -693,6 +745,7 @@ def herdr_sublane_views(
         lane_records=lane_records,
         worktree_resolved=probe_worktree_resolved,
         repo_workspace_id=repo_scope_workspace_id(repo_root),
+        lane_kinds=lifecycle_lane_kinds(),
     )
 
 
@@ -848,6 +901,7 @@ __all__ = (
     "herdr_lane_view_for_worktree",
     "herdr_sublane_views",
     "is_git_worktree_root",
+    "lifecycle_lane_kinds",
     "list_herdr_agent_rows",
     "probe_worktree_resolved",
     "project_herdr_sublanes",

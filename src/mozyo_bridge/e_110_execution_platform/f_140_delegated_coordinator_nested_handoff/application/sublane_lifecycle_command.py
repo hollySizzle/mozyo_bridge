@@ -462,9 +462,13 @@ def format_list_text(outcome: SublaneListOutcome) -> str:
         return "sublanes: none"
     lines = [f"sublanes: {len(outcome.lanes)}"]
     for lane in outcome.lanes:
+        # #15704: surface the recorded delegation-geometry kind so a
+        # delegated_coordinator lane is visually distinct. Display-only, and a
+        # lane with no recorded kind keeps its pre-#15704 row byte-for-byte.
+        kind = f" kind={lane.lane_kind}" if lane.lane_kind else ""
         lines.append(
             f"  {lane.lane_label or lane.lane_id} [{lane.state}]"
-            f" issue={lane.issue or '-'} branch={lane.branch or '-'}"
+            f" issue={lane.issue or '-'} branch={lane.branch or '-'}{kind}"
         )
         lines.append(
             f"    gateway={lane.gateway_pane or '-'} worker={lane.worker_pane or '-'}"

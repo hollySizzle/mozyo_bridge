@@ -81,6 +81,9 @@ METADATA_TOKEN_KEYS = (
 WorkspaceLoader = Callable[[str], Optional[WorkspaceRecord]]
 RoleLoader = Callable[[Path], ParsedRoleBindings]
 LaneRecordsLoader = Callable[[], Mapping[str, LaneMetadataRecord]]
+#: ``(workspace_id, lane_id) -> lane_kind`` display join from the lane lifecycle
+#: store (Redmine #15704).  Display decoration only, never routing authority.
+LaneKindsLoader = Callable[[], Mapping[tuple[str, str], str]]
 PaneRowsLoader = Callable[[], Sequence[Mapping[str, object]]]
 SyncLockFactory = Callable[[], ContextManager[None]]
 
@@ -95,6 +98,16 @@ def _default_workspace_loader(workspace_id: str) -> Optional[WorkspaceRecord]:
 
 def _default_lane_records_loader() -> Mapping[str, LaneMetadataRecord]:
     return LaneMetadataStore().load_all(include_retired=False)
+
+
+def _default_lane_kinds_loader() -> Mapping[tuple[str, str], str]:
+    # The shared #15704 lifecycle-store display join (non-creating readonly read,
+    # fail-open to an empty mapping) — the same source `sublane list` renders from.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+        lifecycle_lane_kinds,
+    )
+
+    return lifecycle_lane_kinds()
 
 
 class MetadataSyncLockError(RuntimeError):
@@ -234,6 +247,7 @@ class HerdrUnitBoardRuntime:
         workspace_loader: WorkspaceLoader = _default_workspace_loader,
         role_loader: RoleLoader = load_parsed_role_bindings,
         lane_records_loader: LaneRecordsLoader = _default_lane_records_loader,
+        lane_kinds_loader: LaneKindsLoader = _default_lane_kinds_loader,
         pane_rows_loader: Optional[PaneRowsLoader] = None,
         sync_lock_factory: SyncLockFactory = unit_board_metadata_lock,
     ) -> None:
@@ -245,6 +259,7 @@ class HerdrUnitBoardRuntime:
         self._workspace_loader = workspace_loader
         self._role_loader = role_loader
         self._lane_records_loader = lane_records_loader
+        self._lane_kinds_loader = lane_kinds_loader
         self._pane_rows_loader = pane_rows_loader or self._list_live_pane_rows
         self._sync_lock_factory = sync_lock_factory
 
@@ -323,19 +338,26 @@ class HerdrUnitBoardRuntime:
 
     @staticmethod
     def _lane_display(
-        records: Sequence[LaneMetadataRecord], workspace_id: str, lane_id: str
+        records: Sequence[LaneMetadataRecord],
+        workspace_id: str,
+        lane_id: str,
+        lane_kinds: Optional[Mapping[tuple[str, str], str]] = None,
     ) -> str:
         if lane_id == "default":
             return lane_work_label(lane_id)
+        # #15704: the lifecycle-recorded delegation-geometry kind decorates the
+        # work label (and thereby the pane title) display-only; an unrecorded
+        # lane renders exactly the pre-#15704 label.
+        kind = (lane_kinds or {}).get((workspace_id, lane_id), "")
         matches = [
             record
             for record in records
             if record.repo_workspace_id == workspace_id and record.lane_id == lane_id
         ]
         if len(matches) != 1:
-            return lane_work_label(lane_id)
+            return lane_work_label(lane_id, lane_kind=kind)
         record = matches[0]
-        return lane_work_label(lane_id, record.issue_id, record.lane_label)
+        return lane_work_label(lane_id, record.issue_id, record.lane_label, lane_kind=kind)
 
     def _observe(self) -> _ObservedBoard:
         observed_at = _utc_now()
@@ -358,6 +380,12 @@ class HerdrUnitBoardRuntime:
             lane_records = tuple(self._lane_records_loader().values())
         except (OSError, ValueError, TypeError):
             lane_records = ()
+        try:
+            lane_kinds = dict(self._lane_kinds_loader())
+        except (OSError, ValueError, TypeError):
+            # The kind join is a display decoration; absence degrades the label,
+            # it never degrades the board.
+            lane_kinds = {}
 
         observations: list[AgentObservation] = []
         unmanaged = 0
@@ -449,7 +477,7 @@ class HerdrUnitBoardRuntime:
                 display_by_unit[unit_key] = display
             project_label, role, responsibility, authority = display
             work_label = self._lane_display(
-                lane_records, identity.workspace_id, identity.lane_id
+                lane_records, identity.workspace_id, identity.lane_id, lane_kinds
             )
             metadata_authority.append(
                 (
