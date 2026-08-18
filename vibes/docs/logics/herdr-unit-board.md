@@ -123,7 +123,8 @@ production install の代替にしない。
 | Unit identity | decoded managed Herdr assigned name | workspace / lane grouping key |
 | project label | workspace registry | 表示のみ |
 | workflow role / 責務 | repo-local workflow role binding | 宣言を表示。推測しない |
-| work label | lane metadata | 表示のみ。ticket subjectとは断定しない |
+| work label (base) | lane metadata | 表示のみ。ticket subjectとは断定しない |
+| work label の lane_kind 装飾 | lane lifecycle store (非作成 readonly reader, #15704) | 表示のみ。canonical 3 token だけを `[<kind>]` suffix で装飾し、未記録 / 読取不能は無装飾へ縮退。routing / authority / liveness に使わない |
 | runtime state | action-time Herdr inventory | live observation |
 | title / token | Herdr display metadata | 表示のみ。identityにしない |
 
