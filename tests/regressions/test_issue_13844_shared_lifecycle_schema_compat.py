@@ -172,8 +172,11 @@ class _Target:
 
 
 class _FakeBinding:
+    # Mirrors RoleProviderBinding.default(): implementation-profile roles -> claude,
+    # coordination-profile roles (incl. the #15655 ``project_gateway`` gateway role)
+    # -> codex.
     def provider_for(self, role):
-        return "codex" if role == "coordinator" else "claude"
+        return "claude" if role in ("implementer", "implementation_worker") else "codex"
 
 
 class _Die(Exception):
