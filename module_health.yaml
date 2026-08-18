@@ -1482,7 +1482,7 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/sublane_actuator_use_case.py
-    lines: 1089
+    lines: 1090
     reason: >-
       Backend-agnostic sublane actuation choreography (create / adopt / confirm /
       dispatch). Already at 999 lines before #13810; the #13809 review (j#78890
@@ -1500,10 +1500,11 @@ allowlist:
       must return the use case's `_blocked` result with the request context) lands here.
       Splitting this shared orchestration mid-review-cycle for these fail-closed branches
       is disproportionate risk; the `_execute` block-site repetition decomposition is
-      deferred to a follow-up under this issue's Version. Redmine #15706 adds the one
-      sender-authority follow-through line (defaulting an admitted delegated-gateway
-      create's upstream to its verified parent lane; the decision body lives in
-      `sublane_actuator_gates.default_upstream_to_verified_parent`) — 1086 -> 1089.
+      deferred to a follow-up under this issue's Version. Redmine #15706 adds the
+      sender-authority follow-through (defaulting an admitted delegated-gateway
+      create's upstream to its verified parent lane, and the typed sender-refusal
+      blocked_reasons projection; both decision bodies live in
+      `sublane_actuator_gates`) — 1086 -> 1090.
     owner_issue: "#13847"
     resolution_version: "v0.12.0 (Version #301 ワークフロー単一ステップ実行入口整備枠)"
     expires: "2027-10-08"

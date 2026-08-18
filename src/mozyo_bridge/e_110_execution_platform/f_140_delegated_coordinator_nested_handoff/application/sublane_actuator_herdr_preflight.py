@@ -47,6 +47,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E501
     REASON_LAUNCHER_INCOMPATIBLE,
+    SENDER_GATEWAY_LIVE_AMBIGUOUS,
+    SENDER_GATEWAY_LIVE_MISSING,
+    SENDER_GATEWAY_LOCATOR_MISSING,
+    SENDER_GATEWAY_UNATTESTED,
+    SENDER_LANE_LIFECYCLE_UNREADABLE,
+    SENDER_LANE_NOT_DELEGATED_COORDINATOR,
+    SENDER_LANE_UNESTABLISHED,
+    SENDER_PROVIDER_NOT_GATEWAY,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     DEFAULT_LANE,
@@ -106,16 +114,12 @@ SENDER_KIND_DEFAULT_COORDINATOR = "default_lane_coordinator"
 #: lane, creating a child implementation lane under itself.
 SENDER_KIND_DELEGATED_GATEWAY = "delegated_coordinator_gateway"
 
-# Typed refusal tokens for the delegated-gateway branch (closed vocabulary; every
-# branch is typed and fail-closed — Redmine #15706 design constraint 4).
-SENDER_LANE_LIFECYCLE_UNREADABLE = "sender_lane_lifecycle_unreadable"
-SENDER_LANE_UNESTABLISHED = "sender_lane_unestablished"
-SENDER_LANE_NOT_DELEGATED_COORDINATOR = "sender_lane_not_delegated_coordinator"
-SENDER_PROVIDER_NOT_GATEWAY = "sender_provider_not_gateway"
-SENDER_GATEWAY_LIVE_MISSING = "sender_gateway_live_missing"
-SENDER_GATEWAY_LIVE_AMBIGUOUS = "sender_gateway_live_ambiguous"
-SENDER_GATEWAY_LOCATOR_MISSING = "sender_gateway_locator_missing"
-SENDER_GATEWAY_UNATTESTED = "sender_gateway_unattested"
+# The typed refusal tokens for the delegated-gateway branch (closed vocabulary; every
+# branch is typed and fail-closed — Redmine #15706 design constraint 4) are DEFINED in
+# the domain blocked-reason vocabulary (review j#108076 finding_typedreasonprojection)
+# so the actuation outcome can project each branch to an honest next action; they are
+# imported at the top of this module and re-exported via ``__all__`` because this
+# producer module is the established import site.
 
 
 @dataclass(frozen=True)
@@ -129,12 +133,19 @@ class DispatchSenderAuthority:
     VERIFIED sender lane when the delegated-gateway branch admitted — the value the
     child lane's lifecycle declaration records as its parent binding — and empty
     otherwise, so a caller can never bind a parent the verdict did not verify.
+
+    ``reason`` (review j#108076 finding_typedreasonprojection) is the STRUCTURED typed
+    branch token of a delegated-gateway refusal — one of the ``SENDER_*`` vocabulary —
+    carried as a field rather than only prose, so the actuation outcome can surface it
+    in ``blocked_reasons`` and map it to an honest next action. It is EMPTY on success
+    and on every pre-#15706 refusal (whose public projection stays byte-invariant).
     """
 
     ok: bool
     detail: str
     sender_kind: str = ""
     parent_lane_id: str = ""
+    reason: str = ""
 
 
 def evaluate_dispatch_sender_authority(
@@ -198,25 +209,19 @@ def evaluate_dispatch_sender_authority(
             False, f"coordinator provider binding is unreadable ({exc})"
         )
     sender_lane = result.identity.lane_id
+    provider_refusal = (
+        f"sender provider {result.identity.role!r} is not the configured "
+        f"coordinator provider {coordinator_provider!r}"
+    )
     if sender_lane == DEFAULT_LANE:
         if result.identity.role != coordinator_provider:
-            return DispatchSenderAuthority(
-                False,
-                (
-                    f"sender provider {result.identity.role!r} is not the configured "
-                    f"coordinator provider {coordinator_provider!r}"
-                ),
-            )
+            return DispatchSenderAuthority(False, provider_refusal)
         return DispatchSenderAuthority(
             True,
             "sender identity matches the coordinator binding and default lane",
             sender_kind=SENDER_KIND_DEFAULT_COORDINATOR,
         )
 
-    legacy_refusal = (
-        f"sender lane {sender_lane!r} is not the coordinator "
-        f"default lane {DEFAULT_LANE!r}"
-    )
     from mozyo_bridge.core.state.lane_kind import (
         LANE_KIND_DELEGATED_COORDINATOR,
         LANE_KIND_IMPLEMENTATION,
@@ -224,8 +229,16 @@ def evaluate_dispatch_sender_authority(
 
     if (requested_lane_kind or "").strip() != LANE_KIND_IMPLEMENTATION:
         # Not a child implementation lane: the extension does not apply and the
-        # pre-#15706 refusal is reported byte-for-byte (acceptance condition 2).
-        return DispatchSenderAuthority(False, legacy_refusal)
+        # pre-#15706 evaluator's outcome is reproduced byte-for-byte INCLUDING its
+        # precedence — the provider mismatch is reported BEFORE the lane mismatch
+        # (acceptance condition 2; review j#108076 finding_legacyrefusalprecedence).
+        if result.identity.role != coordinator_provider:
+            return DispatchSenderAuthority(False, provider_refusal)
+        return DispatchSenderAuthority(
+            False,
+            f"sender lane {sender_lane!r} is not the coordinator "
+            f"default lane {DEFAULT_LANE!r}",
+        )
 
     # 1. Durable geometry: the SENDER lane must be an active delegated_coordinator lane
     # of this workspace, read from the lifecycle authority (never the caller env).
@@ -251,7 +264,8 @@ def evaluate_dispatch_sender_authority(
         return DispatchSenderAuthority(
             False,
             f"{SENDER_LANE_LIFECYCLE_UNREADABLE}: the lane lifecycle authority for "
-            f"sender lane {sender_lane!r} could not be read; {legacy_refusal}",
+            f"sender lane {sender_lane!r} could not be read",
+            reason=SENDER_LANE_LIFECYCLE_UNREADABLE,
         )
     if record is None or getattr(record, "lane_disposition", "") != "active" or int(
         getattr(record, "lane_generation", 0) or 0
@@ -259,7 +273,8 @@ def evaluate_dispatch_sender_authority(
         return DispatchSenderAuthority(
             False,
             f"{SENDER_LANE_UNESTABLISHED}: sender lane {sender_lane!r} owns no active "
-            f"positive-generation lifecycle row in this workspace; {legacy_refusal}",
+            f"positive-generation lifecycle row in this workspace",
+            reason=SENDER_LANE_UNESTABLISHED,
         )
     stored_kind = str(getattr(record, "lane_kind", "") or "")
     if stored_kind != LANE_KIND_DELEGATED_COORDINATOR:
@@ -267,7 +282,8 @@ def evaluate_dispatch_sender_authority(
             False,
             f"{SENDER_LANE_NOT_DELEGATED_COORDINATOR}: sender lane {sender_lane!r} is "
             f"recorded with lane_kind {stored_kind!r}, not "
-            f"{LANE_KIND_DELEGATED_COORDINATOR!r}; {legacy_refusal}",
+            f"{LANE_KIND_DELEGATED_COORDINATOR!r}",
+            reason=SENDER_LANE_NOT_DELEGATED_COORDINATOR,
         )
 
     # 2. The gateway slot: the sender's provider must be the workspace's configured
@@ -285,13 +301,16 @@ def evaluate_dispatch_sender_authority(
         gateway_provider = _norm(gateway_provider_resolver())
     except Exception as exc:  # noqa: BLE001 — an unresolved gateway binding admits nothing.
         return DispatchSenderAuthority(
-            False, f"{SENDER_PROVIDER_NOT_GATEWAY}: gateway provider unresolved ({exc})"
+            False,
+            f"{SENDER_PROVIDER_NOT_GATEWAY}: gateway provider unresolved ({exc})",
+            reason=SENDER_PROVIDER_NOT_GATEWAY,
         )
     if not gateway_provider or result.identity.role != gateway_provider:
         return DispatchSenderAuthority(
             False,
             f"{SENDER_PROVIDER_NOT_GATEWAY}: sender provider {result.identity.role!r} "
             f"is not the configured gateway provider {gateway_provider!r}",
+            reason=SENDER_PROVIDER_NOT_GATEWAY,
         )
 
     # 3. Launch-time attestation: exactly one live attested occupant of the sender
@@ -330,6 +349,7 @@ def evaluate_dispatch_sender_authority(
             False,
             f"{SENDER_GATEWAY_UNATTESTED}: the live inventory / attestation join for "
             f"sender lane {sender_lane!r} could not be read",
+            reason=SENDER_GATEWAY_UNATTESTED,
         )
     if target.status != TARGET_OK:
         refusal = {
@@ -350,6 +370,7 @@ def evaluate_dispatch_sender_authority(
                 else ""
             )
             + ")",
+            reason=refusal,
         )
     return DispatchSenderAuthority(
         True,
@@ -377,6 +398,9 @@ def run_dispatch_sender_preflight(ops) -> tuple[bool, str]:
         ops.env, ops.repo_root, requested_lane_kind=ops.lane_kind
     )
     ops.verified_parent_lane_id = verdict.parent_lane_id if verdict.ok else ""
+    # j#108076 finding_typedreasonprojection: the typed branch token survives to the
+    # public blocked_reasons via this stash; empty on success and on legacy refusals.
+    ops.dispatch_sender_refusal_reason = "" if verdict.ok else verdict.reason
     return verdict.ok, verdict.detail
 
 

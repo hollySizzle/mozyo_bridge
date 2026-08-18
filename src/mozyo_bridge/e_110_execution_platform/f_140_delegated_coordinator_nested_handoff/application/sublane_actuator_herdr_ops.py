@@ -170,6 +170,9 @@ class HerdrSublaneActuatorOps:
     #: The VERIFIED delegated-parent lane stashed by the sender preflight (#15706) —
     #: the ONLY source the child's lifecycle declaration binds a parent from.
     verified_parent_lane_id: str = ""
+    #: The typed delegated-sender refusal token stashed by the sender preflight
+    #: (j#108076); empty on success and on every legacy refusal (byte-invariant).
+    dispatch_sender_refusal_reason: str = ""
 
     # -- git probes / additive worktree add (backend-agnostic, reused verbatim) -----
 

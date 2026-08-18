@@ -47,6 +47,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     evaluate_dispatch_sender,
     evaluate_dispatch_sender_authority,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (  # noqa: E402,E501
+    ACTUATE_BLOCKED,
+    DELEGATED_SENDER_NEXT_ACTIONS,
+    REASON_MISSING_IDENTITY,
+    SublaneActuationOutcome,
+    render_actuation_journal,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E402,E501
     TARGET_AMBIGUOUS,
     TARGET_MISSING,
@@ -164,16 +171,71 @@ class DefaultCoordinatorBranchByteInvarianceTest(unittest.TestCase):
 
     def test_nondefault_lane_with_non_child_target_keeps_the_legacy_refusal(self) -> None:
         # Acceptance condition 2 (非 child 対象): a non-default-lane sender that is NOT
-        # creating a child implementation lane refuses with the pre-#15706 text.
+        # creating a child implementation lane refuses with the pre-#15706 outcome —
+        # INCLUDING its precedence (review j#108076 finding_legacyrefusalprecedence):
+        # a provider mismatch is reported BEFORE the lane mismatch.
         for kind in ("", "delegated_coordinator", "coordinator"):
-            with self.subTest(requested=kind):
+            with self.subTest(requested=kind, provider="mismatch"):
+                # role=codex vs coordinator=claude: the OLD evaluator reports the
+                # provider refusal first, even from a non-default lane.
                 verdict = _decide(requested_lane_kind=kind, record=_l2_record())
+                self.assertFalse(verdict.ok)
+                self.assertEqual(
+                    verdict.detail,
+                    "sender provider 'codex' is not the configured "
+                    "coordinator provider 'claude'",
+                )
+            with self.subTest(requested=kind, provider="match"):
+                verdict = _decide(
+                    requested_lane_kind=kind,
+                    record=_l2_record(),
+                    coordinator_provider="codex",
+                )
                 self.assertFalse(verdict.ok)
                 self.assertEqual(
                     verdict.detail,
                     f"sender lane {L2_LANE!r} is not the coordinator "
                     f"default lane {DEFAULT_LANE!r}",
                 )
+
+    def test_non_admission_grid_matches_the_legacy_evaluator_byte_for_byte(self) -> None:
+        # j#108076 finding_legacyrefusalprecedence: for EVERY combination outside the
+        # one new admission, the new function's (ok, detail) equals the pre-#15706
+        # evaluator's — pinned by direct comparison, not by re-stating the texts.
+        for role in ("claude", "codex"):
+            for lane in (DEFAULT_LANE, L2_LANE):
+                for kind in ("", "delegated_coordinator", "coordinator"):
+                    with self.subTest(role=role, lane=lane, requested=kind):
+                        env = _env(role=role, lane=lane)
+                        with patch(
+                            f"{PREFLIGHT}.read_anchor",
+                            return_value={"workspace_id": WS},
+                        ):
+                            with patch(
+                                f"{GUARD_GATE}.resolve_coordinator_provider",
+                                return_value="claude",
+                            ):
+                                legacy = evaluate_dispatch_sender(
+                                    env, Path("/nonexistent-repo")
+                                )
+                                verdict = evaluate_dispatch_sender_authority(
+                                    env,
+                                    Path("/nonexistent-repo"),
+                                    requested_lane_kind=kind,
+                                    lifecycle_record_reader=(
+                                        lambda _lane: _l2_record()
+                                    ),
+                                    gateway_provider_resolver=lambda: "codex",
+                                    agent_rows_reader=lambda: (),
+                                    inventory_workspace_resolver=lambda: WS,
+                                    lane_target_resolver=(
+                                        lambda rows, **kw: _target()
+                                    ),
+                                )
+                        self.assertEqual(
+                            (verdict.ok, verdict.detail), (legacy[0], legacy[1])
+                        )
+                        self.assertEqual(verdict.reason, "")
 
     def test_missing_sender_env_reports_the_legacy_reason(self) -> None:
         verdict = _decide(env={})
@@ -204,6 +266,7 @@ class DelegatedGatewayBranchTest(unittest.TestCase):
         self.assertTrue(verdict.ok)
         self.assertEqual(verdict.sender_kind, SENDER_KIND_DELEGATED_GATEWAY)
         self.assertEqual(verdict.parent_lane_id, L2_LANE)
+        self.assertEqual(verdict.reason, "")
 
     def test_unreadable_lifecycle_refuses_typed(self) -> None:
         def _boom(_lane):
@@ -212,6 +275,7 @@ class DelegatedGatewayBranchTest(unittest.TestCase):
         verdict = _decide(record_reader=_boom)
         self.assertFalse(verdict.ok)
         self.assertIn(SENDER_LANE_LIFECYCLE_UNREADABLE, verdict.detail)
+        self.assertEqual(verdict.reason, SENDER_LANE_LIFECYCLE_UNREADABLE)
         self.assertEqual(verdict.parent_lane_id, "")
 
     def test_missing_or_inactive_or_zero_generation_row_refuses_typed(self) -> None:
@@ -225,6 +289,7 @@ class DelegatedGatewayBranchTest(unittest.TestCase):
                 verdict = _decide(record=record)
                 self.assertFalse(verdict.ok)
                 self.assertIn(SENDER_LANE_UNESTABLISHED, verdict.detail)
+                self.assertEqual(verdict.reason, SENDER_LANE_UNESTABLISHED)
 
     def test_non_delegated_coordinator_lane_kind_refuses_typed(self) -> None:
         # Acceptance condition 2 (非 L2 sender): an implementation / unkinded lane's
@@ -234,11 +299,15 @@ class DelegatedGatewayBranchTest(unittest.TestCase):
                 verdict = _decide(record=_l2_record(lane_kind=kind))
                 self.assertFalse(verdict.ok)
                 self.assertIn(SENDER_LANE_NOT_DELEGATED_COORDINATOR, verdict.detail)
+                self.assertEqual(
+                    verdict.reason, SENDER_LANE_NOT_DELEGATED_COORDINATOR
+                )
 
     def test_non_gateway_provider_refuses_typed(self) -> None:
         verdict = _decide(env=_env(role="claude"), record=_l2_record())
         self.assertFalse(verdict.ok)
         self.assertIn(SENDER_PROVIDER_NOT_GATEWAY, verdict.detail)
+        self.assertEqual(verdict.reason, SENDER_PROVIDER_NOT_GATEWAY)
 
     def test_unresolved_gateway_provider_refuses_typed(self) -> None:
         def _unresolved():
@@ -271,7 +340,65 @@ class DelegatedGatewayBranchTest(unittest.TestCase):
                 verdict = _decide(record=_l2_record(), target=_target(status))
                 self.assertFalse(verdict.ok)
                 self.assertIn(token, verdict.detail)
+                self.assertEqual(verdict.reason, token)
                 self.assertEqual(verdict.parent_lane_id, "")
+
+
+class DelegatedSenderNextActionProjectionTest(unittest.TestCase):
+    """j#108076 finding_typedreasonprojection: each branch token reaches the public
+    payload / journal with its OWN next action; token-less refusals stay byte-invariant."""
+
+    @staticmethod
+    def _blocked(reasons: tuple) -> SublaneActuationOutcome:
+        return SublaneActuationOutcome(
+            status=ACTUATE_BLOCKED,
+            execute=True,
+            reason="dispatch sender attestation failed before actuation",
+            issue="15706",
+            lane_label="issue_15703_l3_child",
+            blocked_reasons=reasons,
+        )
+
+    def test_each_branch_token_maps_to_its_own_next_action(self) -> None:
+        for token, action in sorted(DELEGATED_SENDER_NEXT_ACTIONS.items()):
+            with self.subTest(token=token):
+                outcome = self._blocked(
+                    (REASON_MISSING_IDENTITY, "sender_attestation", token)
+                )
+                payload = outcome.as_payload()
+                self.assertEqual(payload["next_action"]["action"], action)
+                self.assertEqual(payload["next_action"]["blocked_reason"], token)
+                self.assertIn(token, payload["blocked_reasons"])
+                rendered = render_actuation_journal(outcome)
+                self.assertIn(f"next_action: {action} ({token})", rendered)
+                self.assertNotIn("restore_attested_coordinator_shell", rendered)
+
+    def test_token_less_sender_refusal_keeps_the_coordinator_shell_action(self) -> None:
+        # The pre-#15706 refusal shape (no branch token) projects the EXACT legacy
+        # next action — payload dict and journal text unchanged.
+        outcome = self._blocked((REASON_MISSING_IDENTITY, "sender_attestation"))
+        payload = outcome.as_payload()
+        self.assertEqual(
+            payload["next_action"],
+            {
+                "action": "restore_attested_coordinator_shell",
+                "allowed_methods": [
+                    "relaunch_from_fixed_session_start",
+                    "verified_high_level_coordinator_proxy",
+                ],
+                "forbidden_methods": [
+                    "manual_mozyo_env_injection",
+                    "raw_herdr_send",
+                ],
+            },
+        )
+        rendered = render_actuation_journal(outcome)
+        self.assertIn(
+            "- next_action: restore an attested coordinator shell by relaunching "
+            "from fixed session-start, or use a verified high-level coordinator "
+            "proxy; do not inject MOZYO env manually or use raw herdr send",
+            rendered,
+        )
 
 
 def _attested(_name, *, locator, terminal_id, workspace_id, provider, lane_id=DEFAULT_LANE):

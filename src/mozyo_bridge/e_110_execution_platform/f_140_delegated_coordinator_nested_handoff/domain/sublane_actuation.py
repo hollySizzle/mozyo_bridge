@@ -86,6 +86,39 @@ ACTUATE_STATES = frozenset({ACTUATE_EXECUTED, ACTUATE_READY, ACTUATE_BLOCKED})
 
 #: A required sublane identity field (issue / lane_label / branch / worktree) was blank.
 REASON_MISSING_IDENTITY = "missing_identity"
+
+# --- delegated-gateway sender refusal vocabulary (Redmine #15706, review j#108076
+# finding_typedreasonprojection). The #15706 sender-authority extension refuses with
+# these typed branch tokens; they live HERE — beside the blocked-reason vocabulary the
+# outcome projects — so the application preflight imports downward and the payload /
+# journal renderers can map each branch to an honest next action instead of folding
+# every sender refusal into "restore the coordinator shell". --------------------------- #
+SENDER_LANE_LIFECYCLE_UNREADABLE = "sender_lane_lifecycle_unreadable"
+SENDER_LANE_UNESTABLISHED = "sender_lane_unestablished"
+SENDER_LANE_NOT_DELEGATED_COORDINATOR = "sender_lane_not_delegated_coordinator"
+SENDER_PROVIDER_NOT_GATEWAY = "sender_provider_not_gateway"
+SENDER_GATEWAY_LIVE_MISSING = "sender_gateway_live_missing"
+SENDER_GATEWAY_LIVE_AMBIGUOUS = "sender_gateway_live_ambiguous"
+SENDER_GATEWAY_LOCATOR_MISSING = "sender_gateway_locator_missing"
+SENDER_GATEWAY_UNATTESTED = "sender_gateway_unattested"
+
+#: Each delegated-sender branch token -> the honest operator next action. The lane-authority
+#: tokens point at establishing the delegated_coordinator lane's durable authority, the
+#: provider token at the workflow provider binding, and the liveness/attestation tokens at
+#: restoring the LANE's attested gateway slot — none of them at the workspace coordinator
+#: shell, which is not what failed (review j#108076 finding_typedreasonprojection).
+DELEGATED_SENDER_NEXT_ACTIONS: dict = {
+    SENDER_LANE_LIFECYCLE_UNREADABLE: "establish_delegated_coordinator_lane_authority",
+    SENDER_LANE_UNESTABLISHED: "establish_delegated_coordinator_lane_authority",
+    SENDER_LANE_NOT_DELEGATED_COORDINATOR: (
+        "establish_delegated_coordinator_lane_authority"
+    ),
+    SENDER_PROVIDER_NOT_GATEWAY: "bind_gateway_provider_for_delegated_child_create",
+    SENDER_GATEWAY_LIVE_MISSING: "restore_attested_delegated_gateway_slot",
+    SENDER_GATEWAY_LIVE_AMBIGUOUS: "restore_attested_delegated_gateway_slot",
+    SENDER_GATEWAY_LOCATOR_MISSING: "restore_attested_delegated_gateway_slot",
+    SENDER_GATEWAY_UNATTESTED: "restore_attested_delegated_gateway_slot",
+}
 #: The pure #12604 launch decision refused (unverified target / branch not resolved).
 REASON_LAUNCH_BLOCKED = "launch_blocked"
 #: A live dispatch was requested but no durable-anchor journal id was supplied — the
@@ -425,17 +458,39 @@ class SublaneActuationOutcome:
         if self.startup is not None:
             payload["startup"] = self.startup.as_payload()
         if self.is_blocked and "sender_attestation" in self.blocked_reasons:
-            payload["next_action"] = {
-                "action": "restore_attested_coordinator_shell",
-                "allowed_methods": [
-                    "relaunch_from_fixed_session_start",
-                    "verified_high_level_coordinator_proxy",
-                ],
-                "forbidden_methods": [
-                    "manual_mozyo_env_injection",
-                    "raw_herdr_send",
-                ],
-            }
+            # #15706 (review j#108076 finding_typedreasonprojection): a delegated-sender
+            # branch token carries its own honest next action; a refusal WITHOUT one is
+            # the pre-#15706 coordinator-shell attestation failure, byte-invariant below.
+            delegated = next(
+                (r for r in self.blocked_reasons if r in DELEGATED_SENDER_NEXT_ACTIONS),
+                "",
+            )
+            if delegated:
+                payload["next_action"] = {
+                    "action": DELEGATED_SENDER_NEXT_ACTIONS[delegated],
+                    "blocked_reason": delegated,
+                    "allowed_methods": [
+                        "verify_delegated_lane_lifecycle_and_attestation",
+                        "relaunch_lane_gateway_from_fixed_session_start",
+                    ],
+                    "forbidden_methods": [
+                        "manual_mozyo_env_injection",
+                        "raw_herdr_send",
+                        "manual_lifecycle_row_edit",
+                    ],
+                }
+            else:
+                payload["next_action"] = {
+                    "action": "restore_attested_coordinator_shell",
+                    "allowed_methods": [
+                        "relaunch_from_fixed_session_start",
+                        "verified_high_level_coordinator_proxy",
+                    ],
+                    "forbidden_methods": [
+                        "manual_mozyo_env_injection",
+                        "raw_herdr_send",
+                    ],
+                }
         return payload
 
 
@@ -512,11 +567,29 @@ def render_actuation_journal(outcome: SublaneActuationOutcome) -> str:
     if outcome.is_blocked:
         lines.append("- blocked_reasons: " + ", ".join(outcome.blocked_reasons))
         if "sender_attestation" in outcome.blocked_reasons:
-            lines.append(
-                "- next_action: restore an attested coordinator shell by relaunching "
-                "from fixed session-start, or use a verified high-level coordinator "
-                "proxy; do not inject MOZYO env manually or use raw herdr send"
+            # #15706 (review j#108076): a delegated-sender branch token names its own
+            # remedy; without one, the pre-#15706 coordinator-shell text is unchanged.
+            delegated = next(
+                (
+                    r
+                    for r in outcome.blocked_reasons
+                    if r in DELEGATED_SENDER_NEXT_ACTIONS
+                ),
+                "",
             )
+            if delegated:
+                lines.append(
+                    f"- next_action: {DELEGATED_SENDER_NEXT_ACTIONS[delegated]} "
+                    f"({delegated}); verify the delegated_coordinator lane's lifecycle "
+                    "row and its gateway slot's startup self-attestation; do not inject "
+                    "MOZYO env manually, use raw herdr send, or edit lifecycle rows"
+                )
+            else:
+                lines.append(
+                    "- next_action: restore an attested coordinator shell by relaunching "
+                    "from fixed session-start, or use a verified high-level coordinator "
+                    "proxy; do not inject MOZYO env manually or use raw herdr send"
+                )
         else:
             lines.append(
                 "- next_action: coordinator callback (fail-closed; lane not fully actuated)"
@@ -573,6 +646,15 @@ __all__ = (
     "ACTUATE_STATES",
     "REASON_SENDER_UNATTESTED",
     "REASON_MISSING_IDENTITY",
+    "DELEGATED_SENDER_NEXT_ACTIONS",
+    "SENDER_GATEWAY_LIVE_AMBIGUOUS",
+    "SENDER_GATEWAY_LIVE_MISSING",
+    "SENDER_GATEWAY_LOCATOR_MISSING",
+    "SENDER_GATEWAY_UNATTESTED",
+    "SENDER_LANE_LIFECYCLE_UNREADABLE",
+    "SENDER_LANE_NOT_DELEGATED_COORDINATOR",
+    "SENDER_LANE_UNESTABLISHED",
+    "SENDER_PROVIDER_NOT_GATEWAY",
     "REASON_LAUNCH_BLOCKED",
     "REASON_ANCHOR_REQUIRED",
     "REASON_WORKTREE_CREATE_FAILED",
