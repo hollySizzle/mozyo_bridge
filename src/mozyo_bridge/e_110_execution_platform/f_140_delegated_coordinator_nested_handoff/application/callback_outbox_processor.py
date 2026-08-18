@@ -543,14 +543,23 @@ class CallbackOutboxProcessor:
                 # Redmine #14082: persist the first known-not-sent reason so the retry/dead-letter row
                 # keeps WHY it zero-sent (authorization vs transport precondition), not just "retries
                 # exhausted". A blank reason falls back to the store's default detail (unchanged).
+                # Redmine #15707: prefer the send edge's OWN reason (`send_reason`, #14248) — on the
+                # plain handoff sender `persist_reason` is the Redmine RECEIPT reason (e.g.
+                # `write_optin_unset`), which posed as the zero-send cause here; the background
+                # sender overloads `persist_reason` with the send reason and carries no
+                # `send_reason`, so the fallback keeps its #14082-pinned detail byte-identical.
                 applied = self._outbox.mark_retry_or_dead(
                     row.key, claim_token=token, now=now,
-                    detail=_zero_send_detail(send_result.persist_reason),
+                    detail=_zero_send_detail(
+                        send_result.send_reason or send_result.persist_reason
+                    ),
                 ) != CALLBACK_ABSENT
             else:
                 applied = self._outbox.mark_uncertain(
                     row.key, claim_token=token, now=now,
-                    detail=_zero_send_detail(send_result.persist_reason),
+                    detail=_zero_send_detail(
+                        send_result.send_reason or send_result.persist_reason
+                    ),
                 )
             # When the terminal mark applied, the persisted state is exactly what this delivery
             # intended; when it did not, read the state the reconciling processor actually left.

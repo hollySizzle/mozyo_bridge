@@ -242,6 +242,112 @@ class ConcurrentClaimFencingTest(unittest.TestCase):
         self.assertFalse(self.A.mark_sending(k, claim_token=token_a))
 
 
+class DeadLetterRedriveTest(_OutboxTestCase):
+    """#15707 (c): the explicit, fingerprint-gated dead-letter redrive (compare-and-swap)."""
+
+    def _dead_letter(self, journal="75094", max_attempts=1):
+        k = _key(journal)
+        self.outbox.enqueue(k, max_attempts=max_attempts)
+        self.outbox.claim_pending()
+        self.assertEqual(self.outbox.mark_retry_or_dead(k), CALLBACK_DEAD_LETTER)
+        return k
+
+    def _fingerprint_of(self, key):
+        pairs = self.outbox.dead_letter_fingerprints()
+        for row, fingerprint in pairs:
+            if row.key.as_row() == key.as_row():
+                return fingerprint
+        self.fail(f"no dead-letter fingerprint for {key}")
+
+    def test_requeue_returns_the_row_to_pending_with_a_fresh_budget(self):
+        from mozyo_bridge.core.state.callback_outbox import (
+            CALLBACK_DEFAULT_MAX_ATTEMPTS,
+            REDRIVE_DETAIL,
+            REDRIVE_REQUEUED,
+        )
+
+        k = self._dead_letter()
+        fingerprint = self._fingerprint_of(k)
+        self.assertEqual(
+            self.outbox.requeue_dead_letter(k, expect_fingerprint=fingerprint),
+            REDRIVE_REQUEUED,
+        )
+        row = self.outbox.read()[0]
+        self.assertEqual(row.state, CALLBACK_PENDING)
+        # The attempt history is PRESERVED (auditable + ABA-proof); the redrive grants exactly
+        # one fresh default bounded budget on top of it — the cap is kept, never removed.
+        self.assertEqual(row.attempts, 1)
+        self.assertEqual(row.max_attempts, 1 + CALLBACK_DEFAULT_MAX_ATTEMPTS)
+        self.assertFalse(row.send_attempted)
+        self.assertEqual(row.detail, REDRIVE_DETAIL)  # the redrive is on the record
+        # The redriven row is claimable again through the NORMAL fenced pipeline.
+        self.assertEqual(len(self.outbox.claim_pending()), 1)
+
+    def test_fingerprint_mismatch_is_a_zero_write(self):
+        from mozyo_bridge.core.state.callback_outbox import REDRIVE_FINGERPRINT_MISMATCH
+
+        k = self._dead_letter()
+        self.assertEqual(
+            self.outbox.requeue_dead_letter(k, expect_fingerprint="stale-token"),
+            REDRIVE_FINGERPRINT_MISMATCH,
+        )
+        self.assertEqual(self.outbox.read()[0].state, CALLBACK_DEAD_LETTER)
+
+    def test_a_non_dead_letter_row_is_never_redriven(self):
+        from mozyo_bridge.core.state.callback_outbox import (
+            REDRIVE_STATE_MISMATCH,
+            redrive_fingerprint,
+        )
+
+        k = _key("75094")
+        self.outbox.enqueue(k)
+        self.outbox.claim_pending()
+        self.outbox.mark_uncertain(k)  # uncertain is terminal: a redrive must not touch it
+        token = redrive_fingerprint(k, state=CALLBACK_UNCERTAIN, attempts=0, updated_at="x")
+        self.assertEqual(
+            self.outbox.requeue_dead_letter(k, expect_fingerprint=token),
+            REDRIVE_STATE_MISMATCH,
+        )
+        self.assertEqual(self.outbox.read()[0].state, CALLBACK_UNCERTAIN)
+
+    def test_an_absent_key_is_typed(self):
+        from mozyo_bridge.core.state.callback_outbox import REDRIVE_ABSENT
+
+        self.assertEqual(
+            self.outbox.requeue_dead_letter(_key("99999"), expect_fingerprint="t"),
+            REDRIVE_ABSENT,
+        )
+
+    def test_a_concurrent_transition_invalidates_the_observed_fingerprint(self):
+        from mozyo_bridge.core.state.callback_outbox import (
+            REDRIVE_FINGERPRINT_MISMATCH,
+            REDRIVE_REQUEUED,
+        )
+
+        k = self._dead_letter()
+        observed = self._fingerprint_of(k)
+        # Another operator redrives and the row even dead-letters AGAIN (its whole granted
+        # budget fails): same state, but the attempts history moved monotonically, so the
+        # stale observation must not actuate — even within the same wall-clock second.
+        self.assertEqual(
+            self.outbox.requeue_dead_letter(k, expect_fingerprint=observed), REDRIVE_REQUEUED
+        )
+        for _ in range(64):  # bounded: the granted budget is CALLBACK_DEFAULT_MAX_ATTEMPTS
+            self.outbox.claim_pending()
+            if self.outbox.mark_retry_or_dead(k) == CALLBACK_DEAD_LETTER:
+                break
+        self.assertEqual(self.outbox.read()[0].state, CALLBACK_DEAD_LETTER)
+        self.assertEqual(
+            self.outbox.requeue_dead_letter(k, expect_fingerprint=observed),
+            REDRIVE_FINGERPRINT_MISMATCH,
+        )
+
+    def test_fingerprints_are_partition_scoped(self):
+        self._dead_letter()
+        self.assertEqual(self.outbox.dead_letter_fingerprints(workspace_id="other"), ())
+        self.assertEqual(len(self.outbox.dead_letter_fingerprints(workspace_id="")), 1)
+
+
 class CursorTest(_OutboxTestCase):
     def test_cursor_round_trips_and_advances_even_on_duplicate(self):
         k = _key("75094")
