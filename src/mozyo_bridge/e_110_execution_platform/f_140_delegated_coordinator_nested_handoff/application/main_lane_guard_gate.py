@@ -36,8 +36,11 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff 
     main_lane_implementation_request_blocked,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (
-    resolve_gateway_provider,
+    resolve_role_provider,
     resolve_worker_provider,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_runtime import (
+    ROLE_COORDINATOR,
 )
 
 
@@ -58,13 +61,19 @@ def resolve_coordinator_provider(repo_root: Optional[str] = None) -> str:
     """The runtime provider bound to the coordinator role for ``repo_root`` (fail-closed).
 
     The `coordinator` pseudo-target / callback resolution counterpart of
-    :func:`resolve_implementer_provider` (Redmine #13174 j#72023). Under the default
-    binding this is ``codex`` — byte-identical to the pre-#13174 resolution. A broken
-    config fails closed through the loader's ``RepoLocalConfigError``; a genuinely unbound
-    coordinator raises :class:`~...workflow_provider_resolution.WorkflowProviderUnresolved`
-    rather than silently defaulting to a literal (Redmine #13569 j#76969 correction 4).
+    :func:`resolve_implementer_provider` (Redmine #13174 j#72023). Resolves the
+    ``coordinator`` role DIRECTLY (Redmine #15655 j#107777 finding_1) — it no longer
+    delegates to :func:`~...workflow_provider_resolution.resolve_gateway_provider`,
+    which since #15655 resolves the ``project_gateway`` lane role: the coordinator
+    pseudo-target / callback transport / coordinator pane resolution must follow a
+    coordinator rebind even when the lane gateway deliberately does not. Under the
+    default binding this is ``codex`` — byte-identical to the pre-#13174 resolution.
+    A broken config fails closed through the loader's ``RepoLocalConfigError``; a
+    genuinely unbound coordinator raises
+    :class:`~...workflow_provider_resolution.WorkflowProviderUnresolved` rather than
+    silently defaulting to a literal (Redmine #13569 j#76969 correction 4).
     """
-    return resolve_gateway_provider(repo_root)
+    return resolve_role_provider(ROLE_COORDINATOR, repo_root)
 
 
 def main_lane_guard_blocked(
