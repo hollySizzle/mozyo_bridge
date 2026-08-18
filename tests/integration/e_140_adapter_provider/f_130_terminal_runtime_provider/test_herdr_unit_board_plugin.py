@@ -46,6 +46,15 @@ class HerdrUnitBoardPluginTests(unittest.TestCase):
             self.assertNotIn("workflow", rendered)
             self.assertNotIn("redmine", rendered)
 
+    def test_status_action_is_pinned_to_the_read_only_show_cli(self) -> None:
+        actions = {action["id"]: action for action in self.document["actions"]}
+        self.assertIn("status", actions)
+        self.assertEqual(actions["status"]["contexts"], ["workspace"])
+        self.assertEqual(
+            actions["status"]["command"],
+            ["mozyo-bridge", "herdr", "unit-board", "show"],
+        )
+
     def test_events_are_idempotent_display_refresh_triggers(self) -> None:
         events = {event["on"]: event["command"] for event in self.document["events"]}
         self.assertEqual(
