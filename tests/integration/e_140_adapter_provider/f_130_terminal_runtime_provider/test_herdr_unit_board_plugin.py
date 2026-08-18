@@ -23,7 +23,7 @@ class HerdrUnitBoardPluginTests(unittest.TestCase):
 
     def test_manifest_declares_reviewable_presentation_consumer(self) -> None:
         self.assertEqual(self.document["id"], "mozyo.unit-board")
-        self.assertEqual(self.document["version"], "0.2.0")
+        self.assertEqual(self.document["version"], "0.3.0")
         self.assertEqual(self.document["min_herdr_version"], "0.8.0")
         self.assertNotIn("build", self.document)
         self.assertEqual(self.document["panes"][0]["placement"], "popup")
