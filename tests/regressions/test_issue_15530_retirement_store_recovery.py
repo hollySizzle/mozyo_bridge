@@ -87,6 +87,9 @@ class RetirementStoreRecoveryTest(unittest.TestCase):
         self.assertEqual(self._recover(), (0, "retirement authority schema: 2\n"))
         self.assertEqual(self.fence.status()["store_state"], "present")
         self.assertTrue(self.fence.status()["readable"])
+        # #15653: recovery never chmods the existing primary DB or seal.
+        self.assertEqual(self.fence.path.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(self.fence.seal_path.stat().st_mode & 0o777, 0o644)
         self.assertTrue(control.exists())
         self.assertTrue(staging.exists())
         conn = sqlite3.connect(self.fence.path)

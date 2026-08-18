@@ -799,14 +799,15 @@ class ScratchRetirementFenceTest(unittest.TestCase):
             with self._open(live=True) as txn:
                 txn.current()
 
-    def test_world_readable_primary_is_never_opened(self):
+    def test_world_readable_primary_is_opened_and_never_rechmoded(self):
+        # #15653: the store is not a secret file; a non-0600 mode alone must not block
+        # the authority, and nothing may chmod the existing store back.
         self._bootstrap()
         os.chmod(self.fence.path, 0o666)
-        with self.assertRaises(ScratchRetirementFenceError):
-            self.fence.peek(self.unit)
-        with self.assertRaises(ScratchRetirementFenceError):
-            with self._open(live=True) as txn:
-                txn.current()
+        self.assertIsNone(self.fence.peek(self.unit))
+        with self._open(live=True) as txn:
+            self.assertIsNone(txn.current())
+        self.assertEqual(self.fence.path.stat().st_mode & 0o777, 0o666)
 
     def test_symlink_primary_is_never_opened(self):
         self._bootstrap()

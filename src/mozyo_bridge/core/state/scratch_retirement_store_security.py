@@ -125,14 +125,8 @@ def _finalized_migration_provenance(path: Path, names: tuple[str, ...]) -> bool:
         backup_seal_info = backup_seal.lstat()
         return (
             stat.S_ISREG(info.st_mode)
-            and info.st_uid == os.geteuid()
-            and stat.S_IMODE(info.st_mode) == 0o600
             and stat.S_ISDIR(root_info.st_mode)
-            and root_info.st_uid == os.geteuid()
-            and stat.S_IMODE(root_info.st_mode) == 0o700
             and stat.S_ISREG(marker_info.st_mode)
-            and marker_info.st_uid == os.geteuid()
-            and stat.S_IMODE(marker_info.st_mode) == 0o600
             and marker_info.st_nlink == 2
             and (info.st_dev, info.st_ino) == (marker_info.st_dev, marker_info.st_ino)
             and marker.read_bytes() == control_bytes
@@ -188,12 +182,7 @@ def _verified_backup_pair(
         )
 
         for artifact in (backup, seal):
-            info = artifact.lstat()
-            if (
-                not stat.S_ISREG(info.st_mode)
-                or info.st_uid != os.geteuid()
-                or stat.S_IMODE(info.st_mode) != 0o600
-            ):
+            if not stat.S_ISREG(artifact.lstat().st_mode):
                 return False
         digest = _logical_digest(backup)
         nonce = _canonical_text(seal)
@@ -212,10 +201,6 @@ def _retained_link_matches(
     return (
         stat.S_ISREG(staging.st_mode)
         and stat.S_ISREG(final.st_mode)
-        and staging.st_uid == os.geteuid()
-        and final.st_uid == os.geteuid()
-        and stat.S_IMODE(staging.st_mode) == 0o600
-        and stat.S_IMODE(final.st_mode) == 0o600
         and staging.st_nlink == 2
         and final.st_nlink == 2
         and (staging.st_dev, staging.st_ino) == (final.st_dev, final.st_ino)
@@ -243,13 +228,9 @@ def primary_security_snapshot(
             raise ScratchRetirementStoreSecurityError(
                 "the retirement authority artifact set drifted during verification"
             ) from exc
-        if (
-            not stat.S_ISREG(info.st_mode)
-            or info.st_uid != os.geteuid()
-            or stat.S_IMODE(info.st_mode) != 0o600
-        ):
+        if not stat.S_ISREG(info.st_mode):
             raise ScratchRetirementStoreSecurityError(
-                "the retirement authority has an unsafe owner, mode, or file type"
+                "the retirement authority artifact is not a regular file"
             )
         result[name] = (info.st_dev, info.st_ino, info.st_ctime_ns)
     return result

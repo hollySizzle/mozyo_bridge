@@ -53,12 +53,12 @@ def migrate_scratch_retirement_v1_locked(path: Path, seal_path: Path) -> int:
         return 2
     if version != 1:
         raise ScratchRetirementMigrationError("scratch retirement schema is unsupported")
-    _regular_owned(path)
-    _regular_owned(seal_path)
+    _regular_file(path)
+    _regular_file(seal_path)
     for suffix in ("-wal", "-shm", "-journal"):
         artifact = path.with_name(path.name + suffix)
         if os.path.lexists(artifact):
-            _regular_owned(artifact)
+            _regular_file(artifact)
     nonce = _canonical_text(seal_path)
     if _store_nonce(path) != nonce:
         raise ScratchRetirementMigrationError("scratch retirement seal does not match")
@@ -66,13 +66,9 @@ def migrate_scratch_retirement_v1_locked(path: Path, seal_path: Path) -> int:
     backup = path.with_name(path.name + ".v1.backup")
     backup_seal = backup.with_name(backup.name + ".seal")
     _publish_backup(path, seal_path, backup, backup_seal, wanted, nonce)
-    # Legacy writers inherited the process umask. The verified backup exists before the
-    # migration normalizes the now-token-bearing v2 authority to private owner-only mode.
-    os.chmod(path, 0o600)
-    os.chmod(seal_path, 0o600)
-    _fsync_file(path)
-    _fsync_file(seal_path)
-    _fsync_dir(path.parent)
+    # The existing authority keeps whatever mode the legacy writer gave it: the store is not
+    # a secret file and isolation is the harness's responsibility (#15653), so the migration
+    # never chmods the primary DB or seal.
     # No authority byte is changed until the complete, durable v1 backup was read back.
     conn = sqlite3.connect(path, isolation_level=None)
     try:
@@ -172,7 +168,7 @@ def _staging_root(
                 "was retained for explicit recovery"
             ) from exc
         _fsync_dir(control.parent)
-    _regular_owned(control, exact_mode=True)
+    _regular_file(control)
     try:
         payload = json.loads(control.read_text(encoding="utf-8"))
     except (OSError, UnicodeError, ValueError) as exc:
@@ -199,11 +195,12 @@ def _staging_root(
             "scratch retirement staging authority does not match the locked source"
         )
     root = control.parent / payload["staging_name"]
-    info = root.lstat()
-    if not stat.S_ISDIR(info.st_mode) or info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) != 0o700:
-        raise ScratchRetirementMigrationError("scratch retirement staging directory is unsafe")
+    if not stat.S_ISDIR(root.lstat().st_mode):
+        raise ScratchRetirementMigrationError(
+            "scratch retirement staging root is not a directory"
+        )
     marker = root / "authority.json"
-    _regular_owned(marker, exact_mode=True)
+    _regular_file(marker)
     if marker.stat().st_ino != control.stat().st_ino or marker.stat().st_dev != control.stat().st_dev:
         raise ScratchRetirementMigrationError("scratch retirement staging authority inode drifted")
     artifact_pins = {
@@ -267,8 +264,8 @@ def _repair_staging_seal(staging: Path, nonce: str, pin: tuple[int, int]) -> Non
 
 def _verify_backup(backup: Path, seal: Path, wanted: str, nonce: str) -> None:
     _reject_backup_sidecars(backup)
-    _regular_owned(backup, exact_mode=True)
-    _regular_owned(seal, exact_mode=True)
+    _regular_file(backup)
+    _regular_file(seal)
     if _logical_digest(backup) != wanted or _canonical_text(seal) != nonce:
         raise ScratchRetirementMigrationError("scratch retirement backup does not match")
     _fsync_file(backup)
@@ -290,7 +287,7 @@ def _artifact_pins_payload(value: object) -> bool:
 
 
 def _require_pinned_artifact(path: Path, pin: tuple[int, int]) -> None:
-    _regular_owned(path, exact_mode=True)
+    _regular_file(path)
     info = path.lstat()
     if (info.st_dev, info.st_ino) != pin:
         raise ScratchRetirementMigrationError(
@@ -467,13 +464,11 @@ def _copy_sqlite(
                 image_path_info = image.lstat()
                 if (
                     not stat.S_ISREG(image_info.st_mode)
-                    or image_info.st_uid != os.geteuid()
-                    or stat.S_IMODE(image_info.st_mode) != 0o600
                     or (image_info.st_dev, image_info.st_ino)
                     != (image_path_info.st_dev, image_path_info.st_ino)
                 ):
                     raise ScratchRetirementMigrationError(
-                        "scratch retirement private backup image is unsafe"
+                        "scratch retirement private backup image drifted"
                     )
                 os.ftruncate(staging_fd, 0)
                 os.lseek(staging_fd, 0, os.SEEK_SET)
@@ -534,7 +529,7 @@ def _write_private(path: Path, payload: bytes) -> None:
 
 
 def _version(path: Path) -> int:
-    _regular_owned(path)
+    _regular_file(path)
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
         return int(conn.execute("PRAGMA user_version").fetchone()[0])
@@ -668,12 +663,11 @@ def _canonical_text(path: Path) -> str:
     return value
 
 
-def _regular_owned(path: Path, *, exact_mode: bool = False) -> None:
-    info = path.lstat()
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.geteuid():
-        raise ScratchRetirementMigrationError("scratch retirement artifact is unsafe")
-    if exact_mode and stat.S_IMODE(info.st_mode) != 0o600:
-        raise ScratchRetirementMigrationError("scratch retirement backup mode is unsafe")
+def _regular_file(path: Path) -> None:
+    if not stat.S_ISREG(path.lstat().st_mode):
+        raise ScratchRetirementMigrationError(
+            "scratch retirement artifact is not a regular file"
+        )
 
 
 def _fsync_file(path: Path) -> None:
