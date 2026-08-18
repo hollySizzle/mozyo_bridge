@@ -1047,16 +1047,24 @@ When the env opt-in is unset, `redmine_delivery_transport_from_env()` returns
 the byte-compatible `write_optin_unset` (Redmine #13262; formerly
 `provider_unavailable`).
 
-### Credential boundary (reused verbatim from `redmine_context`)
+### Credential boundary (daemon-trusted sources, symmetric with the read side)
 
-- The trusted base URL comes **only** from `MOZYO_REDMINE_URL` (routed through
-  `normalize_base_url`), so the write destination host is fixed by the daemon
-  environment and nothing else. Only the issue id — the URL path, taken from the
-  durable handoff anchor on that same trusted Redmine — is caller-supplied, and
-  it is percent-quoted so it cannot inject a host/query segment.
-- The API key comes only from `MOZYO_REDMINE_API_KEY`, is sent only in the
-  request header, and is never echoed into a payload, log, receipt, or the
-  `DeliveryTransportError` reason. Credentials are read lazily at write time.
+- The trusted base URL and API key come **only from daemon-trusted sources**,
+  resolved through `resolve_redmine_credentials` (Redmine #15692, aligning the
+  write side with the read side): the environment (`MOZYO_REDMINE_URL` /
+  `MOZYO_REDMINE_API_KEY`) first, then a per-field fallback to the home-scoped,
+  user-owned credential file
+  (`${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/redmine-credentials.yaml`), which is
+  refused unless it has owner-only permissions. The base URL is still routed
+  through `normalize_base_url`, so the write destination host is fixed by those
+  trusted sources and nothing else — never a repo-local file. Only the issue
+  id — the URL path, taken from the durable handoff anchor on that same trusted
+  Redmine — is caller-supplied, and it is percent-quoted so it cannot inject a
+  host/query segment.
+- The API key is sent only in the request header, and is never echoed into a
+  payload, log, receipt, or the `DeliveryTransportError` reason (resolver
+  warnings are pre-redacted: path and permission bits only, never a value).
+  Credentials are resolved lazily at write time.
 
 ### Fail-closed surface
 

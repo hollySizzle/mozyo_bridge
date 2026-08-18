@@ -17,16 +17,21 @@ the provider-owned network write through the protocol seam; the sink
 (:class:`~mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink.RedmineDeliveryRecordSink`)
 owns source/anchor validation and receipt shaping.
 
-Credential boundary (reused verbatim from ``redmine_context``, review #56232):
+Credential boundary (preserves review #56232; Redmine #15692 aligns the write
+side with the read side's :func:`resolve_redmine_credentials`):
 
-- the **trusted base URL comes only from the daemon environment**
-  (``MOZYO_REDMINE_URL``). The write destination is that host and nothing else,
-  ever; no repo-local file, CLI argument, or delivery anchor can redirect where
-  the API key is sent. The issue id (the *path*, not the host) comes from the
-  durable handoff anchor, which is an issue on that same trusted Redmine.
-- the API key comes from the daemon environment (``MOZYO_REDMINE_API_KEY``),
-  is sent only in the request header, and is never echoed into a payload, log,
-  receipt, or the :class:`DeliveryTransportError` reason.
+- the **trusted base URL and API key come only from daemon-trusted sources**:
+  the environment (``MOZYO_REDMINE_URL`` / ``MOZYO_REDMINE_API_KEY``, highest
+  precedence, unchanged behavior) with a per-field fallback to the home-scoped,
+  user-owned credential file
+  (``${MOZYO_BRIDGE_HOME:-~/.mozyo_bridge}/redmine-credentials.yaml``, refused
+  unless owner-only ``0600``-style permissions). The write destination is that
+  trusted host and nothing else, ever; no repo-local file, CLI argument, or
+  delivery anchor can redirect where the API key is sent. The issue id (the
+  *path*, not the host) comes from the durable handoff anchor, which is an
+  issue on that same trusted Redmine.
+- the API key is sent only in the request header, and is never echoed into a
+  payload, log, receipt, or the :class:`DeliveryTransportError` reason.
 
 Explicit opt-in (the "明示 opt-in" of the #12347 acceptance criteria): the live
 network write is gated *twice*. ``--persist-delivery`` selects the persistence
@@ -62,7 +67,8 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from typing import Optional
+from pathlib import Path
+from typing import Mapping, Optional
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery_record_sink import (
     PERSIST_BASE_URL_UNSET,
@@ -71,11 +77,10 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.delivery
     PERSIST_UNAUTHORIZED,
     DeliveryTransportError,
 )
-from mozyo_bridge.redmine_context import (
-    API_KEY_ENV,
-    BASE_URL_ENV,
-    normalize_base_url,
+from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_credentials import (
+    resolve_redmine_credentials,
 )
+from mozyo_bridge.redmine_context import normalize_base_url
 
 # The explicit live-write opt-in. Separate from ``--persist-delivery`` so the
 # live network write is a deliberate, trusted-environment decision and a plain
@@ -98,12 +103,15 @@ def _env_flag(value: Optional[str]) -> bool:
 class RedmineNoteHttpTransport:
     """Post a Redmine journal note via the trusted-base credential boundary.
 
-    Credentials are read from the trusted environment *lazily*, at write time,
-    so a transport can be constructed cheaply and the credential state is
-    re-evaluated per write. The destination host is always the trusted
-    ``MOZYO_REDMINE_URL``; only the issue id (the URL path) comes from the
-    caller. Every failure is surfaced as a :class:`DeliveryTransportError` with
-    an explicit reason and never carries the API key.
+    Credentials are resolved from the trusted daemon sources *lazily*, at
+    write time, so a transport can be constructed cheaply and the credential
+    state is re-evaluated per write. Resolution goes through
+    :func:`resolve_redmine_credentials` (Redmine #15692): environment first
+    (``MOZYO_REDMINE_URL`` / ``MOZYO_REDMINE_API_KEY``), then the home-scoped
+    credential file — the same daemon-trusted, never-repo-local path the read
+    side uses. Only the issue id (the URL path) comes from the caller. Every
+    failure is surfaced as a :class:`DeliveryTransportError` with an explicit
+    reason and never carries the API key.
     """
 
     name = "redmine"
@@ -114,25 +122,44 @@ class RedmineNoteHttpTransport:
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout: float = WRITE_TIMEOUT_SECONDS,
+        home: Optional[Path] = None,
+        environ: Optional[Mapping[str, str]] = None,
     ):
-        # ``None`` defers to the trusted environment at write time (the normal
-        # path). Explicit values are for tests / a future trusted caller; they
-        # are still routed only through ``normalize_base_url`` so a destination
-        # can never be a non-http(s) or path-bearing URL.
+        # ``None`` defers to the trusted daemon sources at write time (the
+        # normal path). Explicit values are for tests / a future trusted
+        # caller; they are still routed only through ``normalize_base_url`` so
+        # a destination can never be a non-http(s) or path-bearing URL.
+        # ``home`` / ``environ`` are injectable for hermetic tests, mirroring
+        # ``resolve_redmine_credentials`` itself.
         self._api_key = api_key
         self._base_url = base_url
         self._timeout = timeout
+        self._home = home
+        self._environ = environ
 
-    def _resolved_base_url(self) -> Optional[str]:
-        raw = self._base_url if self._base_url is not None else os.environ.get(BASE_URL_ENV)
-        return normalize_base_url(raw)
+    def _resolved_credentials(self) -> tuple[Optional[str], Optional[str], tuple[str, ...]]:
+        """``(base_url, api_key, warnings)`` from explicit values, else trusted sources.
 
-    def _resolved_api_key(self) -> Optional[str]:
-        key = self._api_key if self._api_key is not None else os.environ.get(API_KEY_ENV)
-        if key is None:
-            return None
-        key = key.strip()
-        return key or None
+        Per-field precedence: an explicit constructor value, then the
+        environment, then the home-scoped credential file (the resolver skips
+        the file entirely when the environment covers the gap, and refuses a
+        file that is not user-owned with owner-only permissions). ``warnings``
+        are the resolver's pre-redacted strings — safe for a diagnostic
+        message, never carrying a credential value.
+        """
+        base_url = self._base_url
+        api_key = self._api_key
+        warnings: tuple[str, ...] = ()
+        if base_url is None or api_key is None:
+            resolved = resolve_redmine_credentials(self._home, environ=self._environ)
+            if base_url is None:
+                base_url = resolved.base_url
+            if api_key is None:
+                api_key = resolved.api_key
+            warnings = resolved.warnings
+        if api_key is not None:
+            api_key = api_key.strip() or None
+        return normalize_base_url(base_url), api_key, warnings
 
     def post_issue_note(self, issue_id: str, notes: str) -> str:
         """Append ``notes`` as a journal note on ``issue_id``; fail closed.
@@ -145,20 +172,25 @@ class RedmineNoteHttpTransport:
         :class:`DeliveryTransportError` with an explicit, credential-free reason
         on any failure.
         """
-        base_url = self._resolved_base_url()
+        base_url, api_key, warnings = self._resolved_credentials()
+        # Resolver warnings are pre-redacted (path / permission bits only,
+        # never a value), so they may ride on the diagnostic message to explain
+        # e.g. a refused credential file. The message is never copied onto a
+        # receipt.
+        suffix = f" ({'; '.join(warnings)})" if warnings else ""
         if not base_url:
             # Missing or non-http(s)/host-only base: no trusted destination.
             # Redmine #13262: this is the opt-in-set-but-misconfigured case
             # (``base_url_unset``), distinct from the unwired sink's
             # ``write_optin_unset`` (the opt-in was never set at all).
             raise DeliveryTransportError(
-                "no trusted Redmine base URL configured",
+                f"no trusted Redmine base URL configured{suffix}",
                 reason=PERSIST_BASE_URL_UNSET,
             )
-        api_key = self._resolved_api_key()
         if not api_key:
             raise DeliveryTransportError(
-                "no Redmine API key in the trusted environment",
+                f"no Redmine API key in the trusted environment or "
+                f"home-scoped credential file{suffix}",
                 reason=PERSIST_CREDENTIAL_MISSING,
             )
         # The issue id is the only caller-supplied part, and it is the URL path,

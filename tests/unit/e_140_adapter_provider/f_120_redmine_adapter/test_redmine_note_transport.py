@@ -8,6 +8,13 @@ that distinguishes a missing/invalid trusted URL from the unwired sink's
 write_optin_unset), the success path (PUT + 204 -> empty journal id), and the
 no-credential-leak guarantee on the surfaced reason.
 
+Redmine #15692: write-side credential resolution goes through
+``resolve_redmine_credentials`` (env first, home-scoped file fallback with the
+owner-only permission check), symmetric with the read side. The added tests pin
+the file fallback, env-over-file precedence, the per-field gap fill, the
+insecure-permission fail-closed refusal, and that no file-sourced credential
+value ever leaks into a surfaced error.
+
 Abstract placeholders are used deliberately — no personal home path or
 secret-shaped literal in tracked test files
 (`vibes/docs/rules/public-private-boundary.md`). The trusted host is the
@@ -17,7 +24,9 @@ non-routable example host `https://redmine.example.test`; the API key sentinel i
 
 from __future__ import annotations
 
+import os
 import sys
+import tempfile
 import urllib.error
 import unittest
 from pathlib import Path
@@ -215,6 +224,118 @@ class TransportSuccessTest(unittest.TestCase):
         self.assertEqual(
             "https://redmine.example.test/issues/12347.json", captured["url"]
         )
+
+
+FILE_BASE = "https://redmine-file.example.test"
+FILE_API_KEY = "DROP-FILEKEY-SENTINEL"
+
+
+class HomeScopedFileFallbackTest(unittest.TestCase):
+    """Redmine #15692: env-first / home-scoped-file-fallback resolution."""
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+
+    def _write_credentials_file(self, *, mode: int = 0o600) -> Path:
+        path = self.home / "redmine-credentials.yaml"
+        path.write_text(
+            "redmine:\n"
+            f"  api_key: {FILE_API_KEY}\n"
+            f"  url: {FILE_BASE}\n",
+            encoding="utf-8",
+        )
+        os.chmod(path, mode)
+        return path
+
+    def _capture_urlopen(self, sent: dict):
+        def fake_urlopen(request, timeout=None):
+            sent["url"] = request.full_url
+            sent["api_key"] = request.get_header("X-redmine-api-key")
+            return _FakeHTTPResponse(code=204)
+
+        return fake_urlopen
+
+    def test_file_supplies_both_fields_when_env_is_empty(self) -> None:
+        # The dispatch-ir live-write case: no manual env injection, only the
+        # home-scoped file. The write must succeed against the file's host
+        # with the file's key.
+        self._write_credentials_file()
+        sent: dict = {}
+        with patch.dict("os.environ", {}, clear=True), patch(
+            "urllib.request.urlopen", side_effect=self._capture_urlopen(sent)
+        ):
+            transport = RedmineNoteHttpTransport(home=self.home)
+            journal_id = transport.post_issue_note("15692", "note body")
+        self.assertEqual("", journal_id)
+        self.assertEqual(f"{FILE_BASE}/issues/15692.json", sent["url"])
+        self.assertEqual(FILE_API_KEY, sent["api_key"])
+
+    def test_env_wins_over_file(self) -> None:
+        # Backward compatibility: a set env var beats the file per field.
+        self._write_credentials_file()
+        env = {BASE_URL_ENV: TRUSTED_BASE, API_KEY_ENV: API_KEY}
+        sent: dict = {}
+        with patch.dict("os.environ", env, clear=True), patch(
+            "urllib.request.urlopen", side_effect=self._capture_urlopen(sent)
+        ):
+            transport = RedmineNoteHttpTransport(home=self.home)
+            transport.post_issue_note("15692", "note body")
+        self.assertEqual(f"{TRUSTED_BASE}/issues/15692.json", sent["url"])
+        self.assertEqual(API_KEY, sent["api_key"])
+
+    def test_file_fills_the_field_env_left_unset(self) -> None:
+        # Per-field precedence: env base URL + file API key compose.
+        self._write_credentials_file()
+        sent: dict = {}
+        with patch.dict(
+            "os.environ", {BASE_URL_ENV: TRUSTED_BASE}, clear=True
+        ), patch("urllib.request.urlopen", side_effect=self._capture_urlopen(sent)):
+            transport = RedmineNoteHttpTransport(home=self.home)
+            transport.post_issue_note("15692", "note body")
+        self.assertEqual(f"{TRUSTED_BASE}/issues/15692.json", sent["url"])
+        self.assertEqual(FILE_API_KEY, sent["api_key"])
+
+    def test_insecure_file_permissions_fail_closed(self) -> None:
+        # A group/world-accessible credential file is refused (treated as
+        # absent), so with no env the write fails closed on the first gap
+        # (the base URL) with a redacted permission diagnostic.
+        self._write_credentials_file(mode=0o644)
+        with patch.dict("os.environ", {}, clear=True):
+            transport = RedmineNoteHttpTransport(home=self.home)
+            with self.assertRaises(DeliveryTransportError) as ctx:
+                transport.post_issue_note("15692", "note body")
+        self.assertEqual(PERSIST_BASE_URL_UNSET, ctx.exception.reason)
+        self.assertIn("insecure permissions", str(ctx.exception))
+        self.assertNotIn(FILE_API_KEY, str(ctx.exception))
+
+    def test_missing_file_and_env_key_is_credential_missing(self) -> None:
+        # Env base URL set, no key anywhere: the existing credential_missing
+        # reason survives the resolver switch.
+        with patch.dict(
+            "os.environ", {BASE_URL_ENV: TRUSTED_BASE}, clear=True
+        ):
+            transport = RedmineNoteHttpTransport(home=self.home)
+            with self.assertRaises(DeliveryTransportError) as ctx:
+                transport.post_issue_note("15692", "note body")
+        self.assertEqual(PERSIST_CREDENTIAL_MISSING, ctx.exception.reason)
+        self.assertNotIn(FILE_API_KEY, str(ctx.exception))
+
+    def test_explicit_constructor_values_win_over_file(self) -> None:
+        # Explicit values (tests / trusted caller) still take precedence and
+        # keep the normalize_base_url routing.
+        self._write_credentials_file()
+        sent: dict = {}
+        with patch.dict("os.environ", {}, clear=True), patch(
+            "urllib.request.urlopen", side_effect=self._capture_urlopen(sent)
+        ):
+            transport = RedmineNoteHttpTransport(
+                api_key=API_KEY, base_url=TRUSTED_BASE, home=self.home
+            )
+            transport.post_issue_note("15692", "note body")
+        self.assertEqual(f"{TRUSTED_BASE}/issues/15692.json", sent["url"])
+        self.assertEqual(API_KEY, sent["api_key"])
 
 
 if __name__ == "__main__":
