@@ -195,7 +195,7 @@ class ScratchMigrationTest(unittest.TestCase):
             self.assertEqual(conn.execute("PRAGMA user_version").fetchone()[0], 1)
         self.assertFalse(self.fence.path.with_name(self.fence.path.name + ".v1.backup").exists())
 
-    def test_explicit_backup_first_migration_normalizes_mode_and_replays_partial_publish(self):
+    def test_explicit_backup_first_migration_keeps_mode_and_replays_partial_publish(self):
         self._v1()
         module = (
             "mozyo_bridge.core.state.scratch_retirement_migration._publish_pinned_link"
@@ -213,8 +213,10 @@ class ScratchMigrationTest(unittest.TestCase):
             with self.assertRaises(ScratchRetirementFenceError):
                 self.fence.migrate_v1_backup_first()
         self.assertEqual(self.fence.migrate_v1_backup_first(), 2)
-        self.assertEqual(self.fence.path.stat().st_mode & 0o777, 0o600)
-        self.assertEqual(self.fence.seal_path.stat().st_mode & 0o777, 0o600)
+        # #15653: the migration must not chmod the existing primary DB or seal — the
+        # legacy 0644 mode survives the migration untouched.
+        self.assertEqual(self.fence.path.stat().st_mode & 0o777, 0o644)
+        self.assertEqual(self.fence.seal_path.stat().st_mode & 0o777, 0o644)
         self.assertEqual(self.fence.store_shape().state, "present")
         unit = RetirementUnit("ws", "lane", "digest")
         with self.fence.transaction(unit, live_pair_present=True) as txn:
@@ -500,14 +502,14 @@ class ScratchMigrationTest(unittest.TestCase):
                 pass
         self.assertFalse(self.fence.path.exists())
 
-    def test_retained_backup_mode_and_symlink_drift_make_primary_recovery_required(self):
+    def test_retained_backup_symlink_drift_makes_primary_recovery_required(self):
         self._v1()
         self.assertEqual(self.fence.migrate_v1_backup_first(), 2)
         backup = self.fence.path.with_name(self.fence.path.name + ".v1.backup")
+        # #15653: a mode change alone is not drift — the backup stays evidence.
         os.chmod(backup, 0o640)
-        self.assertEqual(self.fence.store_shape().state, "damaged")
+        self.assertEqual(self.fence.store_shape().state, "present")
 
-        os.chmod(backup, 0o600)
         moved = backup.with_name(backup.name + ".foreign")
         backup.rename(moved)
         backup.symlink_to(moved)
