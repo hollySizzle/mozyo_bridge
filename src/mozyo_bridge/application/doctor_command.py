@@ -340,9 +340,10 @@ def format_doctor_text(result: dict[str, Any]) -> str:
         for note in otel.get("notes", []):
             lines.append(f"  note: {note}")
 
-    # persist-delivery env presence (Redmine #13262). Booleans only — the base URL
-    # and API key are credentials and are never rendered as values, only as
-    # set/unset (`vibes/docs/rules/public-private-boundary.md`).
+    # persist-delivery credential resolution (Redmine #13262 / #15698). The base
+    # URL and API key are credentials and are never rendered as values — only as
+    # the resolver's source label (env / file / unresolved), so a file-supplied
+    # configuration no longer reads as unset (`vibes/docs/rules/public-private-boundary.md`).
     delivery_env = sections.get("delivery_env") or {}
     if delivery_env:
         lines.append(f"delivery_env: {delivery_env.get('status', 'unknown')}")
@@ -350,10 +351,10 @@ def format_doctor_text(result: dict[str, Any]) -> str:
             f"  MOZYO_REDMINE_DELIVERY_WRITE: set={delivery_env.get('write_optin_set', False)}"
         )
         lines.append(
-            f"  MOZYO_REDMINE_URL: set={delivery_env.get('base_url_set', False)}"
+            f"  base_url: source={delivery_env.get('base_url_source', 'unresolved')}"
         )
         lines.append(
-            f"  MOZYO_REDMINE_API_KEY: set={delivery_env.get('api_key_set', False)}"
+            f"  api_key: source={delivery_env.get('api_key_source', 'unresolved')}"
         )
 
     # herdr backend probe (Redmine #13355). The section is present only when the

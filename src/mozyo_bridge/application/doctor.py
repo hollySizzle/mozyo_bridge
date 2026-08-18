@@ -569,21 +569,26 @@ def doctor_herdr_section(args: argparse.Namespace) -> dict[str, Any] | None:
 
 
 def doctor_delivery_env_section(args: argparse.Namespace) -> dict[str, Any]:
-    """persist-delivery env-presence report (Redmine #13262).
+    """persist-delivery credential-resolution report (Redmine #13262 / #15698).
 
-    Reports which of the three live-write gates (``MOZYO_REDMINE_DELIVERY_WRITE`` /
-    ``MOZYO_REDMINE_URL`` / ``MOZYO_REDMINE_API_KEY``) are set vs unset, so an
-    operator can reconcile a fail-closed ``--persist-delivery`` receipt
-    (``write_optin_unset`` / ``base_url_unset`` / ``credential_missing``) with the
-    environment. Strictly informational and credential-safe: it reports **only
-    booleans**, never a value, and never auto-enables anything.
+    Reports the ``MOZYO_REDMINE_DELIVERY_WRITE`` opt-in as set vs unset (the
+    opt-in stays environment-only) and, since Redmine #15698, the write
+    transport's actual credential resolution for the base URL and API key —
+    ``resolve_redmine_credentials`` provenance (``env`` / ``file`` /
+    ``unresolved``) rather than env presence — so an operator can reconcile a
+    fail-closed ``--persist-delivery`` receipt (``write_optin_unset`` /
+    ``base_url_unset`` / ``credential_missing``) with what the transport will
+    really use. Strictly informational and credential-safe: it reports **only
+    the opt-in boolean and source labels**, never a value, and never
+    auto-enables anything.
 
     Thin handler over
     :class:`~mozyo_bridge.application.doctor_delivery_env.DeliveryEnvSectionUseCase`:
-    the presence read lives in :class:`LiveDeliveryEnvReads` and the section-dict
-    assembly in the pure ``evaluate_delivery_env_section`` policy. ``args`` is
-    accepted for section-collector signature parity but unused (the environment is
-    process-global).
+    the opt-in presence / resolver-provenance read lives in
+    :class:`LiveDeliveryEnvReads` and the section-dict assembly in the pure
+    ``evaluate_delivery_env_section`` policy. ``args`` is accepted for
+    section-collector signature parity but unused (the environment and the
+    home-scoped credential file are process-global).
     """
     return DeliveryEnvSectionUseCase(LiveDeliveryEnvReads()).execute()
 

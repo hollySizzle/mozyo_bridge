@@ -134,6 +134,25 @@ class FormatDoctorTextTest(unittest.TestCase):
 
         self.assertIs(doctor.format_doctor_text, format_doctor_text)
 
+    def test_delivery_env_renders_resolver_sources_not_env_presence(self) -> None:
+        # Redmine #15698: the section renders the resolver's per-field source
+        # label (env / file / unresolved), never a credential value, and keeps
+        # the env-only opt-in as a set/unset boolean.
+        result = _minimal_result(ok=True)
+        result["sections"]["delivery_env"] = {
+            "status": "ok",
+            "write_optin_set": True,
+            "base_url_source": "file",
+            "api_key_source": "unresolved",
+        }
+        text = format_doctor_text(result)
+        self.assertIn("delivery_env: ok", text)
+        self.assertIn("MOZYO_REDMINE_DELIVERY_WRITE: set=True", text)
+        self.assertIn("base_url: source=file", text)
+        self.assertIn("api_key: source=unresolved", text)
+        self.assertNotIn("MOZYO_REDMINE_URL: set=", text)
+        self.assertNotIn("MOZYO_REDMINE_API_KEY: set=", text)
+
 
 class DoctorCommandPublicSurfaceTest(unittest.TestCase):
     """Pin the boundary's explicit public facade (#12956 cleanup leaf)."""
