@@ -13,6 +13,13 @@ Both `sublane create` entry points run the SAME decision — the plan-only surfa
 and the --dry-run/--execute actuator — because a plan that promises a lane execute
 then refuses is the plan/execute drift #14224 was filed over. The command-level
 cases below drive each entry point against a real temp repo.
+
+Since Redmine #15700 a workspace that declares NO project_gateway binding routes to
+the single-workspace coordinator-parent branch instead of refusing UNDECLARED
+outright; the cases below that covered the undeclared workspace now pin the
+coordinator branch's fail-closed refusals (the branch's own admission is pinned in
+test_issue_15700_single_workspace_delegated_coordinator). Every declared-gateway
+pin is unchanged.
 """
 
 from __future__ import annotations
@@ -33,8 +40,9 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_parent_authority import (  # noqa: E402,E501
     PARENT_BINDINGS_INVALID,
-    PARENT_GATEWAY_UNDECLARED,
+    PARENT_COORDINATOR_BLOCKED,
     PARENT_GATEWAY_UNVERIFIED,
+    PARENT_KIND_DEFAULT_COORDINATOR,
     decide_delegated_parent_authority,
     parent_authority_refusal_text,
 )
@@ -62,22 +70,27 @@ COORDINATOR_ENTRY = {"role": "coordinator", "project_scope": "proj-a"}
 class DecisionTest(unittest.TestCase):
     """The pure admission, one case per refusal and the earned pass."""
 
-    def test_a_coordinator_only_declaration_refuses_undeclared(self) -> None:
+    def test_a_coordinator_only_declaration_without_probe_fails_closed(self) -> None:
         # The filed reproduction: only `coordinator` is bound, no gateway exists.
+        # Since #15700 this routes to the coordinator-parent branch — and with no
+        # probe injected, the branch refuses BLOCKED rather than admitting on the
+        # declaration alone (the pre-#15700 behavior refused UNDECLARED here).
         verdict = decide_delegated_parent_authority(
             _bindings(COORDINATOR_ENTRY), owner_row_active=lambda lane, scope: True
         )
 
         self.assertFalse(verdict.ok)
-        self.assertEqual(PARENT_GATEWAY_UNDECLARED, verdict.reason)
+        self.assertEqual(PARENT_COORDINATOR_BLOCKED, verdict.reason)
+        self.assertEqual(PARENT_KIND_DEFAULT_COORDINATOR, verdict.parent_kind)
 
-    def test_an_empty_declaration_refuses_undeclared(self) -> None:
+    def test_an_empty_declaration_without_probe_fails_closed(self) -> None:
         verdict = decide_delegated_parent_authority(
             ParsedRoleBindings.empty(), owner_row_active=lambda lane, scope: True
         )
 
         self.assertFalse(verdict.ok)
-        self.assertEqual(PARENT_GATEWAY_UNDECLARED, verdict.reason)
+        self.assertEqual(PARENT_COORDINATOR_BLOCKED, verdict.reason)
+        self.assertEqual(PARENT_KIND_DEFAULT_COORDINATOR, verdict.parent_kind)
 
     def test_an_invalid_declaration_refuses_outright(self) -> None:
         verdict = decide_delegated_parent_authority(
@@ -118,12 +131,14 @@ class DecisionTest(unittest.TestCase):
         self.assertEqual([(expected_lane, "proj-a")], seen)
 
     def test_the_refusal_names_both_routes(self) -> None:
+        # The declared-gateway branch's refusal (unchanged by #15700): a declared
+        # but unverified gateway still points at both legitimate routes out.
         verdict = decide_delegated_parent_authority(
-            _bindings(COORDINATOR_ENTRY), owner_row_active=lambda lane, scope: True
+            _bindings(GATEWAY_ENTRY), owner_row_active=lambda lane, scope: False
         )
         text = parent_authority_refusal_text(verdict)
 
-        self.assertIn(PARENT_GATEWAY_UNDECLARED, text)
+        self.assertIn(PARENT_GATEWAY_UNVERIFIED, text)
         self.assertIn("declare-project-gateway", text)
         # Close condition 3: the single-workspace route is stated, not implied.
         self.assertIn("single-workspace", text)
@@ -211,13 +226,17 @@ class BothEntryPointsRefuseIdenticallyTest(_TempRepo):
         return code, out.getvalue() + err.getvalue()
 
     def test_the_plan_only_surface_refuses_with_the_typed_reason(self) -> None:
+        # Since #15700 a coordinator-only declaration routes to the coordinator
+        # branch, which fails closed in this temp repo (no live attested
+        # coordinator exists) with a typed parent_coordinator_* reason and the
+        # branch's own remedy — never an untyped pass-through.
         code, text = self._plan_only(
             self._repo(bindings=[dict(COORDINATOR_ENTRY)]), "delegated_coordinator"
         )
 
         self.assertEqual(1, code)
-        self.assertIn(PARENT_GATEWAY_UNDECLARED, text)
-        self.assertIn("declare-project-gateway", text)
+        self.assertIn("parent_coordinator_", text)
+        self.assertIn("default-lane coordinator", text)
 
     def test_the_dry_run_actuator_refuses_before_any_side_effect(self) -> None:
         repo = self._repo(bindings=[dict(COORDINATOR_ENTRY)])
@@ -225,7 +244,7 @@ class BothEntryPointsRefuseIdenticallyTest(_TempRepo):
         code, text = self._actuator(repo, "delegated_coordinator")
 
         self.assertEqual(1, code)
-        self.assertIn(PARENT_GATEWAY_UNDECLARED, text)
+        self.assertIn("parent_coordinator_", text)
         # Zero side effect: no worktree appeared under the repo.
         self.assertFalse((repo / ".worktrees").exists())
 

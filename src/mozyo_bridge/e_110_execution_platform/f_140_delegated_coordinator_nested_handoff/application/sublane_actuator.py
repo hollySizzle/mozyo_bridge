@@ -324,15 +324,27 @@ def cmd_sublane_start(args: argparse.Namespace) -> int:
     # preflight and before any worktree / pane / dispatch side effect — with the
     # same decision the plan-only surface runs, so plan and execute cannot drift.
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.delegated_parent_authority_gate import (  # noqa: E501
-        delegated_parent_authority_refusal,
+        delegated_parent_authority_verdict,
+    )
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_parent_authority import (  # noqa: E501
+        parent_authority_refusal_text,
     )
 
-    parent_refusal = delegated_parent_authority_refusal(
+    parent_verdict = delegated_parent_authority_verdict(
         repo_root, getattr(args, "lane_kind", "") or ""
     )
-    if parent_refusal is not None:
-        print(parent_refusal, file=sys.stderr)
+    if parent_verdict is not None and not parent_verdict.ok:
+        print(parent_authority_refusal_text(parent_verdict), file=sys.stderr)
         return 1
+    if parent_verdict is not None:
+        # Which parent branch admitted (#15700) — typed, on stderr so the --json
+        # stdout envelope stays parseable. A single-workspace admission must be
+        # observable, never a silent fallback from the gateway assert.
+        print(
+            "sublane create: delegated_coordinator parent authority verified "
+            f"(parent_kind={parent_verdict.parent_kind})",
+            file=sys.stderr,
+        )
 
     # Binding / launchability preflight (Redmine #13569 R1-F2): before ANY worktree or
     # pane actuation, verify the providers the repo-local binding assigns to the lane's
