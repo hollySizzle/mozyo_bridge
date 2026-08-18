@@ -172,6 +172,13 @@ files = [
     # structural-conformance assignment is a real gate against fake signature drift
     # (review j#79040 F1').
     "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_admission_pipeline.py",
+    # Redmine #15707: the callback dead-letter redrive slice (typed request / result value
+    # objects + RedriveStorePort Protocol + the use case the CLI drives).
+    "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/application/callback_redrive.py",
+    # Its constructor-injected fake port: checked so the `RedriveStorePort`
+    # structural-conformance assignment is a real gate against fake signature drift
+    # (review j#79040 F1').
+    "tests/unit/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/test_callback_redrive.py",
 ]
 # The repo is not yet type-clean as a whole: do not chase imports out of the
 # typed island into untyped modules, and tolerate third-party packages that
@@ -246,6 +253,15 @@ warn_return_any = true
 # fully-annotated bar (typed request / result / Protocol port / live adapter all typed).
 [[tool.mypy.overrides]]
 module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_admission_pipeline"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+
+# Redmine #15707: the callback dead-letter redrive use case is held to the same
+# fully-annotated bar (typed request / result / RedriveStorePort Protocol all typed).
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_redrive"
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true
