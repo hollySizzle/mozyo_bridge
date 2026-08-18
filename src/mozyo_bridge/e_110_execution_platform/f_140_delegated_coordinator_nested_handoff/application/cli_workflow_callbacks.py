@@ -540,124 +540,29 @@ def cmd_workflow_callbacks(args: argparse.Namespace) -> int:
         return _emit(payload, as_json=as_json, text_lines=lines)
 
     if getattr(args, "emit_gate", False):
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_gate_record import (
-            attempt_emit_gate_record,
-            review_findings_json_input,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport import (
-            redmine_delivery_transport_from_env,
+        # Redmine #15699: the emit-gate / emit-progress action bodies live in their own module
+        # (module-health split). The collaborators are passed at call time so the established
+        # patch seams on THIS module (_best_effort_emit_supervisor_wake, _emit, the marker-field
+        # builder, the approval write fence) keep governing the behavior unchanged.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_emit_gate import (  # noqa: E501
+            run_emit_gate,
         )
 
-        issue = (getattr(args, "issue", None) or "").strip()
-        gate = (getattr(args, "gate", None) or "").strip()
-        if not issue or not gate:
-            raise SystemExit("--emit-gate requires --issue and --gate")
-        # #13518 R3-F2: approval uses the durable generation lease + pre-write reread fence; a
-        # duplicate consumer or stale observation is a zero-write, non-zero-exit refusal.
-        # #13974 j#81487 F2: a review_request / review_result gate MUST carry the v2 marker fields
-        # (exact full target_head; review_result also its answered review_request journal + conclusion).
-        # The producer refuses malformed fields; approval also exact-matches the admission identity.
-        marker_fields, marker_refusal = _review_gate_marker_fields(args, gate)
-        review_findings, finding_refusal = (
-            (None, None)
-            if marker_refusal is not None
-            else review_findings_json_input(
-                getattr(args, "review_findings_json", None), gate, marker_fields)
+        return run_emit_gate(
+            args,
+            as_json=as_json,
+            emit=_emit,
+            review_gate_marker_fields=_review_gate_marker_fields,
+            review_approval_refusal=_review_approval_refusal,
+            supervisor_wake=_best_effort_emit_supervisor_wake,
         )
-        refusal = (
-            marker_refusal
-            or finding_refusal
-            or _review_approval_refusal(args, issue, gate, marker_fields)
-        )
-        if refusal is not None:
-            payload = {"action": "emit-gate", "issue": issue, "gate": gate,
-                       "recorded": False, "reason": refusal}
-            _emit(payload, as_json=as_json, text_lines=[
-                "action: emit-gate", f"issue: #{issue}", f"gate: {gate}",
-                "recorded: False", f"reason: {refusal}",
-            ])
-            return 1
-        # Credential-gated, opt-in production writer (MOZYO_REDMINE_DELIVERY_WRITE). None ->
-        # write_optin_unset (nothing written, fail-closed — never a silent success).
-        transport = redmine_delivery_transport_from_env()
-        attempt = attempt_emit_gate_record(
-            issue, gate, body=(getattr(args, "body", None) or ""), transport=transport,
-            marker_fields=marker_fields, review_findings=review_findings)
-        if attempt.refusal:
-            _emit(attempt.refusal_payload(issue, gate), as_json=as_json,
-                  text_lines=attempt.refusal_lines(issue, gate))
-            return 1
-        receipt = attempt.receipt
-        assert receipt is not None
-        payload = {"action": "emit-gate", "issue": issue, "gate": gate, **receipt.as_payload()}
-        lines = [
-            "action: emit-gate",
-            f"issue: #{issue}",
-            f"gate: {gate}",
-            f"recorded: {receipt.recorded}",
-            f"reason: {receipt.reason}",
-        ]
-        if receipt.location:
-            lines.append(f"location: {receipt.location}")
-        _emit(payload, as_json=as_json, text_lines=lines)
-        # #13683 review R1-F2: the canonical gate writer is the PRIMARY supervisor trigger — after a
-        # gate is RECORDED, emit a best-effort local wake for (workspace, issue) so the workspace
-        # callback supervisor re-reads that issue without waiting for the reconciliation interval.
-        # Best-effort: a wake-store failure never fails the (already-recorded) gate; a lost wake is
-        # recovered by the supervisor's bounded reconciliation.
-        if receipt.recorded:
-            _best_effort_emit_supervisor_wake(args, issue)
-        # #13520 review R2-F1: fail-closed at the PROCESS gate too — a not-recorded gate (opt-in
-        # unset / transport failure) must NOT exit 0, so a caller that reads only the return code
-        # can never treat an un-written gate as recorded. The structured receipt still prints above.
-        return 0 if receipt.recorded else 1
 
     if getattr(args, "emit_progress", False):
-        # #13889 review F2: the producer half of the sweep watermark. A worker-side progress gate
-        # (review_finding_verdict / progress_log / start / design_consultation) recorded through
-        # this path is marker-bearing, so the sweep can classify it structurally instead of
-        # abstaining from every stall verdict on the issue. Same opt-in / fail-closed contract as
-        # --emit-gate; the marker is round-scoped so it cannot be read as another round's progress.
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_gate_record import (
-            emit_progress_record,
-        )
-        from mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure.redmine_note_transport import (
-            redmine_delivery_transport_from_env,
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_emit_gate import (  # noqa: E501
+            run_emit_progress,
         )
 
-        issue = (getattr(args, "issue", None) or "").strip()
-        kind = (getattr(args, "progress_kind", None) or "").strip()
-        lane = (getattr(args, "lane", None) or "").strip()
-        generation = (getattr(args, "lane_generation", None) or "").strip()
-        if not (issue and kind and lane and generation):
-            raise SystemExit(
-                "--emit-progress requires --issue, --progress-kind, --lane and --lane-generation "
-                "(an unscoped progress marker cannot be attributed to a dispatch round)"
-            )
-        transport = redmine_delivery_transport_from_env()
-        try:
-            receipt = emit_progress_record(
-                issue, kind, lane=lane, lane_generation=generation,
-                body=(getattr(args, "body", None) or ""), transport=transport,
-            )
-        except ValueError as exc:  # an out-of-vocabulary kind is a caller error, surfaced
-            raise SystemExit(str(exc)) from exc
-        payload = {"action": "emit-progress", "issue": issue, "kind": kind, "lane": lane,
-                   "lane_generation": generation, **receipt.as_payload()}
-        lines = [
-            "action: emit-progress",
-            f"issue: #{issue}",
-            f"kind: {kind}",
-            f"lane: {lane} generation: {generation}",
-            f"recorded: {receipt.recorded}",
-            f"reason: {receipt.reason}",
-        ]
-        if receipt.location:
-            lines.append(f"location: {receipt.location}")
-        _emit(payload, as_json=as_json, text_lines=lines)
-        # A progress gate owes no coordinator callback (that is the whole point of the separate
-        # vocabulary), so unlike --emit-gate this deliberately emits NO supervisor wake.
-        return 0 if receipt.recorded else 1
+        return run_emit_progress(args, as_json=as_json, emit=_emit)
 
     if getattr(args, "recovery_plan", False):
         from mozyo_bridge.core.state.workflow_runtime_store import (
@@ -917,6 +822,16 @@ def register_callbacks(sub) -> None:
              "non-approval decision (changes_requested / finding / progress) is unfenced.",
     )
     p.add_argument("--body", help="Optional human-readable prose body for --emit-gate (the marker is appended).")
+    p.add_argument(
+        "--render-note-only", dest="render_note_only", action="store_true",
+        help="Redmine #15699: validate and RENDER the canonical --emit-gate note (marker, and for "
+             "review_result the #14971 finding prose + review-finding-manifest sidecar) to stdout "
+             "WITHOUT posting to Redmine. For write-incapable environments (opt-in unset) whose "
+             "reviewer hand-posts the exact output as ONE journal note; the manifest set_digest is "
+             "not hand-computable. Grants no write authority; skips only the write-time generation "
+             "lease / admission fence (no write happens); every producer grammar refusal is "
+             "identical to the write path.",
+    )
     p.add_argument(
         "--review-findings-json", dest="review_findings_json",
         help="Review Finding Manifest v1 (#14971): UTF-8 JSON file "

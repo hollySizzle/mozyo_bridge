@@ -157,21 +157,23 @@ def review_findings_json_input(
     return findings, None
 
 
-def emit_gate_record(
+def render_gate_record_note(
     issue: str,
     gate: str,
     *,
     body: str = "",
-    transport: Optional[NoteWriteTransport],
     marker_fields: Optional[dict] = None,
     review_findings: Optional[Sequence[ReviewFinding]] = None,
-) -> GateRecordReceipt:
-    """Render a canonical gate note and post it via ``transport`` (fail-closed, opt-in).
+) -> str:
+    """Render the exact canonical gate note :func:`emit_gate_record` would post (pure, no IO).
 
-    Renders the note through :func:`render_gate_note` (always marker-bearing) and posts it. A
-    ``None`` transport (opt-in unset) writes nothing and returns a ``write_optin_unset`` receipt;
-    a :class:`DeliveryTransportError` from the transport maps to its explicit reason. ``gate`` must
-    be a callback-required kind, else ``render_gate_note`` raises (a programming error, surfaced).
+    Redmine #15699: in a write-incapable environment (the ``MOZYO_REDMINE_DELIVERY_WRITE`` opt-in
+    unset), the validated note used to be discarded by the ``write_optin_unset`` receipt, leaving a
+    hand-writing reviewer no way to obtain the #14971 ``review-finding-manifest`` sidecar (its
+    ``set_digest`` is not hand-computable). This is the render half alone: the same producer
+    validation and atomic composition, returned instead of posted, so a hand-posted journal is
+    byte-identical to a canonical write. It grants no write authority — posting the output remains
+    governed by the same preset obligations as any hand-written gate journal.
     """
     fields = marker_fields or {}
     if gate == "review_result":
@@ -184,20 +186,57 @@ def emit_gate_record(
                 REASON_FINDINGS_INPUT_MISSING,
                 "a canonical review_result requires structured review_findings",
             )
-        notes = render_review_result_note(
+        return render_review_result_note(
             issue=issue,
             body=body,
             findings=review_findings,
             marker_fields=fields,
         )
-    else:
-        if review_findings is not None:
-            raise ReviewFindingManifestError(
-                "review_findings_wrong_gate",
-                "structured review findings are valid only for a review_result gate",
-            )
-        notes = render_gate_note(gate, body=body, **fields)
+    if review_findings is not None:
+        raise ReviewFindingManifestError(
+            "review_findings_wrong_gate",
+            "structured review findings are valid only for a review_result gate",
+        )
+    return render_gate_note(gate, body=body, **fields)
+
+
+def emit_gate_record(
+    issue: str,
+    gate: str,
+    *,
+    body: str = "",
+    transport: Optional[NoteWriteTransport],
+    marker_fields: Optional[dict] = None,
+    review_findings: Optional[Sequence[ReviewFinding]] = None,
+) -> GateRecordReceipt:
+    """Render a canonical gate note and post it via ``transport`` (fail-closed, opt-in).
+
+    Renders the note through :func:`render_gate_record_note` (always marker-bearing) and posts it.
+    A ``None`` transport (opt-in unset) writes nothing and returns a ``write_optin_unset`` receipt;
+    a :class:`DeliveryTransportError` from the transport maps to its explicit reason. ``gate`` must
+    be a callback-required kind, else ``render_gate_note`` raises (a programming error, surfaced).
+    """
+    notes = render_gate_record_note(
+        issue,
+        gate,
+        body=body,
+        marker_fields=marker_fields,
+        review_findings=review_findings,
+    )
     return _post(issue, notes, transport)
+
+
+def attempt_render_gate_record_note(*args, **kwargs) -> "tuple[Optional[str], str]":
+    """Call :func:`render_gate_record_note`, projecting a typed producer refusal as data.
+
+    Returns ``(note, "")`` on success, ``(None, refusal)`` on a typed producer refusal — the same
+    refusal tokens the write path emits, so a render-only caller cannot obtain a note the canonical
+    writer would have refused to post.
+    """
+    try:
+        return render_gate_record_note(*args, **kwargs), ""
+    except ReviewFindingManifestError as exc:
+        return None, exc.reason or REASON_FINDINGS_INPUT_INVALID
 
 
 def attempt_emit_gate_record(*args, **kwargs) -> GateRecordAttempt:
@@ -272,7 +311,9 @@ __all__ = (
     "GateRecordAttempt",
     "GateRecordReceipt",
     "attempt_emit_gate_record",
+    "attempt_render_gate_record_note",
     "emit_gate_record",
+    "render_gate_record_note",
     "emit_progress_record",
     "review_findings_json_input",
 )

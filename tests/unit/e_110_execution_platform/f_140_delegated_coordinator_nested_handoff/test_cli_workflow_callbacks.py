@@ -795,6 +795,155 @@ class EmitGateReviewApprovalFenceTest(_CliTestCase):
                             "approval_requires_generation_observation_and_consumer")
 
 
+class EmitGateRenderNoteOnlyTest(_CliTestCase):
+    """Redmine #15699: --render-note-only renders the exact canonical note (marker + #14971
+    finding prose + review-finding-manifest sidecar) WITHOUT writing, for hand-posting in a
+    write-incapable environment. Producer grammar refusals are identical to the write path; only
+    the write-time generation lease / admission fence is skipped (nothing is written)."""
+
+    _HEAD = "b" * 40
+
+    def _emit_args(self, **over):
+        base = dict(
+            emit_gate=True, json=True, issue="15692", gate="review_result", body="",
+            store_path=str(self.store_path),
+            target_head=self._HEAD, review_request_journal="107848",
+            review_generation_json=None, consumer_id=None, review_decision=None,
+            render_note_only=True,
+        )
+        base.update(over)
+        return _args(**base)
+
+    def _findings_json(self, identities=("1",), *, name="findings.json"):
+        p = Path(self._tmp.name) / name
+        p.write_text(
+            _json.dumps({
+                "version": 1,
+                "findings": [
+                    {"id": identity, "summary": f"finding {identity}"}
+                    for identity in identities
+                ],
+            }),
+            encoding="utf-8",
+        )
+        return str(p)
+
+    def _run_json(self, ns):
+        import contextlib
+        import io
+
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_workflow_callbacks(ns)
+        return rc, _json.loads(buf.getvalue())
+
+    def test_approved_render_needs_no_observation_and_writes_nothing(self):
+        # The write path refuses this exact invocation with
+        # approval_requires_generation_observation_and_consumer (see the fence test above); the
+        # render half succeeds because no write happens — and it must touch neither the transport
+        # nor the supervisor wake.
+        from unittest.mock import patch
+
+        def _explode():
+            raise AssertionError("render-note-only must never resolve the write transport")
+
+        wakes: list = []
+        with patch(
+            "mozyo_bridge.e_140_adapter_provider.f_120_redmine_adapter.infrastructure."
+            "redmine_note_transport.redmine_delivery_transport_from_env",
+            _explode,
+        ), patch.object(cli, "_best_effort_emit_supervisor_wake",
+                        lambda args, issue: wakes.append(issue)):
+            rc, out = self._run_json(self._emit_args(review_decision="approval"))
+        self.assertEqual(rc, 0)
+        self.assertFalse(out["recorded"])
+        self.assertTrue(out["rendered"])
+        self.assertEqual(wakes, [])
+        self.assertIn(
+            f"[mozyo:workflow-event:gate=review_result:conclusion=approved:head={self._HEAD}"
+            ":req=107848]",
+            out["note"],
+        )
+
+    def test_approved_note_round_trips_the_strict_manifest_reader(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_finding_manifest import (  # noqa: E501
+            read_review_finding_manifest,
+        )
+
+        rc, out = self._run_json(self._emit_args(review_decision="approval"))
+        self.assertEqual(rc, 0)
+        facts = read_review_finding_manifest(
+            RedmineJournalEntry(issue_id="15692", journal_id="200001", notes=out["note"])
+        )
+        self.assertTrue(facts.valid)
+        self.assertEqual(facts.findings, ())  # the explicit empty approval set, count=0
+
+    def test_changes_requested_note_round_trips_with_findings(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (  # noqa: E501
+            RedmineJournalEntry,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.review_finding_manifest import (  # noqa: E501
+            read_review_finding_manifest,
+        )
+
+        rc, out = self._run_json(self._emit_args(
+            review_decision="changes_requested",
+            review_findings_json=self._findings_json(("1", "2")),
+        ))
+        self.assertEqual(rc, 0)
+        self.assertIn("### finding_1 — finding 1", out["note"])
+        facts = read_review_finding_manifest(
+            RedmineJournalEntry(issue_id="15692", journal_id="200002", notes=out["note"])
+        )
+        self.assertTrue(facts.valid)
+        self.assertEqual(facts.findings, ("1", "2"))
+
+    def test_render_refusal_tokens_match_the_write_path(self):
+        for name, over, reason in (
+            ("missing head", dict(target_head=None), "review_marker_missing_target_head"),
+            (
+                "changes without findings",
+                dict(review_decision="changes_requested"),
+                "review_findings_input_missing",
+            ),
+            (
+                "approved with findings",
+                dict(review_decision="approval",
+                     review_findings_json=self._findings_json(name="approved.json")),
+                "approved_review_carries_findings",
+            ),
+        ):
+            with self.subTest(name=name):
+                rc, out = self._run_json(self._emit_args(**over))
+                self.assertEqual(rc, 1)
+                self.assertFalse(out["recorded"])
+                self.assertNotIn("note", out)
+                self.assertEqual(out["reason"], reason)
+
+    def test_text_mode_prints_the_note_verbatim_for_pasting(self):
+        import contextlib
+        import io
+
+        rc, json_out = self._run_json(self._emit_args(review_decision="approval"))
+        self.assertEqual(rc, 0)
+        buf = io.StringIO()
+        with contextlib.redirect_stdout(buf):
+            rc = cli.cmd_workflow_callbacks(
+                self._emit_args(review_decision="approval", json=False)
+            )
+        self.assertEqual(rc, 0)
+        self.assertEqual(buf.getvalue(), json_out["note"] + "\n")
+
+    def test_non_review_gate_renders_its_marker_note(self):
+        rc, out = self._run_json(self._emit_args(gate="implementation_done", body="done"))
+        self.assertEqual(rc, 0)
+        self.assertTrue(out["rendered"])
+        self.assertIn("[mozyo:workflow-event:gate=implementation_done]", out["note"])
+
+
 class ParseCandidateTest(unittest.TestCase):
     def test_full_spec(self):
         c = cli._parse_candidate("13518:75094:coordinator:review_request")

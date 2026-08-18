@@ -40,7 +40,9 @@ class GatewayInitialDispatchProfileTest(unittest.TestCase):
                 "upstream_coordinator": "coordinator",
             },
         )
-        self.assertEqual(ROLE_PROFILE_VERSION, "2026-08-04")
+        # #15699 bumped the packaged template version with the gateway manifest obligation line;
+        # the pin tracks the current contract text version per the role-profile sync anchor.
+        self.assertEqual(ROLE_PROFILE_VERSION, "2026-08-18")
         self.assertIn(REQUIRED_ROUTE, profile.resolved_text)
         self.assertIn(AUTHORITY_BOUNDARY, profile.resolved_text)
         self.assertEqual(profile.unresolved_placeholders, ())
