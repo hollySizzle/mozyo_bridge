@@ -682,6 +682,34 @@ live smokeはcold startでrootへのcloseが0、agent pairがlive、adopt経路�
 確認する。将来server-side conditional closeを導入する場合だけ、root専用private pinとeffect-edgeの
 exact再joinを新しい契約として設計する。
 
+#### lane tab root の occupation (Redmine #15702)
+
+lane=tab 経路 (#13411) の tab root には、上記 workspace root の保存規則をそのまま適用しない。
+#15227 が root close を落とした結果、`sublane create` ごとに tab の初期 shell pane が空のまま
+恒久残存していた (owner 報告 + herdr pane list 実測)。修正は **occupation (破壊ゼロ)** であり、
+close の再導入ではない:
+
+1. run が lane tab を新規 mint する場合 (`_tab_target_for_lane` = `""` かつ live slot なし、
+   restore container なし)、`herdr tab create --workspace <host> --label <lane> --cwd
+   <lane worktree> --env KEY=VALUE... --no-focus` で **最初の launch slot の prepared pane
+   として** tab を作る (実測 herdr 0.8.0: `--cwd` / `--env` は root pane の shell に反映され、
+   `tab_created.root_pane` は `pane_id` / `workspace_id` / `tab_id` / `terminal_id` を返す)。
+   env は `build_pane_launch_env` を同一入力で呼んで組む — split pane が持つ env と同一。
+   parse は fail-closed (`terminal_id` を欠く root は prepared pane にしない)。
+2. 最初の launch slot は `pane split` を発行せず、この root を prepared pane として
+   `pane run` (provider function) → `agent start --pane <root>` する。prepared receipt /
+   started identity 検査 (locator / terminal_id / workspace / tab exact match) は split pane
+   と同一契約。2 slot 目以降は従来どおり直前 agent pane を anchor に split する。
+3. 成功 run は `tab_pane_reclaimed: true` / `tab_pane_detail: root_occupied_by_first_launch`
+   を記録する (close は発生していない)。occupation の判定は launch identity の exact join
+   (started locator == 保持した root locator) であり、scan ではない。
+4. 変更しない経路: workspace base pane (`_create_workspace` の root と lane-zero host の
+   cosmetic root は従来どおり `generation_unproven_root_preserved`)、default lane、既存 tab へ
+   の heal / rejoin、loose legacy pair、restore container。既存 lane に残存済みの空 pane の
+   掃除も scope 外 (operator 手動 close または別途 sweep)。
+5. `_close_base_pane` の #15227 契約 (locator-only close 禁止 / terminal-generation 束縛必須)
+   は不変。本節は「空 root を作らない」構造であり、close authority を追加しない。
+
 ## 5.1 lane_placement — pair 配置の設定駆動化 (Redmine #13646 / #14569)
 
 herdr pane pair の **split 方向**・**役割順序** (どちらの provider が先 = 左 / 上に置かれるか)・

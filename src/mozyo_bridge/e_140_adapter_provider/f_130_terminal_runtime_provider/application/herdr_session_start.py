@@ -202,8 +202,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     resolve_role_grouped_implementation_target,
     validate_role_grouped_inventory,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_tab_preparation import (  # noqa: E501
+    resolve_lane_tab,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
-    _create_tab,
     _create_workspace,
     _invoke,
     _list_rows,
@@ -221,14 +223,10 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     HerdrSessionStartError,
     SHARED_COORDINATOR_WORKSPACE_LABEL,
     _host_workspace_label,
-    _lane_live_slot_tabs,
     _launch_target_for_lane,
     _parse_started_agent,
-    _parse_tab_created,
-    _parse_workspace_created,
     _shared_coordinator_own_target,
     _shared_coordinator_target,
-    _tab_target_for_lane,
     _workspace_prefix,
     herdr_workspace_segment,
     resolve_container_plan,
@@ -830,29 +828,35 @@ def _prepare_session_locked(
 
     # Non-default implementation lanes keep the #13411 lane=tab path. Project
     # coordinators are intentionally loose pairs in their shared overview workspace.
+    # A freshly minted lane tab is created first-slot-prepared (#15702): its born root
+    # pane carries the first launch slot's cwd/env and terminal receipt, so that slot
+    # occupies the root instead of splitting beside it and no empty shell pane remains.
     target_tab = ""
     lane_slot_tabs: list = []
+    tab_root_prepared = None
     if (
         launch_plans
         and result.lane_id != DEFAULT_LANE
         and not role_grouped_project_coordinator
     ):
-        lane_slot_tabs = _lane_live_slot_tabs(
-            rows, workspace_id, target_workspace, result.lane_id
+        tab_resolution = resolve_lane_tab(
+            rows=rows, workspace_id=workspace_id, target_workspace=target_workspace,
+            lane_id=result.lane_id,
+            restore_tab=(
+                _restore_container.tab_id if _restore_container is not None else None
+            ),
+            first_launch_plan=launch_plans[0],
+            native_bindings=native_admission.bindings,
+            resolved_launches=resolved_launches, attest_launcher=attest_launcher,
+            store_home=store_home, action_id=result.action_id, repo_root=repo_root,
+            binary=binary, env=env, runner=runner, timeout=timeout,
+            effect_fence=workspace_effect_fence,
         )
-        target_tab = (
-            _restore_container.tab_id
-            if _restore_container is not None
-            else _tab_target_for_lane(
-                rows, workspace_id, target_workspace, result.lane_id
-            )
-        )
-        if not target_tab and not lane_slot_tabs:
-            target_tab, tab_pane_id = _create_tab(
-                binary, target_workspace, runner, timeout, env,
-                label=result.lane_id, effect_fence=workspace_effect_fence,
-            )
-            result.tab_pane_id = tab_pane_id
+        target_tab = tab_resolution.target_tab
+        lane_slot_tabs = tab_resolution.lane_slot_tabs
+        tab_root_prepared = tab_resolution.occupy
+        if tab_root_prepared is not None:
+            result.tab_pane_id = tab_root_prepared.locator
         result.herdr_tab_id = target_tab
     # Split placement (#13411 tab axis + #13646 direction / #13646-R1-F1 focus). The first
     # slot occupies the container; later launching slots split beside it. Pure decisions —
@@ -939,9 +943,11 @@ def _prepare_session_locked(
                 shim_dir=launch_shim_dirs.get(plan.provider, ""),
                 workspace_effect_fence=workspace_effect_fence,
                 pane_owner=_restore_pane_owner,
+                occupy_prepared=tab_root_prepared,
             )
         )
         if plan.kind == "launch":
+            tab_root_prepared = None
             split_anchor = result.slots[-1].locator
             occupancy += 1
 

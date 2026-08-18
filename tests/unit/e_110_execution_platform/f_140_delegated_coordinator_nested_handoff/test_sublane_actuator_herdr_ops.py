@@ -210,6 +210,15 @@ class _StatefulHerdr:
             root_pane = f"{wid}:p{self._pane_seq}"
             self._pane_workspace[root_pane] = wid
             self._pane_tab[root_pane] = tab_id
+            # #15702: `--env K=V` reaches the born root pane's shell exactly like a
+            # split pane's env, so the occupying `agent start` can read it back.
+            root_env = {}
+            for index, token in enumerate(rest):
+                if token == "--env" and index + 1 < len(rest):
+                    key, separator, value = rest[index + 1].partition("=")
+                    if separator:
+                        root_env[key] = value
+            self._pane_env[root_pane] = root_env
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -218,7 +227,15 @@ class _StatefulHerdr:
                         "result": {
                             "type": "tab_created",
                             "tab": {"tab_id": tab_id},
-                            "root_pane": {"pane_id": root_pane},
+                            # #15702 (measured herdr 0.8.0): the root pane's FULL
+                            # identity rides the create payload, so the real code
+                            # can occupy it as the first slot's prepared pane.
+                            "root_pane": {
+                                "pane_id": root_pane,
+                                "workspace_id": wid,
+                                "tab_id": tab_id,
+                                "terminal_id": f"terminal-{root_pane}",
+                            },
                         }
                     }
                 ),

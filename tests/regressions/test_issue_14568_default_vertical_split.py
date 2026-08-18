@@ -133,7 +133,9 @@ def _prepare(
 
 
 def _second_split(herdr) -> str:
-    second = herdr.pane_splits[1]
+    # #15702: a fresh lane tab's first slot occupies the born root (no split), so the
+    # splitting slot's `pane split` is the LAST one on either lane class.
+    second = herdr.pane_splits[-1]
     return second[second.index("--direction") + 1]
 
 
