@@ -44,6 +44,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REASON_HANDOFF_FAILED,
     REASON_ADOPT_OWNER_UNBOUND,
     REASON_LANE_MISMATCH,
+    REASON_LIFECYCLE_ANCHOR_REQUIRED,
     REASON_MISSING_IDENTITY,
     REASON_PANE_CREATE_FAILED,
     REASON_STAMP_FAILED,
@@ -331,14 +332,21 @@ class MissingIdentityTests(unittest.TestCase):
         self.assertEqual(outcome.status, ACTUATE_BLOCKED)
         self.assertIn(REASON_ANCHOR_REQUIRED, outcome.blocked_reasons)
 
-    def test_no_dispatch_execute_without_journal_is_allowed(self):
-        # --no-dispatch drops the anchor requirement (no worker is dispatched).
+    def test_no_dispatch_execute_without_journal_fails_closed_for_fresh_create(self):
+        # Redmine #15703: --no-dispatch used to drop the anchor requirement entirely,
+        # so a fresh create's lifecycle owner declaration silently skipped and the
+        # lane ran owner-rowless (permanently fail-closed downstream). A fresh create
+        # now requires the durable anchor even without a dispatch, refused before any
+        # worktree / pane mutation. Adopt of an existing live matching pair is exempt
+        # (see test_issue_15703_create_lifecycle_anchor_fence).
         ops = FakeActuatorOps(git=True, lanes=[None, _lane()])
         outcome = SublaneActuateUseCase(ops).run(
             _req(journal=None), execute=True, dispatch=False
         )
-        self.assertEqual(outcome.status, ACTUATE_EXECUTED)
-        self.assertEqual(outcome.dispatch_result, DISPATCH_SKIPPED)
+        self.assertEqual(outcome.status, ACTUATE_BLOCKED)
+        self.assertIn(REASON_LIFECYCLE_ANCHOR_REQUIRED, outcome.blocked_reasons)
+        self.assertNotIn("create_worktree", ops._names())
+        self.assertNotIn("append_lane_column", ops._names())
 
 
 class SenderAttestationPreflightTests(unittest.TestCase):
@@ -503,7 +511,7 @@ class SenderAttestationPreflightTests(unittest.TestCase):
 
         ops = ExplodingSenderOps(git=True, lanes=[None, _lane()])
         outcome = SublaneActuateUseCase(ops).run(
-            _req(journal=None), execute=True, dispatch=False
+            _req(), execute=True, dispatch=False
         )
         self.assertEqual(outcome.status, ACTUATE_EXECUTED)
 

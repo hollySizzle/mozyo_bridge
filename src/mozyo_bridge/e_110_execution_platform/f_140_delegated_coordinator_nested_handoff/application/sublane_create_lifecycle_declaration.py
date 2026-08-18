@@ -23,6 +23,17 @@ from __future__ import annotations
 import sys
 from typing import Optional
 
+#: Typed skip outcomes (Redmine #15703): every declare skip names its cause instead of
+#: returning silently. The tokens are observability for callers / tests — the write
+#: stays best-effort and a skip still never breaks the actuation. The create's
+#: fail-closed net for the anchorless-fresh-create case is the pre-mutation
+#: ``create_lifecycle_anchor_gate`` (``sublane_actuator_gates``); by the time this
+#: function sees an empty anchor the caller is a legacy / non-gated surface, so the
+#: skip is surfaced as a typed stderr warning rather than an exception.
+DECLARE_SKIPPED_MISSING_INPUTS = "missing_inputs"
+DECLARE_SKIPPED_INVALID_ANCHOR = "invalid_anchor"
+DECLARE_SKIPPED_STORE_ERROR = "store_error"
+
 
 def _norm(value: Optional[str]) -> str:
     return (value or "").strip()
@@ -37,14 +48,20 @@ def declare_created_lane_lifecycle(
     worktree_identity: str = "",
     lane_kind: str = "",
     parent_lane_id: str = "",
-) -> None:
+) -> Optional[str]:
     """Declare this lane's owner binding (best-effort, never raises; Redmine #13681 W1).
 
     A declare needs both the lane unit identity ``(repo_workspace_id, lane_label)`` and the
     durable decision anchor (``--journal``). A create with no journal — or an unresolved
     workspace segment / lane label — is **owner-unbound**: no lifecycle row is written, and
     the lane reads as owner-unbound at the roster and send gate. That is a fail-closed gap
-    surfaced honestly downstream, never a guessed owner.
+    surfaced honestly downstream, never a guessed owner. Redmine #15703: the gap used to
+    be SILENT (no stderr trace, live evidence lane ``issue_15692_write_transport``), which
+    made the downstream owner-row refusals look causeless; every skip branch now prints a
+    typed stderr warning and returns its ``DECLARE_SKIPPED_*`` token (``None`` means the
+    declaration reached the store and resolved — applied, ``already_declared``, or
+    ``owner_conflict``, which stay "correct, not an error"). The anchorless FRESH create
+    itself is refused earlier, pre-mutation, by ``create_lifecycle_anchor_gate``.
 
     ``worktree_identity`` (Redmine #13754) is the lane's canonical worktree token, recorded
     here so ``retire --execute`` can prove the caller's ``--worktree`` belongs to this lane.
@@ -95,8 +112,23 @@ def declare_created_lane_lifecycle(
     issue_id = _norm(issue)
     lane = _norm(lane_label)
     workspace = _norm(repo_workspace_id)
-    if not (anchor and issue_id and lane and workspace):
-        return
+    missing = [
+        name
+        for name, value in (
+            ("journal", anchor),
+            ("issue", issue_id),
+            ("lane_label", lane),
+            ("workspace", workspace),
+        )
+        if not value
+    ]
+    if missing:
+        print(
+            "warning: lane lifecycle declare skipped "
+            f"(missing: {', '.join(missing)}); lane reads as owner-unbound",
+            file=sys.stderr,
+        )
+        return DECLARE_SKIPPED_MISSING_INPUTS
     from mozyo_bridge.core.state.lane_kind import LaneKindError
     from mozyo_bridge.core.state.lane_lifecycle import (
         CAS_ALREADY_DECLARED,
@@ -115,7 +147,12 @@ def declare_created_lane_lifecycle(
     except (DecisionPointerError, ValueError):
         # A non-decimal issue / journal cannot anchor a re-readable decision — skip
         # rather than write an owner row no recovery could ever resolve.
-        return
+        print(
+            "warning: lane lifecycle declare skipped (non-decimal issue / journal "
+            "anchor); lane reads as owner-unbound",
+            file=sys.stderr,
+        )
+        return DECLARE_SKIPPED_INVALID_ANCHOR
     try:
         result = LaneLifecycleStore().declare_active(
             key,
@@ -133,7 +170,7 @@ def declare_created_lane_lifecycle(
             "lane reads as owner-unbound",
             file=sys.stderr,
         )
-        return
+        return DECLARE_SKIPPED_STORE_ERROR
     _backfill_missing_worktree_binding(
         key,
         result=result,
@@ -141,6 +178,7 @@ def declare_created_lane_lifecycle(
         worktree_identity=worktree_identity,
         already_declared=CAS_ALREADY_DECLARED,
     )
+    return None
 
 
 def _backfill_missing_worktree_binding(
@@ -229,7 +267,7 @@ def _backfill_missing_worktree_binding(
 
 def declare_created_lane_lifecycle_for(
     ops, repo_workspace_id: str, *, worktree_identity: str = ""
-) -> None:
+) -> Optional[str]:
     """The actuator adapter's declare call seam (#13681 W1), reading its facts off ``ops``.
 
     Extracted from ``HerdrSublaneActuatorOps._declare_lane_lifecycle`` (module-health leaf,
@@ -239,7 +277,7 @@ def declare_created_lane_lifecycle_for(
     the sender-authority preflight VERIFIED and stashed (#15706; empty on the default-lane
     coordinator pass, so a parent binding can never come from raw caller env).
     """
-    declare_created_lane_lifecycle(
+    return declare_created_lane_lifecycle(
         repo_workspace_id=repo_workspace_id,
         lane_label=ops.lane_label,
         issue=ops.issue,
@@ -251,6 +289,9 @@ def declare_created_lane_lifecycle_for(
 
 
 __all__ = (
+    "DECLARE_SKIPPED_INVALID_ANCHOR",
+    "DECLARE_SKIPPED_MISSING_INPUTS",
+    "DECLARE_SKIPPED_STORE_ERROR",
     "declare_created_lane_lifecycle",
     "declare_created_lane_lifecycle_for",
 )

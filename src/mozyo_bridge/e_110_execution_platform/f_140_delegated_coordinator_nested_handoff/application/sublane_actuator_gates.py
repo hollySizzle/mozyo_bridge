@@ -8,6 +8,10 @@ use case as a collaborator (its ``_blocked`` builder) and returns a terminal
 
 * :func:`pre_mutation_admission` — everything that must hold before the FIRST mutation, so
   that boundary has one definition rather than one per caller. It runs:
+  * :func:`create_lifecycle_anchor_gate` — a fresh-lane create with no durable
+    ``--journal`` anchor would silently skip its lifecycle owner declaration and birth
+    an owner-rowless lane (Redmine #15703); it refuses zero-mutation unless an existing
+    live matching pair will be adopted instead.
   * :func:`runtime_placement_gate` — the action-time runtime fingerprint front door
     (R1-F1): the official mutating entry goes zero-write when the active runtime is a
     source/installed skew missing the same-tab placement behavior the repo-local source
@@ -30,6 +34,7 @@ from typing import Optional
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_actuation import (
     REASON_LAUNCH_BLOCKED,
     REASON_LAUNCHER_INCOMPATIBLE,
+    REASON_LIFECYCLE_ANCHOR_REQUIRED,
     REASON_PAIR_SPLIT,
     REASON_PARTIAL_PAIR_RECOVERY,
     REASON_RUNTIME_FINGERPRINT,
@@ -53,6 +58,65 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (
     SUBLANE_STATE_PAIR_SPLIT,
 )
+
+
+def create_lifecycle_anchor_gate(
+    use_case,
+    request,
+    *,
+    launch_action,
+    dispatch: bool,
+    fill_decision,
+    fill_override_reason,
+) -> Optional[SublaneActuationOutcome]:
+    """Refuse an anchorless create that would birth an owner-rowless lane (Redmine #15703).
+
+    The create path's lifecycle owner declaration
+    (:func:`...sublane_create_lifecycle_declaration.declare_created_lane_lifecycle`) is
+    keyed on the durable ``--journal`` decision anchor; with no anchor it skips and the
+    fresh lane runs **owner-rowless** — every downstream owner-row rail (dispatch-worker /
+    retire / recover) then fails closed with no visible cause (live evidence: lane
+    ``issue_15692_write_transport``). The dispatch leg already requires the anchor
+    (``anchor_required``), so the residual entry is a ``--no-dispatch`` (or otherwise
+    dispatch-free) execute; this gate closes it BEFORE the first mutation.
+
+    Exempt: an existing live matching pair, which the execute will ADOPT — its owner row
+    is validated (fresh or ``already_declared``) by the anchor-tolerant adopt declaration
+    gate (#13810 R3-F3), so an anchorless self-heal / adopt re-run keeps its existing
+    behavior. The exemption requires a POSITIVELY identified adoptable pair: an
+    unreadable inventory (``read_lane`` fail-safe ``None``) or an identity mismatch is
+    treated as a fresh-lane birth and refused, never adopted-over.
+    """
+    if (getattr(request, "journal", "") or "").strip():
+        return None
+    existing = use_case.ops.read_lane(
+        resolve_lane_runtime_root(
+            use_case.ops,
+            getattr(request, "worktree_path", "") or "",
+            skip_no_git=launch_action == LAUNCH_SKIP_NO_GIT,
+        )
+    )
+    adoptable = bool(
+        existing is not None
+        and existing.gateway_pane
+        and existing.worker_pane
+        and use_case._identity_matches(existing, request)
+    )
+    if adoptable:
+        return None
+    return use_case._blocked(
+        request,
+        launch_action=launch_action,
+        reason="a fresh lane create requires a durable-anchor journal id (--journal): "
+        "the lane's lifecycle owner declaration is keyed on it and would silently "
+        "skip, leaving an owner-rowless lane every downstream owner-row rail "
+        "fails closed against; refusing before any worktree / pane mutation — "
+        "re-run with --journal <decision journal id>",
+        reasons=(REASON_LIFECYCLE_ANCHOR_REQUIRED,),
+        dispatch=dispatch,
+        fill_decision=fill_decision,
+        fill_override_reason=fill_override_reason,
+    )
 
 
 def runtime_placement_gate(
@@ -211,9 +275,10 @@ def pre_mutation_admission(
 
     One entry point so the "nothing has happened yet" boundary has a single definition and a
     later conjunct cannot be added to one caller only: the base-commit pin (#14258 R1), the
-    runtime placement fingerprint (#13705), and the managed-launch launcher compatibility
-    conjunction (#14258). Returns the (possibly base-pinned) request and the first blocked
-    outcome, or ``None`` when every check passes.
+    fresh-lane lifecycle anchor requirement (#15703), the runtime placement fingerprint
+    (#13705), and the managed-launch launcher compatibility conjunction (#14258). Returns
+    the (possibly base-pinned) request and the first blocked outcome, or ``None`` when
+    every check passes.
 
     The pin runs FIRST and its result is what every later check and every mutation sees —
     that ordering is the fix: a gate that verified an unpinned ref would be verifying a
@@ -229,7 +294,11 @@ def pre_mutation_admission(
     )
     if outcome is not None:
         return request, outcome
-    for gate in (runtime_placement_gate, launcher_compatibility_gate):
+    for gate in (
+        create_lifecycle_anchor_gate,
+        runtime_placement_gate,
+        launcher_compatibility_gate,
+    ):
         outcome = gate(
             use_case,
             request,
@@ -486,6 +555,7 @@ def default_upstream_to_verified_parent(ops, request):
 
 
 __all__ = (
+    "create_lifecycle_anchor_gate",
     "default_upstream_to_verified_parent",
     "pair_attestation_admission",
     "pair_split_admission",

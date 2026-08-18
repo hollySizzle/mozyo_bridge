@@ -346,7 +346,12 @@ def register_sublane_group(
         "commit to avoid cutting the lane from a stale checkout.",
     )
     sublane_create.add_argument(
-        "--journal", default=None, help="Durable-anchor journal id for the dispatch step"
+        "--journal",
+        default=None,
+        help="Durable-anchor journal id for the dispatch step and for the fresh "
+        "lane's lifecycle owner declaration (Redmine #15703: a fresh --execute "
+        "create fails closed without it; only an adopt of an existing live "
+        "matching lane may omit it)",
     )
     # Lane-role aware pane placement (Redmine #13647 Tranche 1b, disposition j#85650):
     # the creating coordinator ASSERTS where in the delegation tree the new lane sits
@@ -425,7 +430,8 @@ def register_sublane_group(
         action="store_true",
         help="Actuate the plan (create/adopt the worktree + cockpit gateway/worker "
         "column and dispatch the implementation_request). Default: plan only, no side "
-        "effects. Requires --journal for the dispatch anchor.",
+        "effects. Requires --journal for the dispatch anchor and (even with "
+        "--no-dispatch) for a fresh lane's lifecycle owner declaration.",
     )
     sublane_create.add_argument(
         "--dry-run",

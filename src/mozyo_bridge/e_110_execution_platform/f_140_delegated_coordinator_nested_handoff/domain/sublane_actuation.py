@@ -124,6 +124,14 @@ REASON_LAUNCH_BLOCKED = "launch_blocked"
 #: A live dispatch was requested but no durable-anchor journal id was supplied — the
 #: workflow-step contract fails closed rather than dispatch a worker without an anchor.
 REASON_ANCHOR_REQUIRED = "anchor_required"
+#: A live create would birth a FRESH lane (no adoptable live pair) without the durable
+#: journal anchor its lifecycle owner declaration is keyed on (Redmine #15703). The
+#: declare would silently skip and the lane would run owner-rowless — permanently
+#: fail-closed at every downstream owner-row rail (dispatch-worker / retire / recover)
+#: with no trace — so the create refuses BEFORE any worktree / pane mutation instead.
+#: An adopt of an existing live matching pair is exempt: its owner row is validated by
+#: the adopt declaration gate (#13810 R3-F3), which stays anchor-tolerant.
+REASON_LIFECYCLE_ANCHOR_REQUIRED = "lifecycle_anchor_required"
 #: ``git worktree add`` failed — the branch already exists, the worktree path is taken, or
 #: git refused. Covers the acceptance's "branch collision" and "worktree collision".
 REASON_WORKTREE_CREATE_FAILED = "worktree_create_failed"
@@ -195,6 +203,7 @@ BLOCKED_REASONS = frozenset(
         REASON_MISSING_IDENTITY,
         REASON_LAUNCH_BLOCKED,
         REASON_ANCHOR_REQUIRED,
+        REASON_LIFECYCLE_ANCHOR_REQUIRED,
         REASON_WORKTREE_CREATE_FAILED,
         REASON_PANE_CREATE_FAILED,
         REASON_STAMP_FAILED,
@@ -657,6 +666,7 @@ __all__ = (
     "SENDER_PROVIDER_NOT_GATEWAY",
     "REASON_LAUNCH_BLOCKED",
     "REASON_ANCHOR_REQUIRED",
+    "REASON_LIFECYCLE_ANCHOR_REQUIRED",
     "REASON_WORKTREE_CREATE_FAILED",
     "REASON_PANE_CREATE_FAILED",
     "REASON_STAMP_FAILED",
