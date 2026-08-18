@@ -19,6 +19,7 @@ from typing import Optional
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.delegated_parent_authority import (  # noqa: E501
     DELEGATED_COORDINATOR_LANE_KIND,
     PARENT_SCOPE_UNRESOLVED,
+    CoordinatorParentProbe,
     ParentAuthorityVerdict,
     decide_delegated_parent_authority,
     parent_authority_refusal_text,
@@ -29,7 +30,24 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 
 __all__ = (
     "delegated_parent_authority_refusal",
+    "delegated_parent_authority_verdict",
 )
+
+
+def delegated_parent_authority_verdict(
+    repo_root: Path, lane_kind: str
+) -> Optional[ParentAuthorityVerdict]:
+    """The full admission verdict for creating ``lane_kind`` at ``repo_root``.
+
+    ``None`` for every lane kind other than ``delegated_coordinator`` — the
+    admission is the geometry assertion's own cost, and no other kind asserts a
+    parent. For a delegated_coordinator the verdict carries ``parent_kind``
+    (which branch decided; #15700) even on success, so the caller can surface
+    the taken branch instead of admitting silently.
+    """
+    if (lane_kind or "").strip() != DELEGATED_COORDINATOR_LANE_KIND:
+        return None
+    return _decide(repo_root)
 
 
 def delegated_parent_authority_refusal(
@@ -37,15 +55,13 @@ def delegated_parent_authority_refusal(
 ) -> Optional[str]:
     """The refusal text for creating ``lane_kind`` at ``repo_root``, or ``None``.
 
-    ``None`` for every lane kind other than ``delegated_coordinator`` — the
-    admission is the geometry assertion's own cost, and no other kind asserts a
-    parent — and for a delegated_coordinator whose parent gateway is both declared
-    and verified.
+    ``None`` for every lane kind other than ``delegated_coordinator`` — and for a
+    delegated_coordinator whose parent verified (a declared + verified project
+    gateway, or — with no gateway declared at all — the workspace's live attested
+    default-lane coordinator, #15700).
     """
-    if (lane_kind or "").strip() != DELEGATED_COORDINATOR_LANE_KIND:
-        return None
-    verdict = _decide(repo_root)
-    if verdict.ok:
+    verdict = delegated_parent_authority_verdict(repo_root, lane_kind)
+    if verdict is None or verdict.ok:
         return None
     return parent_authority_refusal_text(verdict)
 
@@ -70,6 +86,75 @@ def _decide(repo_root: Path) -> ParentAuthorityVerdict:
                 "gateway's owner row cannot be scoped or verified"
             ),
         )
+
+    def coordinator_parent_probe() -> CoordinatorParentProbe:
+        # The single-workspace branch's reads (#15700). Reuses the coordinator
+        # proxy rail's own resolvers — the same exactly-one live-attested policy —
+        # rather than a second implementation that could drift from it. Any read
+        # failure folds to a blocked probe: an unreadable parent verifies nothing.
+        try:
+            import os
+
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.coordinator_proxy_send import (  # noqa: E501
+                live_agent_rows,
+                live_workspace_id,
+                resolve_default_lane_authority,
+                resolve_expected_provider,
+                resolve_proxy_target,
+            )
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.coordinator_proxy import (  # noqa: E501
+                AUTHORITY_RESOLVED,
+                TARGET_MISSING,
+            )
+
+            status, role, _scope, reason = resolve_default_lane_authority(repo_root)
+            provider = (
+                resolve_expected_provider(repo_root, role)
+                if status == AUTHORITY_RESOLVED and role
+                else ""
+            )
+            live_status = ""
+            live_detail = ""
+            verified_target = ""
+            if status == AUTHORITY_RESOLVED and provider:
+                workspace_id = live_workspace_id(repo_root)
+                if not workspace_id:
+                    live_status = TARGET_MISSING
+                    live_detail = (
+                        "the herdr workspace anchor did not resolve, so no live "
+                        "default-lane coordinator can be found"
+                    )
+                else:
+                    target = resolve_proxy_target(
+                        live_agent_rows(os.environ),
+                        workspace_id=workspace_id,
+                        provider=provider,
+                    )
+                    live_status = target.status
+                    verified_target = target.assigned_name
+                    live_detail = (
+                        f"live={target.live} with_locator={target.with_locator}"
+                        + (
+                            f" attestation={target.attestation_state}"
+                            f" ({target.attestation_reason})"
+                            if target.attestation_state
+                            else ""
+                        )
+                    )
+            return CoordinatorParentProbe(
+                authority_status=status,
+                authority_reason=reason,
+                role=role,
+                provider=provider,
+                live_status=live_status,
+                live_detail=live_detail,
+                verified_target=verified_target,
+            )
+        except Exception:  # noqa: BLE001 - an unreadable parent verifies nothing
+            return CoordinatorParentProbe(
+                authority_status="blocked",
+                authority_reason="coordinator_parent_probe_unavailable",
+            )
 
     def owner_row_active(lane_id: str, project_scope: str) -> bool:
         try:
@@ -97,4 +182,8 @@ def _decide(repo_root: Path) -> ParentAuthorityVerdict:
             return False
         return str(getattr(record, "project_scope", "") or "") == project_scope
 
-    return decide_delegated_parent_authority(parsed, owner_row_active=owner_row_active)
+    return decide_delegated_parent_authority(
+        parsed,
+        owner_row_active=owner_row_active,
+        coordinator_parent_probe=coordinator_parent_probe,
+    )
