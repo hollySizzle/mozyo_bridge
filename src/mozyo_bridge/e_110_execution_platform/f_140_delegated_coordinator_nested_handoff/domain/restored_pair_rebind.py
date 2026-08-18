@@ -55,6 +55,13 @@ REBIND_BLOCK_DECISION_ANCHOR_UNUSABLE = "decision_anchor_unusable"
 REBIND_SLOT_PROVIDER_MISMATCH = "provider_mismatch"
 REBIND_SLOT_DUPLICATE_LIVE = "duplicate_live_candidates"
 REBIND_SLOT_LIVE_ABSENT = "live_slot_absent"
+#: The single name-matched row is a positively-signalled shell residue
+#: (:func:`...herdr_slot_liveness.classify_named_slot` != SLOT_LIVE): a blank
+#: detected-agent field or an unknown runtime status with no detected agent.
+#: Liveness is a REQUIRED conjunct independent of the attestation join — a
+#: restore can leave the locator / terminal identity and the stored attestation
+#: intact around a dead shell (#15656 review j#107780 finding_1).
+REBIND_SLOT_STALE = "stale_named_slot"
 REBIND_SLOT_LIVE_LOCATOR_UNRESOLVED = "live_locator_unresolved"
 REBIND_SLOT_LIVE_PROVIDER_MISMATCH = "live_provider_mismatch"
 REBIND_SLOT_NOT_DRIFTED = "locator_not_drifted"
@@ -214,6 +221,7 @@ __all__ = (
     "REBIND_SLOT_PROVIDER_MISMATCH",
     "REBIND_SLOT_DUPLICATE_LIVE",
     "REBIND_SLOT_LIVE_ABSENT",
+    "REBIND_SLOT_STALE",
     "REBIND_SLOT_LIVE_LOCATOR_UNRESOLVED",
     "REBIND_SLOT_LIVE_PROVIDER_MISMATCH",
     "REBIND_SLOT_NOT_DRIFTED",
