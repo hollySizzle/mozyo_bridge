@@ -99,6 +99,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (
     encode_assigned_name,
 )
+from tests.support.process_home_pin import pin_process_home
 
 NOW = "2026-07-13T00:00:00+00:00"
 WS = "wsBacklog"
@@ -184,6 +185,8 @@ def _cli_args(**over) -> argparse.Namespace:
 class LegacyPendingTerminalTest(unittest.TestCase):
     def setUp(self) -> None:
         self.home = Path(tempfile.mkdtemp())
+        # The drain / deliver edges run the ambient-home retirement gate (#15709).
+        pin_process_home(self, self.home)
         self.store_path = workflow_runtime_store_path(self.home)
         self.store = WorkflowRuntimeStore(path=self.store_path)
         self.outbox = CallbackOutbox(path=self.store_path)
