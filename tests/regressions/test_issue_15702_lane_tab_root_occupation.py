@@ -233,6 +233,61 @@ class LaneTabRootOccupationTest(unittest.TestCase):
         self.assertEqual(herdr.start_argvs, [])
 
 
+class TabRootIdentityExplicitOnlyTest(unittest.TestCase):
+    """Review j#107914 finding_1: the root pane's container identity is explicit-only.
+
+    Backfilling a missing ``root_pane.workspace_id`` from the locator prefix or a
+    missing ``root_pane.tab_id`` from the envelope made the coherence checks
+    trivially true for exactly the payloads they exist to reject. Every field is
+    required; a missing OR mismatched field is malformed and yields ``None``.
+    """
+
+    @staticmethod
+    def _payload(**root):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_bound_launch import (  # noqa: E501
+            _parse_tab_created_prepared,
+        )
+
+        base = {"pane_id": "w1:p4", "terminal_id": "term_x"}
+        base.update(root)
+        return _parse_tab_created_prepared(
+            json.dumps(
+                {
+                    "result": {
+                        "type": "tab_created",
+                        "tab": {"tab_id": "w1:t4"},
+                        "root_pane": base,
+                    }
+                }
+            )
+        )
+
+    def test_complete_identity_is_accepted(self) -> None:
+        parsed = self._payload(workspace_id="w1", tab_id="w1:t4")
+        self.assertIsNotNone(parsed)
+        tab_id, prepared = parsed
+        self.assertEqual(tab_id, "w1:t4")
+        self.assertEqual(
+            (prepared.locator, prepared.workspace_id, prepared.tab_id),
+            ("w1:p4", "w1", "w1:t4"),
+        )
+
+    def test_missing_workspace_id_is_rejected(self) -> None:
+        self.assertIsNone(self._payload(tab_id="w1:t4"))
+
+    def test_missing_tab_id_is_rejected(self) -> None:
+        self.assertIsNone(self._payload(workspace_id="w1"))
+
+    def test_missing_both_container_ids_is_rejected(self) -> None:
+        self.assertIsNone(self._payload())
+
+    def test_mismatched_workspace_id_is_rejected(self) -> None:
+        self.assertIsNone(self._payload(workspace_id="w9", tab_id="w1:t4"))
+
+    def test_mismatched_tab_id_is_rejected(self) -> None:
+        self.assertIsNone(self._payload(workspace_id="w1", tab_id="w1:t9"))
+
+
 class LaneTabTopologyPinTest(unittest.TestCase):
     """Full-topology pin through the shared FakeHerdr: N lanes → zero empty tab panes."""
 
