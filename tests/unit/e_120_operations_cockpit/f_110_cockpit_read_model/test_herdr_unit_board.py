@@ -186,6 +186,53 @@ class UnitBoardReadModelTests(unittest.TestCase):
         )
         self.assertEqual(lane_work_label("default"), "default lane")
 
+    def test_lane_kind_suffix_renders_only_canonical_tokens(self) -> None:
+        # #15704: the recorded delegation-geometry kind decorates the label so a
+        # coordinator lane is visually distinct; display decoration only.
+        self.assertEqual(
+            lane_work_label(
+                "issue_15693_l2_trial", lane_kind="delegated_coordinator"
+            ),
+            "#15693 l2 trial [delegated_coordinator]",
+        )
+        # An off-contract or absent kind keeps the pre-#15704 label byte-for-byte.
+        self.assertEqual(
+            lane_work_label("issue_15693_l2_trial", lane_kind="parent"),
+            "#15693 l2 trial",
+        )
+        self.assertEqual(
+            lane_work_label("issue_15693_l2_trial", lane_kind=""),
+            "#15693 l2 trial",
+        )
+
+    def test_lane_kind_reaches_the_pane_title_through_the_work_label(self) -> None:
+        # #15704: metadata_for_unit builds the herdr pane title from the work
+        # label, so a kind-decorated label makes the coordinator visible there.
+        unit = build_unit_board(
+            (
+                AgentObservation(
+                    workspace_id="ws",
+                    lane_id="issue_15693_l2_trial",
+                    provider="codex",
+                    pane_id="w1:p1",
+                    runtime_state="idle",
+                    interactive_ready=True,
+                    project_label="proj",
+                    workflow_role="coordinator",
+                    responsibility="scope",
+                    work_label=lane_work_label(
+                        "issue_15693_l2_trial",
+                        lane_kind="delegated_coordinator",
+                    ),
+                    authority_state="resolved",
+                ),
+            ),
+            observed_at="now",
+        ).units[0]
+        tokens, title = metadata_for_unit(unit)
+        self.assertIn("[delegated_coordinator]", title)
+        self.assertIn("[delegated_coordinator]", tokens["mozyo_work"])
+
     def test_display_values_strip_controls_and_obey_metadata_cap(self) -> None:
         value = safe_text("  project\nname\x00  " + "x" * 100)
         self.assertNotIn("\n", value)

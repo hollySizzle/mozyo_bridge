@@ -50,6 +50,7 @@ import re
 from dataclasses import dataclass, field
 from typing import Collection, Iterable, Mapping, Optional, Tuple
 
+from mozyo_bridge.core.state.lane_kind import is_lane_kind
 from mozyo_bridge.e_110_execution_platform.f_120_agent_discovery_pane_resolution.domain.agent_discovery import (
     parse_location,
 )
@@ -238,6 +239,13 @@ class SublaneLaneView:
     :data:`STALE_HINT_WINDOW_SPLIT` hint is raised. ``stale_hints`` is the
     machine-readable retire decision material — advisory only, never an
     auto-retire trigger and never a routing input.
+
+    ``lane_kind`` (Redmine #15704) is the lane's recorded delegation-geometry kind
+    (``coordinator`` | ``delegated_coordinator`` | ``implementation``), carried so a
+    delegated-coordinator lane is visually distinguishable from an implementation
+    lane. Display-only: empty when no canonical durable kind fact was resolvable
+    (a pre-#13647 lane, an unreadable store), and routing / authority / liveness
+    never read it.
     """
 
     workspace_id: str
@@ -254,6 +262,7 @@ class SublaneLaneView:
     host_window_name: Optional[str] = None
     windows: Tuple[str, ...] = ()
     stale_hints: Tuple[str, ...] = ()
+    lane_kind: str = ""
 
     def as_payload(self) -> dict[str, object]:
         return {
@@ -271,6 +280,7 @@ class SublaneLaneView:
             "host_window_name": self.host_window_name,
             "windows": list(self.windows),
             "stale_hints": list(self.stale_hints),
+            "lane_kind": self.lane_kind,
         }
 
 
@@ -398,6 +408,7 @@ def project_sublanes(
     grouped: dict[Tuple[str, str], list[SublanePane]] = {}
     labels: dict[Tuple[str, str], str] = {}
     repo_roots: dict[Tuple[str, str], str] = {}
+    kinds: dict[Tuple[str, str], str] = {}
 
     for row in pane_rows:
         lane_id = (row.get("lane_id") or "").strip() or DEFAULT_LANE
@@ -427,6 +438,12 @@ def project_sublanes(
         # Keep the first non-empty lane label seen for the lane.
         if not labels.get(key):
             labels[key] = (row.get("lane_label") or "").strip()
+        # Keep the first CANONICAL lane kind seen (Redmine #15704): the pane-row
+        # ``lane_kind`` is the ``@mozyo_lane_kind`` display cache, so only the
+        # closed three-token vocabulary is projected — an off-contract or absent
+        # value degrades to "" (unrecorded) rather than leaking a cache token.
+        if not kinds.get(key) and is_lane_kind(lane_kind_raw):
+            kinds[key] = lane_kind_raw
         # Prefer an explicit repo-root stamp; fall back to the pane cwd.
         if key not in repo_roots or not repo_roots[key]:
             repo_roots[key] = (
@@ -478,6 +495,7 @@ def project_sublanes(
                     worktree_unresolved=lane_id in unresolved_worktrees,
                     integrated_into=integrated_branches.get(lane_id),
                 ),
+                lane_kind=kinds.get(key, ""),
             )
         )
     return views

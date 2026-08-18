@@ -100,6 +100,7 @@ def runtime(rows, *, runner=None, parsed=None) -> HerdrUnitBoardRuntime:
         ),
         role_loader=lambda repo: parsed if parsed is not None else role_bindings(),
         lane_records_loader=lambda: {},
+        lane_kinds_loader=lambda: {},
         pane_rows_loader=lambda: pane_rows(
             *dict.fromkeys(
                 row.get("pane_id")
@@ -112,6 +113,59 @@ def runtime(rows, *, runner=None, parsed=None) -> HerdrUnitBoardRuntime:
 
 
 class HerdrUnitBoardRuntimeTests(unittest.TestCase):
+    def test_lane_kind_join_decorates_work_label_display_only(self) -> None:
+        # #15704: the lifecycle-store kind join reaches the board's work label
+        # (and thereby the pane title) for a non-default lane.
+        lane = "issue_15693_l2_trial"
+        rows = (
+            row(
+                "codex",
+                "w1:p9",
+                name=encode_assigned_name(WORKSPACE_ID, "codex", lane),
+            ),
+        )
+        board = HerdrUnitBoardRuntime(
+            "/bin/herdr",
+            lister=FakeLister(rows),
+            workspace_loader=lambda workspace_id: workspace_record(),
+            role_loader=lambda repo: role_bindings(),
+            lane_records_loader=lambda: {},
+            lane_kinds_loader=lambda: {
+                (WORKSPACE_ID, lane): "delegated_coordinator"
+            },
+            pane_rows_loader=lambda: pane_rows("w1:p9"),
+        )
+        unit = board.snapshot().units[0]
+        self.assertEqual(unit.work_label, "#15693 l2 trial [delegated_coordinator]")
+
+    def test_broken_lane_kinds_loader_degrades_to_plain_label(self) -> None:
+        # The kind join is display decoration; a failing loader must degrade the
+        # label, never the board.
+        lane = "issue_15693_l2_trial"
+        rows = (
+            row(
+                "codex",
+                "w1:p9",
+                name=encode_assigned_name(WORKSPACE_ID, "codex", lane),
+            ),
+        )
+
+        def broken_loader():
+            raise OSError("lifecycle store unreadable")
+
+        board = HerdrUnitBoardRuntime(
+            "/bin/herdr",
+            lister=FakeLister(rows),
+            workspace_loader=lambda workspace_id: workspace_record(),
+            role_loader=lambda repo: role_bindings(),
+            lane_records_loader=lambda: {},
+            lane_kinds_loader=broken_loader,
+            pane_rows_loader=lambda: pane_rows("w1:p9"),
+        )
+        snapshot = board.snapshot()
+        self.assertTrue(snapshot.ok)
+        self.assertEqual(snapshot.units[0].work_label, "#15693 l2 trial")
+
     def test_action_identity_preserves_exact_long_lane_after_public_truncation(self) -> None:
         lane_a = "x" * 80
         lane_b = "x" * 81
@@ -143,6 +197,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             workspace_loader=lambda workspace_id: workspace_record(),
             role_loader=lambda repo: parsed,
             lane_records_loader=lambda: {},
+            lane_kinds_loader=lambda: {},
             pane_rows_loader=lambda: pane_rows("w1:p1", "w1:p2"),
         )
 
@@ -231,6 +286,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             ),
             role_loader=lambda repo: parsed,
             lane_records_loader=lambda: {},
+            lane_kinds_loader=lambda: {},
             pane_rows_loader=lambda: pane_rows("w1:p2"),
         )
 
@@ -292,6 +348,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             workspace_loader=load_workspace,
             role_loader=load_roles,
             lane_records_loader=lambda: {},
+            lane_kinds_loader=lambda: {},
             pane_rows_loader=lambda: pane_rows("w1:p1", "w1:p2"),
         )
 
@@ -399,6 +456,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             lister=FakeLister(()),
             runner=runner,
             lane_records_loader=lambda: {},
+            lane_kinds_loader=lambda: {},
             sync_lock_factory=nullcontext,
         )
 
@@ -449,6 +507,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             workspace_loader=lambda workspace_id: workspace_record(),
             role_loader=lambda repo: role_bindings(),
             lane_records_loader=lambda: {},
+            lane_kinds_loader=lambda: {},
             pane_rows_loader=lambda: pane_rows("w1:p2", tokens=tokens),
             sync_lock_factory=nullcontext,
         )
@@ -469,6 +528,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             "/bin/herdr",
             lister=FakeLister(()),
             runner=runner,
+            lane_kinds_loader=lambda: {},
             pane_rows_loader=lambda: pane_rows("w1:p2", "w1:p2"),
             sync_lock_factory=nullcontext,
         )
@@ -491,6 +551,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             lister=FakeLister((row("codex", "w1:p2"),)),
             runner=runner,
             lane_records_loader=lambda: {},
+            lane_kinds_loader=lambda: {},
             sync_lock_factory=nullcontext,
         )
 
@@ -523,6 +584,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
                     lister=FakeLister(()),
                     runner=runner,
                     lane_records_loader=lambda: {},
+                    lane_kinds_loader=lambda: {},
                     sync_lock_factory=nullcontext,
                 )
 
@@ -560,6 +622,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             workspace_loader=lambda workspace_id: workspace_record(),
             role_loader=lambda repo: role_bindings(),
             lane_records_loader=lambda: {},
+            lane_kinds_loader=lambda: {},
             pane_rows_loader=lambda: (
                 events.append("panes") or pane_rows("w1:p2")
             ),
@@ -596,6 +659,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             "/bin/herdr",
             lister=lister,
             runner=runner,
+            lane_kinds_loader=lambda: {},
             pane_rows_loader=pane_rows_loader,
             sync_lock_factory=unavailable_lock,
         )
@@ -628,6 +692,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             workspace_loader=lambda workspace_id: workspace_record(),
             role_loader=lambda repo: role_bindings(),
             lane_records_loader=lambda: {},
+            lane_kinds_loader=lambda: {},
             pane_rows_loader=lambda: pane_rows("w1:p2"),
             sync_lock_factory=release_failure,
         )
@@ -719,6 +784,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             ),
             role_loader=lambda repo: role_bindings(),
             lane_records_loader=lambda: {},
+            lane_kinds_loader=lambda: {},
             pane_rows_loader=lambda: pane_rows("w1:p2"),
             sync_lock_factory=nullcontext,
         )
@@ -782,6 +848,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
                     ),
                     role_loader=lambda repo: role_bindings(),
                     lane_records_loader=lambda: {},
+                    lane_kinds_loader=lambda: {},
                     pane_rows_loader=lambda: pane_rows("w1:p2"),
                     sync_lock_factory=lambda: unit_board_metadata_lock(home),
                 )
@@ -850,6 +917,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
             workspace_loader=lambda workspace_id: None,
             role_loader=lambda repo: role_bindings(),
             lane_records_loader=lambda: {},
+            lane_kinds_loader=lambda: {},
             pane_rows_loader=lambda: pane_rows("w1:p2"),
             sync_lock_factory=nullcontext,
         )
@@ -1057,6 +1125,7 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
                     ),
                     role_loader=lambda repo: parsed,
                     lane_records_loader=lambda: {},
+                    lane_kinds_loader=lambda: {},
                     pane_rows_loader=lambda: pane_rows("w1:p2"),
                 )
 
