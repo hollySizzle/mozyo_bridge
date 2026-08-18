@@ -29,10 +29,12 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
-from mozyo_bridge.core.state.callback_outbox import (  # noqa: E402
+from mozyo_bridge.core.state.callback_outbox import CallbackOutbox  # noqa: E402
+from mozyo_bridge.core.state.callback_outbox_redrive import (  # noqa: E402
     REDRIVE_FINGERPRINT_MISMATCH,
     REDRIVE_REQUEUED,
-    CallbackOutbox,
+    dead_letter_fingerprints,
+    requeue_dead_letter,
 )
 from mozyo_bridge.core.state.workflow_runtime_store import (  # noqa: E402
     CALLBACK_DEAD_LETTER,
@@ -119,15 +121,15 @@ class BusyDeadLetterRedriveTest(unittest.TestCase):
 
     def test_explicit_redrive_then_idle_delivery_completes_the_callback(self) -> None:
         self._exhaust_against_busy_coordinator()
-        row, fingerprint = self.outbox.dead_letter_fingerprints()[0]
+        row, fingerprint = dead_letter_fingerprints(self.outbox)[0]
         # A stale observation zero-writes; the exact one requeues.
         self.assertEqual(
-            self.outbox.requeue_dead_letter(row.key, expect_fingerprint="stale"),
+            requeue_dead_letter(self.outbox, row.key, expect_fingerprint="stale"),
             REDRIVE_FINGERPRINT_MISMATCH,
         )
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_DEAD_LETTER)
         self.assertEqual(
-            self.outbox.requeue_dead_letter(row.key, expect_fingerprint=fingerprint),
+            requeue_dead_letter(self.outbox, row.key, expect_fingerprint=fingerprint),
             REDRIVE_REQUEUED,
         )
         self.assertEqual(self.outbox.read()[0].state, CALLBACK_PENDING)
@@ -140,8 +142,8 @@ class BusyDeadLetterRedriveTest(unittest.TestCase):
 
     def test_a_redriven_row_that_stays_busy_dead_letters_again_bounded(self) -> None:
         self._exhaust_against_busy_coordinator()
-        row, fingerprint = self.outbox.dead_letter_fingerprints()[0]
-        self.outbox.requeue_dead_letter(row.key, expect_fingerprint=fingerprint)
+        row, fingerprint = dead_letter_fingerprints(self.outbox)[0]
+        requeue_dead_letter(self.outbox, row.key, expect_fingerprint=fingerprint)
         # The grant is ONE fresh bounded budget, not an unbounded retry loop.
         for _ in range(8):
             self.processor.deliver(_busy_sender())

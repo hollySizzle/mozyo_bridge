@@ -849,13 +849,10 @@ def resolve_herdr_send_target(
     # lane (tier 3 — the parent coordinator), NOT the sublane sender's own lane (the tier-2
     # same-lane a bare `--to codex` derives, Review j#74511 Finding 1). An explicit
     # `--target-lane` still wins (tier-1 explicit lane in `derive_target_lane`), so an
-    # intentional lane override is never ignored. The outward `receiver` (the marker `to=` /
-    # the `binds_receiver` process gate) is unchanged by this translation, so the caller's
-    # `--to` must name the provider the coordinator role actually resolves to — after a
-    # coordinator rebind (#13229) that is NOT necessarily `codex`, and a contradicting token
-    # is refused as `invalid_args` by the receiver-binding fence (measured: #15704 j#108012).
-    # The callback senders therefore derive `--to` from the coordinator role authority
-    # (#15707); `--to` public choices stay `claude|codex` (an internal, semantic translation).
+    # intentional lane override is never ignored. The outward `receiver` (marker `to=` / the
+    # `binds_receiver` gate) is unchanged: `--to` must name the provider the coordinator role
+    # RESOLVES to — after a rebind (#13229) not necessarily `codex`; a contradicting token is
+    # refused as `invalid_args` (#15704 j#108012), so callback senders derive it (#15707).
     norm_target = _norm(target)
     route_receiver = (
         RECEIVER_COORDINATOR

@@ -37,12 +37,14 @@ EXIT_FINGERPRINT_MISMATCH = 6
 
 def cmd_workflow_callback_redrive(args: argparse.Namespace) -> int:
     """Dry-run list of the dead-letter backlog, or the ONE gated re-enqueue (``--apply``)."""
-    from mozyo_bridge.core.state.callback_outbox import (
+    from mozyo_bridge.core.state.callback_outbox import CallbackOutboxKey
+    from mozyo_bridge.core.state.callback_outbox_redrive import (
         REDRIVE_ABSENT,
         REDRIVE_FINGERPRINT_MISMATCH,
         REDRIVE_REQUEUED,
         REDRIVE_STATE_MISMATCH,
-        CallbackOutboxKey,
+        dead_letter_fingerprints,
+        requeue_dead_letter,
     )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_callbacks import (  # noqa: E501
         _outbox_from_args,
@@ -65,7 +67,7 @@ def cmd_workflow_callback_redrive(args: argparse.Namespace) -> int:
 
     if not getattr(args, "apply", False):
         issue_filter = str(getattr(args, "issue", "") or "").strip()
-        pairs = outbox.dead_letter_fingerprints(workspace_id=workspace_id)
+        pairs = dead_letter_fingerprints(outbox, workspace_id=workspace_id)
         if issue_filter:
             pairs = tuple(p for p in pairs if p[0].issue == issue_filter)
         payload = {
@@ -106,7 +108,7 @@ def cmd_workflow_callback_redrive(args: argparse.Namespace) -> int:
         source=source, issue=issue, journal=journal,
         normalized_gate=gate, callback_route=route, workspace_id=workspace_id,
     )
-    disposition = outbox.requeue_dead_letter(key, expect_fingerprint=fingerprint)
+    disposition = requeue_dead_letter(outbox, key, expect_fingerprint=fingerprint)
     exit_code = {
         REDRIVE_REQUEUED: EXIT_OK,
         REDRIVE_ABSENT: EXIT_ABSENT,

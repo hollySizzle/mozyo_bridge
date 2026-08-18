@@ -29,7 +29,6 @@ State machine (closed vocabulary):
 
 from __future__ import annotations
 
-import hashlib
 import secrets
 import sqlite3
 from dataclasses import dataclass
@@ -57,37 +56,6 @@ from mozyo_bridge.core.state.workflow_runtime_store import (
     WorkflowRuntimeStoreError,
     workflow_runtime_store_path,
 )
-
-
-#: Typed results of :meth:`CallbackOutbox.requeue_dead_letter` (Redmine #15707 c). A closed
-#: vocabulary so the operator surface can map each disposition to a distinct exit code; every
-#: value except :data:`REDRIVE_REQUEUED` is a zero-write.
-REDRIVE_REQUEUED = "requeued"
-REDRIVE_ABSENT = "absent"
-REDRIVE_STATE_MISMATCH = "state_mismatch"
-REDRIVE_FINGERPRINT_MISMATCH = "fingerprint_mismatch"
-
-#: The detail a redriven row carries: the redrive is an explicit operator action, and the row's
-#: history must say so (the prior dead-letter detail is replaced, not appended — the fingerprint
-#: the operator quoted already bound the exact observed row).
-REDRIVE_DETAIL = "redriven from dead-letter by explicit operator action"
-
-
-def redrive_fingerprint(
-    key: "CallbackOutboxKey", *, state: str, attempts: int, updated_at: str
-) -> str:
-    """The observation token an explicit dead-letter redrive must quote back (pure).
-
-    Binds the exact row *as observed* — its UNIQUE key plus the mutable fields every state
-    transition touches (``state`` / ``attempts`` / ``updated_at``) — so a redrive races nothing:
-    any concurrent transition (a recovery, another redrive, a late terminal mark) changes the
-    fingerprint and the apply zero-writes with :data:`REDRIVE_FINGERPRINT_MISMATCH`. Domain-
-    separated and truncated; NOT a secret, just a compare-and-swap token.
-    """
-    material = "\x1f".join(
-        ("mozyo-bridge:callback-redrive:v1", *key.as_row(), str(state), str(int(attempts)), str(updated_at))
-    )
-    return hashlib.sha256(material.encode("utf-8")).hexdigest()[:16]
 
 
 def _utc_now() -> str:
@@ -789,134 +757,6 @@ class CallbackOutbox:
         finally:
             conn.close()
 
-    # -- explicit dead-letter redrive (Redmine #15707 c) ---------------------------------------
-
-    def dead_letter_fingerprints(
-        self, *, workspace_id: Optional[str] = None
-    ) -> tuple["tuple[CallbackOutboxRow, str]", ...]:
-        """Read the dead-letter backlog with each row's redrive fingerprint (read-only).
-
-        The dry-run half of the explicit redrive: the operator reads this, decides which ONE
-        row to redrive, and quotes its fingerprint back to :meth:`requeue_dead_letter`.
-        ``workspace_id`` filters to that partition (``None`` = all — the CLI gates this behind
-        its own workspace attestation). The fingerprint is computed from the same persisted
-        fields the apply re-reads, so a row that mutates in between can never be redriven.
-        """
-        self._ensure_migrated_if_exists()
-        conn = self._connect_ro()
-        if conn is None:
-            return ()
-        try:
-            if not self._table_present(conn):
-                return ()
-            sql = (
-                "SELECT source, issue, journal, normalized_gate, callback_route, workspace_id, "
-                "state, attempts, updated_at FROM callback_outbox WHERE state=?"
-            )
-            params: list = [CALLBACK_DEAD_LETTER]
-            if workspace_id is not None:
-                sql += " AND workspace_id=?"
-                params.append(str(workspace_id))
-            raw = conn.execute(sql + " ORDER BY seq, rowid", tuple(params)).fetchall()
-            rows = _select_rows(conn, [CALLBACK_DEAD_LETTER])
-        finally:
-            conn.close()
-        by_key = {r.key.as_row(): r for r in rows}
-        out = []
-        for source, issue, journal, gate, route, ws, state, attempts, updated_at in raw:
-            key = CallbackOutboxKey(
-                source=source, issue=issue, journal=journal,
-                normalized_gate=gate, callback_route=route, workspace_id=ws,
-            )
-            row = by_key.get(key.as_row())
-            if row is None:
-                continue
-            out.append(
-                (
-                    row,
-                    redrive_fingerprint(
-                        key, state=state, attempts=int(attempts), updated_at=str(updated_at)
-                    ),
-                )
-            )
-        return tuple(out)
-
-    def requeue_dead_letter(
-        self,
-        key: CallbackOutboxKey,
-        *,
-        expect_fingerprint: str,
-        now: Optional[str] = None,
-    ) -> str:
-        """Return ONE observed dead-letter row to ``pending`` (explicit redrive; #15707 c).
-
-        The out-of-band operator action the outbox state machine deliberately lacks: a
-        dead-lettered row is terminal to every automatic path (claim / recover / replay never
-        touch it — the #13974 never-resurrect invariant), so re-delivering one that dead-lettered
-        for a since-repaired cause (e.g. bounded ``precondition_not_idle`` retries against a
-        busy coordinator) requires this explicit compare-and-swap:
-
-        - the row must still be :data:`CALLBACK_DEAD_LETTER`, and
-        - ``expect_fingerprint`` must equal the fingerprint of the row AS PERSISTED NOW
-          (:func:`redrive_fingerprint` over state / attempts / updated_at), proving the caller
-          observed this exact row and nothing raced it.
-
-        On success the row returns to ``pending`` with ONE fresh default bounded budget:
-        ``attempts`` is PRESERVED (the delivery history stays auditable, and its monotonic growth
-        is what makes the fingerprint ABA-proof — a redriven row that dead-letters again can
-        never re-match an old observation) and ``max_attempts`` becomes
-        ``attempts + CALLBACK_DEFAULT_MAX_ATTEMPTS``, so exactly one more bounded-retry cycle is
-        granted per explicit redrive (the cap semantics are kept, never removed). Delivery then
-        re-runs the whole fenced pipeline (claim -> generation fences -> admission -> one send),
-        so a stale row is still zero-send terminal — a redrive re-admits, it never bypasses.
-        Every other outcome (:data:`REDRIVE_ABSENT` / :data:`REDRIVE_STATE_MISMATCH` /
-        :data:`REDRIVE_FINGERPRINT_MISMATCH`) is a typed zero-write.
-        """
-        stamp = now or _utc_now()
-        conn = self._connect_immediate()
-        try:
-            conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT state, attempts, updated_at FROM callback_outbox WHERE source=? AND "
-                "issue=? AND journal=? AND normalized_gate=? AND callback_route=? AND "
-                "workspace_id=?",
-                key.as_row(),
-            ).fetchone()
-            if row is None:
-                conn.execute("ROLLBACK")
-                return REDRIVE_ABSENT
-            state, attempts, updated_at = str(row[0]), int(row[1]), str(row[2])
-            if state != CALLBACK_DEAD_LETTER:
-                conn.execute("ROLLBACK")
-                return REDRIVE_STATE_MISMATCH
-            expected = redrive_fingerprint(
-                key, state=state, attempts=attempts, updated_at=updated_at
-            )
-            if str(expect_fingerprint or "").strip() != expected:
-                conn.execute("ROLLBACK")
-                return REDRIVE_FINGERPRINT_MISMATCH
-            conn.execute(
-                "UPDATE callback_outbox SET state=?, max_attempts=?, send_attempted=0, "
-                "claim_token='', detail=?, updated_at=? WHERE source=? AND issue=? AND "
-                "journal=? AND normalized_gate=? AND callback_route=? AND workspace_id=?",
-                (
-                    CALLBACK_PENDING,
-                    attempts + CALLBACK_DEFAULT_MAX_ATTEMPTS,
-                    REDRIVE_DETAIL,
-                    stamp,
-                    *key.as_row(),
-                ),
-            )
-            conn.execute("COMMIT")
-            return REDRIVE_REQUEUED
-        except sqlite3.DatabaseError as exc:
-            self._rollback(conn)
-            raise WorkflowRuntimeStoreError(
-                f"callback dead-letter redrive failed ({type(exc).__name__}); fail closed"
-            ) from exc
-        finally:
-            conn.close()
-
     def _update(
         self,
         key: CallbackOutboxKey,
@@ -1123,10 +963,4 @@ __all__ = (
     "CallbackOutboxRow",
     "CallbackEnqueueResult",
     "CallbackOutbox",
-    "REDRIVE_ABSENT",
-    "REDRIVE_DETAIL",
-    "REDRIVE_FINGERPRINT_MISMATCH",
-    "REDRIVE_REQUEUED",
-    "REDRIVE_STATE_MISMATCH",
-    "redrive_fingerprint",
 )
