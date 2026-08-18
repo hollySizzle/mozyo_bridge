@@ -671,7 +671,13 @@ class _Herdr:
             if "--label" in rest:
                 self.workspace_labels[wid] = rest[rest.index("--label") + 1]
             root_pane = f"{wid}:p1"
-            self.pane_locations[root_pane] = (wid, f"{wid}:t1", "")
+            # Redmine #15705 (measured herdr 0.8.0): `--cwd` / `--env K=V` reach the
+            # root pane's shell, and `workspace_created` returns the root pane's FULL
+            # identity — workspace_id / tab_id / terminal_id — so the real code can
+            # treat the born root as the first launch slot's prepared pane.
+            cwd = rest[rest.index("--cwd") + 1] if "--cwd" in rest else ""
+            self.pane_locations[root_pane] = (wid, f"{wid}:t1", cwd)
+            self.pane_envs[root_pane] = self._start_env(rest)
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -681,7 +687,12 @@ class _Herdr:
                         "result": {
                             "type": "workspace_created",
                             "workspace": {"workspace_id": wid},
-                            "root_pane": {"pane_id": root_pane},
+                            "root_pane": {
+                                "pane_id": root_pane,
+                                "workspace_id": wid,
+                                "tab_id": f"{wid}:t1",
+                                "terminal_id": f"terminal:{root_pane}",
+                            },
                         },
                     }
                 ),
@@ -1590,20 +1601,22 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as tmp:
             with self.assertRaises(HerdrSessionStartError) as caught:
-                # Default lane: a lane's first slot occupies its tab root (#15702),
-                # so the split-path container guard is exercised on the pair whose
-                # first slot still splits the workspace base pane.
+                # Default pair: since #15705 the FIRST slot occupies the minted
+                # workspace root, so the split-path container guard is exercised on
+                # the SECOND slot — the one that still issues a `pane split`.
                 self._prepare(
                     tmp,
-                    providers=["claude"],
+                    providers=["claude", "codex"],
                     herdr=herdr,
                     lane="",
                     herdr_runner=contradictory_split,
                 )
 
         self.assertIn("no parseable pane identity", str(caught.exception))
-        self.assertEqual(herdr.pane_runs, [])
-        self.assertEqual(herdr.start_argvs, [])
+        # Only the occupying first slot reached pane run / agent start; the
+        # splitting slot was refused before either.
+        self.assertEqual(len(herdr.pane_runs), 1)
+        self.assertEqual(len(herdr.start_argvs), 1)
 
     def test_generation_incapable_launcher_refuses_before_any_actuation(self) -> None:
         # #14203 review j#87479 F1: a launcher that carries `agent-attest` + a matching
@@ -2584,10 +2597,10 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(before, after)  # nothing mutated
         self.assertEqual(_non_capability_calls(herdr), [])
 
-    def test_cold_start_creates_workspace_and_preserves_unbound_root(self) -> None:
-        # #15227: the created root has no terminal-bound generation authority. A cold
-        # start must launch the exact pair but preserve that cosmetic root rather than
-        # turn its locator into destructive authority.
+    def test_cold_start_creates_workspace_and_occupies_its_root(self) -> None:
+        # #15227: the created root has no terminal-bound generation authority, so it
+        # is never closed. #15705: the cold-start mint is first-slot-prepared, so the
+        # born root IS the first launch's pane — occupation, still zero close.
         herdr = _Herdr(created_workspace="wZ")
         with tempfile.TemporaryDirectory() as tmp:
             result, anchor, repo = self._prepare(
@@ -2601,8 +2614,8 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(herdr.pane_closes, [])
         self.assertEqual(result.herdr_workspace_id, "wZ")
         self.assertEqual(result.base_pane_id, "wZ:p1")
-        self.assertFalse(result.base_pane_reclaimed)
-        self.assertEqual(result.base_pane_detail, "generation_unproven_root_preserved")
+        self.assertTrue(result.base_pane_reclaimed)
+        self.assertEqual(result.base_pane_detail, "root_occupied_by_first_launch")
         # Every launched agent actually landed inside the created workspace (#13330
         # review j#73231) — not a herdr-auto-created sibling.
         for slot in result.slots:
@@ -2801,12 +2814,12 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                 register_workspace(repo, home=home)
                 workspace_id = read_anchor(repo)["workspace_id"]
                 with self.assertRaises(HerdrSessionStartError):
-                    # Default lane: a lane's first slot occupies its tab root
-                    # (#15702), so the record-then-refuse split guard is pinned on
-                    # the path whose first slot still issues a `pane split`.
+                    # Default pair: since #15705 the FIRST slot occupies the minted
+                    # workspace root, so the record-then-refuse split guard is
+                    # pinned on the SECOND slot — the one still issuing `pane split`.
                     prepare_session(
                         repo_root=repo,
-                        providers=["codex"],
+                        providers=["codex", "claude"],
                         lane_id="",
                         env=_launch_env(binary),
                         runner=herdr.run,
@@ -2815,14 +2828,16 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
                         probe=_FAST_PROBE,
                     )
             action_id = startup_action_id(
-                StartupUnit(workspace_id, "default", ("codex",)), nonce
+                StartupUnit(workspace_id, "default", ("codex", "claude")), nonce
             )
             action = fence.read(action_id)
         self.assertIsNotNone(action)
-        participant = action.participant_for("codex")
+        participant = action.participant_for("claude")
         self.assertEqual(participant.locator.partition(":")[0], "w9")
         self.assertIn("workspace=w9 tab=w9:t7", participant.receipt)
-        self.assertEqual(herdr.start_argvs, [])
+        # Only the occupying first slot started; the mislocated split slot was
+        # recorded in the startup transaction and refused before its agent start.
+        self.assertEqual(len(herdr.start_argvs), 1)
 
     def test_mislocated_launch_fails_closed_and_leaves_base_pane(self) -> None:
         # Redmine #13330 review j#73231: if `agent start` lands in a DIFFERENT
@@ -2846,8 +2861,9 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             )
         self.assertEqual(herdr.pane_closes, [])
         self.assertEqual(result.base_pane_id, "wZ:p1")
-        self.assertFalse(result.base_pane_reclaimed)
-        self.assertEqual(result.base_pane_detail, "generation_unproven_root_preserved")
+        # #15705: the root is occupied by the first launch — still no close reached.
+        self.assertTrue(result.base_pane_reclaimed)
+        self.assertEqual(result.base_pane_detail, "root_occupied_by_first_launch")
         # Slots still launched successfully despite the failed reclaim.
         self.assertTrue(all(s.outcome == SLOT_LAUNCHED for s in result.slots))
 
@@ -3033,12 +3049,13 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
         self.assertEqual(herdr.tab_creates, [])
         self.assertTrue(all("--tab" not in argv for argv in herdr.start_argvs))
         self.assertEqual(
-            len(herdr.pane_splits), 2,
-            "Herdr 0.8 requires one prepared pane per agent",
+            len(herdr.pane_splits), 1,
+            "the first slot occupies the minted shared root (#15705); only the "
+            "second slot needs a prepared split pane",
         )
         self.assertEqual(
-            herdr.pane_splits[1][
-                herdr.pane_splits[1].index("--direction") + 1
+            herdr.pane_splits[0][
+                herdr.pane_splits[0].index("--direction") + 1
             ],
             "down",
         )
@@ -3176,13 +3193,20 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
     def _assert_columns_tile_beside_preserved_root(
         self, herdr, rects, sessions, columns
     ):
-        """Managed columns tile their subtree while the unpinned root stays intact."""
+        """Managed columns tile the whole tab: the minted root is occupied (#15705).
+
+        Pre-#15705 this asserted exactly one preserved non-agent root beside the
+        managed subtree. A fresh shared workspace is now minted first-slot-prepared,
+        so its born root IS the first session's agent pane — zero non-agent panes
+        remain and the managed columns alone tile the full tab, still with no close.
+        """
         managed_ids = {
             slot.locator for session in sessions for slot in session.slots
         }
         root_ids = set(rects).difference(managed_ids)
-        self.assertEqual(len(root_ids), 1, "the cosmetic root must be preserved once")
-        root = rects[root_ids.pop()]
+        self.assertEqual(
+            root_ids, set(), "the minted root must be occupied by the first launch"
+        )
         left = min(x for x, _width in columns.values())
         right = max(x + width for x, width in columns.values())
         managed_width = right - left
@@ -3191,16 +3215,10 @@ class SessionStartTest(_SessionStartHarness, unittest.TestCase):
             managed_width,
             "the project columns do not exactly tile their managed envelope",
         )
-        self.assertEqual(root["height"], herdr.split_extent)
-        self.assertTrue(
-            root["x"] + root["width"] <= left
-            or right <= root["x"],
-            "the preserved root overlaps the managed project subtree",
-        )
         self.assertEqual(
-            root["width"] + managed_width,
+            managed_width,
             herdr.split_cross,
-            "the root and managed subtree do not tile the full tab",
+            "the managed columns do not tile the full tab",
         )
         self.assertEqual(herdr.pane_closes, [])
 
@@ -5499,7 +5517,7 @@ class LaneTabSubdivisionTest(unittest.TestCase):
         self.assertEqual(result.herdr_tab_id, "")
         self.assertEqual(result.tab_pane_id, "")
         self.assertEqual(herdr.pane_closes, [])
-        self.assertEqual(result.base_pane_detail, "generation_unproven_root_preserved")
+        self.assertEqual(result.base_pane_detail, "root_occupied_by_first_launch")
 
     def test_heal_rejoins_the_same_tab_and_splits(self) -> None:
         # A heal (one slot already live in a tab) rejoins the SAME tab and splits
@@ -6328,7 +6346,8 @@ class LanePlacementLaunchTest(unittest.TestCase):
             result, _ = self._prepare(
                 tmp, herdr=herdr, providers=["claude", "codex"], lane=""
             )
-        first, second = herdr.pane_splits
+        # First slot occupied the minted workspace root (#15705): one split only.
+        (second,) = herdr.pane_splits
         self.assertEqual(second[second.index("--direction") + 1], "down")
         self.assertEqual(second[2], herdr.start_argvs[0][herdr.start_argvs[0].index("--pane") + 1])
         self.assertEqual([s.provider for s in result.slots], ["codex", "claude"])
@@ -6414,8 +6433,10 @@ class LanePlacementLaunchTest(unittest.TestCase):
                 lane="",
                 lane_placement=self._placement(default={"split": "down"}),
             )
-        first, second = herdr.pane_splits
-        self.assertEqual(first[2], "wZ:p1")
+        # First slot occupied the minted workspace root (#15705): one split, whose
+        # anchor is the occupant — the root pane itself.
+        (second,) = herdr.pane_splits
+        self.assertEqual(second[2], "wZ:p1")
         self.assertEqual(second[second.index("--direction") + 1], "down")
         self.assertEqual(second[2], herdr.start_argvs[0][herdr.start_argvs[0].index("--pane") + 1])
 
@@ -7482,8 +7503,10 @@ class LaneRolePlacementLaunchTest(unittest.TestCase):
                 ),
                 launch_context=LaneLaunchContext(lane_kind="coordinator"),
             )
-        first, second = herdr.pane_splits
-        self.assertEqual(first[2], "wZ:p1")
+        # First slot occupied the minted workspace root (#15705); only the second
+        # slot splits — beside the occupant, which IS the root pane.
+        (second,) = herdr.pane_splits
+        self.assertEqual(second[2], "wZ:p1")
         self.assertEqual(second[second.index("--direction") + 1], "down")
 
     def test_by_lane_kind_order_reorders_launch_sequence(self) -> None:

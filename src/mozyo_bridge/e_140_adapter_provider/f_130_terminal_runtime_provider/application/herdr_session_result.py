@@ -155,8 +155,11 @@ class SessionStartResult:
       **created** (blank when no workspace was created: all-adopt, dry-run, or a
       launch into an already-existing workspace). It is observation, not locator-only
       close authority; a scanned-for shell is never substituted.
-    - ``base_pane_reclaimed`` — historical observation; current unbound roots remain False.
-    - ``base_pane_detail`` — the typed preservation reason (normally
+    - ``base_pane_reclaimed`` — True when the run-minted workspace's root pane became
+      the FIRST launch's agent pane (Redmine #15705 first-slot-prepared workspace,
+      detail ``root_occupied_by_first_launch``); occupation, never a close. False on
+      any other path (an unbound root stays preserved, #15227).
+    - ``base_pane_detail`` — the typed reason (``root_occupied_by_first_launch`` /
       ``generation_unproven_root_preserved``), never provider stderr.
 
     The tab fields (Redmine #13411) are the lane=tab analogue: a non-default lane

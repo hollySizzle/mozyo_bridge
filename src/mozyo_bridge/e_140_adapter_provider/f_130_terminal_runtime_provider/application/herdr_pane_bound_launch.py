@@ -415,6 +415,114 @@ def create_prepared_lane_tab(
     return parsed
 
 
+def _parse_workspace_created_prepared(
+    stdout: object,
+) -> "tuple[str, PreparedPane] | None":
+    """``(workspace_id, root PreparedPane)`` from ``workspace create`` (fail-closed).
+
+    The prepared-root variant of ``herdr_lane_topology._parse_workspace_created``
+    (Redmine #15705): a workspace created with ``--cwd`` / ``--env`` makes its born
+    root pane the first launch slot's prepared pane — the workspace analogue of the
+    #15702 lane tab — so the parse must capture the FULL pane identity including the
+    ``terminal_id`` the ``agent start`` identity check joins on. Measured herdr
+    0.8.0 shape::
+
+        {"result": {"type": "workspace_created",
+                    "workspace": {"workspace_id": "w1", ...},
+                    "root_pane": {"pane_id": "w1:p1", "workspace_id": "w1",
+                                  "tab_id": "w1:t1", "terminal_id": "term_...", ...}}}
+
+    The root pane must DECLARE its own workspace_id / tab_id (the j#107914
+    explicit-only rule): backfilling a missing field from the locator prefix or the
+    envelope workspace would make the coherence checks trivially true for exactly
+    the payloads they exist to reject. Returns ``None`` (the caller fails closed and
+    starts nothing in a guessed pane) on any missing / malformed / incoherent id.
+    """
+    if not isinstance(stdout, str):
+        return None
+    try:
+        payload = json.loads(stdout)
+    except (TypeError, ValueError):
+        return None
+    if not isinstance(payload, Mapping):
+        return None
+    result = payload.get("result")
+    if not isinstance(result, Mapping) or result.get("type") != "workspace_created":
+        return None
+    workspace = result.get("workspace")
+    root_pane = result.get("root_pane")
+    if not isinstance(workspace, Mapping) or not isinstance(root_pane, Mapping):
+        return None
+    workspace_id = _norm(workspace.get("workspace_id"))
+    locator = _norm(root_pane.get("pane_id"))
+    root_workspace_id = _norm(root_pane.get("workspace_id"))
+    tab_id = _norm(root_pane.get("tab_id"))
+    terminal_id = root_pane.get("terminal_id")
+    if (
+        not valid_target(workspace_id)
+        or not valid_target(locator)
+        or root_workspace_id != workspace_id
+        or not valid_target(tab_id)
+        or _workspace_prefix(locator) != workspace_id
+        or not tab_id.startswith(f"{workspace_id}:t")
+        or tab_id == f"{workspace_id}:t"
+        or type(terminal_id) is not str
+        or not terminal_id
+        or terminal_id.strip() != terminal_id
+    ):
+        return None
+    return workspace_id, PreparedPane(locator, workspace_id, tab_id, terminal_id)
+
+
+def create_prepared_workspace(
+    *,
+    binary: str,
+    label: str,
+    repo_root: Path,
+    env_entries: Sequence[str],
+    runner: Runner,
+    timeout: float,
+    env: Mapping[str, str],
+    effect_fence: "Callable[[], None] | None" = None,
+) -> "tuple[str, PreparedPane]":
+    """Mint a workspace whose born root pane IS the first launch slot's prepared pane.
+
+    Redmine #15705 — the workspace analogue of :func:`create_prepared_lane_tab`
+    (#15702). The default-lane coordinator pair has no lane tab: its container is the
+    minted workspace's own root tab, so the pre-#15705 first slot split BESIDE the
+    workspace root and the root stayed a permanent empty shell column (#15227
+    removed the close because a bare locator carries no terminal-generation
+    authority). Creating the workspace with the first slot's ``--cwd`` / ``--env``
+    (measured herdr 0.8.0: both reach the root shell, and ``workspace_created``
+    returns the root's full identity including ``terminal_id``) lets the first
+    ``agent start`` land in the born root under the same exact-identity checks a
+    split pane gets — occupation, never destruction. An unparseable /
+    identity-incoherent response fails closed before any agent start.
+    """
+    argv = ["workspace", "create", "--cwd", str(repo_root)]
+    if label:
+        argv.extend(["--label", label])
+    for entry in env_entries:
+        if not isinstance(entry, str) or "=" not in entry or entry.startswith("="):
+            raise HerdrSessionStartError(
+                "workspace create received a malformed environment entry"
+            )
+        argv.extend(["--env", entry])
+    argv.append("--no-focus")
+    if effect_fence is not None:
+        effect_fence()
+    completed = _invoke(binary, argv, runner, timeout, env=dict(env))
+    parsed = _parse_workspace_created_prepared(completed.stdout)
+    if parsed is None:
+        raise HerdrSessionStartError(
+            "herdr workspace create returned no parseable prepared root pane identity "
+            "(expected result.workspace.workspace_id + result.root_pane "
+            "pane_id/terminal_id in a workspace_created payload); refuse to start an "
+            "agent in an untracked pane"
+        )
+    return parsed
+
+
 def build_provider_shell_function_command(*, provider: str, shim_dir: str) -> str:
     """Define the canonical provider name only in the prepared pane's shell.
 
@@ -733,6 +841,7 @@ __all__ = (
     "choose_split_anchor",
     "choose_workspace_pane_anchor",
     "create_prepared_lane_tab",
+    "create_prepared_workspace",
     "list_workspace_panes",
     "prepare_complete_launch_shims",
     "prepared_pane_recorder",
