@@ -458,8 +458,9 @@ flow:
    (2) 非 default lane は、他 lane slots が占める workspace から live default-lane slots
    (coordinator pair) の workspace を除外した残り = **sublane host workspace**、(3) どちらも
    無ければ workspace create する (lane slot は operator 可読 `--label` 付き、cosmetic のみ —
-   join key は常に live mzb1 inventory)。default lane は自 pin のみ join し host へは決して
-   join しない。各段で pin が複数 workspace に split したら fail-closed。lane ゼロの host は
+   join key は常に live mzb1 inventory。default lane の fresh mint は #15705 の
+   first-slot-prepared occupation で行う — 下記「空 base pane の保存と occupation」)。
+   default lane は自 pin のみ join し host へは決して join しない。各段で pin が複数 workspace に split したら fail-closed。lane ゼロの host は
    managed lane slot がゼロになっても、generation-bound private pinを持たないbase rootは
    destructive authorityに使わずcosmetic residueとして保存する。workspace/tabの消滅は
    closeの前提・成功条件にせず、次のlaneはlive inventoryへjoinするかon demandで再mintする
@@ -472,14 +473,15 @@ flow:
    で tab を mint する (label は cosmetic、join key は `tab_id`)。自 slot が loose pane (pre-#13411、
    tab_id 無し) の heal は loose のまま launch する (pair を新 tab へ分裂させない。full relaunch で
    tab へ移行)。自 slot が複数 tab に split したら fail-closed。default lane は tab を使わない
-   (byte-invariant)。launch は §5.0 の `pane split` でexact tab内paneを先に作り、`agent start
-   --pane <pane_id>`で行う。tab 内 2 slot 目 (fresh pair の第 2、または heal で生存 slot の隣) は
+   (byte-invariant)。launch は prepared pane — fresh mint では occupation した root
+   (#15702 lane tab / #15705 default-lane workspace)、それ以外は §5.0 の `pane split` で
+   先に作った exact tab内pane — へ `agent start --pane <pane_id>` で行う。tab 内 2 slot 目 (fresh pair の第 2、または heal で生存 slot の隣) は
    直前のslot paneをanchorにする。方向と
    provider 順序は `lane_placement` config で lane class 別に宣言できる (Redmine #13646、下記
    §lane_placement)。**未設定時は product default `--split down` を出す (Redmine #14568)**。
-   default lane は `--tab` を出さないままだが `--split` は出す (両者は独立 flag)。tab root pane は
-   #13330 の workspace base pane と同型でterminal generationに束縛されないため、全launch成功後も
-   locatorだけではcloseせずcosmetic residueとして保存する。**
+   default lane は `--tab` を出さないままだが `--split` は出す (両者は独立 flag)。この run が
+   occupation しなかった root pane (既存 tab への heal / 旧 generation の残存等) は terminal
+   generation に束縛されないため、locatorだけではcloseせずcosmetic residueとして保存する。**
 3. mint durable name: `encode_assigned_name(workspace_segment, role, lane)` で mzb1 名を作る。
 4. 要求 agent (`claude` / `codex`) を herdr 管理 agent として **durable 名を start 時に付与**して
    launch する (下記 launch contract)。self-identity (`MOZYO_WORKSPACE_ID` /
@@ -640,24 +642,42 @@ herdr agent start <NAME> [--cwd PATH] [--env KEY=VALUE]... [--no-focus] -- <argv
 自動テストは injected runner で argv + JSON parse を検証する (live binary は不使用)。end-to-end
 live smoke は coordinator の post-review step。
 
-### 空 base pane の保存 (cold start、#13330 / #15227)
+### 空 base pane の保存と occupation (cold start、#13330 / #15227 / #15705)
 
 herdr workspace は生成時に必ず `root_pane` (agent 無しの空 base shell) を 1 個持つ (実測:
 `workspace create` 応答 = `result.type == "workspace_created"` に `result.workspace.workspace_id`
-+ `result.root_pane.pane_id`、`pane_count: 1`)。cold start で初回 `agent start` を `--workspace`
++ `result.root_pane` の full identity — `pane_id` / `workspace_id` / `tab_id` / `terminal_id`。
+herdr 0.8.0 実測、#15705 j#107994)。cold start で初回 `agent start` を `--workspace`
 無しで呼ぶと herdr が workspace を暗黙生成し、この root pane が使われない残骸として agent pane の横に
 残る (dogfood 発見 #12)。旧runtimeは作成応答のlocatorだけでこのrootを回収したが、Herdr 0.8の
 `pane close <locator>`はterminal generationを原子的に条件化できない。#15227以後は、このcosmetic
-rootをcurrent generationへ束縛するprivate pinが無い限り **保存してzero-close** とする:
+rootをcurrent generationへ束縛するprivate pinが無い限り **保存してzero-close** とする。#15705 は
+さらに、**DEFAULT lane の fresh mint を first-slot-prepared occupation にする**ことで、保存すべき
+空 root がそもそも生まれない構造にした (close authority は一切追加しない):
 
 1. 全 slot を launch 前に分類する (adopt / launch / dry-run plan)。
 2. launch する slot があり、かつ adopted agent が既存 workspace を pin していない (pure cold start) 場合は
-   **明示的に** `herdr workspace create --cwd <repo> --no-focus` を呼び、応答の `workspace_id` と
-   `root_pane.pane_id` を保持する。応答が parse 不能なら fail-closed (推測で pane を閉じない)。
-3. 各launch slot用paneを、保持したrootまたは直前のlive managed paneをanchorに`pane split`で作成し、
-   `agent start --pane <pane_id>`で起動する (§5.0)。
-4. 全launch成功後も、root用のterminal-bound conditional-close authorityが無い現行providerでは
-   `herdr pane close`を呼ばず、`generation_unproven_root_preserved`を記録する。
+   **明示的に** workspace create を呼ぶ。**default lane (coordinator pair) の mint は #15705 の
+   first-slot-prepared 形**: `herdr workspace create --cwd <repo> [--label <label>] --env
+   KEY=VALUE... --no-focus` を最初の launch slot の prepared pane として呼ぶ (実測 herdr 0.8.0:
+   `--cwd` / `--env` は root pane の shell に反映される)。env は `build_pane_launch_env` を split
+   pane と同一入力で呼んで組む。応答 `root_pane` の full identity を explicit-only で parse し
+   (`workspace_id` / `tab_id` の backfill 禁止、`terminal_id` を欠く root は prepared pane に
+   しない)、parse 不能なら fail-closed (推測で pane を閉じず、agent start しない)。適用される
+   mint は per_project の default pair / shared_space coordinators / role_grouped project
+   coordinators の 3 経路。**非 default lane の sublane host mint は従来どおり env なしの plain
+   create** — その first slot は #15702 の lane tab root に land するため host root は占有不能。
+3. default lane の最初の launch slot は occupation した root へ `pane run` (provider function) →
+   `agent start --pane <root>` する (`pane split` なし。prepared receipt / started identity 検査
+   — locator / terminal_id / workspace exact match — は split pane と同一契約)。2 slot 目以降、
+   host mint 経路、heal は従来どおり保持したrootまたは直前のlive managed paneをanchorに
+   `pane split`で作成し、`agent start --pane <pane_id>`で起動する (§5.0)。
+4. occupation が成立した root は `base_pane_reclaimed: true` / `base_pane_detail:
+   root_occupied_by_first_launch` を記録する (close は発生していない。判定は launch identity の
+   exact join — started locator == 保持した root locator — であり、scan ではない)。この run が
+   occupy しなかった root (host mint の cosmetic root 等) は従来どおり、terminal-bound
+   conditional-close authorityが無い現行providerでは `herdr pane close`を呼ばず、
+   `generation_unproven_root_preserved`を記録する。
 
 fail-closed / safety 不変条件:
 
@@ -678,7 +698,8 @@ fail-closed / safety 不変条件:
   registry には持ち込まない。mixed adopt+launch では adopted locator の `wN` prefix から launch target を
   導出し、複数 workspace prefix が混在する場合は fail-closed。
 
-live smokeはcold startでrootへのcloseが0、agent pairがlive、adopt経路がbyte-invariantであることを
+live smokeはcold startでrootへのcloseが0、**fresh unit (coordinator pair) に空 shell pane が
+残らない (#15705 occupation)**、agent pairがlive、adopt経路がbyte-invariantであることを
 確認する。将来server-side conditional closeを導入する場合だけ、root専用private pinとeffect-edgeの
 exact再joinを新しい契約として設計する。
 
@@ -703,10 +724,13 @@ close の再導入ではない:
 3. 成功 run は `tab_pane_reclaimed: true` / `tab_pane_detail: root_occupied_by_first_launch`
    を記録する (close は発生していない)。occupation の判定は launch identity の exact join
    (started locator == 保持した root locator) であり、scan ではない。
-4. 変更しない経路: workspace base pane (`_create_workspace` の root と lane-zero host の
-   cosmetic root は従来どおり `generation_unproven_root_preserved`)、default lane、既存 tab へ
-   の heal / rejoin、loose legacy pair、restore container。既存 lane に残存済みの空 pane の
-   掃除も scope 外 (operator 手動 close または別途 sweep)。
+4. 変更しない経路: 既存 tab への heal / rejoin、loose legacy pair、restore container、
+   sublane host workspace の cosmetic root (host mint は plain create のまま — first slot は
+   lane tab 側に land するため占有不能で、従来どおり `generation_unproven_root_preserved`)。
+   **default lane / workspace base pane は #15705 が同型の occupation を適用した** (上記
+   「空 base pane の保存と occupation」— 適用は DEFAULT lane の fresh mint 3 経路のみ)。
+   既存 lane に残存済みの空 pane の掃除は引き続き scope 外 (operator 手動 close または別途
+   sweep)。
 5. `_close_base_pane` の #15227 契約 (locator-only close 禁止 / terminal-generation 束縛必須)
    は不変。本節は「空 root を作らない」構造であり、close authority を追加しない。
 
