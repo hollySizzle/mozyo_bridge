@@ -35,6 +35,9 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
     _workspace_prefix,
     resolve_focus_first_launch,
 )
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_bound_launch import (  # noqa: E501
+    PreparedPane,
+)
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
     _create_workspace,
     _list_workspace_labels,
@@ -274,10 +277,17 @@ def _shared_project_coordinator_target(
 
 @dataclass(frozen=True)
 class SharedProjectCoordinatorWorkspace:
-    """Resolved workspace plus the root pane created by this run, when any."""
+    """Resolved workspace plus the root pane created by this run, when any.
+
+    ``base_prepared`` (Redmine #15705) carries the minted root's full prepared
+    identity when the run created the workspace first-slot-prepared, so the first
+    launch occupies the born root instead of splitting beside it. ``None`` on every
+    adopt / join path and for a caller that supplied no prepared minter.
+    """
 
     workspace_id: str
     base_pane_id: str = ""
+    base_prepared: Optional[PreparedPane] = None
 
 
 def _resolve_project_coordinator_workspace_under_lock(
@@ -292,8 +302,18 @@ def _resolve_project_coordinator_workspace_under_lock(
     timeout: float,
     env: Mapping[str, str],
     effect_fence: Optional[Callable[[], None]] = None,
+    prepared_minter: "Optional[Callable[[str], tuple[str, PreparedPane]]]" = None,
 ) -> SharedProjectCoordinatorWorkspace:
-    """Resolve/create while the session or public wrapper owns the shared fence."""
+    """Resolve/create while the session or public wrapper owns the shared fence.
+
+    ``prepared_minter`` (Redmine #15705) is the session-start run's
+    first-slot-prepared workspace mint. When supplied and this call must CREATE the
+    shared space, the workspace is minted with the first launch slot's cwd / env so
+    its born root pane is occupied by that slot instead of surviving as an empty
+    shell. Every adopt / join outcome is untouched, and a caller without a first
+    launch slot to prepare (the public non-launch wrapper) omits it and keeps the
+    plain create.
+    """
     own_target = _shared_project_coordinator_own_target(
         rows, workspace_id, lane_id, adopted_locators
     )
@@ -310,6 +330,9 @@ def _resolve_project_coordinator_workspace_under_lock(
         return SharedProjectCoordinatorWorkspace(own_target)
     if target:
         return SharedProjectCoordinatorWorkspace(target)
+    if prepared_minter is not None:
+        target, prepared = prepared_minter(PROJECT_COORDINATOR_WORKSPACE_LABEL)
+        return SharedProjectCoordinatorWorkspace(target, prepared.locator, prepared)
     target, base_pane = _create_workspace(
         binary,
         repo_root,

@@ -585,16 +585,24 @@ def _reclaim_root_panes(
     is the strict launch identity ``_execute_slot`` already enforced (the started
     locator equals the prepared root locator), never a scan. Nothing is closed on
     either branch — occupation removed the empty pane without destructive authority.
+
+    Redmine #15705 applies the identical rule to the WORKSPACE root: a DEFAULT-lane
+    run that minted its workspace first-slot-prepared has its born root occupied by
+    the first launch, so ``base_pane_id`` gets the same occupied-vs-preserved join.
     """
+    launched = {
+        slot.locator
+        for slot in result.slots
+        if getattr(slot, "outcome", "") == SLOT_LAUNCHED
+    }
     if result.base_pane_id:
-        result.base_pane_reclaimed = False
-        result.base_pane_detail = "generation_unproven_root_preserved"
+        if result.base_pane_id in launched:
+            result.base_pane_reclaimed = True
+            result.base_pane_detail = "root_occupied_by_first_launch"
+        else:
+            result.base_pane_reclaimed = False
+            result.base_pane_detail = "generation_unproven_root_preserved"
     if result.tab_pane_id:
-        launched = {
-            slot.locator
-            for slot in result.slots
-            if getattr(slot, "outcome", "") == SLOT_LAUNCHED
-        }
         if result.tab_pane_id in launched:
             result.tab_pane_reclaimed = True
             result.tab_pane_detail = "root_occupied_by_first_launch"

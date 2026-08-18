@@ -78,7 +78,11 @@ def _render_text(result: SessionStartResult) -> str:
             lines.append(f"      {slot.health_detail}")
     if result.base_pane_id:
         state = (
-            "reclaimed"
+            # Redmine #15705: the run-minted workspace's root pane became the first
+            # launch's agent pane — no residue and nothing was closed.
+            "occupied (root_occupied_by_first_launch)"
+            if result.base_pane_detail == "root_occupied_by_first_launch"
+            else "reclaimed"
             if result.base_pane_reclaimed
             else (
                 "preserved (generation_unproven_root_preserved)"

@@ -26,14 +26,14 @@ Flow (per requested provider agent, ``claude`` / ``codex``):
 Duplicate requested ``(provider, lane)`` slots fail closed **before any side effect**
 (spec §5 slot-uniqueness) so the same durable name is never minted twice.
 
-Pane-bound launch and root preservation (Redmine #13330, #15101, #15227)
+Pane-bound launch and root occupation (#13330, #15101, #15227, #15702, #15705)
 -------------------------------------------------------------------------
-Herdr 0.8 no longer places a process while starting it. A cold run explicitly creates
-the workspace or tab, splits its run-owned root pane (or an exact live managed pane),
-and starts each provider in that prepared pane. The captured root lacks a terminal-bound
-generation pin, so geometry finalization records typed preservation and never closes it
-by locator. A failure retains typed startup debt for the public rollback path; it never
-scans for or closes an unowned shell pane.
+Herdr 0.8 no longer places a process while starting it. A cold run mints the workspace
+or tab FIRST-SLOT-PREPARED (born with the first launch slot's cwd / env — #15702 lane
+tabs, #15705 default-lane workspaces) so its root IS the first prepared pane; later
+slots split beside it. A root this run did not occupy stays preserved — no terminal
+generation pin, never closed by locator (#15227). A failure retains typed startup debt
+for the public rollback path; it never scans for or closes an unowned shell pane.
 
 Placement: dedicated sublane host workspace (Redmine #13380)
 ------------------------------------------------------------
@@ -204,6 +204,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_lane_tab_preparation import (  # noqa: E501
     resolve_lane_tab,
+    workspace_root_minter,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_pane_lifecycle import (
     _create_workspace,
@@ -728,10 +729,18 @@ def _prepare_session_locked(
         action_id=result.action_id,
     )
     # Resolve workspace; role_grouped_space separates all three roles (#14996).
-    launch_plans = [p for p in plans if p.kind == "launch"]
-    target_workspace = ""
+    target_workspace, workspace_root_prepared = "", None
     if launch_plans:
         adopt_locators = [p.locator for p in plans if p.kind == "adopt"]
+        # #15705: a fresh DEFAULT-lane workspace mint is first-slot-prepared —
+        # occupation of its own root tab removes the empty root, never a close.
+        mint_prepared = workspace_root_minter(
+            first_launch_plan=launch_plans[0], native_bindings=native_admission.bindings,
+            resolved_launches=resolved_launches, attest_launcher=attest_launcher,
+            store_home=store_home, action_id=result.action_id, workspace_id=workspace_id,
+            lane_id=result.lane_id, repo_root=repo_root, binary=binary, env=env,
+            runner=runner, timeout=timeout, effect_fence=workspace_effect_fence,
+        )
         if _restore_container is not None:
             target_workspace = _restore_container.workspace_id
         elif shared_space_project_coordinator:
@@ -759,16 +768,10 @@ def _prepare_session_locked(
                     SHARED_COORDINATOR_WORKSPACE_LABEL,
                 )
                 if not target_workspace:
-                    target_workspace, base_pane_id = _create_workspace(
-                        binary,
-                        repo_root,
-                        runner,
-                        timeout,
-                        env,
-                        label=SHARED_COORDINATOR_WORKSPACE_LABEL,
-                        effect_fence=workspace_effect_fence,
+                    target_workspace, workspace_root_prepared = mint_prepared(
+                        SHARED_COORDINATOR_WORKSPACE_LABEL
                     )
-                    result.base_pane_id = base_pane_id
+                    result.base_pane_id = workspace_root_prepared.locator
         elif role_grouped_project_coordinator:
             if _launch_shims is None:
                 raise HerdrSessionStartError(
@@ -790,9 +793,11 @@ def _prepare_session_locked(
                 timeout=timeout,
                 env=env,
                 effect_fence=workspace_effect_fence,
+                prepared_minter=mint_prepared,
             )
             target_workspace = shared.workspace_id
             result.base_pane_id = shared.base_pane_id
+            workspace_root_prepared = shared.base_prepared
         else:
             if role_grouped_implementation:
                 target_workspace = resolve_role_grouped_implementation_target(
@@ -809,21 +814,17 @@ def _prepare_session_locked(
                     rows, workspace_id, result.lane_id, adopt_locators
                 )
             if not target_workspace:
-                create_label = (
-                    _host_workspace_label(resolved_root)
-                    if result.lane_id != DEFAULT_LANE
-                    else ""
-                )
-                target_workspace, base_pane_id = _create_workspace(
-                    binary,
-                    repo_root,
-                    runner,
-                    timeout,
-                    env,
-                    label=create_label,
-                    effect_fence=workspace_effect_fence,
-                )
-                result.base_pane_id = base_pane_id
+                if result.lane_id == DEFAULT_LANE:
+                    target_workspace, workspace_root_prepared = mint_prepared("")
+                    result.base_pane_id = workspace_root_prepared.locator
+                else:
+                    # Host mint stays plain: first slot lands in its #15702 lane tab.
+                    target_workspace, base_pane_id = _create_workspace(
+                        binary, repo_root, runner, timeout, env,
+                        label=_host_workspace_label(resolved_root),
+                        effect_fence=workspace_effect_fence,
+                    )
+                    result.base_pane_id = base_pane_id
         result.herdr_workspace_id = target_workspace
 
     # Non-default implementation lanes keep the #13411 lane=tab path. Project
@@ -831,9 +832,8 @@ def _prepare_session_locked(
     # A freshly minted lane tab is created first-slot-prepared (#15702): its born root
     # pane carries the first launch slot's cwd/env and terminal receipt, so that slot
     # occupies the root instead of splitting beside it and no empty shell pane remains.
-    target_tab = ""
+    target_tab, root_prepared = "", workspace_root_prepared
     lane_slot_tabs: list = []
-    tab_root_prepared = None
     if (
         launch_plans
         and result.lane_id != DEFAULT_LANE
@@ -854,9 +854,9 @@ def _prepare_session_locked(
         )
         target_tab = tab_resolution.target_tab
         lane_slot_tabs = tab_resolution.lane_slot_tabs
-        tab_root_prepared = tab_resolution.occupy
-        if tab_root_prepared is not None:
-            result.tab_pane_id = tab_root_prepared.locator
+        if tab_resolution.occupy is not None:
+            result.tab_pane_id = tab_resolution.occupy.locator
+            root_prepared = tab_resolution.occupy
         result.herdr_tab_id = target_tab
     # Split placement (#13411 tab axis + #13646 direction / #13646-R1-F1 focus). The first
     # slot occupies the container; later launching slots split beside it. Pure decisions —
@@ -943,11 +943,11 @@ def _prepare_session_locked(
                 shim_dir=launch_shim_dirs.get(plan.provider, ""),
                 workspace_effect_fence=workspace_effect_fence,
                 pane_owner=_restore_pane_owner,
-                occupy_prepared=tab_root_prepared,
+                occupy_prepared=root_prepared,
             )
         )
         if plan.kind == "launch":
-            tab_root_prepared = None
+            root_prepared = None
             split_anchor = result.slots[-1].locator
             occupancy += 1
 

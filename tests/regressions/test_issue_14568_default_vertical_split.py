@@ -355,13 +355,13 @@ class RollbackAndSafetyContractsTest(unittest.TestCase):
 
     def test_single_provider_request_stays_single_and_never_splits_first(self) -> None:
         # The product-default `order` names both providers; a single-provider request must
-        # not grow a peer. Herdr 0.8 still prepares exactly one pane for that one process;
-        # there is no second, pair-forming split.
+        # not grow a peer. Since #15705 the fresh default mint is first-slot-prepared, so
+        # the one process occupies the born workspace root — no pane split at all.
         herdr = _Herdr(created_workspace="wZ")
         with tempfile.TemporaryDirectory() as tmp:
             result, _, _ = _prepare(tmp, herdr=herdr, providers=["claude"], lane="")
         self.assertEqual(len(herdr.start_argvs), 1)
-        self.assertEqual(len(herdr.pane_splits), 1)
+        self.assertEqual(herdr.pane_splits, [])
         self.assertEqual([s.provider for s in result.slots], ["claude"])
 
     def test_heal_splits_down_beside_the_live_sibling_and_moves_nothing(self) -> None:
@@ -385,15 +385,18 @@ class RollbackAndSafetyContractsTest(unittest.TestCase):
         self.assertNotIn("--focus", split)
         self.assertEqual(herdr.pane_closes, [])
 
-    def test_an_undeclared_fresh_pair_preserves_the_unbound_root_pane(self) -> None:
+    def test_an_undeclared_fresh_pair_occupies_the_born_root_pane(self) -> None:
+        # Since #15705 the fresh default mint is first-slot-prepared: the born root
+        # is the first launch's pane (typed `root_occupied_by_first_launch`) and
+        # nothing is ever closed — the #15227 no-close contract is unchanged.
         herdr = _Herdr(created_workspace="wZ")
         with tempfile.TemporaryDirectory() as tmp:
             result, _, _ = _prepare(
                 tmp, herdr=herdr, providers=["codex", "claude"], lane=""
             )
         self.assertEqual(herdr.pane_closes, [])
-        self.assertFalse(result.base_pane_reclaimed)
-        self.assertIn("generation_unproven_root_preserved", result.base_pane_detail)
+        self.assertTrue(result.base_pane_reclaimed)
+        self.assertIn("root_occupied_by_first_launch", result.base_pane_detail)
 
     def test_a_failing_launch_still_fails_closed_and_leaves_the_root_pane(self) -> None:
         # The product default runs before the first launch and must not disturb the

@@ -482,18 +482,60 @@ class FakeHerdr:
     # -- command handlers -----------------------------------------------------
 
     def _cmd_workspace_create(self, argv, rest):
-        ws = self._mint_workspace(cwd=_flag_value(rest, "--cwd") or "")
+        # D (Redmine #13330) + #15705 (measured herdr 0.8.0): `--cwd` / `--env K=V`
+        # reach the born root pane's shell, and the `workspace_created` payload
+        # returns the root pane's FULL identity — workspace_id / tab_id (the
+        # workspace's own first tab) / terminal_id / cwd — so the real code can
+        # treat the born root as the first launch slot's prepared pane. The fake's
+        # internal tab model keeps the base pane on the ``""`` default tab (the
+        # pre-#15705 convention every consumer of ``tab_of`` relies on); only the
+        # payload reports the measured first-tab identity.
+        cwd = ""
+        pane_env: dict = {}
+        label = ""
+        i = 2
+        while i < len(rest):
+            token = rest[i]
+            if token in {"--label", "--cwd"}:
+                if token == "--cwd":
+                    cwd = rest[i + 1]
+                else:
+                    label = rest[i + 1]
+                i += 2
+            elif token == "--env":
+                key, separator, _value = rest[i + 1].partition("=")
+                if not key or not separator:
+                    raise UnknownHerdrCommandError(
+                        "workspace create received a malformed environment entry: "
+                        f"{rest!r}"
+                    )
+                pane_env[key] = rest[i + 1].partition("=")[2]
+                i += 2
+            elif token in {"--focus", "--no-focus"}:
+                i += 1
+            else:
+                raise UnknownHerdrCommandError(
+                    f"workspace create: unmodelled flag {token!r} in {rest!r}"
+                )
+        ws = self._mint_workspace(cwd=cwd)
         # Record the verbatim `--label` (Redmine #13380 host / #14139 shared space) so a
         # later `workspace list` reflects it — the backend-readable adopt authority.
-        ws.label = _flag_value(rest, "--label") or ""
+        ws.label = label
         root_pane = ws.panes[0]
+        ws.pane_env[root_pane] = dict(pane_env)
         return _ok(
             argv,
             {
                 "result": {
                     "type": "workspace_created",
                     "workspace": {"workspace_id": ws.workspace_id},
-                    "root_pane": {"pane_id": root_pane},
+                    "root_pane": {
+                        "pane_id": root_pane,
+                        "workspace_id": ws.workspace_id,
+                        "tab_id": f"{ws.workspace_id}:t1",
+                        "terminal_id": f"terminal-{root_pane}",
+                        "cwd": ws.pane_cwd[root_pane],
+                    },
                     "pane_count": 1,
                 }
             },

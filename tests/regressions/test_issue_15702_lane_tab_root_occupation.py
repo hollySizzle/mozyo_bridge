@@ -14,7 +14,8 @@ and only the second slot issues a ``pane split``. Nothing is closed anywhere.
 These pins hold the four contract edges:
 
 1. fresh lane create → zero empty pane in the lane tab, zero ``pane close``;
-2. default lane / workspace base pane → byte-invariant (#15227 preservation intact);
+2. default lane / workspace base pane → occupied too since Redmine #15705 moved
+   #15702's original scope boundary (the pin tracks the successor contract);
 3. heal into an existing tab → no tab create, no occupation;
 4. a mislocated / identity-incomplete tab root fails closed before any agent start.
 """
@@ -126,21 +127,23 @@ class LaneTabRootOccupationTest(unittest.TestCase):
         self.assertEqual(herdr.pane_closes, [])
         self.assertEqual(result.tab_pane_detail, "root_occupied_by_first_launch")
 
-    def test_default_lane_base_pane_preservation_is_byte_invariant(self) -> None:
-        # The workspace base pane axis (#13330 / #15227) is untouched: the default
-        # pair still splits the created root and preserves it, with zero close.
+    def test_default_lane_mint_is_occupied_since_15705(self) -> None:
+        # This pin originally froze #15702's scope boundary: the default pair kept
+        # splitting beside its preserved workspace root. Redmine #15705 moves that
+        # boundary — a fresh DEFAULT-lane workspace mint is now first-slot-prepared
+        # too, so the pair is root (occupied) + ONE split, still with zero close.
         herdr = _Herdr(created_workspace="wZ")
         with tempfile.TemporaryDirectory() as tmp:
             result, _ = _prepare(
                 tmp, herdr=herdr, providers=["codex", "claude"], lane=""
             )
         self.assertEqual(herdr.tab_creates, [])
-        self.assertEqual(len(herdr.pane_splits), 2)
+        self.assertEqual(len(herdr.pane_splits), 1)
         self.assertEqual(herdr.pane_splits[0][2], "wZ:p1")
         self.assertEqual(herdr.pane_closes, [])
-        self.assertFalse(result.base_pane_reclaimed)
+        self.assertTrue(result.base_pane_reclaimed)
         self.assertEqual(
-            result.base_pane_detail, "generation_unproven_root_preserved"
+            result.base_pane_detail, "root_occupied_by_first_launch"
         )
 
     def test_heal_into_existing_tab_never_occupies(self) -> None:
