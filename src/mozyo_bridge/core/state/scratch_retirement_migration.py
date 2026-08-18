@@ -11,6 +11,7 @@ import secrets
 import sqlite3
 import stat
 import sys
+import tempfile
 from pathlib import Path
 
 from mozyo_bridge.core.state.scratch_retirement_attempt_codec import (
@@ -28,6 +29,21 @@ from mozyo_bridge.core.state.scratch_retirement_pin import (
 
 class ScratchRetirementMigrationError(RuntimeError):
     pass
+
+
+def _recoverable_migration_shape(state: str, present: tuple[str, ...]) -> bool:
+    allowed = {
+        "db", "wal", "shm", "journal", "seal", "v1_backup", "v1_backup_seal",
+        "v1_migration", "v1_private_staging",
+    }
+    required = {"db", "seal", "v1_migration", "v1_private_staging"}
+    return (
+        state == "damaged"
+        and set(present).issubset(allowed)
+        and required.issubset(present)
+        and present.count("v1_migration") == 1
+        and present.count("v1_private_staging") == 1
+    )
 
 
 def migrate_scratch_retirement_v1_locked(path: Path, seal_path: Path) -> int:
@@ -224,8 +240,16 @@ def _repair_staging_database(
     except (ScratchRetirementMigrationError, sqlite3.DatabaseError):
         valid = False
     if not valid:
-        _truncate_pinned(staging, pin)
         _copy_sqlite(source, staging, pin)
+        try:
+            if _logical_digest(staging) != wanted:
+                raise ScratchRetirementMigrationError(
+                    "scratch retirement source drifted during backup"
+                )
+        except sqlite3.DatabaseError as exc:
+            raise ScratchRetirementMigrationError(
+                "scratch retirement private backup image is invalid"
+            ) from exc
     _require_pinned_artifact(staging, pin)
 
 
@@ -393,32 +417,83 @@ def _reject_backup_sidecars(backup: Path) -> None:
         raise ScratchRetirementMigrationError("scratch retirement backup has a sidecar")
 
 
-def _copy_sqlite(source: Path, staging: Path, pin: tuple[int, int]) -> None:
+def _copy_sqlite(
+    source: Path,
+    staging: Path,
+    pin: tuple[int, int],
+) -> None:
+    """Copy a logical SQLite snapshot into the exact pinned staging inode.
+
+    SQLite cannot portably open ``/dev/fd/<n>`` as a database path (macOS rejects
+    it with ``SQLITE_CANTOPEN``).  Build and validate a complete private image
+    first, then copy its bytes through the already-open, identity-checked staging
+    descriptor.  The destination is not truncated until the image is complete.
+    """
+    source_digest = _logical_digest(source)
     flags = os.O_RDWR
     if hasattr(os, "O_NOFOLLOW"):
         flags |= os.O_NOFOLLOW
-    fd = os.open(staging, flags)
-    info = os.fstat(fd)
-    if (info.st_dev, info.st_ino) != pin:
-        os.close(fd)
-        raise ScratchRetirementMigrationError(
-            "scratch retirement staging database changed before copy"
-        )
-    fd_root = Path("/proc/self/fd") if Path("/proc/self/fd").is_dir() else Path("/dev/fd")
-    if not fd_root.is_dir():
-        os.close(fd)
-        raise ScratchRetirementMigrationError(
-            "this platform cannot write a pinned retirement backup inode"
-        )
-    src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
-    dst = sqlite3.connect(f"file:{fd_root / str(fd)}?mode=rw", uri=True)
+    staging_fd = os.open(staging, flags)
     try:
-        src.backup(dst)
+        info = os.fstat(staging_fd)
+        if (info.st_dev, info.st_ino) != pin:
+            raise ScratchRetirementMigrationError(
+                "scratch retirement staging database changed before copy"
+            )
+        with tempfile.TemporaryDirectory(prefix="mozyo-retirement-backup-") as root:
+            image = Path(root) / "store.sqlite3"
+            src = sqlite3.connect(f"file:{source}?mode=ro", uri=True)
+            try:
+                dst = sqlite3.connect(image)
+                try:
+                    src.backup(dst)
+                    if _logical_digest_connection(dst) != source_digest:
+                        raise ScratchRetirementMigrationError(
+                            "scratch retirement source drifted during backup"
+                        )
+                finally:
+                    dst.close()
+            finally:
+                src.close()
+            os.chmod(image, 0o600)
+            _reject_backup_sidecars(image)
+
+            image_flags = os.O_RDONLY
+            if hasattr(os, "O_NOFOLLOW"):
+                image_flags |= os.O_NOFOLLOW
+            image_fd = os.open(image, image_flags)
+            try:
+                image_info = os.fstat(image_fd)
+                image_path_info = image.lstat()
+                if (
+                    not stat.S_ISREG(image_info.st_mode)
+                    or image_info.st_uid != os.geteuid()
+                    or stat.S_IMODE(image_info.st_mode) != 0o600
+                    or (image_info.st_dev, image_info.st_ino)
+                    != (image_path_info.st_dev, image_path_info.st_ino)
+                ):
+                    raise ScratchRetirementMigrationError(
+                        "scratch retirement private backup image is unsafe"
+                    )
+                os.ftruncate(staging_fd, 0)
+                os.lseek(staging_fd, 0, os.SEEK_SET)
+                while True:
+                    chunk = os.read(image_fd, 1024 * 1024)
+                    if not chunk:
+                        break
+                    view = memoryview(chunk)
+                    while view:
+                        written = os.write(staging_fd, view)
+                        if written <= 0:
+                            raise OSError(
+                                "short scratch retirement database image write"
+                            )
+                        view = view[written:]
+                os.fsync(staging_fd)
+            finally:
+                os.close(image_fd)
     finally:
-        dst.close()
-        src.close()
-        os.close(fd)
-    _fsync_file(staging)
+        os.close(staging_fd)
     _require_pinned_artifact(staging, pin)
 
 
@@ -470,21 +545,27 @@ def _version(path: Path) -> int:
 def _logical_digest(path: Path) -> str:
     conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
     try:
-        version = int(conn.execute("PRAGMA user_version").fetchone()[0])
-        if version != 1:
-            raise ScratchRetirementMigrationError("scratch retirement backup is not v1")
-        _validate_v1(conn)
-        tables = tuple(
-            row[0]
-            for row in conn.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
-            )
-        )
-        if tables != ("scratch_retirement", "store_meta"):
-            raise ScratchRetirementMigrationError("scratch retirement v1 table shape is unknown")
-        dump = "\n".join(conn.iterdump())
+        return _logical_digest_connection(conn)
     finally:
         conn.close()
+
+
+def _logical_digest_connection(conn: sqlite3.Connection) -> str:
+    version = int(conn.execute("PRAGMA user_version").fetchone()[0])
+    if version != 1:
+        raise ScratchRetirementMigrationError("scratch retirement backup is not v1")
+    _validate_v1(conn)
+    tables = tuple(
+        row[0]
+        for row in conn.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' ORDER BY name"
+        )
+    )
+    if tables != ("scratch_retirement", "store_meta"):
+        raise ScratchRetirementMigrationError(
+            "scratch retirement v1 table shape is unknown"
+        )
+    dump = "\n".join(conn.iterdump())
     return hashlib.sha256(f"v={version}\n{dump}".encode("utf-8")).hexdigest()
 
 

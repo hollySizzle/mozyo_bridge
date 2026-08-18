@@ -446,6 +446,11 @@ forceやpending overrideを加えない。pending generationが本当に破棄�
   crash replay/recovery evidenceとして保持され、primary欠落、backup/pin/security drift、unproven
   stagingは`recovery_required`相当のdamaged状態となりnormal write/closeを0にする。旧pinのterminalを
   live inventoryからbackfillしてauthorityへ昇格させない。
+  - `migrate --write`がdurable control markerとprivate pinned stagingを作成した後に中断した場合だけ、
+    `mozyo-bridge herdr retirement-store recover --write`で同じmigrationを再開する。recoveryはexact source
+    digest・seal nonce・owner/mode・control/marker hardlink・staging/final inode pinを再照合し、foreign、
+    partial、drifted、複数stagingはzero-writeで拒否する。healthy v1の初回migration、primary欠落、generic
+    reset、authority削除、retirement履歴忘却には使用できない。
 - worktree / branch 除去、process launch / resume、raw herdr / tmux、store 直接 mutation は伴わない。
 
 ## 統合 (integration disposition)

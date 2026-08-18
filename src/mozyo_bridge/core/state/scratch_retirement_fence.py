@@ -62,6 +62,7 @@ from mozyo_bridge.core.state.scratch_retirement_pin import (
 )
 from mozyo_bridge.core.state.scratch_retirement_migration import (
     ScratchRetirementMigrationError,
+    _recoverable_migration_shape,
     migrate_scratch_retirement_v1_locked,
 )
 from mozyo_bridge.core.state.scratch_retirement_store_security import (
@@ -495,6 +496,18 @@ class ScratchRetirementFence:
 
     def migrate_v1_backup_first(self) -> int:
         """Explicitly migrate exact v1 after publishing a durable logical backup."""
+        return self._migrate_v1_backup_first(recovery_only=False)
+
+    def recover_v1_migration(self) -> int:
+        """Resume only an exact, durably anchored interrupted v1 migration."""
+        shape = self.store_shape()
+        if not _recoverable_migration_shape(shape.state, shape.present_artifacts):
+            raise ScratchRetirementFenceError(
+                "the retirement authority has no recoverable interrupted migration"
+            )
+        return self._migrate_v1_backup_first(recovery_only=True)
+
+    def _migrate_v1_backup_first(self, *, recovery_only: bool) -> int:
         lock = self.lock_path
         lock.parent.mkdir(parents=True, exist_ok=True)
         fd = os.open(lock, os.O_CREAT | os.O_RDWR, 0o600)
@@ -507,6 +520,13 @@ class ScratchRetirementFence:
                         "another retirement transaction holds the authority"
                     ) from exc
                 raise
+            current_shape = self.store_shape()
+            if recovery_only and not _recoverable_migration_shape(
+                current_shape.state, current_shape.present_artifacts
+            ):
+                raise ScratchRetirementFenceError(
+                    "the interrupted retirement migration changed before recovery"
+                )
             primary = {
                 name for name, path in primary_artifact_paths(
                     self.path, self.seal_path, self.temp_path
