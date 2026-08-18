@@ -75,6 +75,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_reboot_audit import register_sublane_reboot_audit_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_residue_close import register_sublane_close_residue_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_recovery_cli import register_sublane_recover_restored_pair_parser  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_rebind_cli import register_sublane_rebind_restored_pair_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_callback import (
     CALLBACK_ABSENT,
     CALLBACK_CHOICES,
@@ -689,3 +690,6 @@ def register_sublane_group(
     register_sublane_reboot_audit_parser(sublane_sub)
     register_sublane_close_residue_parser(sublane_sub)
     register_sublane_recover_restored_pair_parser(sublane_sub)
+    # Redmine #15656: the lifecycle-pin rebind for a herdr-restart-restored active pair —
+    # the SAME attested sessions on new locators; only the declared_slots snapshot moves.
+    register_sublane_rebind_restored_pair_parser(sublane_sub)
