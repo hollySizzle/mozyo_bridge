@@ -340,6 +340,13 @@ diff 起因の failure と識別可能にする。
   非容量 errno は環境事象と呼ばず、そのまま propagate する。
 - 診断は red を green にしない、retry しない、何も削除しない。挙動を変えるのは
   「red の読み方」だけである。
+- **注記は probabilistic に留める** (review j#108141 finding_overclaim)。marker は raw な
+  stderr substring であり「疑い」までしか支持しない。temp 消費を増やす diff 自身が quota を
+  押し得るため、注記は suspected cause と検証義務を述べ、「diff は無関係」という断定を
+  しない。regression が断定文の再混入を pin する。
+- **refusal も既定 path redaction に従う** (review j#108141 finding_pathleak)。宣言 path や
+  OSError の filename は既定 message に出さず (env var 名 + role/digest label + errno/strerror
+  のみ)、raw path は `--reveal-paths` 時のみ出る (`TempRootUnavailable.revealed`)。
 
 ### 掃除ではなく宣言的退避を採る
 

@@ -24,6 +24,7 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_d
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (
     TESTS_TEMP_BASE_ENV,
+    path_label,
 )
 
 #: The task-root prefix, mirrored from ``commands_test_run`` without importing
@@ -38,13 +39,22 @@ class TempRootUnavailable(RuntimeError):
     capacity refusal (EDQUOT / ENOSPC) while creating the root. Fail-closed
     like the fence errors on the same rail: a run whose temp root cannot be
     trusted is refused, not silently relocated.
+
+    ``str(exc)`` is the DEFAULT message and carries no absolute path — like
+    every other verdict surface it may be pasted into a ticket or a CI log
+    (review j#108141 finding_pathleak). ``revealed`` is the local-debug
+    variant with the raw paths, printed only under ``--reveal-paths``.
     """
 
     def __init__(
-        self, message: str, diagnosis: DiskPressureDiagnosis | None = None
+        self,
+        message: str,
+        diagnosis: DiskPressureDiagnosis | None = None,
+        revealed: str | None = None,
     ) -> None:
         super().__init__(message)
         self.diagnosis = diagnosis
+        self.revealed = revealed if revealed is not None else message
 
 
 def resolve_tests_temp_base(
@@ -55,25 +65,32 @@ def resolve_tests_temp_base(
     A declared base that is missing, not a directory, or not writable raises
     :class:`TempRootUnavailable` — the operator asked for a specific base, so
     quietly using ``/tmp`` instead would run in exactly the environment the
-    declaration exists to escape. The path is echoed back: it is the
-    operator's own configuration value, and a label-only refusal would be
-    undebuggable.
+    declaration exists to escape. The default message identifies the value by
+    the env var name and a role/digest label only; the raw path rides on
+    ``revealed`` for ``--reveal-paths`` (review j#108141 finding_pathleak).
     """
     source = os.environ if env is None else env
     declared = source.get(TESTS_TEMP_BASE_ENV, "").strip()
     if not declared:
         return None
     base = Path(declared).expanduser()
+
+    def refusal(problem: str) -> TempRootUnavailable:
+        tail = (
+            f"{problem}; refusing to fall back to the default temp root "
+            "silently"
+        )
+        return TempRootUnavailable(
+            f"the {TESTS_TEMP_BASE_ENV} declaration "
+            f"({path_label(str(base), 'declared-temp-base')}) {tail} "
+            "(--reveal-paths prints the declared path)",
+            revealed=f"{TESTS_TEMP_BASE_ENV}={declared} {tail}",
+        )
+
     if not base.is_dir():
-        raise TempRootUnavailable(
-            f"{TESTS_TEMP_BASE_ENV}={declared} is not an existing directory; "
-            "refusing to fall back to the default temp root silently"
-        )
+        raise refusal("is not an existing directory")
     if not os.access(base, os.W_OK | os.X_OK):
-        raise TempRootUnavailable(
-            f"{TESTS_TEMP_BASE_ENV}={declared} is not writable; refusing to "
-            "fall back to the default temp root silently"
-        )
+        raise refusal("is not writable")
     return base.resolve()
 
 

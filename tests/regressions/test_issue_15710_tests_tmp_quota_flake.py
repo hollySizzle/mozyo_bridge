@@ -31,6 +31,7 @@ from unittest.mock import patch
 
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application import (
     commands_test_run,
+    test_temp_root,
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.test_temp_root import (
     TempRootUnavailable,
@@ -38,6 +39,7 @@ from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.application.t
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_disk_pressure import (
     PRESSURE_NOTE,
+    DiskPressureDiagnosis,
     MarkerScanner,
 )
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_home_isolation import (
@@ -70,6 +72,43 @@ class DeclaredTempBaseTest(unittest.TestCase):
             with self.assertRaises(TempRootUnavailable):
                 resolve_tests_temp_base({TESTS_TEMP_BASE_ENV: not_a_dir.name})
 
+    def test_an_unwritable_declared_base_fails_closed_without_fallback(
+        self,
+    ) -> None:
+        """Review j#108141 finding_unwritablegap. The access seam is patched
+        rather than chmod-ing a fixture: chmod 000 is a no-op for root (CI
+        containers), which would make the branch's coverage euid-dependent."""
+        with tempfile.TemporaryDirectory() as base:
+            with patch.object(test_temp_root.os, "access", return_value=False):
+                with self.assertRaises(TempRootUnavailable) as ctx:
+                    resolve_tests_temp_base({TESTS_TEMP_BASE_ENV: base})
+            self.assertIn("is not writable", str(ctx.exception))
+            # And the runner refuses before ever creating a task root: the
+            # declared-but-unusable base must not degrade into the default
+            # temp dir the declaration exists to escape.
+            with patch.object(
+                test_temp_root.os, "access", return_value=False
+            ), patch.dict(os.environ, {TESTS_TEMP_BASE_ENV: base}), patch.object(
+                commands_test_run.tempfile,
+                "TemporaryDirectory",
+                side_effect=AssertionError("no task root may be created"),
+            ):
+                with self.assertRaises(TempRootUnavailable):
+                    commands_test_run._make_task_root()
+
+    def test_the_default_refusal_names_no_absolute_declared_path(self) -> None:
+        """Review j#108141 finding_pathleak: the default message may be pasted
+        into a ticket / CI log, so the raw declared path rides only on the
+        --reveal-paths variant."""
+        with tempfile.TemporaryDirectory() as base:
+            gone = str(Path(base) / "secret-layout" / "does-not-exist")
+            with self.assertRaises(TempRootUnavailable) as ctx:
+                resolve_tests_temp_base({TESTS_TEMP_BASE_ENV: gone})
+        self.assertNotIn(gone, str(ctx.exception))
+        self.assertIn(TESTS_TEMP_BASE_ENV, str(ctx.exception))
+        self.assertIn("declared-temp-base", str(ctx.exception))
+        self.assertIn(gone, ctx.exception.revealed)
+
     def test_the_task_root_lands_under_the_declared_base(self) -> None:
         with tempfile.TemporaryDirectory() as base:
             with patch.dict(os.environ, {TESTS_TEMP_BASE_ENV: base}):
@@ -91,10 +130,19 @@ class DeclaredTempBaseTest(unittest.TestCase):
 
 
 class SetupPressureIsRefusedAsEnvironmentalTest(unittest.TestCase):
-    def _run(self, side_effect: OSError) -> tuple[int, str]:
+    def _run(
+        self, side_effect: OSError, *, reveal_paths: bool = False
+    ) -> tuple[int, str]:
         stderr = io.StringIO()
         args = type(
-            "Args", (), {"repo": None, "unittest_args": (), "format": "text"}
+            "Args",
+            (),
+            {
+                "repo": None,
+                "unittest_args": (),
+                "format": "text",
+                "reveal_paths": reveal_paths,
+            },
         )()
         with patch.object(
             commands_test_run.tempfile,
@@ -124,6 +172,22 @@ class SetupPressureIsRefusedAsEnvironmentalTest(unittest.TestCase):
         self.assertIn(PRESSURE_NOTE, err)
         self.assertIn("ENOSPC", err)
 
+    def test_the_default_refusal_carries_no_oserror_filename(self) -> None:
+        """Review j#108141 finding_pathleak: str(OSError) renders the filename,
+        which is an absolute path; the default refusal keeps errno + strerror
+        only and the raw text is opt-in via --reveal-paths."""
+        failure = OSError(
+            errno.EDQUOT, "Disk quota exceeded", "/tmp/secret-task-root/file"
+        )
+        code, err = self._run(failure)
+        self.assertEqual(code, 1)
+        self.assertNotIn("/tmp/secret-task-root/file", err)
+        self.assertIn("EDQUOT", err)
+        self.assertIn("Disk quota exceeded", err)
+        code, revealed = self._run(failure, reveal_paths=True)
+        self.assertEqual(code, 1)
+        self.assertIn("/tmp/secret-task-root/file", revealed)
+
     def test_an_unrelated_oserror_is_not_relabelled_environmental(self) -> None:
         """EACCES must propagate untouched: calling a permission failure
         "disk pressure" would hide a real fence or setup defect."""
@@ -140,6 +204,28 @@ class SetupPressureIsRefusedAsEnvironmentalTest(unittest.TestCase):
             with self.assertRaises(OSError) as ctx:
                 commands_test_run.cmd_tests_run(args)
         self.assertEqual(ctx.exception.errno, errno.EACCES)
+
+
+class TheNoteNeverOutrunsItsEvidenceTest(unittest.TestCase):
+    """Review j#108141 finding_overclaim: the markers are raw stderr
+    substrings, so the note may claim suspicion and a verification duty —
+    never that the change under test is uninvolved."""
+
+    def test_the_note_stays_probabilistic(self) -> None:
+        diagnosis = DiskPressureDiagnosis(
+            stage="suite-stderr", markers=("EDQUOT x48",), temp_base="/tmp"
+        )
+        joined = " ".join(diagnosis.reasons)
+        self.assertIn("suspected", joined)
+        self.assertIn("verify before attributing", joined)
+        self.assertIn("can still be involved", joined)
+        for certainty in (
+            "not evidence",
+            "not caused by",
+            "unrelated to the change",
+            "proves",
+        ):
+            self.assertNotIn(certainty, joined)
 
 
 class _StderrSink:

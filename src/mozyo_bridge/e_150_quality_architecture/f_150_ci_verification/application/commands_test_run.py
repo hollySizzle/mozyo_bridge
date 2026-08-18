@@ -105,18 +105,22 @@ def _pressure_refusal(exc: OSError) -> TempRootUnavailable:
     """Wrap a capacity refusal during setup into the typed environmental error.
 
     The observed incident (#15710): ``[Errno 122] Disk quota exceeded`` under
-    a /tmp that ``df`` showed 3% full — per-user tmpfs quota, not a defect of
-    the change under test. The message must make that distinction readable.
+    a /tmp that ``df`` showed 3% full — per-user tmpfs quota. The default
+    message carries the errno token and strerror but NOT ``str(exc)``, whose
+    filename would leak an absolute path into a pasted verdict; the full
+    OSError text rides on ``revealed`` for ``--reveal-paths`` (review
+    j#108141 finding_pathleak).
     """
+    token = _errno.errorcode.get(exc.errno or 0, f"errno {exc.errno}")
     diagnosis = diagnose_disk_pressure(
-        effective_temp_base(),
-        markers=(_errno.errorcode.get(exc.errno or 0, f"errno {exc.errno}"),),
-        stage="temp-root-setup",
+        effective_temp_base(), markers=(token,), stage="temp-root-setup"
     )
+    reasons = "; ".join(diagnosis.reasons)
+    detail = f"{token}: {exc.strerror}" if exc.strerror else token
     return TempRootUnavailable(
-        f"could not materialise the task temp root ({exc}); "
-        + "; ".join(diagnosis.reasons),
+        f"could not materialise the task temp root ({detail}); {reasons}",
         diagnosis,
+        revealed=f"could not materialise the task temp root ({exc}); {reasons}",
     )
 
 
@@ -278,8 +282,12 @@ def cmd_tests_run(args: argparse.Namespace) -> int:
     except TempRootUnavailable as exc:
         # Environmental / configuration refusal (#15710): the task temp root is
         # unusable. The message already carries the typed diagnosis, so a red
-        # exit here is readable as environment, never as a diff failure.
-        print(f"tests run: {exc}", file=sys.stderr)
+        # exit here is readable as environment, never as a diff failure. The
+        # default message is path-free; --reveal-paths opts into the raw one.
+        message = (
+            exc.revealed if getattr(args, "reveal_paths", False) else str(exc)
+        )
+        print(f"tests run: {message}", file=sys.stderr)
         return 1
     except (AuditHookInstallError, OsFenceUnavailable) as exc:
         # Fail closed and run nothing: a suite executed without the refusal layer
@@ -464,7 +472,10 @@ def isolate_self(args: argparse.Namespace, *, label: str) -> int | None:
     except TempRootUnavailable as exc:
         # Environmental / configuration refusal (#15710); same shape as the
         # `tests run` handler so all three entry points read alike.
-        print(f"tests {label}: {exc}", file=sys.stderr)
+        message = (
+            exc.revealed if getattr(args, "reveal_paths", False) else str(exc)
+        )
+        print(f"tests {label}: {message}", file=sys.stderr)
         return 1
     except (AuditHookInstallError, OsFenceUnavailable) as exc:
         print(f"tests {label}: refusing to run without the write fence -- {exc}",

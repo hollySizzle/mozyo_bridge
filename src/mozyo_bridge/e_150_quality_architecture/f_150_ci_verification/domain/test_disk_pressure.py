@@ -151,10 +151,16 @@ class DiskPressureDiagnosis:
             if self.existing_roots is None
             else str(self.existing_roots)
         )
+        # Deliberately probabilistic (review j#108141 finding_overclaim): the
+        # markers are raw stderr substrings, which support suspicion and no
+        # more — and a diff that increases temp usage can itself push a run
+        # over the quota, so the note must not certify the change innocent.
         return (
             f"{PRESSURE_NOTE} ({self.stage}): {', '.join(self.markers)} -- "
-            "an environment condition (per-user temp quota / transient "
-            "pressure), not evidence against the change under test",
+            "the suspected cause is an environment condition (per-user temp "
+            "quota / transient pressure); verify before attributing these "
+            "failures to the change under test, which can still be involved "
+            "(e.g. by increasing temp usage)",
             f"temp base {self.temp_base_label}: blocks {pct(self.used_percent)} "
             f"used, inodes {pct(self.inode_percent)} used; existing "
             f"mozyo-tests-home-* roots (leftover or concurrent, not removed): "
