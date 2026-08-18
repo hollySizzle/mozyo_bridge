@@ -4,10 +4,10 @@ Redmine #13892 (design j#80526: "component status/doctor 可視性を追加し�
 文書化する"; review j#80523 R3-F5: the status method existed but nothing production-side ever
 called it, so it was a Python API, not operator visibility).
 
-The retirement authority fails closed on every damaged artifact shape, and this issue
-deliberately ships **no** generic recover/reset (an unsafe reset would let a lost store forget
-prior retirements and re-close a relaunched pair). That combination is only operable if an
-operator can *see* why a retire refuses — hence this read-only rail. It mirrors the
+The retirement authority fails closed on every damaged artifact shape and ships no generic
+reset (an unsafe reset would let a lost store forget prior retirements and re-close a relaunched
+pair). A narrowly verified recovery exists only for a durably anchored interrupted v1 migration.
+Operators must be able to *see* why a retire refuses — hence this read-only rail. It mirrors the
 ``herdr attestation-store status`` precedent: it creates nothing, mutates nothing, and never
 touches a process.
 """
@@ -42,14 +42,22 @@ def cmd_herdr_retirement_store_status(args: argparse.Namespace) -> int:
     if status.get("detail"):
         print(f"  detail: {status['detail']}")
     if status["store_state"] == "damaged" or readable is False:
-        # No generic recover/reset ships with this issue by design (j#80526): re-creating a
-        # lost authority would erase the evidence of prior retirements. Say so plainly rather
-        # than leaving an operator to guess at a repair that does not exist.
+        recoverable = {
+            "v1_migration",
+            "v1_private_staging",
+        }.issubset(status.get("present_artifacts", ()))
+        recovery_note = (
+            " If this is an interrupted v1 migration with exact durable staging "
+            "evidence, use `herdr retirement-store recover --write`; foreign or "
+            "drifted staging is refused."
+            if recoverable
+            else ""
+        )
         print(
             "  note: `herdr session-retire` fails closed while the authority is damaged. "
             "This is deliberate — a lost authority is never silently re-created, because "
-            "that would forget prior retirements and could re-close a relaunched pair. "
-            "Recovery is an operator decision recorded on the issue, not a command."
+            "that would forget prior retirements and could re-close a relaunched pair."
+            + recovery_note
         )
     return 0 if readable is not False else 1
 
@@ -73,8 +81,27 @@ def cmd_herdr_retirement_store_migrate(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_herdr_retirement_store_recover(args: argparse.Namespace) -> int:
+    """Resume an exact interrupted v1 migration; never reset an authority."""
+    from mozyo_bridge.core.state.scratch_retirement_fence import (
+        ScratchRetirementFence,
+        ScratchRetirementFenceError,
+    )
+
+    if not getattr(args, "write", False):
+        print("retirement-store recover requires --write")
+        return 2
+    try:
+        version = ScratchRetirementFence().recover_v1_migration()
+    except ScratchRetirementFenceError:
+        print("retirement authority recovery refused")
+        return 1
+    print(f"retirement authority schema: {version}")
+    return 0
+
+
 def register_herdr_retirement_store_parser(herdr_sub, *, add_repo_option=None) -> None:
-    """Register ``herdr retirement-store status`` (Redmine #13892)."""
+    """Register retirement-store operator surfaces (Redmine #13892, #15530)."""
     parser = herdr_sub.add_parser(
         "retirement-store",
         help=(
@@ -109,11 +136,25 @@ def register_herdr_retirement_store_parser(herdr_sub, *, add_repo_option=None) -
     if add_repo_option is not None:
         add_repo_option(migrate)
     migrate.set_defaults(func=cmd_herdr_retirement_store_migrate)
+    recover = sub.add_parser(
+        "recover",
+        help=(
+            "Resume an exact interrupted v1 migration from its durable private staging "
+            "evidence. This is not a reset."
+        ),
+    )
+    recover.add_argument(
+        "--write", action="store_true", help="Authorize the verified recovery write"
+    )
+    if add_repo_option is not None:
+        add_repo_option(recover)
+    recover.set_defaults(func=cmd_herdr_retirement_store_recover)
 
 
 __all__ = (
     "cmd_herdr_retirement_store_status",
     "cmd_herdr_retirement_store_migrate",
+    "cmd_herdr_retirement_store_recover",
     "register_herdr_retirement_store_parser",
     "register_herdr_retirement_surfaces",
 )
