@@ -36,6 +36,7 @@ def declare_created_lane_lifecycle(
     journal: str,
     worktree_identity: str = "",
     lane_kind: str = "",
+    parent_lane_id: str = "",
 ) -> None:
     """Declare this lane's owner binding (best-effort, never raises; Redmine #13681 W1).
 
@@ -61,6 +62,13 @@ def declare_created_lane_lifecycle(
     any write; here that refusal
     is caught with the same best-effort contract as every other declare failure — the lane
     stays owner-unbound rather than the actuation breaking.
+
+    ``parent_lane_id`` (v12, Redmine #15706) is the VERIFIED parent delegated_coordinator
+    lane of a child implementation lane an admitted delegated-gateway sender created —
+    supplied only from the sender-authority verdict (never raw caller env), recorded
+    generation-bound so the child's callback route (child gateway -> parent lane -> the
+    workspace coordinator) is replayable from the durable row. Empty (every pre-#15706
+    caller and every default-lane coordinator create) records no delegated parent.
 
     The write is best-effort like the metadata upsert: a store error never breaks the
     actuation. A re-run (self-heal, #13378) re-declares and is refused idempotently
@@ -117,6 +125,7 @@ def declare_created_lane_lifecycle(
             # Byte-exact (review j#85852 F1): the store's closed-vocabulary check is the
             # boundary; a padded token is refused there rather than quietly repaired here.
             lane_kind=lane_kind,
+            parent_lane_id=parent_lane_id,
         )
     except (LaneLifecycleError, DecisionPointerError, LaneKindError, OSError) as exc:
         print(
@@ -218,4 +227,30 @@ def _backfill_missing_worktree_binding(
         )
 
 
-__all__ = ("declare_created_lane_lifecycle",)
+def declare_created_lane_lifecycle_for(
+    ops, repo_workspace_id: str, *, worktree_identity: str = ""
+) -> None:
+    """The actuator adapter's declare call seam (#13681 W1), reading its facts off ``ops``.
+
+    Extracted from ``HerdrSublaneActuatorOps._declare_lane_lifecycle`` (module-health leaf,
+    Redmine #15706): the adapter supplies the create-time governance facts it owns —
+    ``lane_kind``, the delegation-geometry kind (親 / 子 / 孫) stored generation-bound as the
+    heal authority (#13647 T1b), and ``verified_parent_lane_id``, the delegated-parent lane
+    the sender-authority preflight VERIFIED and stashed (#15706; empty on the default-lane
+    coordinator pass, so a parent binding can never come from raw caller env).
+    """
+    declare_created_lane_lifecycle(
+        repo_workspace_id=repo_workspace_id,
+        lane_label=ops.lane_label,
+        issue=ops.issue,
+        journal=ops.journal,
+        worktree_identity=worktree_identity,
+        lane_kind=ops.lane_kind,
+        parent_lane_id=getattr(ops, "verified_parent_lane_id", "") or "",
+    )
+
+
+__all__ = (
+    "declare_created_lane_lifecycle",
+    "declare_created_lane_lifecycle_for",
+)

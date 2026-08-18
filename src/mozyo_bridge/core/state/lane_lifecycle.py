@@ -322,6 +322,7 @@ class LaneLifecycleStore:
         issue_id: str = "",
         worktree_identity: str = "",
         lane_kind: str = "",
+        parent_lane_id: str = "",
         now: Optional[str] = None,
     ) -> CasOutcome:
         """Declare a fresh lane ``active`` / ``not_requested`` at revision 1.
@@ -347,6 +348,8 @@ class LaneLifecycleStore:
         (:class:`~mozyo_bridge.core.state.lane_kind.LaneKindError`) rather than storing an
         off-vocabulary authority value. It is bound to THIS generation: no transition rewrites
         it, and a governance change re-binds it on a new generation via ``open_next_generation``.
+        ``parent_lane_id`` (v12, #15706) is the VERIFIED delegated-parent lane from an admitted
+        sender-authority verdict (never raw caller env); empty declares no delegated parent.
 
         Refuses an existing lane (:data:`CAS_ALREADY_DECLARED`) — a re-declare must
         go through an explicit transition, never a silent overwrite (the
@@ -395,7 +398,7 @@ class LaneLifecycleStore:
                     revision=1,
                     stamp=stamp,
                     worktree=worktree,
-                    lane_kind=kind,
+                    lane_kind=kind, parent_lane_id=norm(parent_lane_id),
                 )
             except sqlite3.IntegrityError:
                 # The index is the backstop the pre-checks above should have caught.

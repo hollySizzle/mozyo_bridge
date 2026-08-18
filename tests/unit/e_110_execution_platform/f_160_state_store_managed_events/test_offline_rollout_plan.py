@@ -110,7 +110,7 @@ class OfflineRolloutPlanTests(unittest.TestCase):
             ["mzb1_ws_a__codex__default", "mzb1_ws_b__claude__lane_1"],
         )
         self.assertEqual(first.plan["stores"]["attestation"]["target_version"], 4)
-        self.assertEqual(first.plan["stores"]["lane_lifecycle"]["target_version"], 11)
+        self.assertEqual(first.plan["stores"]["lane_lifecycle"]["target_version"], 12)
         self.assertEqual(first.plan["stores"]["startup_transaction"]["target_version"], 2)
         self.assertEqual(first.plan["stores"]["launch_generation"]["target_version"], 2)
         self.assertEqual(

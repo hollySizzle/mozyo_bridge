@@ -45,7 +45,7 @@ STORE_NAMES = frozenset(
 )
 STORE_TARGET_VERSIONS = {
     STORE_ATTESTATION: 4,
-    STORE_LANE_LIFECYCLE: 11,
+    STORE_LANE_LIFECYCLE: 12,  # v12 = #15706 parent_lane_id
     STORE_LAUNCH_GENERATION: 2,
     STORE_STARTUP_TRANSACTION: 2,
 }
@@ -621,7 +621,7 @@ def build_offline_rollout_plan(
             {"phase": "consumer_zero", "required_readback": "zero"},
             {"phase": "verified_backup", "stores": sorted(stores)},
             {"phase": "migrate_attestation", "target_version": 4},
-            {"phase": "migrate_lane_lifecycle", "target_version": 11},
+            {"phase": "migrate_lane_lifecycle", "target_version": 12},
             {"phase": "migrate_startup_transaction", "target_version": 2},
             {"phase": "rebuild_launch_generation", "target_version": 2},
             {"phase": "exact_runtime_install"},

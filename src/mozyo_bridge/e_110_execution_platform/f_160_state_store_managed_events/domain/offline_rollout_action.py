@@ -204,7 +204,7 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
         raise OfflineRolloutActionError("artifact_distribution_unsupported")
     stores = plan.get("stores")
     targets = {
-        "attestation": 4, "lane_lifecycle": 11,
+        "attestation": 4, "lane_lifecycle": 12,
         "launch_generation": 2, "startup_transaction": 2,
     }
     if not isinstance(stores, Mapping) or set(stores) != set(targets):
@@ -286,7 +286,7 @@ def verify_plan(plan: object, expected_digest: object) -> Mapping[str, object]:
         raise OfflineRolloutActionError("plan_schema_transitions_invalid")
     for phase_name, target in (
         ("migrate_attestation", 4),
-        ("migrate_lane_lifecycle", 11),
+        ("migrate_lane_lifecycle", 12),
         ("migrate_startup_transaction", 2),
         ("rebuild_launch_generation", 2),
     ):
@@ -675,7 +675,7 @@ def _verify_historical_v3_plan(plan: Mapping[str, object]) -> None:
     synthetic["schema_version"] = 4
     synthetic_stores = synthetic["stores"]
     synthetic_stores["attestation"]["target_version"] = 4
-    synthetic_stores["lane_lifecycle"]["target_version"] = 11
+    synthetic_stores["lane_lifecycle"]["target_version"] = 12
     synthetic_stores["launch_generation"] = {
         "state": "absent",
         "version": None,
@@ -693,7 +693,7 @@ def _verify_historical_v3_plan(plan: Mapping[str, object]) -> None:
         for name, target in sorted(
             {
                 "attestation": 4,
-                "lane_lifecycle": 11,
+                "lane_lifecycle": 12,
                 "launch_generation": 2,
                 "startup_transaction": 2,
             }.items()
@@ -704,7 +704,7 @@ def _verify_historical_v3_plan(plan: Mapping[str, object]) -> None:
         if phase["phase"] == "migrate_attestation":
             phase["target_version"] = 4
         elif phase["phase"] == "migrate_lane_lifecycle":
-            phase["target_version"] = 11
+            phase["target_version"] = 12
     insert_at = HISTORICAL_V3_EXECUTION_PHASES.index("exact_runtime_install")
     synthetic_phases.insert(
         insert_at, {"phase": "rebuild_launch_generation", "target_version": 2}

@@ -616,6 +616,8 @@ class OldLifecycleRowsAreBlockedNotGuessed(unittest.TestCase):
                     "ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin"
                 )
                 conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
+                # v12 (#15706) added parent_lane_id; a faithful pre-v12 rewind drops it too.
+                conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN parent_lane_id")
                 conn.execute(
                     "UPDATE state_schema_components SET schema_version = 9 "
                     "WHERE component = 'lane_lifecycle'"
@@ -641,6 +643,8 @@ class OldLifecycleRowsAreBlockedNotGuessed(unittest.TestCase):
                     "ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin"
                 )
                 conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
+                # v12 (#15706) added parent_lane_id; a faithful pre-v12 rewind drops it too.
+                conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN parent_lane_id")
                 conn.execute("UPDATE lane_lifecycle_records SET lane_generation = 5")
                 conn.execute(
                     "UPDATE state_schema_components SET schema_version = 9 "

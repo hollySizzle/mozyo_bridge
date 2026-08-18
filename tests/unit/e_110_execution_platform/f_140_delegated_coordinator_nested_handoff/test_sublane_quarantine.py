@@ -896,6 +896,8 @@ class QuarantineMigrationAuditTest(_QuarantineCase):
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN release_observation")
             # v10 (#14756) added lane_epoch; a faithful pre-v10 rewind drops it too.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN lane_epoch")
+            # v12 (#15706) added parent_lane_id; a faithful pre-v12 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN parent_lane_id")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 5 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),

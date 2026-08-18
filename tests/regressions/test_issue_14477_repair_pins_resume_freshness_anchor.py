@@ -538,6 +538,8 @@ class PreV8CompatibilityTest(_Fixture):
             # v11 (#15227) added reconcile_close_pin; retaining it would be a partial/newer
             # shape merely stamped v7, not a genuine historical v7 store.
             conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN reconcile_close_pin")
+            # v12 (#15706) added parent_lane_id; a faithful pre-v12 rewind drops it too.
+            conn.execute("ALTER TABLE lane_lifecycle_records DROP COLUMN parent_lane_id")
             conn.execute(
                 "UPDATE state_schema_components SET schema_version = 7 WHERE component = ?",
                 (LANE_LIFECYCLE_COMPONENT,),
@@ -2599,6 +2601,7 @@ class StoredBindingKindIsNeverNormalisedTest(_Fixture):
             # A genuine v4 shape lacks every column added after it, not only the v5 tranche —
             # the schema gate matches the FULL signature and refuses a partial rewind.
             for column in (
+                "parent_lane_id",  # v12 (#15706)
                 "reconcile_close_pin",  # v11
                 "lane_epoch",  # v10
                 "release_observation",  # v9

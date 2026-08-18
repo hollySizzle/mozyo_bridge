@@ -49,6 +49,7 @@ _V8_ADDS = frozenset({"hibernated_at"})  # #14477 immutable resume-freshness bou
 _V9_ADDS = frozenset({"release_observation"})  # #14477 j#94582 release-observation authority
 _V10_ADDS = frozenset({"lane_epoch"})  # #14756 monotonic hibernate-generation epoch
 _V11_ADDS = frozenset({"reconcile_close_pin"})  # #15227 generation-bound owed close
+_V12_ADDS = frozenset({"parent_lane_id"})  # #15706 delegated-parent lane binding
 
 #: The EXACT allowed column-name signatures per recorded version (Redmine #13754 R6-F1,
 #: j#78803). A recognized store must match one of its version's signatures EXACTLY (set
@@ -69,6 +70,7 @@ _SHAPE_V8 = _SHAPE_V7 | _V8_ADDS
 _SHAPE_V9 = _SHAPE_V8 | _V9_ADDS
 _SHAPE_V10 = _SHAPE_V9 | _V10_ADDS
 _SHAPE_V11 = _SHAPE_V10 | _V11_ADDS
+_SHAPE_V12 = _SHAPE_V11 | _V12_ADDS
 _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     1: (_SHAPE_V1,),
     2: (_SHAPE_V2,),
@@ -81,6 +83,7 @@ _ALLOWED_SHAPES_BY_VERSION: dict[int, tuple[frozenset, ...]] = {
     9: (_SHAPE_V9,),
     10: (_SHAPE_V10,),
     11: (_SHAPE_V11,),
+    12: (_SHAPE_V12,),
 }
 
 #: The authority-affecting definition each column MUST carry: ``(type, notnull, default,
@@ -126,4 +129,9 @@ _COLUMN_DEFS: dict[str, tuple[str, int, Optional[str], int]] = {
     # ``typeof(lane_epoch) = 'text'``. ``'0'`` is the migration default and means NO EPOCH HAS
     # EVER BEEN MINTED; it is never a substitute boundary (see :mod:`...lane_epoch`).
     "lane_epoch": ("BLOB", 1, "'0'", 0),
+    # #15706: the VERIFIED parent delegated_coordinator lane a child implementation lane
+    # was created under, or '' for every lane created by the default-lane coordinator /
+    # a declared project gateway (and every pre-v12 row). Written once at declare time
+    # from the admitted sender-authority verdict — never from raw caller env.
+    "parent_lane_id": ("TEXT", 1, "''", 0),
 }

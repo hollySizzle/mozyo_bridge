@@ -118,7 +118,7 @@ def _plan() -> dict:
             "lane_lifecycle": {
                 "state": "recognized",
                 "version": 10,
-                "target_version": 11,
+                "target_version": 12,
                 "upgrade_required": True,
                 "content_digest": "2" * 64,
                 "migration_plan_digest": "",
@@ -157,7 +157,7 @@ def _plan() -> dict:
         "restore_order": [top],
         "schema_transitions": [
             {"store": "attestation", "from_version": 1, "to_version": 4},
-            {"store": "lane_lifecycle", "from_version": 10, "to_version": 11},
+            {"store": "lane_lifecycle", "from_version": 10, "to_version": 12},
             {"store": "launch_generation", "from_version": 1, "to_version": 2},
             {"store": "startup_transaction", "from_version": 1, "to_version": 2},
         ],
@@ -172,7 +172,7 @@ def _plan() -> dict:
             {"phase": "consumer_zero", "required_readback": "zero"},
             {"phase": "verified_backup", "stores": ["attestation"]},
             {"phase": "migrate_attestation", "target_version": 4},
-            {"phase": "migrate_lane_lifecycle", "target_version": 11},
+            {"phase": "migrate_lane_lifecycle", "target_version": 12},
             {"phase": "migrate_startup_transaction", "target_version": 2},
             {"phase": "rebuild_launch_generation", "target_version": 2},
             {"phase": "exact_runtime_install"},

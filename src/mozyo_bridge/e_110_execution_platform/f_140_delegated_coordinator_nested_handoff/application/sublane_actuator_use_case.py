@@ -71,6 +71,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     resolve_lane_runtime_root,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_gates import (  # noqa: E501
+    default_upstream_to_verified_parent,
     pair_attestation_admission,
     pair_split_admission,
     pre_mutation_admission,
@@ -216,6 +217,9 @@ class SublaneActuateUseCase:
                         fill_decision=fill_decision_token,
                         fill_override_reason=fill_override_reason,
                     )
+                # #15706: an admitted delegated-gateway create defaults the child's
+                # upstream_coordinator to the verdict's verified parent lane.
+                request = default_upstream_to_verified_parent(self.ops, request)
 
         # 4. Resolve the launch decision and preserve a fail-closed future contract.
         launch = decide_create_launch(self.ops, request, self.policy)

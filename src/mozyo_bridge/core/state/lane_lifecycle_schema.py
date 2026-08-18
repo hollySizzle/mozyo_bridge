@@ -108,11 +108,16 @@ LANE_LIFECYCLE_COMPONENT = "lane_lifecycle"
 #: has to live in the storage class: the bytes written are the bytes returned. The CAS also
 #: matches on the raw bytes and ``typeof(lane_epoch) = 'text'``, so a concurrent writer that
 #: changed either the value or its type loses. Semantics: :mod:`...lane_epoch`.
-LANE_LIFECYCLE_SCHEMA_VERSION = 11
-#: The component shapes this build can read and write. ``1``–``10`` are migrated
-#: additively to ``11``; anything else — a newer version from a future build, or a foreign
+#: v12 (Redmine #15706) adds ``parent_lane_id`` — the VERIFIED parent delegated_coordinator
+#: lane a child implementation lane was created under, written once at declare time from the
+#: admitted sender-authority verdict (never from raw caller env). ``''`` on every pre-v12 row
+#: and on every lane created by the default-lane coordinator / a declared project gateway —
+#: an ordinary "no delegated parent" fact, never a guessed binding.
+LANE_LIFECYCLE_SCHEMA_VERSION = 12
+#: The component shapes this build can read and write. ``1``–``11`` are migrated
+#: additively to ``12``; anything else — a newer version from a future build, or a foreign
 #: value — fails closed and the store is left untouched (R3-F1).
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12})
 #: A coordinator decision that cannot be rebuilt from events; loss requires an
 #: explicit re-declare from the Redmine durable pointer.
 LANE_LIFECYCLE_RECOVERY_POLICY = "operator_current_state"
@@ -162,6 +167,7 @@ CREATE TABLE IF NOT EXISTS {_TABLE} (
     hibernated_at TEXT NOT NULL DEFAULT '',
     release_observation TEXT NOT NULL DEFAULT '',
     lane_epoch BLOB NOT NULL DEFAULT '0',
+    parent_lane_id TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (repo_workspace_id, lane_id)
 )
 """
@@ -198,7 +204,7 @@ _COLUMNS = (
     "decision_issue_id, decision_journal, created_at, updated_at, worktree_identity, "
     "binding_kind, project_scope, lane_generation, declared_slots, reconcile_phase, "
     "reconcile_close_pin, "
-    "lane_kind, hibernated_at, release_observation, lane_epoch"
+    "lane_kind, hibernated_at, release_observation, lane_epoch, parent_lane_id"
 )
 
 # The exact per-version shape / column-definition tables live in their own leaf so this
@@ -886,6 +892,16 @@ def ensure_lane_lifecycle_schema(path: Path) -> LifecycleSchemaOutcome:
                 conn.execute(
                     f"ALTER TABLE {_TABLE} "
                     "ADD COLUMN reconcile_close_pin TEXT NOT NULL DEFAULT ''"
+                )
+            # v12 (#15706): the verified delegated-parent lane binding. A pre-v12 row lands
+            # EMPTY — an ordinary "no delegated parent" fact (every such lane was created by
+            # the default-lane coordinator or a declared project gateway). Never back-filled
+            # from caller env, display caches, or the delegation projection: only a create
+            # whose sender-authority verdict verified the parent writes a non-empty value.
+            if "parent_lane_id" not in current_columns:
+                conn.execute(
+                    f"ALTER TABLE {_TABLE} "
+                    "ADD COLUMN parent_lane_id TEXT NOT NULL DEFAULT ''"
                 )
             conn.execute(_OWNER_INDEX_SQL)
             conn.execute(_PROJECT_OWNER_INDEX_SQL)

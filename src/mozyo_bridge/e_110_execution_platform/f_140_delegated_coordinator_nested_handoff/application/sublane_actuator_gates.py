@@ -451,7 +451,25 @@ def pair_attestation_admission(
     )
 
 
+def default_upstream_to_verified_parent(ops, request):
+    """Route an admitted delegated-gateway create's callback at its parent (#15706).
+
+    A create the sender preflight admitted as a delegated_coordinator gateway hangs its
+    child's callback route off the VERIFIED parent lane the verdict stashed on ``ops``
+    (``verified_parent_lane_id``): a lane-unspecified dispatch defaults the gateway's
+    ``upstream_coordinator`` profile field to that lane instead of the workspace
+    default-lane ``coordinator`` route, which would skip the parent tier. An explicit
+    ``--upstream-coordinator`` always wins, and the default-lane coordinator pass leaves
+    the request byte-invariant (its verified parent lane is empty).
+    """
+    parent_lane = (getattr(ops, "verified_parent_lane_id", "") or "").strip()
+    if parent_lane and not (request.upstream_coordinator or "").strip():
+        return replace(request, upstream_coordinator=parent_lane)
+    return request
+
+
 __all__ = (
+    "default_upstream_to_verified_parent",
     "pair_attestation_admission",
     "pair_split_admission",
     "runtime_placement_gate",
