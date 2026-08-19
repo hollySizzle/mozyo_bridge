@@ -1,7 +1,7 @@
 # ADR-0011: 3階層構造は「責務の所在の分担」であり、レビューの多重化ではない
 
 - status: proposed (owner ratify 待ち。owner は 2026-08-18 の対話で本モデルの内容を確定させたが、ADR の *file 化された exact text* はまだ ratify していない。active 化は owner の文面裁定 anchor 成立後。coordinator 直接執筆 — owner 決定 doc は relay で意図が劣化するため subagent へ dispatch しない、の境界 (#15578 誰が書くか) に従う。)
-- date: 2026-08-18
+- date: 2026-08-18 (本文整合: 2026-08-19 — ratify 前の事実更新。モデル配置の変遷・実証達成・返送経路の現状を後述の各節に反映。決定行 (規約) は変更していない)
 - 改稿注記: 本 ADR は ADR-0009 (小規模の既定運用モデル「1階層/2役割」、1階層⇔3階層の切替) を**補完**する。ADR-0009 は「いつ1階層/いつ3階層か」を決め、本 ADR は「3階層のとき各層が何に責任を持つか」を決める。番号 0007 / 0008 / 0010 は他 branch の draft で予約されているため 0011 を採る。
 - related: #15631 (3階層を実運用可能にする取りまとめ US)、ADR-0009 (運用モデル。本 ADR がモデル配置の向きを更新: 下記)、#15578 (運用モデル ADR 文面 / 誰が書くか境界)、#15152 (単一レーン頭打ちの実証根拠)、#15629 (自律実行ログ)、中央 preset `### US-Level Audit Model` / `### Close Approval Separation` / `### Owner Close Approval Delegation`、CLAUDE.md project-local additions (project-gateway routing 境界)。
 
@@ -44,19 +44,21 @@
 
 ## 正直なトレードオフ (本 ADR は rosy な文書ではない)
 
-1. **サブレーンのレビューが唯一の網**: US の正しさを保証する検査が第3層1回になり、上位に再捕捉が無い (意図的)。ゆえに**サブレーンのレビュー役の系統独立性が load-bearing** であり、サブレーンの対が死角を共有すると誰も気づかない。冗長を削る設計は正しいが、その分だけ第3層の品質と、レビュー結果を上へ返す**返送経路の堅牢性**に賭けている。2026-08-18 時点でレビュー返送シナリオのテストが isolation 結合で不安定 (単独/部分実行で偽陽性) であり、この"唯一の網"の信頼性に直結するため、返送経路の堅牢化は #15631 の後続で優先度高とする。
+1. **サブレーンのレビューが唯一の網**: US の正しさを保証する検査が第3層1回になり、上位に再捕捉が無い (意図的)。ゆえに**サブレーンのレビュー役の系統独立性が load-bearing** であり、サブレーンの対が死角を共有すると誰も気づかない。冗長を削る設計は正しいが、その分だけ第3層の品質と、レビュー結果を上へ返す**返送経路の堅牢性**に賭けている。(現状更新 2026-08-19: 返送シナリオの isolation 結合不安定は #15709 で、callback 不達 3 class (precondition_not_idle 死蔵 / lane_binding_absent / receiver 導出) は #15707 で、suite の ambient home / 実 remote SSH coupling は #15711 で解消済み。残る既知穴は L2→L1 default-lane callback の `target_unavailable` (受信側 terminal generation 証明不足) で #15712 が追跡中。不達時も durable-record polling で運用は成立している。)
 
-2. **第2層が空席だと owner がボトルネックになる**: 「finding を飛ばすか/やりすぎか」の proportionality 判断は第2層の責務だが、2026-08-18 時点でその判断は owner 本人に上がっている。第2層を担い手 (レーン) で埋めるのが owner をボトルネックから外す最大のテコであり、本モデルの実効性は第2層の staffing とセットで初めて出る。
+2. **第2層が空席だと owner がボトルネックになる**: 「finding を飛ばすか/やりすぎか」の proportionality 判断は第2層の責務だが、その判断が owner 本人に上がる構造は owner をボトルネックにする。第2層を担い手 (レーン) で埋めるのが owner を外す最大のテコであり、本モデルの実効性は第2層の staffing とセットで初めて出る。(現状更新 2026-08-19: #15693 の bounded trial で L2 lane (`issue_15693_l2_trial`, delegated_coordinator) が稼働し、scheduling・並列 lane 作成・衝突 fence・state-only uptake・residual 起票まで自律実行できることを実証済み。常設化の owner 判断は未収集で #15693 を open anchor として維持。)
 
 3. **「ADR 全層参照」は機構が要る**: 各層の文脈へ ADR を実際に注入・解決する仕組み (既存の role_profile / workflow_contract 注入の延長) が無いと「参照必須」が掛け声で終わる。これはハーネス整備項目 (#15631 後続)。
 
-## モデル配置の更新 (ADR-0009 の向きを更新)
+## モデル配置 (原則と正本の分離)
 
-owner 決定 (2026-08-18): **第1層コーディネーター = Codex (X-High、高推論)**、**その補佐 (assistant) = Fable5 (Claude 系)**。これは ADR-0009 が draft で記録していた「coordinator = Claude 系統 / Opus5 は coordinator 席に置かない」という**向きを更新**する (ADR-0009 は未 ratify のため衝突はしない)。意図は「この project でこの配置がどうなるか」を見る期間限定トライアル。ADR-0009 を最終化する際に本更新と整合させる。起動設定: codex の X-High は launch_argv `["--config", "model_reasoning_effort=xhigh"]` (default) / `model_reasoning_effort=high` (sublane)。第3層のレビュー役は第1層 (Codex) と別系統である必要があるため、レビュー系統は Claude 側 (Fable5) に置く。
+本 ADR が規定するのは**配置の原則のみ**とする: (a) 第3層のレビュー役は実装役と別モデル系統であること、(b) coordinator 席と review 系統の独立が保たれること。**具体の provider / model 値は本 ADR に書かない** — 正本は committed `.mozyo-bridge/config.yaml` (`agents.profiles` / `provider_binding`、設計正本 #13157) であり、運用切替は config commit + Redmine 記録で表現する (router 規約と同じ向き)。ADR に具体値を焼き込むと owner の配置変更のたびに ADR が古くなるため、これは初稿 (2026-08-18 朝時点の「L1=Codex X-High / 補佐=Fable5」焼き込み) からの**構造修正**である。
+
+変遷の記録 (事実、正本は各 Redmine anchor): 2026-08-18 朝に L1=Codex X-High トライアル → 同日 owner 指示で **L1 coordinator = Claude 系 / coordination assistant = Codex X-High** へ rebind (#15655)。2026-08-19 owner 指示で **第3層実装 worker = Opus 5 (Claude 系)** へ切替 (#15631 j#108184)。第2層 delegated coordinator と第3層 review gateway は Codex 系 — したがって「実装 = Claude 系 / review = Codex 系」の系統独立 (原則 a) は全変遷を通じて維持されている。ADR-0009 draft の「coordinator = Claude 系統」との関係は rebind 後は整合に戻っており、ADR-0009 最終化時に本節と照合する。
 
 ## 影響
 
 - 3階層で実装するときの責務は本 ADR に従う。多重レビューを足す変更、および第2層に主観的再レビューを持ち込む変更は本 ADR と矛盾する。
-- 本モデルの実効化は「第2層の staffing」「サブレーン返送経路の堅牢化」「ADR 注入機構」を前提とし、これらは #15631 で分解・追跡する。
-- 成功条件は「全機構を作り込んで production-ready 宣言」ではなく、**最小の3階層 (第2層1人 + 第3層サブレーン1対) で実在の1 US を最後まで通す**こと。
+- 本モデルの実効化は「第2層の staffing」「サブレーン返送経路の堅牢化」「ADR 注入機構」を前提とし、これらは #15631 で分解・追跡する。(現状 2026-08-19: 前2者は上記トレードオフ節の現状更新のとおり実質達成、ADR 注入機構は未着手のハーネス整備項目のまま。)
+- 成功条件は「全機構を作り込んで production-ready 宣言」ではなく、**最小の3階層 (第2層1人 + 第3層サブレーン1対) で実在の1 US を最後まで通す**こと。**この成功条件は 2026-08-19 に完全形で達成された** (判定 anchor: #15631 j#108127、実証 US #15703。以後 #15709 / #15710 / #15711 でも同型で再現)。達成は「モデルが実運用可能」の実証であり、本 ADR の ratify (文面裁定) は別途 owner の行為として残る。
 - status は proposed。owner の文面裁定 anchor が成立するまで active な ADR として扱わない。適用範囲は本 repo (repo-local 宣言)。中央 preset / OSS 配布物は本 ADR では変更しない。
