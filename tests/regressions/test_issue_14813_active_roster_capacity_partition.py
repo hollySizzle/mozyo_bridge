@@ -20,6 +20,7 @@ Fixed by commit ``69049e2c``'s successor on ``issue_14813_active_roster_projecti
 from __future__ import annotations
 
 import sys
+import tempfile
 import unittest
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -27,6 +28,8 @@ from typing import Optional, Tuple
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
+
+from tests.support.process_home_pin import pin_process_home  # noqa: E402
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
     glance_snapshot_source as source,
@@ -463,6 +466,12 @@ class ClosedStatusSurvivesTheNoGatePathTest(unittest.TestCase):
     Runs through `active_lane_snapshots` and `cmd_workflow_glance`, not the fold, because the
     reversal happened in the snapshot builder and only shows up on the CLI surface.
     """
+
+    def setUp(self) -> None:
+        # cmd_workflow_glance builds its stores through the AMBIENT process home; unpinned,
+        # the run creates state.sqlite in the operator home and the verdict couples to
+        # whatever lane rows that shared store already holds (#15711).
+        pin_process_home(self, Path(tempfile.mkdtemp()))
 
     def _record(self, issue: str, *, issue_open: bool):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.glance_snapshot_source import (  # noqa: E501

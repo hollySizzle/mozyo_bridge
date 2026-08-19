@@ -40,6 +40,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ForwardSendOutcome,
     execute_herdr_forward,
 )
+from tests.support.process_home_pin import pin_process_home
 
 WS = "e1487dcb1f2d4412b28e825fdeccf9e8"
 CODEX = "codex"
@@ -347,10 +348,11 @@ class CompletionHookTest(unittest.TestCase):
     the next forward send; a failed / stale / drifted callback never advances."""
 
     def setUp(self):
-        import os
         self.home = Path(tempfile.mkdtemp())
-        os.environ["MOZYO_BRIDGE_HOME"] = str(self.home)
-        self.addCleanup(lambda: os.environ.pop("MOZYO_BRIDGE_HOME", None))
+        # pin_process_home restores the caller's exact MOZYO_BRIDGE_HOME; the previous
+        # set-then-pop left the variable ABSENT for every later test in the process, which
+        # un-pinned the remainder of a raw run onto the fallback home (#15711).
+        pin_process_home(self, self.home)
         self.fence = ForwardOutboxFence(home=self.home)
         self.fence.bootstrap()
         self.route = ForwardRouteKey(WS, "default", "grandparent_coordinator", "project_gateway", "")
@@ -522,7 +524,6 @@ class ReceiverVisibleRoundtripTest(unittest.TestCase):
         self.assertFalse(any("Forward action id" in l for l in c.record_lines()))
 
     def test_end_to_end_id_roundtrip_completes_the_generation(self):
-        import os
         import re
         import argparse as _ap
         from unittest.mock import patch
@@ -530,8 +531,8 @@ class ReceiverVisibleRoundtripTest(unittest.TestCase):
             herdr_workflow_step as hws,
         )
         home = Path(tempfile.mkdtemp())
-        os.environ["MOZYO_BRIDGE_HOME"] = str(home)
-        self.addCleanup(lambda: os.environ.pop("MOZYO_BRIDGE_HOME", None))
+        # Restore-not-pop, as in CompletionHookTest.setUp (#15711).
+        pin_process_home(self, home)
         fence = ForwardOutboxFence(home=home)
         fence.bootstrap()
         route = ForwardRouteKey(WS, "default", "grandparent_coordinator", "project_gateway", "")

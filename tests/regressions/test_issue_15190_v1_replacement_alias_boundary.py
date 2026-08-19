@@ -53,6 +53,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.applica
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.coordinator_placement_mode import (  # noqa: E501
     DEFAULT_COORDINATOR_PLACEMENT_MODE,
 )
+from tests.support.process_home_pin import pin_process_home
 
 CANONICAL_ID = "ddd145b984ea4bc6ba842f72d4d4161f"
 NESTED_ID = "262468a689664fb08615f56b5ef1afe1"
@@ -95,6 +96,12 @@ class V1ReplacementAliasBoundaryTest(unittest.TestCase):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.base = Path(self._tmp.name).resolve()
+        # _run_lock_held acquires session_start_gate(mozyo_bridge_home()); unpinned, that
+        # takes the lease inside the operator's live home on a raw run (#15711). The gate
+        # demands an owner-only, rename-stable directory, so give it one.
+        gate_home = self.base / "mozyo-home"
+        gate_home.mkdir(mode=0o700)
+        pin_process_home(self, gate_home)
         self.canonical = self.base / "repo"
         self.canonical.mkdir()
         subprocess.run(

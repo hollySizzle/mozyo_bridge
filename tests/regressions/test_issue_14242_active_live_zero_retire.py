@@ -37,6 +37,8 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
+from tests.support.process_home_pin import pin_process_home  # noqa: E402
+
 from mozyo_bridge.core.state.lane_release_observation import (  # noqa: E402
     build_release_observation,
 )
@@ -649,6 +651,10 @@ class PostTerminalLaunchAdmissionTest(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name) / "home"
         self.home.mkdir()
+        # _seed_active_bound's declare_lane runs the no-arg LaneDeclarationStore, whose
+        # lifecycle component resolves the AMBIENT home (state.sqlite) beside the explicit
+        # store_home; unpinned, that lands in the operator home on a raw run (#15711).
+        pin_process_home(self, self.home)
 
     def _admit(self, lane: str = _LANE):
         from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501

@@ -94,8 +94,12 @@ class TransportFailClosedTest(unittest.TestCase):
         # Redmine #13262: opt-in set (a transport exists) but no trusted base URL
         # -> the distinct `base_url_unset` reason, not the old collapsed
         # `provider_unavailable`.
+        # home= pins the credential-file leg to an empty dir: with the env cleared, the
+        # resolver would otherwise read the AMBIENT home's redmine-credentials.yaml — on a
+        # raw run, the operator's real credential file, whose base URL then sends this
+        # write onto the network (#15711).
         with patch.dict("os.environ", {API_KEY_ENV: API_KEY}, clear=True):
-            transport = RedmineNoteHttpTransport()
+            transport = RedmineNoteHttpTransport(home=Path(tempfile.mkdtemp()))
             with self.assertRaises(DeliveryTransportError) as ctx:
                 transport.post_issue_note("12347", "note body")
             self.assertEqual(PERSIST_BASE_URL_UNSET, ctx.exception.reason)
@@ -110,8 +114,11 @@ class TransportFailClosedTest(unittest.TestCase):
             self.assertEqual(PERSIST_BASE_URL_UNSET, ctx.exception.reason)
 
     def test_missing_api_key_is_credential_missing(self) -> None:
+        # Same ambient-home pin as above: without it, a raw run finds the operator's real
+        # API key in the home credential file and proceeds past this refusal to a live
+        # network PUT (#15711).
         with patch.dict("os.environ", {BASE_URL_ENV: TRUSTED_BASE}, clear=True):
-            transport = RedmineNoteHttpTransport()
+            transport = RedmineNoteHttpTransport(home=Path(tempfile.mkdtemp()))
             with self.assertRaises(DeliveryTransportError) as ctx:
                 transport.post_issue_note("12347", "note body")
             self.assertEqual(PERSIST_CREDENTIAL_MISSING, ctx.exception.reason)
