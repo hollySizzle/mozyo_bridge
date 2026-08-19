@@ -36,6 +36,7 @@ the recurrence with the same harness the diagnosis used.
 
 from __future__ import annotations
 
+import hashlib
 import os
 import stat
 import subprocess
@@ -84,7 +85,36 @@ exit 255
 """
 
 
-def _adversarial_environment(base: Path) -> tuple[dict[str, str], Path, Path, set[str]]:
+def _watched_snapshot(roots: dict[str, Path]) -> dict[str, tuple[str, int, str]]:
+    """Content-sensitive recursive snapshot of every watched home.
+
+    Review j#108212 finding_ambientwritesnapshot: a bare top-level name-set
+    comparison misses an in-place overwrite of a planted file (content / mode /
+    type change) and any write nested under an existing directory. Each entry
+    therefore records ``label:relative-path -> (type, permission bits, content
+    digest)``. Values carry only relative names, modes, and digests — never a
+    file's content or an operator path — so an assertion diff stays safe to
+    print.
+    """
+    state: dict[str, tuple[str, int, str]] = {}
+    for label, root in sorted(roots.items()):
+        for path in sorted(root.rglob("*")):
+            rel = f"{label}:{path.relative_to(root)}"
+            info = path.lstat()
+            mode = stat.S_IMODE(info.st_mode)
+            if stat.S_ISREG(info.st_mode):
+                digest = hashlib.sha256(path.read_bytes()).hexdigest()
+                state[rel] = ("file", mode, digest)
+            elif stat.S_ISDIR(info.st_mode):
+                state[rel] = ("dir", mode, "")
+            else:
+                state[rel] = ("other", mode, "")
+    return state
+
+
+def _adversarial_environment(
+    base: Path,
+) -> tuple[dict[str, str], dict[str, Path], Path, dict[str, tuple[str, int, str]]]:
     """Build the fake-ambient / fake-fallback / fence-root / ssh-shim world.
 
     Three harness-owned homes cover every resolution shape a test can take:
@@ -115,6 +145,11 @@ def _adversarial_environment(base: Path) -> tuple[dict[str, str], Path, Path, se
         directory.mkdir(parents=True)
     for home in (ambient, fallback_root, fallback, fence_root):
         home.chmod(0o700)
+    # A pre-existing subdirectory per home, as real homes have: a write nested under
+    # it changes no top-level name, so only the recursive snapshot can see it
+    # (review j#108212 finding_ambientwritesnapshot).
+    for home in (ambient, fallback, fence_root):
+        (home / "backups").mkdir(mode=0o700)
     sources = (
         "version: 1\n"
         "sources:\n"
@@ -141,20 +176,14 @@ def _adversarial_environment(base: Path) -> tuple[dict[str, str], Path, Path, se
     )
     env["MOZYO_15711_SSH_LOG"] = str(ssh_log)
     env["PATH"] = f"{shim_bin}{os.pathsep}{env.get('PATH', '')}"
-    planted = (
-        {p.name for p in ambient.iterdir()}
-        | {f"fallback:{p.name}" for p in fallback.iterdir()}
-        | {f"fence:{p.name}" for p in fence_root.iterdir()}
-    )
-    return env, ambient, ssh_log, planted
+    roots = {"ambient": ambient, "fallback": fallback, "fence": fence_root}
+    return env, roots, ssh_log, _watched_snapshot(roots)
 
 
 class FullSuiteAmbientCouplingTest(unittest.TestCase):
     def test_family_is_green_and_silent_under_the_adversarial_environment(self) -> None:
         base = Path(tempfile.mkdtemp())
-        env, ambient, ssh_log, planted = _adversarial_environment(base)
-        fallback = Path(env["HOME"]) / ".mozyo_bridge"
-        fence_root = Path(env["MOZYO_BRIDGE_TEST_HOME_FENCE"])
+        env, roots, ssh_log, planted = _adversarial_environment(base)
 
         proc = subprocess.run(
             [sys.executable, "-m", "unittest", *FAMILY_MODULES],
@@ -170,14 +199,10 @@ class FullSuiteAmbientCouplingTest(unittest.TestCase):
             "a family verdict coupled to the ambient home / remote sources:\n"
             + proc.stderr[-4000:],
         )
-        # No ambient write into any watched home: the pinned per-test homes own every
-        # store the family touches.
-        after = (
-            {p.name for p in ambient.iterdir()}
-            | {f"fallback:{p.name}" for p in fallback.iterdir()}
-            | {f"fence:{p.name}" for p in fence_root.iterdir()}
-        )
-        self.assertEqual(after, planted)
+        # No ambient write into any watched home — content-sensitively: the recursive
+        # (path, type, mode, digest) snapshot also rejects an in-place overwrite of a
+        # planted file and a write nested under an existing directory (j#108212).
+        self.assertEqual(_watched_snapshot(roots), planted)
         # And not one outbound ssh spawn: the multi-source branch must never be entered
         # from a test, so the recording shim stays silent.
         self.assertFalse(
@@ -185,12 +210,45 @@ class FullSuiteAmbientCouplingTest(unittest.TestCase):
             "a test spawned ssh toward a configured remote source",
         )
 
+    def test_snapshot_rejects_inplace_overwrite_and_nested_write(self) -> None:
+        # Negative control for the watched-home comparison (j#108212
+        # finding_ambientwritesnapshot): each escape the old name-set comparison was
+        # blind to must flip the snapshot. No suite run is needed — this pins the
+        # detector itself, so a future weakening of the snapshot goes red here.
+        base = Path(tempfile.mkdtemp())
+        _env, roots, _ssh_log, planted = _adversarial_environment(base)
+        ambient = roots["ambient"]
+
+        # Same-length in-place overwrite of a planted file: name, size, and top-level
+        # listing all stay identical; only the content digest can catch it.
+        target = ambient / "unit-board-sources.yaml"
+        original = target.read_bytes()
+        target.write_bytes(original[:-1] + (b"#" if original[-1:] != b"#" else b";"))
+        self.assertNotEqual(_watched_snapshot(roots), planted)
+        target.write_bytes(original)
+        self.assertEqual(_watched_snapshot(roots), planted)
+
+        # A write nested under a pre-existing directory: the top-level name set of
+        # every root is unchanged; only the recursive walk can catch it.
+        nested = ambient / "backups" / "state-writeback.sqlite"
+        nested.write_bytes(b"nested-write-control")
+        self.assertNotEqual(_watched_snapshot(roots), planted)
+        nested.unlink()
+        self.assertEqual(_watched_snapshot(roots), planted)
+
+        # A permission flip on a planted credential trap: same name, same content.
+        credential = ambient / "redmine-credentials.yaml"
+        credential.chmod(0o644)
+        self.assertNotEqual(_watched_snapshot(roots), planted)
+        credential.chmod(0o600)
+        self.assertEqual(_watched_snapshot(roots), planted)
+
     def test_forward_send_cleanup_restores_the_callers_home_pin(self) -> None:
         # The defect was restore-vs-pop: after the module ran, MOZYO_BRIDGE_HOME was
         # ABSENT, un-pinning the remainder of the process. Run the module in a nested
         # interpreter with a sentinel pin and require the sentinel to survive.
         base = Path(tempfile.mkdtemp())
-        env, _ambient, _ssh_log, _planted = _adversarial_environment(base)
+        env, _roots, _ssh_log, _planted = _adversarial_environment(base)
         sentinel = env["MOZYO_BRIDGE_HOME"]
         bootstrap = (
             "import os, sys, unittest\n"
