@@ -29,11 +29,6 @@ from pathlib import Path
 
 from mozyo_bridge.application.cli_common import add_repo_option
 from mozyo_bridge.application.repo_local_config_loader import repo_local_config_path
-from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application.cli_config import (  # noqa: E501
-    _atomic_write,
-    _dump_v2,
-    _load_raw_record,
-)
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.lane_placement import (  # noqa: E501
     LANE_PLACEMENT_LANE_CLASSES,
     LANE_PLACEMENT_RATIO_MAX,
@@ -43,12 +38,9 @@ from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.
     HERDR_API_GAPS,
     LAYOUT_PRESETS,
     LIVE_EFFECT_MATRIX,
-    LayoutPresetError,
-    apply_preset_to_lane_placement,
     classify_effective_preset,
 )
 from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.domain.repo_local_config import (  # noqa: E501
-    RepoLocalConfig,
     RepoLocalConfigError,
 )
 
@@ -261,126 +253,88 @@ def cmd_layout_preset_status(args) -> int:
 
 
 def cmd_layout_preset_apply(args) -> int:
-    """Handle ``layout preset apply`` — preview (default) or write the declaration."""
+    """Handle ``layout preset apply`` — argument reading, rendering, exit-code mapping.
+
+    The whole load → expand → re-validate → preview / atomic-write flow is owned by
+    :class:`~.layout_preset_apply.LayoutPresetApplyService` behind the config-document
+    port (j#108183 finding_oopboundary); this handler only builds the typed input,
+    projects the typed result to human / JSON output, and maps ``result.ok`` to the
+    exit code. Every success rendering — including the already-matching no-op — carries
+    the typed live-effect boundary (j#108183 finding_liveeffect).
+    """
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application.layout_preset_apply import (  # noqa: E501
+        LayoutPresetApplyInput,
+        LayoutPresetApplyService,
+        YamlConfigDocumentAdapter,
+    )
+
     as_json = bool(getattr(args, "json", False))
-    write = bool(getattr(args, "write", False))
     path = repo_local_config_path(getattr(args, "repo", None))
-
-    try:
-        raw_record = _load_raw_record(path)
-    except RepoLocalConfigError as exc:
-        if as_json:
-            print(json.dumps({"ok": False, "error": str(exc)}))
-        else:
-            print(f"layout preset apply: cannot read {path}: {exc}", file=sys.stderr)
-        return 1
-    if raw_record is None:
-        raw_record = {}
-    if not isinstance(raw_record, dict):
-        msg = (
-            f"layout preset apply: {path} is not a YAML mapping; refusing to rewrite it"
-        )
-        if as_json:
-            print(json.dumps({"ok": False, "error": msg}))
-        else:
-            print(msg, file=sys.stderr)
-        return 1
-
-    try:
-        application = apply_preset_to_lane_placement(
-            raw_record.get("lane_placement"),
-            preset=getattr(args, "preset_name"),
+    service = LayoutPresetApplyService(YamlConfigDocumentAdapter(path))
+    result = service.apply(
+        LayoutPresetApplyInput(
+            preset_name=getattr(args, "preset_name"),
             ratio=getattr(args, "ratio", None),
+            write=bool(getattr(args, "write", False)),
         )
-    except LayoutPresetError as exc:
+    )
+
+    if not result.ok:
         if as_json:
-            print(json.dumps({"ok": False, "error": str(exc)}))
+            print(json.dumps({"ok": False, "status": result.status, "error": result.error}))
         else:
-            print(f"layout preset apply: {exc}", file=sys.stderr)
+            print(f"layout preset apply: {result.error}", file=sys.stderr)
         return 1
 
-    # The rewrite touches EXACTLY the `lane_placement` key (#15708 acceptance 2: a
-    # display / placement declaration must never reach any other block).
-    new_record = dict(raw_record)
-    new_record["lane_placement"] = {
-        key: (dict(value) if isinstance(value, dict) else value)
-        for key, value in application.lane_placement_record.items()
-    }
-
-    # Re-validate the WHOLE produced config through the same fail-closed loader every
-    # command uses, before anything could be written (mirrors `config migrate`).
-    try:
-        RepoLocalConfig.from_record(new_record)
-    except RepoLocalConfigError as exc:
-        msg = f"layout preset apply: refusing to write an invalid config: {exc}"
-        if as_json:
-            print(json.dumps({"ok": False, "error": msg}))
-        else:
-            print(msg, file=sys.stderr)
-        return 1
-
-    payload = {
-        "ok": True,
-        "path": str(path),
-        "preset": application.preset,
-        "split": application.split,
-        "ratio": application.ratio,
-        "already_matching": application.already_matching,
-        "changes": list(application.changes),
-        "shadowed_by_lane_kind": list(application.shadowed_lane_kinds),
-        "written": False,
-        **_live_effect_payload(),
-    }
-
-    if application.already_matching:
-        if as_json:
-            print(json.dumps(payload))
-        else:
-            print(
-                f"layout preset apply: {path} already declares preset "
-                f"'{application.preset}'; nothing to do."
-            )
-            _print_shadow_warning(application.shadowed_lane_kinds)
-        return 0
-
-    if not write:
-        document = _dump_v2(new_record)
-        if as_json:
-            payload["document"] = document
-            print(json.dumps(payload))
-        else:
-            print(f"layout preset apply (dry-run): {path}")
-            for change in application.changes:
-                print(f"  - {change}")
-            _print_shadow_warning(application.shadowed_lane_kinds)
-            _print_live_effect()
-            print("\n--- would write ---")
-            print(document, end="" if document.endswith("\n") else "\n")
-            print("--- end (pass --write to apply) ---")
-        return 0
-
-    try:
-        backup = _atomic_write(path, _dump_v2(new_record))
-    except OSError as exc:
-        msg = f"layout preset apply: could not write {path}: {exc}"
-        if as_json:
-            print(json.dumps({"ok": False, "error": msg}))
-        else:
-            print(msg, file=sys.stderr)
-        return 1
-
-    payload["written"] = True
-    payload["backup"] = str(backup) if backup.exists() else None
     if as_json:
+        payload = {
+            "ok": True,
+            "status": result.status,
+            "path": str(result.path),
+            "preset": result.preset,
+            "split": result.split,
+            "ratio": result.ratio,
+            "already_matching": result.status == "already_matching",
+            "changes": list(result.changes),
+            "shadowed_by_lane_kind": list(result.shadowed_by_lane_kind),
+            "written": result.status == "written",
+            **_live_effect_payload(),
+        }
+        if result.status == "previewed":
+            payload["document"] = result.document
+        if result.status == "written":
+            payload["backup"] = str(result.backup) if result.backup else None
         print(json.dumps(payload))
-    else:
-        print(f"layout preset apply: wrote {path} (preset '{application.preset}').")
-        if backup.exists():
-            print(f"  backup: {backup}")
-        for change in application.changes:
-            print(f"  - {change}")
-        _print_shadow_warning(application.shadowed_lane_kinds)
+        return 0
+
+    if result.status == "already_matching":
+        print(
+            f"layout preset apply: {result.path} already declares preset "
+            f"'{result.preset}'; nothing to do."
+        )
+        _print_shadow_warning(result.shadowed_by_lane_kind)
         _print_live_effect()
+        return 0
+
+    if result.status == "previewed":
+        document = result.document or ""
+        print(f"layout preset apply (dry-run): {result.path}")
+        for change in result.changes:
+            print(f"  - {change}")
+        _print_shadow_warning(result.shadowed_by_lane_kind)
+        _print_live_effect()
+        print("\n--- would write ---")
+        print(document, end="" if document.endswith("\n") else "\n")
+        print("--- end (pass --write to apply) ---")
+        return 0
+
+    print(f"layout preset apply: wrote {result.path} (preset '{result.preset}').")
+    if result.backup:
+        print(f"  backup: {result.backup}")
+    for change in result.changes:
+        print(f"  - {change}")
+    _print_shadow_warning(result.shadowed_by_lane_kind)
+    _print_live_effect()
     return 0
 
 
