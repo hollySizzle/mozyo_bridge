@@ -244,10 +244,15 @@ def verified_terminal_generation_token(
     """Return the launch token only when its atomic participant receipt owns terminal.
 
     The durable generation row binds the action token to the logical slot and locator.
-    The completed startup transaction binds that same token to the ``pane_bound_v2``
-    receipt written from the prepared pane's own response.  Requiring the current
-    terminal id to match that receipt prevents a restored terminal from borrowing the
-    stale token of the process that previously occupied the same name and locator.
+    The startup transaction binds that same token to the ``pane_bound_v2`` receipt
+    written from the prepared pane's own response.  Requiring the current terminal id
+    to match that receipt prevents a restored terminal from borrowing the stale token
+    of the process that previously occupied the same name and locator.  Because this
+    wrapper always supplies the receipt proof, it also accepts the live-preserved
+    ``rollback_owed`` shape that
+    :func:`~mozyo_bridge.core.state.herdr_launch_generation.completed_generation_startup_token`
+    documents (Redmine #15712) — the settle-time health debt of a pair whose launched
+    slot verifiably attested and still owns its exact terminal.
     """
     expected_terminal = norm(terminal_id)
     if not expected_terminal:
