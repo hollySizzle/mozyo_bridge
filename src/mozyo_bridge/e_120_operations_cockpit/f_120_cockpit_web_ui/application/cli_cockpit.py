@@ -105,6 +105,16 @@ def register(sub) -> None:
     )
     layout_apply.set_defaults(func=cmd_layout_apply)
 
+    # `layout preset` (Redmine #15708): declarative pair-geometry preset switching.
+    # The handlers live with the `lane_placement` schema they rewrite
+    # (governance_distribution f_140); only the parser wiring sits here so the
+    # subcommand lands under the existing `layout` group.
+    from mozyo_bridge.e_130_governance_distribution.f_140_rules_docs_catalog.application.cli_layout_preset import (  # noqa: E501
+        register_preset,
+    )
+
+    register_preset(layout_sub)
+
     cockpit = sub.add_parser(
         "cockpit",
         help=(
