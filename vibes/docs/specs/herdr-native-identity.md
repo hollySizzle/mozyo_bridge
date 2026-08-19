@@ -415,6 +415,18 @@ side effectだという証拠を持たない。そのため、そのpairへのHe
 receiptやlaunch generationは更新されない。DB retryやschema migrationも過去のterminal provenanceを生成できず、
 既存live pairを自動的に強いauthorityへ昇格させない。
 
+上記の`pane_bound_v1`不採用とは別に、**v2 receipt / attested generationを持つのにstartup transactionが
+`rollback_owed`のまま清算不能になったpair**は、queue-enter delivery側の照合で受理される (Redmine #15712)。
+settle時のbounded health probeがslot boot (実測: default-lane coordinator relaunchのClaude Code起動) を
+待ちきれず`owed`と記帳した後も、conditional-close primitiveを持たないruntimeではrollback railがpresent
+participantを保存するため、pairはlive / attested / generation-finalizedのままactionだけが恒久に
+`completed_success`へ到達できない。この形は識別証明の欠落ではなく完了記帳の欠落なので、
+`completed_generation_startup_token`は`rollback_owed`を次の**全conjunct**が成立する場合に限り受理する:
+participant exact一致 (assigned_name / locator / not closed)、caller供給の**terminal-bound receipt照合の
+成立** (照合を供給できないcallerは従来どおり`completed_success`のみ)、同actionのexecution eventsに当該
+participant自身の`attestation_write_succeeded`があること。`completed_rolled_back` / mid-startup phase /
+foreign・stale terminal / pending generationは従来どおりfail-closedであり、caller主張はどこにも入らない。
+
 lifecycle rowを持たない**非default scratch pair**だけは、exact candidate runtimeを使い、次の公開railでv2へ
 置き換えられる。1行目はread-only preflightであり、green判定とこのpairを閉じる明示承認の後にだけ2行目を実行する。
 positive absence / retired proofを確認してからfresh startへ進む。
