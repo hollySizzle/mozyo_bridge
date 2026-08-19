@@ -13,7 +13,7 @@ agents:
         - claude-fable-5
         sublane:
         - --model
-        - claude-fable-5
+        - claude-opus-5
     coordination:
       provider: codex
       launch_argv:
