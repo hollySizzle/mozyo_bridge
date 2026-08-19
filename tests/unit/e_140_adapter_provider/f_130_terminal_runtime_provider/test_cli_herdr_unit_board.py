@@ -40,6 +40,7 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     MetadataSyncLockError,
     unit_board_metadata_lock,
 )
+from tests.support.process_home_pin import pin_process_home
 
 
 WORKSPACE_ID = "a" * 32
@@ -113,6 +114,12 @@ def runtime(rows, *, runner=None, parsed=None) -> HerdrUnitBoardRuntime:
 
 
 class HerdrUnitBoardRuntimeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # The default metadata sync lock lives under the AMBIENT process home
+        # (.herdr-unit-board-metadata.lock); unpinned, a runtime built without an explicit
+        # sync_lock_factory writes it into the operator home on a raw run (#15711).
+        pin_process_home(self, Path(tempfile.mkdtemp()))
+
     def test_lane_kind_join_decorates_work_label_display_only(self) -> None:
         # #15704: the lifecycle-store kind join reaches the board's work label
         # (and thereby the pane title) for a non-default lane.
@@ -1143,6 +1150,14 @@ class HerdrUnitBoardRuntimeTests(unittest.TestCase):
 
 
 class HerdrUnitBoardCliTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # show/watch without --local-only read the AMBIENT home's unit-board-sources.yaml;
+        # with the operator's real sources declared, the multi-source branch bypasses the
+        # mocked _runtime and spawns a REAL `ssh <target> mozyo-bridge herdr unit-board show`
+        # per remote source — and the watch loop (mocked time.sleep) can spin it unboundedly
+        # (#15711). A pinned empty home is the local-only default the mocks assume.
+        pin_process_home(self, Path(tempfile.mkdtemp()))
+
     def parser(self) -> argparse.ArgumentParser:
         parser = argparse.ArgumentParser()
         sub = parser.add_subparsers(dest="group", required=True)

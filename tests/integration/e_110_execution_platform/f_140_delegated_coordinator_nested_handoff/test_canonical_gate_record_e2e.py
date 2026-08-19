@@ -36,6 +36,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.redmine_journal_source import (
     RedmineJournalEntry,
 )
+from tests.support.process_home_pin import pin_process_home
 
 
 class _CapturingTransport:
@@ -67,6 +68,10 @@ class CanonicalGateRecordE2ETest(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
+        # The production emit-gate entrypoint enqueues a supervisor wake hint through the
+        # AMBIENT process home (supervisor-wake.sqlite); unpinned, that lands in the
+        # operator home on a raw run (#15711).
+        pin_process_home(self, Path(self._tmp.name))
         self.outbox = CallbackOutbox(path=Path(self._tmp.name) / "wf.sqlite")
 
     def test_recorded_gate_is_discovered_and_delivered_once(self):

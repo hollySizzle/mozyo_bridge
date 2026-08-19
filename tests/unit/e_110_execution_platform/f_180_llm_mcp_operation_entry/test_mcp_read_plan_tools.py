@@ -13,11 +13,14 @@ from __future__ import annotations
 
 import ast
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
+
+from tests.support.process_home_pin import pin_process_home  # noqa: E402
 
 from mozyo_bridge.e_110_execution_platform.f_180_llm_mcp_operation_entry.application import (  # noqa: E402,E501
     read_plan_tools,
@@ -143,6 +146,12 @@ class DocsResolveTests(unittest.TestCase):
 
 
 class WorkflowGlanceTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # run_workflow_glance builds its default stores through the AMBIENT process home
+        # (reconcile state.sqlite is created read-write); unpinned, that lands in the
+        # operator home on a raw run (#15711).
+        pin_process_home(self, Path(tempfile.mkdtemp()))
+
     def test_a_glance_with_no_reachable_source_reports_degraded_not_empty(self) -> None:
         outcome = run_workflow_glance(
             {"issues": ["15151"]},

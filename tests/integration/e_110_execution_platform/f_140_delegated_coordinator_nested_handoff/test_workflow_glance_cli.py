@@ -35,6 +35,7 @@ from mozyo_bridge.core.state.herdr_delivery_ledger import (
     HerdrDeliveryLedgerRecord,
 )
 from mozyo_bridge.core.state.workflow_runtime_store import WorkflowRuntimeStore
+from tests.support.process_home_pin import pin_process_home
 
 
 def _run(argv):
@@ -157,6 +158,9 @@ class ActiveLanesRedmineFoldTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
+        # The glance source wiring also opens the AMBIENT reconcile store (state.sqlite)
+        # read-write; unpinned, that creates it in the operator home on a raw run (#15711).
+        pin_process_home(self, Path(self._tmp.name))
         self.store_path = Path(self._tmp.name) / "workflow-runtime.sqlite"  # left empty
         _pin_residue_read_empty(self)
         self.redmine = Path(self._tmp.name) / "redmine.json"
@@ -271,6 +275,8 @@ class ActiveLanesStoreAdvisoryTest(unittest.TestCase):
         _pin_residue_read_empty(self)
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
+        # Same ambient reconcile-store coupling as ActiveLanesRedmineFoldTest (#15711).
+        pin_process_home(self, Path(self._tmp.name))
         self.store_path = Path(self._tmp.name) / "workflow-runtime.sqlite"
         self.ledger_path = Path(self._tmp.name) / "herdr-delivery-ledger.sqlite"
 

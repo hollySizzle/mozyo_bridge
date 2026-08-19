@@ -13,7 +13,12 @@ from __future__ import annotations
 
 import dataclasses
 import errno
+import sys
 import unittest
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.e_150_quality_architecture.f_150_ci_verification.domain.test_disk_pressure import (
     PRESSURE_NOTE,
