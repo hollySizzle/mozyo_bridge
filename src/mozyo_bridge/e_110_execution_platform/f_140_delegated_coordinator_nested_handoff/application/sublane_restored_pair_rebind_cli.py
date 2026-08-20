@@ -100,7 +100,8 @@ def register_sublane_rebind_restored_pair_parser(sublane_sub: Any) -> None:
             "participant locator when the pane moved) from server-owned inventory "
             "facts, recording the old->new lineage in the outcome. Default is a "
             "read-only preflight; --execute writes only the lifecycle pin snapshot / "
-            "generation row / participant locator (never a close / launch / send / "
+            "generation row / startup participant (locator + re-minted pane_bound_v2 "
+            "receipt) / attestation record (never a close / launch / send / "
             "worktree change; lane_generation is unchanged)."
         ),
     )
@@ -131,8 +132,9 @@ def register_sublane_rebind_restored_pair_parser(sublane_sub: Any) -> None:
         "--execute",
         action="store_true",
         help=(
-            "Perform the declared_slots CAS write when every fail-closed gate "
-            "passes. Default: read-only preflight, zero-write."
+            "Perform the re-attest CAS writes (declared slots, generation rows, "
+            "startup participant locator + receipt, attestation record) when every "
+            "fail-closed gate passes. Default: read-only preflight, zero-write."
         ),
     )
     add_repo_option(parser)

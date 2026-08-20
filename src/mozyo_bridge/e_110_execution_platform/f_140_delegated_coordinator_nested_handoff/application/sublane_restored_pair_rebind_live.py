@@ -174,6 +174,11 @@ class _SlotResult:
     reasons: list
     reattest: Optional[SlotReattestPlan] = None
     skipped: bool = False
+    #: #15769 round 3: the slot is fully repaired already (live-bound, no stale
+    #: axis). It contributes no blocking reason — a partially-completed pair's
+    #: retry must finish the OTHER slot — and only an ALL-current run is the
+    #: pair-level typed no-op refusal.
+    already_current: bool = False
 
 
 @dataclass(frozen=True)
@@ -322,6 +327,7 @@ class LiveRestoredPairRebindOps:
         allow_missing: bool = False,
     ) -> _SlotResult:
         reasons: list[str] = []
+        already_current = False
         assigned = _norm(declared.assigned_name)
         declared_locator = _norm(declared.locator)
         want_provider = _norm(expected_provider)
@@ -488,10 +494,13 @@ class LiveRestoredPairRebindOps:
                         # to act on.
                         pass
                     elif gen_state == GEN_LIVE_BOUND:
-                        # Nothing is stale on any axis: typed no-op.
-                        reasons.append(
-                            slot_reason(REBIND_SLOT_TERMINAL_UNCHANGED, slot_role)
-                        )
+                        # Nothing is stale on any axis. NOT a blocking reason
+                        # (review j#108879 finding_partialpairretrydeadlocks): a
+                        # retry after a partial-pair failure must pass this
+                        # already-repaired slot through and finish the other
+                        # one. The pair-level aggregation refuses only when
+                        # EVERY slot is current.
+                        already_current = True
                     else:
                         # Nothing drifted: the declared pin already IS the live
                         # generation, so a rebind has no evidence to act on.
@@ -602,7 +611,9 @@ class LiveRestoredPairRebindOps:
             reason=",".join(reasons),
             generation_state=gen_state,
         )
-        return _SlotResult(slot_plan, pin, reasons, reattest=reattest)
+        return _SlotResult(
+            slot_plan, pin, reasons, reattest=reattest, already_current=already_current
+        )
 
     # -- the single observation join ------------------------------------------
 
@@ -761,6 +772,21 @@ class LiveRestoredPairRebindOps:
             if result.reattest is not None
         )
         new_slots = (gateway_pin, worker_pin)
+        if not slot_reattests and new_slots == old_slots:
+            # Every resolvable slot is already current and no pin moves: the
+            # true pair-level no-op (review j#108879: only an ALL-current run
+            # refuses; a partially-repaired pair keeps going instead).
+            for result, role in (
+                (gateway_result, _PIN_ROLE_GATEWAY),
+                (worker_result, _PIN_ROLE_WORKER),
+            ):
+                if result.already_current:
+                    reasons.append(slot_reason(REBIND_SLOT_TERMINAL_UNCHANGED, role))
+            if not reasons:
+                reasons.append(
+                    slot_reason(REBIND_SLOT_TERMINAL_UNCHANGED, _PIN_ROLE_GATEWAY)
+                )
+            return blocked(**slot_fields)
         return _RebindContext(
             RestoredPairRebindPlan(
                 issue=issue,

@@ -455,6 +455,40 @@ class PreservedPaneReattest(_Base):
         self.assertIn("terminal_unchanged_noop:gateway", joined)
         self.assertIn("terminal_unchanged_noop:worker", joined)
 
+    def test_retry_after_a_partial_pair_failure_finishes_the_other_slot(self):
+        # Review j#108879 finding_partialpairretrydeadlocks: after the gateway
+        # slot commits and the worker slot fails, the retry must NOT classify
+        # the repaired gateway as the pair-blocking no-op — it passes the
+        # current slot through and finishes the worker.
+        from unittest import mock
+
+        from mozyo_bridge.core.state.herdr_launch_generation import (
+            HerdrLaunchGenerationStore as _Store,
+        )
+
+        self.seed_launch_time_pair()
+        ops = _TestOps(self.home, _preserved_pane_rows())
+        real = _Store.reattest_restored_terminal
+
+        def worker_explodes(store, **kwargs):
+            if kwargs.get("assigned_name") == WK_NAME:
+                raise RuntimeError("injected worker failure")
+            return real(store, **kwargs)
+
+        with mock.patch.object(_Store, "reattest_restored_terminal", worker_explodes):
+            first = self.run_rail(ops, execute=True)
+        self.assertFalse(first.applied)
+        self.assertIn("slot_reattest_refused:worker", first.detail)
+        # Slot 1 (gateway) committed; the worker row is still stale.
+        self.assertEqual(self.generation(GW_NAME).terminal_id, GW_TERM_NEW)
+        self.assertEqual(self.generation(WK_NAME).terminal_id, WK_TERM_OLD)
+        # The retry (no injection) finishes the worker instead of deadlocking
+        # on the already-repaired gateway.
+        second = self.run_rail(ops, execute=True)
+        self.assertEqual(second.status, STATUS_COMPLETED, second.detail)
+        self.assertTrue(second.applied)
+        self.assertEqual(self.generation(WK_NAME).terminal_id, WK_TERM_NEW)
+
 
 class MovedPaneReattest(_Base):
     """Shape B: the restore moved the panes — pins + generation + participant."""
