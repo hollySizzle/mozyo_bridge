@@ -258,6 +258,7 @@ class LaneDeclarationStore:
         issue_id: str,
         worktree_identity: str,
         declared_slots: Sequence[ProcessGenerationPin] = (),
+        lane_kind: str = "",
         now: Optional[str] = None,
     ) -> CasOutcome:
         """Fill the MISSING binding fields of an existing ``active`` issue owner row (#13809).
@@ -271,7 +272,12 @@ class LaneDeclarationStore:
 
         - a **pre-#13754** row with an empty ``worktree_identity`` (and empty ``declared_slots``);
         - a **v4 → v5 migrated** row whose ``worktree_identity`` was set at #13754 but whose
-          ``declared_slots`` snapshot is empty (a pins-only gap).
+          ``declared_slots`` snapshot is empty (a pins-only gap);
+        - a **supersede-minted recovery row** (Redmine #15774) whose ``lane_kind`` is
+          deliberately empty (``supersede_and_activate`` never guesses geometry): the
+          creating caller's own ``--lane-kind`` assertion fills it here, empty-to-value
+          only — a non-empty different kind is a divergent re-declare and stays a
+          zero-write refusal.
 
         This surface fills whichever binding field(s) are empty via an exact
         ``expected_revision`` CAS, so the gate-verified live worktree + typed pins land on the
@@ -311,6 +317,11 @@ class LaneDeclarationStore:
             )
         pinned = validate_declared_slots(tuple(declared_slots))
         encoded_slots = encode_declared_slots(pinned)
+        # Checked byte-exact like declare_lane (review j#85852 F1); "" means "no assertion".
+        geometry_kind = (
+            optional_lane_kind(lane_kind, source="backfill_active_binding(lane_kind=)")
+            or ""
+        )
         stamp = now or _utc_now()
         # Redmine #13844 R2: a binding backfill is a schema-needing mutation — open via the shared
         # explicit write gate (preflight FIRST, then backup-first migration).
@@ -362,25 +373,43 @@ class LaneDeclarationStore:
                     revision=current.revision,
                 )
             if (
+                geometry_kind
+                and current.lane_kind
+                and current.lane_kind != geometry_kind
+            ):
+                # A stored geometry kind is part of the declaration identity (#13647 v7):
+                # a different non-empty assertion is divergent, never edited (#15774).
+                conn.execute("ROLLBACK")
+                return CasOutcome(
+                    applied=False,
+                    reason=CAS_ALREADY_DECLARED,
+                    revision=current.revision,
+                )
+            filled_kind = current.lane_kind or geometry_kind
+            if (
                 current.worktree_identity == worktree
                 and current.declared_slots == encoded_slots
+                and current.lane_kind == filled_kind
             ):
-                # Nothing missing: both fields are already exactly present -> idempotent no-op.
+                # Nothing missing: every field is already exactly present -> idempotent no-op.
                 conn.execute("ROLLBACK")
                 return CasOutcome(
                     applied=True, reason=CAS_APPLIED, revision=current.revision
                 )
-            # Fill the missing field(s): an empty worktree binding and/or an empty declared-
-            # slot snapshot (the pins-only v4->v5 gap, review j#79015 F2). A field already
+            # Fill the missing field(s): an empty worktree binding, an empty declared-
+            # slot snapshot (the pins-only v4->v5 gap, review j#79015 F2), and/or an empty
+            # geometry kind (the supersede-minted recovery row, #15774). A field already
             # exactly present is rewritten to the same value.
             revision = current.revision + 1
             conn.execute(
                 f"UPDATE {_TABLE} SET worktree_identity = ?, declared_slots = ?, "
+                "lane_kind = ?, "
                 "revision = ?, updated_at = ? "
                 "WHERE repo_workspace_id = ? AND lane_id = ? AND revision = ?",
                 (
                     worktree,
                     encoded_slots,
+                    filled_kind,
                     revision,
                     stamp,
                     key.repo_workspace_id,

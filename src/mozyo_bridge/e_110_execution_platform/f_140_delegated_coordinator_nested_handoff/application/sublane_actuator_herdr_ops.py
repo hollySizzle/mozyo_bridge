@@ -537,6 +537,7 @@ class HerdrSublaneActuatorOps:
             lane_id=lane_id,
             providers=providers,
             rows=rows,
+            lane_kind=self.lane_kind or "",  # #15774: kind reaches the adopt declare/backfill
         )
         if outcome == ADOPT_DECL_DECLARE_ERROR:
             print(
