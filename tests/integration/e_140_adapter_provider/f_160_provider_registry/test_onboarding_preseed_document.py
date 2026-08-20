@@ -7,12 +7,18 @@ lives in that join. Hermetic throughout: every document is inside a per-test tem
 directory and the environment is passed in explicitly, so nothing reads or writes the
 operator's real home.
 
-The central claim is narrow and non-obvious: **a document that already carries the
-declared defaults is never opened for writing**, so an operator who has already
-onboarded gets a byte-identical file — mtime included — out of every managed launch.
-That is asserted directly rather than inferred from a status token, because "we returned
-already_complete" and "we did not touch the file" are different statements and only the
-second one is the guarantee.
+The central claim is narrow and non-obvious: **a document whose completion flags are
+already honored is never opened for writing** (completion semantics per verdict
+j#108694), so an operator who has already onboarded gets a byte-identical file — mtime
+included — out of every managed launch. That is asserted directly rather than inferred
+from a status token, because "we returned already_complete" and "we did not touch the
+file" are different statements and only the second one is the guarantee.
+
+Since review j#108680 finding_filesystemportboundary the use case takes a filesystem
+port; these tests deliberately keep calling it with the DEFAULT (the real local
+adapter), so the ``os.link`` create-new, the ``os.replace`` merge, real modes, and real
+mtimes stay covered. The decision flow's branch coverage against a fake port lives in
+``tests/unit/.../test_agent_provider_onboarding_preseed.py``.
 """
 
 from __future__ import annotations
@@ -132,6 +138,42 @@ class OnboardingPreseedDocumentTests(unittest.TestCase):
         self.assertNotIn("theme", outcome.seeded_keys)
         # A seed neither widens nor narrows the mode the operator chose.
         self.assertEqual(os.stat(self.primary).st_mode & 0o777, 0o644)
+
+    def test_a_false_completion_flag_is_reseeded_to_true(self) -> None:
+        # Review j#108680 finding_completionstateaspresence (verdict j#108694): the r1
+        # presence check called this document — in front of which the onboarding screen
+        # absolutely renders — "already complete" and returned byte-invariant. The flag
+        # must be re-placed; the operator's own theme stays theirs.
+        with open(self.primary, "w", encoding="utf-8") as handle:
+            json.dump(
+                {"hasCompletedOnboarding": False, "theme": "light", "numStartups": 9},
+                handle,
+            )
+
+        outcome = preseed_provider_onboarding("claude", {"HOME": self.home})
+
+        self.assertEqual(outcome.status, SEED_STATUS_SEEDED)
+        self.assertEqual(outcome.seeded_keys, ("hasCompletedOnboarding",))
+        merged = self._read()
+        self.assertIs(merged["hasCompletedOnboarding"], True)
+        self.assertEqual(merged["theme"], "light")
+        self.assertEqual(merged["numStartups"], 9)
+
+    def test_honored_flags_leave_the_file_alone_even_without_a_theme(self) -> None:
+        # Completion is decided by the flags alone (verdict j#108694): a provider that
+        # has recorded onboarding as done never re-asks the theme question, so this
+        # document is complete and stays byte-identical — mtime included — despite the
+        # declared `theme` default being absent.
+        body = '{\n  "hasCompletedOnboarding": true\n}\n'
+        with open(self.primary, "w", encoding="utf-8") as handle:
+            handle.write(body)
+        before_mtime = os.stat(self.primary).st_mtime_ns
+
+        outcome = preseed_provider_onboarding("claude", {"HOME": self.home})
+
+        self.assertEqual(outcome.status, SEED_STATUS_ALREADY_COMPLETE)
+        self.assertEqual(self._text(), body)
+        self.assertEqual(os.stat(self.primary).st_mtime_ns, before_mtime)
 
     # --- document resolution --------------------------------------------------------
 

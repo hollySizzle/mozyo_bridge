@@ -522,6 +522,24 @@ class BoundedSelfLookupTest(unittest.TestCase):
         self.assertEqual(reason, "binary_unresolved")
 
 
+#: Patch target that pins the onboarding seed to its byte-invariant "nothing declared"
+#: outcome, for CLI tests whose subject is NOT the seed. Since verdict j#108694 the
+#: seed outcome gates the exec, so a test env without a usable HOME would otherwise die
+#: at the seed gate before reaching the behavior under test. The gate's own contract is
+#: asserted in :class:`OnboardingSeedGateTest`.
+_NEUTRAL_SEED_PATCH = dict(
+    target=(
+        "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+        "application.herdr_agent_attest.seed_provider_onboarding"
+    ),
+    return_value="not_declared",
+)
+
+
+def _neutral_seed():
+    return patch(_NEUTRAL_SEED_PATCH["target"], return_value=_NEUTRAL_SEED_PATCH["return_value"])
+
+
 class CmdAgentAttestTest(unittest.TestCase):
     def _args(self, provider_argv, replacement_action_id=""):
         return argparse.Namespace(
@@ -552,7 +570,7 @@ class CmdAgentAttestTest(unittest.TestCase):
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_agent_attest.bounded_self_lookup",
             return_value=("wY:p2", TERMINAL_ID, "self_lookup_succeeded", ""),
-        ), patch("os.execvp") as execvp:
+        ), _neutral_seed(), patch("os.execvp") as execvp:
             execvp.side_effect = SystemExit(0)
             with self.assertRaises(SystemExit):
                 cmd_herdr_agent_attest(
@@ -571,7 +589,7 @@ class CmdAgentAttestTest(unittest.TestCase):
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_agent_attest.bounded_self_lookup",
             return_value=("wY:p2", TERMINAL_ID, "self_lookup_succeeded", ""),
-        ), patch(
+        ), _neutral_seed(), patch(
             "os.execvp"
         ) as execvp:
             # Simulate exec replacing the process (so the unreachable guard is not hit).
@@ -594,6 +612,164 @@ class CmdAgentAttestTest(unittest.TestCase):
         assert_cli_diagnostics(
             self, diagnostics, [("error", MISSING_PROVIDER_ARGV_MESSAGE, 2)]
         )
+
+
+class OnboardingSeedGateTest(unittest.TestCase):
+    """A launch whose onboarding seed did not land is refused BEFORE the provider exec.
+
+    Redmine #15744 review j#108680 finding_seedfailurenotgatingexec, verdict j#108694 —
+    which OVERRULED the r1 "a failed seed never gates the exec" contract (previously
+    pinned by the regression file's ``test_a_failed_seed_still_lets_the_provider_boot``):
+    booting anyway renders the exact first-run screen the seed exists to remove, where
+    the #13760 admission gate then refuses to send and the lane stalls silently
+    (#15722 j#108276). The refusal is typed (``die`` + a ``provider_exec_rejected``
+    event, reason ``onboarding_seed_failed``) so it surfaces as a startup failure the
+    launcher's health probe reports immediately.
+    """
+
+    _PRESEED_TARGET = (
+        "mozyo_bridge.e_140_adapter_provider.f_160_provider_registry."
+        "application.agent_provider_onboarding_preseed.preseed_provider_onboarding"
+    )
+
+    def _args(self):
+        return argparse.Namespace(
+            assigned_name=NAME,
+            workspace_id="ws1",
+            role="claude",
+            lane="default",
+            provider_argv=["--", "claude"],
+        )
+
+    def _run_wrapper(self, preseed_effect):
+        """Drive the real CLI entry with the seed USE CASE replaced, recording events.
+
+        The seam is the lazily imported ``preseed_provider_onboarding`` — one layer
+        below :func:`seed_provider_onboarding` — so the wrapper's own token handling
+        and gate run for real.
+        """
+        events: list[tuple[str, str]] = []
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            "os.environ",
+            {"HOME": tmp, "MOZYO_BRIDGE_HOME": tmp, "MOZYO_HERDR_BINARY": "/x/herdr"},
+            clear=True,
+        ), patch(
+            self._PRESEED_TARGET, side_effect=preseed_effect
+        ), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_agent_attest._build_event_appender",
+            return_value=lambda stage, bounded_reason="": events.append(
+                (stage, bounded_reason)
+            ),
+        ), patch(
+            "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
+            "application.herdr_agent_attest.bounded_self_lookup",
+            return_value=("wY:p2", TERMINAL_ID, "self_lookup_succeeded", ""),
+        ), patch(
+            "os.execvp"
+        ) as execvp:
+            execvp.side_effect = SystemExit(0)
+            with observed_cli_diagnostics() as diagnostics:
+                with self.assertRaises(SystemExit) as raised:
+                    cmd_herdr_agent_attest(self._args())
+        return events, execvp, diagnostics, raised.exception
+
+    @staticmethod
+    def _seed_outcome(status: str):
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_onboarding_preseed import (  # noqa: E501
+            OnboardingSeedOutcome,
+        )
+
+        return lambda provider_id, env: OnboardingSeedOutcome(status=status)
+
+    def _seed_refusal_message(self, status: str) -> str:
+        return (
+            "the provider's first-run onboarding pre-seed did not land "
+            f"(seed status: {status}); refusing to launch a provider that would boot "
+            "into its onboarding screen instead of a composer (Redmine #15744)"
+        )
+
+    def test_a_failed_seed_refuses_the_exec_with_a_typed_error(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_onboarding_preseed import (  # noqa: E501
+            SEED_STATUS_FAILED,
+        )
+
+        events, execvp, diagnostics, exit_exc = self._run_wrapper(
+            self._seed_outcome(SEED_STATUS_FAILED)
+        )
+
+        execvp.assert_not_called()
+        self.assertEqual(exit_exc.code, 2)
+        assert_cli_diagnostics(
+            self,
+            diagnostics,
+            [("error", self._seed_refusal_message(SEED_STATUS_FAILED), 2)],
+        )
+        # The refusal is on the projection too, typed: the seed failure row and then
+        # the exec rejection naming the seed as the reason.
+        from mozyo_bridge.core.state.startup_execution_events import (
+            STAGE_ONBOARDING_SEED_FAILED,
+            STAGE_PROVIDER_EXEC_CALL_REACHED,
+            STAGE_PROVIDER_EXEC_REJECTED,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_attest import (  # noqa: E501
+            EXEC_REASON_ONBOARDING_SEED_FAILED,
+        )
+
+        self.assertIn(
+            (STAGE_PROVIDER_EXEC_REJECTED, EXEC_REASON_ONBOARDING_SEED_FAILED), events
+        )
+        stages = [stage for stage, _reason in events]
+        self.assertIn(STAGE_ONBOARDING_SEED_FAILED, stages)
+        self.assertNotIn(STAGE_PROVIDER_EXEC_CALL_REACHED, stages)
+
+    def test_a_raising_seed_path_refuses_the_exec_too(self) -> None:
+        # An unforeseen defect in the seed path is still typed (`seed_raised`) and
+        # still refuses: the membership gate fails closed on everything that is not a
+        # declared proceed status.
+        def _explode(provider_id, env):
+            raise RuntimeError("seed path defect")
+
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_agent_attest import (  # noqa: E501
+            SEED_REASON_SEED_RAISED,
+        )
+
+        events, execvp, diagnostics, exit_exc = self._run_wrapper(_explode)
+
+        execvp.assert_not_called()
+        self.assertEqual(exit_exc.code, 2)
+        assert_cli_diagnostics(
+            self,
+            diagnostics,
+            [("error", self._seed_refusal_message(SEED_REASON_SEED_RAISED), 2)],
+        )
+
+    def test_every_proceed_status_still_reaches_the_exec(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_onboarding_preseed import (  # noqa: E501
+            SEED_STATUS_ALREADY_COMPLETE,
+            SEED_STATUS_NOT_DECLARED,
+            SEED_STATUS_SEEDED,
+        )
+        from mozyo_bridge.core.state.startup_execution_events import (
+            STAGE_PROVIDER_EXEC_CALL_REACHED,
+        )
+
+        for status in (
+            SEED_STATUS_NOT_DECLARED,
+            SEED_STATUS_ALREADY_COMPLETE,
+            SEED_STATUS_SEEDED,
+        ):
+            with self.subTest(status=status):
+                events, execvp, diagnostics, exit_exc = self._run_wrapper(
+                    self._seed_outcome(status)
+                )
+                execvp.assert_called_once()
+                self.assertEqual(exit_exc.code, 0)
+                assert_cli_diagnostics(self, diagnostics, [])
+                self.assertIn(
+                    STAGE_PROVIDER_EXEC_CALL_REACHED,
+                    [stage for stage, _reason in events],
+                )
 
 
 def _install_real_exe(directory: str, name: str) -> str:
@@ -712,7 +888,7 @@ class CmdAgentAttestArgv0DecouplingTest(unittest.TestCase):
             "mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider."
             "application.herdr_agent_attest.record_identity_attestation",
             return_value=None,
-        ), patch("os.execv") as execv, patch("os.execvp") as execvp:
+        ), _neutral_seed(), patch("os.execv") as execv, patch("os.execvp") as execvp:
             execv.side_effect = SystemExit(0)
             execvp.side_effect = SystemExit(0)
             with self.assertRaises(SystemExit):

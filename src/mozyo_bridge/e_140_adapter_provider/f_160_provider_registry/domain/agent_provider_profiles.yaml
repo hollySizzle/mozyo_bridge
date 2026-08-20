@@ -126,9 +126,10 @@ profiles:
     # documented first-run defaults into the provider's OWN config document before the
     # provider process starts.
     #
-    # This is NOT auto-answering the UI, and the schema enforces the difference: no
-    # credential, no login state, and no trust / permission acceptance may be declared
-    # here (`FORBIDDEN_SEED_KEY_SUBSTRINGS`). `login_required`,
+    # This is NOT auto-answering the UI, and the schema enforces the difference: only
+    # the exact known-safe UI-default keys are seedable at all (`ALLOWED_SEED_KEYS`,
+    # default deny per #15744 verdict j#108694), so no credential, no login state, and
+    # no trust / permission acceptance can be declared here. `login_required`,
     # `workspace_trust_confirmation` and `directory_trust_confirmation` therefore remain
     # exactly what they were — operator-resolved blockers — and only the cosmetic
     # first-run question is pre-answered by configuration.

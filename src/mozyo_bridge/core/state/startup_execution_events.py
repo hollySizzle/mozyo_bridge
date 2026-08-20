@@ -131,9 +131,10 @@ STAGE_PROVIDER_EXEC_FAILED = "provider_exec_failed"
 #: Redmine #15744: the wrapper wrote the provider's declared first-run onboarding
 #: defaults into the provider's own config document before the exec.
 STAGE_ONBOARDING_SEED_APPLIED = "onboarding_seed_applied"
-#: The seed could not be applied, with a value-free reason. Recorded because the operator
-#: may then meet an onboarding screen, and "why was the pane blocked" must be answerable
-#: from the projection rather than from a guess.
+#: The seed could not be applied, with a value-free reason naming WHICH seed step
+#: failed. Since #15744 verdict j#108694 the wrapper then refuses the provider exec
+#: (a `provider_exec_rejected` row follows, reason `onboarding_seed_failed`), so "why
+#: did the launch stop" is answerable from the projection rather than from a guess.
 STAGE_ONBOARDING_SEED_FAILED = "onboarding_seed_failed"
 
 #: The closed, ordered set of recognized stage tokens. An unrecognized stage is refused

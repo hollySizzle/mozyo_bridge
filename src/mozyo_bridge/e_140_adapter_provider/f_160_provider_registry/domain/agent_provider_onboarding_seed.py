@@ -98,17 +98,32 @@ _SEED_KEY_RE = re.compile(r"\A[A-Za-z_][A-Za-z0-9_-]*\Z")
 #: Document ids are tokens a typed outcome may name, so they follow the same shape.
 _DOCUMENT_ID_RE = re.compile(r"\A[a-z_][a-z0-9_]*\Z")
 
+#: The exact, exhaustive set of keys a seed may install — the fence that DECIDES
+#: (Redmine #15744 review j#108680 finding_semantickeyfencebypassable, verdict j#108694).
+#: The first shape of this fence was the substring blacklist below, and the review
+#: demonstrated it admits authorisation-shaped keys that carry none of the substrings
+#: (``loggedIn``, ``termsAccepted``, ``accountIdentity``). A blacklist can only refuse
+#: the vocabularies its author foresaw; the reviewable claim a profile makes by
+#: declaring a key is "this is a known-safe first-run UI default", and only an
+#: enumeration of the known-safe keys can hold that claim. So the fence is now an
+#: EXACT allowlist and the default is deny: a key absent from this set is refused,
+#: whatever it looks like. Growing it is deliberately a reviewed source diff, never a
+#: data-only profile edit. Matched case-sensitively — the provider's config keys are
+#: case-sensitive, and admitting a respelling would admit a key the provider does not
+#: actually read.
+ALLOWED_SEED_KEYS: frozenset[str] = frozenset({"hasCompletedOnboarding", "theme"})
+
 #: Substrings that make a key an authentication or authorisation state rather than a UI
 #: default. Matched case-insensitively against the whole key, so ``oauthAccount``,
 #: ``primaryApiKey``, ``hasTrustDialogAccepted``, and their spellings in a future
 #: provider are all refused without this schema enumerating provider vocabularies.
 #:
-#: This is a *fence*, not a classifier: it cannot prove a key is harmless, only refuse
-#: the families this block must never install. The reviewable claim a profile makes by
-#: declaring a key is still "this is a first-run UI default"; the fence exists so that
-#: claim cannot be quietly violated by a data-only edit. It deliberately over-refuses
-#: (``key`` also catches ``keychain`` / ``keyboardShortcuts``): a provider that genuinely
-#: needs such a default should have to change this set in a reviewed diff.
+#: Since verdict j#108694 this set is an *additional guard*, kept for its specific
+#: error messages and as a tripwire on future allowlist growth (an allowlisted key that
+#: ever matched one of these families would be refused here first, in a reviewed diff's
+#: face); :data:`ALLOWED_SEED_KEYS` is what decides admission. It deliberately
+#: over-refuses (``key`` also catches ``keychain`` / ``keyboardShortcuts``), which is
+#: harmless under a default-deny allowlist.
 FORBIDDEN_SEED_KEY_SUBSTRINGS: frozenset[str] = frozenset(
     {
         "apikey",
@@ -252,12 +267,19 @@ class OnboardingSeedDocument:
                     f"agent provider profile {provider_id!r} onboarding_seed document "
                     f"{field_name!r} must be a string, got {type(value).__name__}"
                 )
+        # `create_when_absent` is handed through UNCOERCED (review j#108680
+        # finding_createflagtypecoercion, verdict j#108694): the earlier
+        # ``bool(record.get(...))`` turned the YAML/JSON string ``"false"`` into True —
+        # truthiness inverting the declared meaning — and made ``__post_init__``'s own
+        # strict isinstance check unreachable. The raw value now reaches that check, so
+        # anything but an actual bool (or absence, defaulting to False) fails closed
+        # with the typed profile error.
         return cls(
             document_id=record["id"],
             base_env=record.get("base_env") or "",
             base_home_relative=record.get("base_home_relative") or "",
             filename=record["filename"],
-            create_when_absent=bool(record.get("create_when_absent", False)),
+            create_when_absent=record.get("create_when_absent", False),
         )
 
 
@@ -291,6 +313,19 @@ def _validate_seed_key(key: object, *, provider_id: str) -> str:
                 f"trust acceptance stays an operator-resolved startup blocker "
                 f"(Redmine #13760 境界, restated by #15744)"
             )
+    if key not in ALLOWED_SEED_KEYS:
+        # The deciding fence (review j#108680 finding_semantickeyfencebypassable,
+        # verdict j#108694): default deny. The guards above give the credential / trust
+        # families their specific refusals; everything else — including an
+        # authorisation-shaped key that dodges every substring (``loggedIn``,
+        # ``termsAccepted``, ``accountIdentity``) — stops here.
+        raise _seed_error(
+            f"agent provider profile {provider_id!r} may not seed {key!r}: only the "
+            f"known-safe first-run UI defaults {sorted(ALLOWED_SEED_KEYS)} are seedable. "
+            f"Admission is an exact allowlist (default deny); a new UI default must be "
+            f"added to ALLOWED_SEED_KEYS in a reviewed source diff, never smuggled in "
+            f"through a data-only profile edit (Redmine #15744 verdict j#108694)"
+        )
     return key
 
 
@@ -320,6 +355,87 @@ def _validate_seed_value(
         f"agent provider profile {provider_id!r} onboarding_seed value for {key!r} must "
         f"be a boolean, integer, or string, got {type(value).__name__}. A nested value "
         f"would let a seed reach a per-project sub-document"
+    )
+
+
+@dataclass(frozen=True)
+class OnboardingSeedEvaluation:
+    """One document's completion verdict against a declaration (pure value; no I/O).
+
+    ``complete`` is the *do-not-open-for-writing* verdict: the non-destructive contract
+    ("an already-onboarded config is byte-identical, mtime included") hangs off exactly
+    this bit, so what "complete" means lives here in the domain, not in the writer.
+
+    ``unsatisfied_keys`` are the declared ``(key, value)`` pairs the seed must place,
+    in declaration order. Non-empty exactly when ``complete`` is False.
+    """
+
+    complete: bool
+    unsatisfied_keys: tuple[tuple[str, OnboardingSeedValue], ...]
+
+
+def _seed_key_satisfied(
+    declared_value: OnboardingSeedValue, current_value: object, *, present: bool
+) -> bool:
+    """Whether one declared default is already honored by the document's current value.
+
+    The per-key semantics fixed by verdict j#108694 (review j#108680
+    finding_completionstateaspresence):
+
+    - a **boolean-declared** key is satisfied only by the exact value ``True`` — the
+      provider tests its completion flag strictly, so a present-but-``False`` / ``None``
+      / ``1`` flag leaves the onboarding screen rendering exactly as an absent one does;
+    - a **string-declared** key is satisfied by ANY existing non-empty string — the
+      operator's own choice (a ``theme`` they picked) is respected and NEVER overwritten;
+      only absence / ``None`` / ``""`` takes the declared default;
+    - any other declared scalar (an int) is satisfied by presence, the pre-verdict
+      semantics, because no stricter contract has been ruled for it.
+    """
+    if isinstance(declared_value, bool):
+        return current_value is True
+    if isinstance(declared_value, str):
+        return isinstance(current_value, str) and current_value != ""
+    return present
+
+
+def evaluate_onboarding_completion(
+    declared: Mapping[str, OnboardingSeedValue],
+    body: Mapping[str, object],
+) -> OnboardingSeedEvaluation:
+    """Judge one parsed config document against the declared defaults (pure; no I/O).
+
+    Redmine #15744 review j#108680 finding_completionstateaspresence, fixed per verdict
+    j#108694. The first implementation asked only whether every declared KEY was
+    PRESENT, which mistook ``{"hasCompletedOnboarding": false}`` — a provider state in
+    which the onboarding screen absolutely renders — for "already onboarded" and
+    returned the byte-invariant outcome while the symptom survived.
+
+    Completion is decided by the **completion flags**: every declared key whose declared
+    value is boolean ``True``. The document is complete iff ALL of them are already
+    exactly ``True`` — and then it is complete *even when other declared keys (theme)
+    are absent*, because a provider that has recorded onboarding as done never re-asks
+    the theme question, so writing the remaining defaults would touch an operator's
+    settled config for nothing.
+
+    A declaration with NO boolean-``True`` key has no completion flag to read, so it
+    falls back to the previous presence semantics: complete iff every declared key is
+    present, and only the absent ones are unsatisfied.
+    """
+    flags = [key for key, value in declared.items() if value is True]
+    if flags:
+        if all(body.get(key) is True for key in flags):
+            return OnboardingSeedEvaluation(complete=True, unsatisfied_keys=())
+        unsatisfied = tuple(
+            (key, value)
+            for key, value in declared.items()
+            if not _seed_key_satisfied(value, body.get(key), present=key in body)
+        )
+        return OnboardingSeedEvaluation(complete=False, unsatisfied_keys=unsatisfied)
+    missing = tuple(
+        (key, value) for key, value in declared.items() if key not in body
+    )
+    return OnboardingSeedEvaluation(
+        complete=not missing, unsatisfied_keys=missing
     )
 
 
@@ -476,6 +592,7 @@ def parse_onboarding_seed(
 
 
 __all__ = (
+    "ALLOWED_SEED_KEYS",
     "FORBIDDEN_SEED_KEYS",
     "FORBIDDEN_SEED_KEY_SUBSTRINGS",
     "MAX_SEED_DOCUMENTS",
@@ -485,6 +602,8 @@ __all__ = (
     "VERSIONS_WITHOUT_ONBOARDING_SEED",
     "OnboardingSeedDeclaration",
     "OnboardingSeedDocument",
+    "OnboardingSeedEvaluation",
     "OnboardingSeedValue",
+    "evaluate_onboarding_completion",
     "parse_onboarding_seed",
 )

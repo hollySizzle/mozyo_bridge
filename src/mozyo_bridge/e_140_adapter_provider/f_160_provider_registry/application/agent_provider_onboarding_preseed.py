@@ -3,8 +3,8 @@
 The use case behind the ``onboarding_seed`` profile block
 (:mod:`...domain.agent_provider_onboarding_seed`). It resolves the provider's own config
 document from the trusted environment, and — only when the provider's own declared
-first-run defaults are ABSENT — writes them, so the provider boots straight to a
-composer instead of an onboarding screen.
+first-run defaults are not yet honored — writes them, so the provider boots straight to
+a composer instead of an onboarding screen.
 
 WHY THIS EXISTS. #13760 taught the launch layer to recognise pre-composer startup
 screens and refuse to send into them. That made the failure honest but did not remove
@@ -20,32 +20,49 @@ provider's UI — is untouched here, and the difference is not a matter of degre
 - a seed acts on a *config document*, before any process is running, writing values the
   provider itself documents as its defaults.
 
-The schema is what keeps that distinction from eroding: a seed may not declare a
-credential, a login state, or a trust / permission acceptance, so the screens that
-matter (``login_required``, ``workspace_trust_confirmation``,
-``directory_trust_confirmation``) remain operator-resolved no matter what a future
-profile edit tries to add.
+The schema is what keeps that distinction from eroding: a seed may only declare a key on
+the exact known-safe allowlist (never a credential, a login state, or a trust /
+permission acceptance), so the screens that matter (``login_required``,
+``workspace_trust_confirmation``, ``directory_trust_confirmation``) remain
+operator-resolved no matter what a future profile edit tries to add.
 
-**Non-destructive by construction.** A key that is already present is never rewritten,
-and when NO declared key is missing the document is not opened for writing at all — so
-an already-onboarded operator's config is byte-identical after a managed launch,
-including its formatting and its mtime. That is the acceptance criterion this module is
-built around, not an optimisation.
+**Non-destructive by construction.** What "already onboarded" means is the domain's
+:func:`...agent_provider_onboarding_seed.evaluate_onboarding_completion` (review
+j#108680 finding_completionstateaspresence, verdict j#108694): a document whose
+completion FLAGS are all exactly ``True`` is complete and is not opened for writing at
+all — byte-identical, formatting and mtime included. A document whose flags are not
+honored (absent, ``False``, ``None``, a non-``true`` scalar) is seeded on every
+unsatisfied key, while an operator's own non-empty string value (their ``theme``) is
+never overwritten. That contract is what this module is built around, not an
+optimisation.
+
+**Filesystem access goes through a port.** The use case holds the decision flow and the
+typed outcomes; every filesystem side effect is behind
+:class:`OnboardingDocumentFilesystem` (a ``typing.Protocol``), with
+:class:`LocalOnboardingDocumentFilesystem` as the injected-by-default live adapter
+(review j#108680 finding_filesystemportboundary, verdict j#108694 — the
+object-oriented-architecture-policy port/adapter boundary). Unit tests express the
+decision flow against a fake port; the adapter's own semantics — the race-free
+``os.link`` create-new and the atomic ``os.replace`` — are asserted against real temp
+directories.
 
 **Honest limit on concurrency.** A fresh document is created race-free (a temp file
 linked into place, which fails rather than clobbers if another writer won). Merging into
 an EXISTING document is atomic in the filesystem sense (``os.replace``, so no reader ever
 sees a torn file) but is a read-modify-write, so a provider process writing the same
 document in the same instant could have its update overwritten. That window is only
-reachable while the document exists AND still lacks a declared key — i.e. while a
-provider is mid-onboarding, which is precisely the state a managed launch is not
+reachable while the document exists AND still fails the completion evaluation — i.e.
+while a provider is mid-onboarding, which is precisely the state a managed launch is not
 supposed to be racing. It is not closed by a lock here because the provider does not
 take one this code could share; naming the limit is more useful than a lock that would
 imply a mutual exclusion that does not exist.
 
-**Never raises, never blocks the boot.** Every outcome is a typed, value-free token. The
-caller is the startup wrapper, and a config that cannot be seeded must degrade to "the
-operator may see an onboarding screen", never to a dead pane.
+**Never raises; the caller decides what a failure costs.** Every outcome is a typed,
+value-free token. The caller is the startup wrapper, and since verdict j#108694
+(finding_seedfailurenotgatingexec) a ``failed`` outcome REFUSES the provider exec there
+— a broken seed path surfaces as a typed startup failure instead of a silent
+first-run-UI stall — so the tokens this module returns are launch-gating and must stay
+exact.
 """
 
 from __future__ import annotations
@@ -54,23 +71,25 @@ import json
 import os
 import tempfile
 from dataclasses import dataclass
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional, Protocol
 
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_onboarding_seed import (  # noqa: E501
     OnboardingSeedDeclaration,
     OnboardingSeedDocument,
+    evaluate_onboarding_completion,
 )
 
 #: The provider declares no seed (Codex today), or is not a registered provider at all.
 #: The byte-invariant outcome: nothing was read, nothing was written.
 SEED_STATUS_NOT_DECLARED = "not_declared"
-#: Every declared default was already present. **No write was attempted** — the
+#: Every completion flag was already exactly honored. **No write was attempted** — the
 #: already-onboarded config is byte-identical, mtime included.
 SEED_STATUS_ALREADY_COMPLETE = "already_complete"
-#: At least one declared default was missing and the document now carries it.
+#: At least one declared default was unsatisfied and the document now carries it.
 SEED_STATUS_SEEDED = "seeded"
-#: The seed could not be applied. The provider still launches; the operator may meet the
-#: onboarding screen, which is the pre-#15744 behavior and never worse than it.
+#: The seed could not be applied. Since verdict j#108694 the wrapper REFUSES the
+#: provider exec on this token (typed startup failure), so a broken seed path can never
+#: degrade into the silent first-run-UI stall #15722 j#108276 documented.
 SEED_STATUS_FAILED = "failed"
 
 #: No usable absolute home directory in the passed environment, so no document location
@@ -98,11 +117,147 @@ _CREATED_DOCUMENT_MODE = 0o600
 #: Mode for a base directory this code creates, for the same reason.
 _CREATED_BASE_MODE = 0o700
 
-#: Private sentinel: the race-free create lost to another writer, so the document now
-#: exists and the caller should re-read and merge. Deliberately NOT one of the public
-#: ``SEED_REASON_*`` tokens — it never reaches an outcome, because it describes a step
-#: this module recovers from rather than a state a caller has to reason about.
-_RACE_LOST = "race_lost"
+
+@dataclass(frozen=True)
+class OnboardingDocumentStat:
+    """The two facts the seed needs about an existing document (value object).
+
+    ``owner_is_caller`` is the foreign-owner boundary: writing another account's
+    provider config is outside what a managed launch may do, whatever the filesystem
+    permits. ``mode`` (permission bits only) is carried onto a replacement so a seed
+    never widens, and never narrows, what the operator chose for the file.
+    """
+
+    owner_is_caller: bool
+    mode: int
+
+
+class OnboardingDocumentFilesystem(Protocol):
+    """Filesystem port for the onboarding pre-seed (review j#108680
+    finding_filesystemportboundary, verdict j#108694).
+
+    Exactly the operations the use case performs, no more: existence probing for
+    document selection, reading a document's text, reading its ownership + mode,
+    ensuring its base directory, the race-free create-new, and the atomic replace.
+    The decision flow (JSON parsing, completion evaluation, typed reason mapping)
+    stays in the use case; adapters signal failure with the ``OSError`` family —
+    ``FileNotFoundError`` for an absent document on read, ``FileExistsError`` for a
+    lost create-new race — and the use case maps those to the typed ``SEED_REASON_*``
+    tokens, so a fake port expresses a failure the same way the real filesystem does.
+    """
+
+    def document_exists(self, path: str) -> bool:
+        """Whether a candidate document exists at ``path`` (document selection)."""
+        ...
+
+    def read_document_text(self, path: str) -> str:
+        """``path``'s text (UTF-8). Raises ``FileNotFoundError`` when absent."""
+        ...
+
+    def stat_document(self, path: str) -> OnboardingDocumentStat:
+        """Ownership + permission bits of the existing document at ``path``."""
+        ...
+
+    def ensure_base_directory(self, base: str, mode: int) -> None:
+        """Make sure directory ``base`` exists (created dirs get ``mode``)."""
+        ...
+
+    def create_new_document(self, path: str, text: str, mode: int) -> None:
+        """Create ``path`` with ``text`` and ``mode``, atomically and never clobbering.
+
+        Raises ``FileExistsError`` when another writer got there first (the caller
+        re-reads and merges into what actually landed).
+        """
+        ...
+
+    def replace_document(self, path: str, text: str, mode: int) -> None:
+        """Atomically replace ``path``'s contents with ``text``, setting ``mode``."""
+        ...
+
+
+class LocalOnboardingDocumentFilesystem:
+    """The live :class:`OnboardingDocumentFilesystem` adapter (real local filesystem).
+
+    Holds the two write idioms whose exactness the contract depends on:
+
+    - **create-new** writes a temp file in the target directory and ``os.link``s it
+      into place — the atomic-create idiom (equivalent to an ``O_EXCL`` create), which
+      fails with ``FileExistsError`` if another writer won rather than overwriting
+      whatever they wrote. A filesystem that refuses ``os.link`` surfaces as a generic
+      ``OSError`` instead of being papered over with a clobbering ``os.replace``,
+      because silently overwriting a document another process just created is the one
+      outcome the idiom exists to prevent.
+    - **replace** writes a temp file and ``os.replace``s it over the target, so a
+      concurrent reader sees either the old document or the new one and never a torn
+      file.
+    """
+
+    def document_exists(self, path: str) -> bool:
+        return os.path.exists(path)
+
+    def read_document_text(self, path: str) -> str:
+        with open(path, "r", encoding="utf-8") as handle:
+            return handle.read()
+
+    def stat_document(self, path: str) -> OnboardingDocumentStat:
+        stat = os.stat(path)
+        return OnboardingDocumentStat(
+            owner_is_caller=stat.st_uid == os.geteuid(),
+            mode=stat.st_mode & 0o7777,
+        )
+
+    def ensure_base_directory(self, base: str, mode: int) -> None:
+        if os.path.isdir(base):
+            return
+        os.makedirs(base, mode=mode, exist_ok=True)
+        if not os.path.isdir(base):
+            raise NotADirectoryError(base)
+
+    def create_new_document(self, path: str, text: str, mode: int) -> None:
+        self._write_via_temp(path, text, mode, link_new=True)
+
+    def replace_document(self, path: str, text: str, mode: int) -> None:
+        self._write_via_temp(path, text, mode, link_new=False)
+
+    @staticmethod
+    def _write_via_temp(path: str, text: str, mode: int, *, link_new: bool) -> None:
+        """Write ``text`` to a same-directory temp file and land it on ``path``."""
+        base = os.path.dirname(path) or "."
+        handle = None
+        temp_path = ""
+        try:
+            fd, temp_path = tempfile.mkstemp(
+                dir=base, prefix=".mozyo-onboarding-seed-"
+            )
+            handle = os.fdopen(fd, "w", encoding="utf-8")
+            handle.write(text)
+            handle.flush()
+            os.fsync(handle.fileno())
+            handle.close()
+            handle = None
+            os.chmod(temp_path, mode)
+            if link_new:
+                os.link(temp_path, path)
+            else:
+                os.replace(temp_path, path)
+                temp_path = ""
+        finally:
+            if handle is not None:
+                try:
+                    handle.close()
+                except OSError:
+                    pass
+            if temp_path:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+
+#: The default injected adapter: existing callers (the startup wrapper) stay
+#: source-compatible and hit the real filesystem, which is the only one that exists at
+#: launch time. Stateless, so one shared instance is safe.
+_LOCAL_FILESYSTEM = LocalOnboardingDocumentFilesystem()
 
 
 @dataclass(frozen=True)
@@ -158,18 +313,23 @@ def _resolve_home(env: Mapping[str, str]) -> str:
     return home if home and os.path.isabs(home) else ""
 
 
-def _read_document(path: str) -> "tuple[Optional[dict], str]":
+def _read_document(
+    filesystem: OnboardingDocumentFilesystem, path: str
+) -> "tuple[Optional[dict], str]":
     """Read one JSON document: ``(mapping, reason)`` with exactly one meaningful half.
 
     ``(None, "")`` means the document does not exist — the create path. A non-empty
     reason means it exists but must not be rewritten.
     """
     try:
-        with open(path, "r", encoding="utf-8") as handle:
-            parsed = json.load(handle)
+        text = filesystem.read_document_text(path)
     except FileNotFoundError:
         return None, ""
-    except (OSError, ValueError, UnicodeDecodeError):
+    except (OSError, UnicodeDecodeError):
+        return None, SEED_REASON_DOCUMENT_UNREADABLE
+    try:
+        parsed = json.loads(text)
+    except ValueError:
         return None, SEED_REASON_DOCUMENT_UNREADABLE
     if not isinstance(parsed, dict):
         return None, SEED_REASON_DOCUMENT_NOT_MAPPING
@@ -177,7 +337,10 @@ def _read_document(path: str) -> "tuple[Optional[dict], str]":
 
 
 def _select_document(
-    declaration: OnboardingSeedDeclaration, env: Mapping[str, str], home: str
+    declaration: OnboardingSeedDeclaration,
+    env: Mapping[str, str],
+    home: str,
+    filesystem: OnboardingDocumentFilesystem,
 ) -> "tuple[OnboardingSeedDocument, str]":
     """The declared document to seed, and its absolute path.
 
@@ -188,106 +351,15 @@ def _select_document(
     """
     for document in declaration.documents:
         path = resolve_document_path(document, env, home)
-        if os.path.exists(path):
+        if filesystem.document_exists(path):
             return document, path
     creatable = declaration.creatable_document
     return creatable, resolve_document_path(creatable, env, home)
 
 
-def _ensure_base(path: str) -> str:
-    """Make sure the document's parent directory exists; return a failure reason or ``""``."""
-    base = os.path.dirname(path) or "."
-    if os.path.isdir(base):
-        return ""
-    try:
-        os.makedirs(base, mode=_CREATED_BASE_MODE, exist_ok=True)
-    except OSError:
-        return SEED_REASON_BASE_UNUSABLE
-    return "" if os.path.isdir(base) else SEED_REASON_BASE_UNUSABLE
-
-
-def _write_new_document(path: str, document_body: dict) -> str:
-    """Create ``path`` with ``document_body``, refusing to clobber. Returns a reason or ``""``.
-
-    Race-free by construction: the body is written to a temp file in the same directory
-    and ``os.link``ed into place, which fails with ``FileExistsError`` if another writer
-    got there first rather than overwriting whatever they wrote. The caller then falls
-    back to the merge path and re-reads what actually landed. Returns :data:`_RACE_LOST`
-    in that case — the one reason here that is not a caller-visible failure.
-
-    ``os.link`` within a single directory is the atomic-create idiom; a filesystem that
-    refuses it reaches the generic write failure rather than being papered over with a
-    clobbering ``os.replace``, because silently overwriting a document another process
-    just created is the one outcome this function exists to prevent.
-    """
-    base = os.path.dirname(path) or "."
-    handle = None
-    temp_path = ""
-    try:
-        fd, temp_path = tempfile.mkstemp(dir=base, prefix=".mozyo-onboarding-seed-")
-        handle = os.fdopen(fd, "w", encoding="utf-8")
-        json.dump(document_body, handle, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        handle.close()
-        handle = None
-        os.chmod(temp_path, _CREATED_DOCUMENT_MODE)
-        os.link(temp_path, path)
-    except FileExistsError:
-        return _RACE_LOST
-    except (OSError, ValueError, TypeError):
-        return SEED_REASON_WRITE_FAILED
-    finally:
-        if handle is not None:
-            try:
-                handle.close()
-            except OSError:
-                pass
-        if temp_path:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-    return ""
-
-
-def _replace_document(path: str, document_body: dict, preserve_mode: int) -> str:
-    """Atomically replace ``path``'s contents, keeping its existing mode. Reason or ``""``.
-
-    ``os.replace`` is atomic, so a concurrent reader sees either the old document or the
-    new one and never a partial write. The existing mode is carried onto the replacement
-    so a seed cannot widen (or narrow) what the operator chose for the file.
-    """
-    base = os.path.dirname(path) or "."
-    handle = None
-    temp_path = ""
-    try:
-        fd, temp_path = tempfile.mkstemp(dir=base, prefix=".mozyo-onboarding-seed-")
-        handle = os.fdopen(fd, "w", encoding="utf-8")
-        json.dump(document_body, handle, indent=2)
-        handle.write("\n")
-        handle.flush()
-        os.fsync(handle.fileno())
-        handle.close()
-        handle = None
-        os.chmod(temp_path, preserve_mode)
-        os.replace(temp_path, path)
-        temp_path = ""
-    except (OSError, ValueError, TypeError):
-        return SEED_REASON_WRITE_FAILED
-    finally:
-        if handle is not None:
-            try:
-                handle.close()
-            except OSError:
-                pass
-        if temp_path:
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-    return ""
+def _render_document(document_body: dict) -> str:
+    """The exact text a seeded document carries (the pre-port byte shape, unchanged)."""
+    return json.dumps(document_body, indent=2) + "\n"
 
 
 def _lookup_declaration(
@@ -314,17 +386,23 @@ def preseed_provider_onboarding(
     env: Mapping[str, str],
     *,
     profile_lookup: Optional[Callable[[str], Any]] = None,
+    filesystem: OnboardingDocumentFilesystem = _LOCAL_FILESYSTEM,
 ) -> OnboardingSeedOutcome:
     """Place ``provider_id``'s declared first-run defaults, idempotently. Never raises.
 
     Returns a typed :class:`OnboardingSeedOutcome`. The three non-failure shapes are all
     normal: ``not_declared`` (this provider has no seed — byte-invariant),
-    ``already_complete`` (nothing missing, and nothing written), and ``seeded``.
+    ``already_complete`` (every completion flag already honored, and nothing written),
+    and ``seeded``. A ``failed`` outcome gates the launch at the caller (verdict
+    j#108694), so the tokens are exact contract, not telemetry.
 
     ``env`` is the environment the provider will inherit; the caller passes
     ``os.environ`` from inside the launched process, which is the only place the
     provider's real ``HOME`` / config-relocation variables are truthfully readable — the
     same reason the identity self-attestation runs there (#13637).
+
+    ``filesystem`` is the port every side effect goes through; the default is the real
+    local adapter so the wrapper's call is unchanged.
     """
     declaration = _lookup_declaration(provider_id, profile_lookup)
     if declaration is None:
@@ -336,14 +414,14 @@ def preseed_provider_onboarding(
             status=SEED_STATUS_FAILED, reason=SEED_REASON_HOME_UNRESOLVED
         )
 
-    document, path = _select_document(declaration, env, home)
+    document, path = _select_document(declaration, env, home, filesystem)
     declared = declaration.completion_key_map
 
     # One retry: the create path can lose a race to another writer, and the honest
     # response is to re-read what actually landed and merge into it rather than to
     # report a failure the filesystem already resolved.
     for _attempt in (0, 1):
-        body, reason = _read_document(path)
+        body, reason = _read_document(filesystem, path)
         if reason:
             return OnboardingSeedOutcome(
                 status=SEED_STATUS_FAILED,
@@ -351,63 +429,72 @@ def preseed_provider_onboarding(
                 document_id=document.document_id,
             )
         if body is None:
-            base_reason = _ensure_base(path)
-            if base_reason:
+            try:
+                filesystem.ensure_base_directory(
+                    os.path.dirname(path) or ".", _CREATED_BASE_MODE
+                )
+            except OSError:
                 return OnboardingSeedOutcome(
                     status=SEED_STATUS_FAILED,
-                    reason=base_reason,
+                    reason=SEED_REASON_BASE_UNUSABLE,
                     document_id=document.document_id,
                 )
-            write_reason = _write_new_document(path, dict(declared))
-            if not write_reason:
-                return OnboardingSeedOutcome(
-                    status=SEED_STATUS_SEEDED,
-                    document_id=document.document_id,
-                    seeded_keys=tuple(declared),
+            try:
+                filesystem.create_new_document(
+                    path, _render_document(dict(declared)), _CREATED_DOCUMENT_MODE
                 )
-            if write_reason != _RACE_LOST:
+            except FileExistsError:
+                # Lost the create race — go around and merge into what the winner wrote.
+                continue
+            except (OSError, ValueError, TypeError):
                 return OnboardingSeedOutcome(
                     status=SEED_STATUS_FAILED,
-                    reason=write_reason,
+                    reason=SEED_REASON_WRITE_FAILED,
                     document_id=document.document_id,
                 )
-            # Lost the create race — go around and merge into what the winner wrote.
-            continue
+            return OnboardingSeedOutcome(
+                status=SEED_STATUS_SEEDED,
+                document_id=document.document_id,
+                seeded_keys=tuple(declared),
+            )
 
-        missing = {key: value for key, value in declared.items() if key not in body}
-        if not missing:
-            # The whole non-destructive contract: an already-onboarded document is not
-            # opened for writing, so it stays byte-identical down to its mtime.
+        evaluation = evaluate_onboarding_completion(declared, body)
+        if evaluation.complete:
+            # The whole non-destructive contract: a document whose completion flags are
+            # all honored is not opened for writing, so it stays byte-identical down to
+            # its mtime — even when a non-flag default (theme) is absent (verdict
+            # j#108694 semantics).
             return OnboardingSeedOutcome(
                 status=SEED_STATUS_ALREADY_COMPLETE, document_id=document.document_id
             )
         try:
-            stat = os.stat(path)
+            stat = filesystem.stat_document(path)
         except OSError:
             return OnboardingSeedOutcome(
                 status=SEED_STATUS_FAILED,
                 reason=SEED_REASON_DOCUMENT_UNREADABLE,
                 document_id=document.document_id,
             )
-        if stat.st_uid != os.geteuid():
+        if not stat.owner_is_caller:
             return OnboardingSeedOutcome(
                 status=SEED_STATUS_FAILED,
                 reason=SEED_REASON_FOREIGN_OWNER,
                 document_id=document.document_id,
             )
         merged = dict(body)
-        merged.update(missing)
-        write_reason = _replace_document(path, merged, stat.st_mode & 0o7777)
-        if write_reason:
+        merged.update(dict(evaluation.unsatisfied_keys))
+        try:
+            filesystem.replace_document(path, _render_document(merged), stat.mode)
+        except (OSError, ValueError, TypeError):
             return OnboardingSeedOutcome(
                 status=SEED_STATUS_FAILED,
-                reason=write_reason,
+                reason=SEED_REASON_WRITE_FAILED,
                 document_id=document.document_id,
             )
         return OnboardingSeedOutcome(
             status=SEED_STATUS_SEEDED,
             document_id=document.document_id,
-            seeded_keys=tuple(sorted(missing)),
+            seeded_keys=tuple(sorted(key for key, _v in evaluation.unsatisfied_keys)),
         )
 
     # Both attempts lost the create race, which means the document exists and something
@@ -430,6 +517,9 @@ __all__ = (
     "SEED_STATUS_FAILED",
     "SEED_STATUS_NOT_DECLARED",
     "SEED_STATUS_SEEDED",
+    "LocalOnboardingDocumentFilesystem",
+    "OnboardingDocumentFilesystem",
+    "OnboardingDocumentStat",
     "OnboardingSeedOutcome",
     "preseed_provider_onboarding",
     "resolve_document_path",
