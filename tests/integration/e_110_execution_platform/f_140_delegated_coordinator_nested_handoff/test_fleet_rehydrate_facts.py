@@ -1,0 +1,362 @@
+"""The fleet rehydrate fact join, wired to real collaborators (Redmine #15745).
+
+Several REAL collaborators at once, hermetic: a real lane lifecycle store and a real lane
+metadata store in a temp home, a real herdr delivery ledger, and real git worktrees on a
+temp repo. Only the host-shaped edges are faked — the workspace identity, the live
+assigned-name inventory, the provider binding, and the Redmine open/closed read — because
+each needs a registry, a herdr server, or a network this suite must not touch.
+
+What the wiring must prove, as opposed to what the pure unit tests already pin:
+
+- the join reads the lane's delegation geometry, worktree binding and branch from the
+  DURABLE row + metadata (not from a lane label or a pane), and the resulting plan matches;
+- the durable delivery record actually gates the dispatch action end to end: seed a confirmed
+  delivery for the lane's exact causal key and ``restore_dispatch`` disappears;
+- an unreadable delivery ledger blocks that lane instead of reading as "never delivered";
+- producing the plan mutates nothing — the temp home's byte content is identical before and
+  after, so the read-only stage genuinely has an effect budget of zero.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import os
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+ROOT = Path(__file__).resolve().parents[4]
+sys.path.insert(0, str(ROOT / "src"))
+
+from mozyo_bridge.core.state.herdr_delivery_ledger import (  # noqa: E402
+    HerdrDeliveryLedger,
+    HerdrDeliveryLedgerRecord,
+    RAIL_EVENT,
+)
+from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore  # noqa: E402
+from mozyo_bridge.core.state.lane_kind import (  # noqa: E402
+    LANE_KIND_DELEGATED_COORDINATOR,
+    LANE_KIND_IMPLEMENTATION,
+)
+from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
+    DecisionPointer,
+    LaneLifecycleKey,
+)
+from mozyo_bridge.core.state.lane_lifecycle_readonly import (  # noqa: E402
+    LaneLifecycleReader,
+)
+from mozyo_bridge.core.state.lane_metadata import record_lane_created  # noqa: E402
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402
+    sublane_fleet_rehydrate as rehydrate,
+    sublane_herdr_projection as projection,
+    sublane_reboot_audit as audit,
+    workflow_provider_resolution as providers,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.fleet_rehydrate import (  # noqa: E402
+    ACTION_HEAL_PAIR,
+    ACTION_RESTORE_DISPATCH,
+    ACTION_RESUME_BRIEF,
+    BLOCKED,
+    BLOCK_DISPATCH_UNREADABLE,
+    BLOCK_RESUME_PROFILE_INCOMPLETE,
+    DISPATCH_DELIVERED,
+    DISPATCH_OWED,
+    REHYDRATE,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.fleet_rehydrate_dispatch_fold import (  # noqa: E402
+    KIND_IMPLEMENTATION_REQUEST,
+    redmine_marker,
+)
+
+WORKSPACE = "ws-fleet-15745"
+GATEWAY = "codex"
+WORKER = "claude"
+ISSUE = "15745"
+LANE = "issue_15745_demo"
+BRANCH = "issue_15745_demo"
+ANCHOR = "108799"
+
+
+def _git(*args, cwd):
+    subprocess.run(
+        ["git", *args],
+        cwd=str(cwd),
+        check=True,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def _home_digest(home: Path) -> str:
+    """A byte digest of every file under ``home`` — the effect-budget probe."""
+    digest = hashlib.sha256()
+    for path in sorted(p for p in home.rglob("*") if p.is_file()):
+        digest.update(str(path.relative_to(home)).encode())
+        digest.update(path.read_bytes())
+    return digest.hexdigest()
+
+
+class FleetRehydrateFactJoinTests(unittest.TestCase):
+    maxDiff = None
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        root = Path(self._tmp.name)
+        self.home = root / "home"
+        self.home.mkdir()
+        self.repo = root / "repo"
+        self.repo.mkdir()
+        _git("init", "-q", "-b", "main", cwd=self.repo)
+        _git("config", "user.email", "dev@example.invalid", cwd=self.repo)
+        _git("config", "user.name", "dev", cwd=self.repo)
+        (self.repo / "README.md").write_text("fleet\n")
+        _git("add", "README.md", cwd=self.repo)
+        _git("commit", "-qm", "seed", cwd=self.repo)
+        self.worktree = root / "wt-lane"
+        _git("worktree", "add", "-q", "-b", BRANCH, str(self.worktree), cwd=self.repo)
+        self.addCleanup(self._tmp.cleanup)
+
+    # -- fixtures ---------------------------------------------------------
+
+    def _declare(self, *, lane=LANE, lane_kind=LANE_KIND_IMPLEMENTATION, issue=ISSUE):
+        from mozyo_bridge.core.state.lane_lifecycle_schema import lane_lifecycle_path
+
+        store = LaneDeclarationStore(path=lane_lifecycle_path(self.home))
+        outcome = store.declare_lane(
+            LaneLifecycleKey(WORKSPACE, lane),
+            decision=DecisionPointer(
+                source="redmine", issue_id=issue, journal_id=ANCHOR
+            ),
+            issue_id=issue,
+            worktree_identity="wt_" + lane,
+            lane_kind=lane_kind,
+        )
+        self.assertTrue(outcome.applied, outcome.reason)
+        record_lane_created(
+            lane_workspace_token="wt_" + lane,
+            repo_workspace_id=WORKSPACE,
+            issue_id=issue,
+            lane_label=lane,
+            branch=BRANCH,
+            worktree_path=str(self.worktree),
+            lane_id=lane,
+            home=self.home,
+        )
+
+    def _seed_delivery(self, *, journal=ANCHOR, status="sent", reason="ok"):
+        marker = redmine_marker(ISSUE, journal, KIND_IMPLEMENTATION_REQUEST, GATEWAY)
+        HerdrDeliveryLedger(home=self.home).append(
+            HerdrDeliveryLedgerRecord(
+                notification_marker=marker,
+                receiver=GATEWAY,
+                source="redmine",
+                issue_id=ISSUE,
+                journal_id=journal,
+                status=status,
+                reason=reason,
+                rail=RAIL_EVENT,
+            )
+        )
+
+    def _rows(self, *, live=True, lane=LANE):
+        """Real `herdr agent list` row shape: the canonical assigned name is the key."""
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            encode_assigned_name,
+        )
+
+        if not live:
+            return []
+        return [
+            {
+                "name": encode_assigned_name(WORKSPACE, role, lane),
+                "pane_id": f"w1V:p{role[0].upper()}",
+                "agent": role,
+                "agent_status": "awaiting_input",
+            }
+            for role in (GATEWAY, WORKER)
+        ]
+
+    def _gather(self, *, rows=None, resume_inputs=None, issue_closed=False):
+        env = mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)})
+        with env, mock.patch.object(
+            projection, "repo_scope_workspace_id", return_value=WORKSPACE
+        ), mock.patch.object(
+            providers, "resolve_gateway_provider", return_value=GATEWAY
+        ), mock.patch.object(
+            providers, "resolve_worker_provider", return_value=WORKER
+        ), mock.patch.object(
+            audit,
+            "read_issue_closed_states",
+            return_value={ISSUE: issue_closed},
+        ), mock.patch(
+            "mozyo_bridge.shared.paths.mozyo_bridge_home", return_value=self.home
+        ):
+            return rehydrate.gather_fleet_facts(
+                self.repo,
+                home=self.home,
+                rows=rows if rows is not None else [],
+                resume_inputs=resume_inputs,
+            )
+
+    # -- the join ---------------------------------------------------------
+
+    def test_durable_row_and_metadata_drive_the_plan_not_the_lane_label(self):
+        self._declare()
+        facts = self._gather()
+        self.assertEqual(len(facts), 1)
+        fact = facts[0]
+        self.assertEqual(fact.lane_id, LANE)
+        self.assertEqual(fact.lane_kind, LANE_KIND_IMPLEMENTATION)
+        self.assertEqual(fact.managed_roles, (GATEWAY, WORKER))
+        self.assertEqual(fact.reboot.branch, BRANCH)
+        self.assertTrue(fact.reboot.worktree_present)
+        self.assertTrue(fact.reboot.branch_exists)
+        # No delivery was ever recorded for this lane's causal key, so the anchored
+        # implementation_request is genuinely owed and bound to the lifecycle anchor.
+        self.assertEqual(fact.dispatch.state, DISPATCH_OWED)
+        self.assertEqual(fact.dispatch.anchor_journal, ANCHOR)
+
+        plan = rehydrate.plan_fleet(facts)[0]
+        self.assertEqual(plan.disposition, REHYDRATE)
+        self.assertEqual(plan.actions, (ACTION_HEAL_PAIR, ACTION_RESTORE_DISPATCH))
+
+    def test_a_confirmed_delivery_removes_the_dispatch_action_end_to_end(self):
+        self._declare()
+        self._seed_delivery()
+        facts = self._gather()
+        self.assertEqual(facts[0].dispatch.state, DISPATCH_DELIVERED)
+        plan = rehydrate.plan_fleet(facts)[0]
+        self.assertEqual(plan.actions, (ACTION_HEAL_PAIR,))
+
+    def test_a_live_pair_needs_neither_heal_nor_dispatch(self):
+        self._declare()
+        self._seed_delivery()
+        facts = self._gather(rows=self._rows())
+        self.assertTrue(facts[0].pair_whole)
+        plan = rehydrate.plan_fleet(facts)[0]
+        self.assertEqual(plan.disposition, "skip")
+        self.assertEqual(plan.actions, ())
+
+    def test_an_unreadable_ledger_blocks_rather_than_reading_as_undelivered(self):
+        self._declare()
+        ledger = self.home / "herdr-delivery-ledger.sqlite"
+        ledger.write_bytes(b"not a sqlite database at all")
+        facts = self._gather()
+        plan = rehydrate.plan_fleet(facts)[0]
+        self.assertEqual(plan.disposition, BLOCKED)
+        self.assertEqual(plan.reason, BLOCK_DISPATCH_UNREADABLE)
+        self.assertEqual(plan.actions, ())
+
+    def test_a_delegated_lane_without_its_project_fields_blocks(self):
+        self._declare(lane_kind=LANE_KIND_DELEGATED_COORDINATOR)
+        facts = self._gather()
+        plan = rehydrate.plan_fleet(facts)[0]
+        self.assertEqual(plan.disposition, BLOCKED)
+        self.assertEqual(plan.reason, BLOCK_RESUME_PROFILE_INCOMPLETE)
+
+    def test_a_delegated_lane_with_a_fresh_anchor_and_fields_briefs(self):
+        self._declare(lane_kind=LANE_KIND_DELEGATED_COORDINATOR)
+        # The IR anchor is delivered; the brief rides a DIFFERENT, fresh anchor, which is
+        # exactly what makes its causal key owed after a restart.
+        self._seed_delivery()
+        facts = self._gather(
+            resume_inputs={
+                LANE: rehydrate.ResumeBriefInput(
+                    anchor_journal="108900",
+                    fields=(
+                        ("parent_project", "giken-3800-mozyo-bridge"),
+                        ("child_project", "giken-3800-mozyo-bridge"),
+                        # A lane created BY the default-lane coordinator carries an empty
+                        # `parent_lane_id`, so its parent issue is genuinely not derivable
+                        # from the child's own row: it is supplied, never guessed.
+                        ("parent_issue", "15631"),
+                    ),
+                )
+            }
+        )
+        fact = facts[0]
+        self.assertEqual(fact.resume_brief.anchor_journal, "108900")
+        self.assertEqual(fact.resume_brief.state, DISPATCH_OWED)
+        self.assertEqual(
+            dict(fact.resume_profile_fields)["parent_callback_target"], "coordinator"
+        )
+        plan = rehydrate.plan_fleet(facts)[0]
+        self.assertEqual(plan.actions, (ACTION_HEAL_PAIR, ACTION_RESUME_BRIEF))
+
+    def test_a_delegated_lane_missing_only_the_parent_issue_still_blocks(self):
+        """Every one of the four fields is load-bearing; three out of four is not a brief."""
+        self._declare(lane_kind=LANE_KIND_DELEGATED_COORDINATOR)
+        facts = self._gather(
+            resume_inputs={
+                LANE: rehydrate.ResumeBriefInput(
+                    anchor_journal="108900",
+                    fields=(("parent_project", "p"), ("child_project", "c")),
+                )
+            }
+        )
+        plan = rehydrate.plan_fleet(facts)[0]
+        self.assertEqual(plan.disposition, BLOCKED)
+        self.assertEqual(plan.reason, BLOCK_RESUME_PROFILE_INCOMPLETE)
+        self.assertIn("parent_issue", plan.detail)
+
+    def test_the_read_only_plan_mutates_nothing(self):
+        """The effect budget of the plan stage, measured on the real home."""
+        self._declare()
+        self._seed_delivery()
+        before = _home_digest(self.home)
+        facts = self._gather()
+        plans = rehydrate.plan_fleet(facts)
+        payload = rehydrate.rehydrate_payload(facts, plans, execute=False)
+        text = rehydrate.format_rehydrate_text(facts, plans, execute=False)
+        self.assertEqual(payload["state"], "plan")
+        self.assertIn("read-only", text)
+        self.assertEqual(
+            _home_digest(self.home),
+            before,
+            "producing a plan must not write a byte of managed state",
+        )
+        # And the lifecycle authority is still exactly the row we declared.
+        row = LaneLifecycleReader(home=self.home).get(LaneLifecycleKey(WORKSPACE, LANE))
+        self.assertIsNotNone(row)
+        self.assertEqual(row.revision, 1)
+        self.assertEqual(row.lane_generation, 1)
+
+    def test_the_pasteable_payload_carries_no_host_local_worktree_path(self):
+        self._declare()
+        facts = self._gather()
+        plans = rehydrate.plan_fleet(facts)
+        payload = rehydrate.rehydrate_payload(facts, plans, execute=False)
+        import json
+
+        rendered = json.dumps(payload) + rehydrate.format_rehydrate_text(
+            facts, plans, execute=False
+        )
+        self.assertNotIn(str(self.worktree), rendered)
+        self.assertNotIn("recorded_worktree", rendered)
+
+    def test_an_unresolvable_workspace_is_unavailable_not_empty(self):
+        self._declare()
+        with mock.patch.object(
+            projection, "repo_scope_workspace_id", return_value=""
+        ):
+            with self.assertRaises(rehydrate.FleetRehydrateUnavailable) as caught:
+                rehydrate.gather_fleet_facts(self.repo, home=self.home, rows=[])
+        self.assertIn("workspace identity", str(caught.exception))
+
+    def test_an_unreadable_lifecycle_store_is_unavailable_not_empty(self):
+        with mock.patch.object(
+            projection, "repo_scope_workspace_id", return_value=WORKSPACE
+        ), mock.patch(
+            "mozyo_bridge.core.state.lane_lifecycle_readonly.load_lane_lifecycle_readonly",
+            return_value=None,
+        ):
+            with self.assertRaises(rehydrate.FleetRehydrateUnavailable) as caught:
+                rehydrate.gather_fleet_facts(self.repo, home=self.home, rows=[])
+        self.assertIn("NOT the same as the store having no rows", str(caught.exception))
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

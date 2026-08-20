@@ -73,6 +73,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_convergence import register_sublane_converge_bound_pair_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_hibernated_bound_pair_composer_discard import register_sublane_prepare_bound_pair_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_reboot_audit import register_sublane_reboot_audit_parser  # noqa: E501
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_fleet_rehydrate import register_sublane_rehydrate_fleet_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_residue_close import register_sublane_close_residue_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_recovery_cli import register_sublane_recover_restored_pair_parser  # noqa: E501
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_rebind_cli import register_sublane_rebind_restored_pair_parser  # noqa: E501
@@ -695,6 +696,12 @@ def register_sublane_group(
     # and the lane-scoped shell-residue close it recommends.
     register_sublane_reboot_audit_parser(sublane_sub)
     register_sublane_close_residue_parser(sublane_sub)
+    # Redmine #15745: the post-restart FLEET rail. Deliberately a separate command from
+    # `reboot-audit`: that surface answers "what disposition should each lane converge to"
+    # and offers no all-lanes action by design; this one answers "which undelivered action
+    # does each ACTIVE lane owe" and actuates exactly those, lane by lane, under the same
+    # per-lane typed skip / block discipline.
+    register_sublane_rehydrate_fleet_parser(sublane_sub)
     register_sublane_recover_restored_pair_parser(sublane_sub)
     # Redmine #15656: the lifecycle-pin rebind for a herdr-restart-restored active pair —
     # the SAME attested sessions on new locators; only the declared_slots snapshot moves.

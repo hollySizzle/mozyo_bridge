@@ -4605,6 +4605,18 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
             ['*', '*'],
             "inherits via a used import of redmine_journal_source; names no marker token itself",
         ),
+        "src/mozyo_bridge/e_110_execution_platform/f_140_delegated_coordinator_nested_handoff/domain/fleet_rehydrate_dispatch_fold.py": (  # noqa: E501
+            ['handoff'],
+            "inherits via a used import of handoff for the canonical `build_marker` producer "
+            "(Redmine #15745 fleet rehydrate replay fence); names no marker token itself. It "
+            "RENDERS a causal key and compares it BYTE-EXACT against the `notification_marker` "
+            "column of a delivery-ledger row — it never parses a marker, never scans a note "
+            "body, and never assembles marker text from prose. The 'more than one marker' "
+            "question therefore does not arise: a ledger row carries exactly one marker value, "
+            "and a row whose stored value differs from what the canonical producer renders for "
+            "that row's own anchor / kind / receiver is DROPPED as not this key's evidence "
+            "rather than partially matched",
+        ),
     }
 
     @classmethod
