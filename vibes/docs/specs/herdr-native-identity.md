@@ -427,7 +427,7 @@ participant exact一致 (assigned_name / locator / not closed)、caller供給の
 participant自身の`attestation_write_succeeded`があること。`completed_rolled_back` / mid-startup phase /
 foreign・stale terminal / pending generationは従来どおりfail-closedであり、caller主張はどこにも入らない。
 
-**`success_owed` / `health_check` strandも同じgateで受理する (Redmine #15748)。** 前提としてまず用語を正す
+**`success_owed` strandも同じgateで受理する。`health_check`は受理しない (Redmine #15748)。** 前提としてまず用語を正す
 (review #15748 j#108919 / verdict j#108925): **startup transactionのphaseはどれもhealth verdictではない。**
 `settle`のowedには`SessionStartResult.owes_rollback`が渡り (`herdr_session_start_completion`)、これは
 `not ok`より意図的に狭く「この runが自ら launchした slotの補償債務」だけを表す。adopted / surfacedな
@@ -436,22 +436,31 @@ unhealthy slot、ratio / column失敗では`ok=false`でも`owes_rollback=false`
 以上を意味しない。read side (`completed_generation_startup_token`) が問うのは**identity** — 「この locatorの
 live terminalは この launch自身の side effectか」 — であり、記帳phaseはその反証にならない。
 
-受理の線は「terminalか否か」ではなく **「settleに進入したか (launch setが閉じたか)」** である。`settle`は
-`health_check` / `success_owed`の唯一のwriterで、`health_check`は**進入時**、すなわちこのactionが行う launchが
-すべて記録された後に書かれる。そこから先の3 phaseはいずれも「launchは全て済み、帳簿だけが閉じていない」:
+受理の線は「terminalか否か」ではなく **「補償decisionが記帳されたか (post-decisionか)」** である
+(review j#108936 / verdict j#108943)。該当するのは次の2 phaseで、いずれも「debtの有無は決まったが帳簿が
+閉じていない」状態である:
 
-- `health_check` — 補償judgementが未記帳。offline rollout restore経路の`completion_fence` raiseで到達可能。
-- `rollback_owed` — 補償債務を記帳済み (#15712で受理済み)。
-- `success_owed` — 補償債務なしを記帳済みだが terminal記帳が未了。清算できるrailは**存在しない**
-  (rollback railは`nothing_owed`を返す)。
+- `rollback_owed` — 補償債務ありと記帳済み (#15712で受理済み)。
+- `success_owed` — 補償債務なしと記帳済みだが terminal記帳が未了。決定内容は`completed_success`と同一で、
+  違いは最後の1 writeだけ。清算できるrailは**存在しない** (rollback railは`nothing_owed`を返す)。
 
-この3 phaseは**receipt proof gate** — caller供給のterminal-bound receipt照合の成立、および同actionの
+この2 phaseは**receipt proof gate** — caller供給のterminal-bound receipt照合の成立、および同actionの
 execution eventsに当該participant自身の`attestation_write_succeeded`があること — を全て満たす場合に限り
-tokenを貸す。terminalな`completed_success`は従来どおりparticipant joinだけで貸す。**補償債務が記帳された
-case (`rollback_owed`) を受理しておきながら、judgementが未記帳のcase (`health_check`) をidentity問題で拒む
-一貫した根拠はない。** `planned` / `launching`は launch setがまだ開いており (`record_participant`がroleを
-追加でき、run全体のrollbackが正常なdisposition)、`completed_rolled_back`はparticipantが不在と証明済みなので、
-いずれも従来どおりfail-closedのままである。
+tokenを貸す。terminalな`completed_success`は従来どおりparticipant joinだけで貸す。
+
+**`health_check`は受理しない。** `settle`は補償分岐の**前**に`health_check`を書くため、owning runがこの後
+`rollback_owed`を書く可能性が残っている。すなわちこのphaseはstrandであると同時に**live launchのin-flight
+state**でもあり、durable factだけでは両者を区別できない。決定的なのは、**この verdictがdelivery専用では
+ない**ことである — 同じtokenが offline rolloutの破壊的close (`capture_close_authority` /
+`_present_pin_join`はいずれも独自のphase検査を持たず、このtokenで判定する) と recovery consumerを
+licenseする。pre-decisionのphaseを受理することは、まだ launch中のpairをclose railへ渡すことであり、
+記帳済みのpost-decision debtとはrisk classが異なる。したがって`planned` / `launching` / `health_check`は
+mid-startupとして従来どおりfail-closedであり、`completed_rolled_back`はparticipant不在証明済みのため
+同じく拒否する。
+
+`health_check` strandの解消には、共有verifierから**delivery限定capabilityを分離**し、破壊的 / recovery
+consumerのstrict boundaryを別設計したうえで、mid-startup fail-closed規則を明示改訂する必要がある。これは
+本節の受理条件を広げることでは達成できない (未解決residual)。
 
 **書込み側の昇格・降格は採らない。** 外部から`completed_success`を書くことは「この runが補償債務なしと
 **記帳した**」というprovenanceの捏造であり、owning runが生存していればその最終`set_phase`がterminal判定で
@@ -462,9 +471,18 @@ raiseして、稀なstrandをlaunch時failureへ格上げしてしまう。`heal
 **受理はrollback railの権限を奪わない。** `health_check` / `rollback_owed`は引き続き
 `herdr_session_rollback.ACTIONABLE_PHASES`に属し、明示rollbackの対象である。ただし現runtimeの実挙動として、
 live participantがあり conditional-close primitiveが無い場合、railは全live participantを
-`conditional_close_unavailable`にして`blocked` / effect 0を返し、actionをterminalizeしない。つまり
-**現runtimeではこの3 phaseのstrandを終端させるrailは存在せず**、照合側受理だけが live paneのgoverned送達を
-回復させる。将来 conditional-close primitiveが入ればrailが本来の清算を完遂する。
+`conditional_close_unavailable`にして`blocked` / effect 0を返し、actionをterminalizeしない
+(`success_owed`はそもそもactionableでなく`nothing_owed`が返る)。つまり**現runtimeではこれらのstrandを
+終端させるrailは存在しない**。`rollback_owed` / `success_owed`は照合側受理でgoverned送達が回復するが、
+`health_check`は上記の理由で受理できないため**未解決のまま残る**。将来 conditional-close primitiveが入れば
+railが本来の清算を完遂する。
+
+**破壊的consumerへの影響 (明示)。** 本受理は`verified_terminal_generation_token`を消費する全 matcher
+consumerに及ぶ。`herdr_offline_rollout_close.capture_close_authority` / `_present_pin_join`は独自のphase
+検査を持たないため、`success_owed`のpairは offline rolloutの破壊的closeでも license される (`rollback_owed`
+は#15712で既にそうなっている)。`success_owed`は`completed_success`と同一の補償decisionを持つのでこれは
+意図した範囲である。`herdr_offline_rollout_legacy_absence`と`capture_close_authority`の`_positive_absence`
+経路は独自に`phase == completed_success`を再検査するため影響を受けない。
 
 lifecycle rowを持たない**非default scratch pair**だけは、exact candidate runtimeを使い、次の公開railでv2へ
 置き換えられる。1行目はread-only preflightであり、green判定とこのpairを閉じる明示承認の後にだけ2行目を実行する。

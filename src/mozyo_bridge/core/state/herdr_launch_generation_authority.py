@@ -34,58 +34,63 @@ def completed_generation_startup_token(
     this locator this launch's own side effect?* — so a bookkeeping phase is never a
     disproof.
 
-    **The line is whether the launch set is closed**, not whether the phase is
-    terminal. ``settle`` is the only writer of ``health_check`` / ``success_owed``, and
-    it writes ``health_check`` on entry, once every launch this action will make has
-    been made and recorded. From there the action is one of:
+    **The line is whether the compensation DECISION is recorded**, not whether the
+    phase is terminal and not merely whether the launch set is closed (review #15748
+    j#108936, verdict j#108943). Two phases sit past that decision with their books
+    still open, and both lend their token only under the receipt-proof gate — a
+    caller-supplied terminal-bound ``participant_receipt_matches`` proof AND this
+    participant's own ``attestation_write_succeeded`` among the action's execution
+    events:
 
-    * ``health_check`` (Redmine #15748) — settle was entered; the compensation verdict
-      is not recorded yet. A run that died in that window (measured reachable: the
-      offline-rollout restore path's ``completion_fence`` raising between the two
-      writes) strands here.
     * ``rollback_owed`` (Redmine #15712) — the run recorded a fresh-launch compensation
       debt. On a runtime without a conditional-close primitive the rollback rail
       preserves every present participant, so a slot whose boot outlived the
       settle-time probe (measured: the default-lane coordinator relaunch) stays live,
       attested and generation-finalized while its action can never terminalize.
-    * ``success_owed`` (Redmine #15748) — the run recorded that it owes no compensation;
-      only the terminal record is outstanding. No rail owes it a settlement at all (the
-      rollback rail answers ``nothing_owed``), so a run that died between its two final
-      writes is otherwise permanently unprovable.
-    * ``completed_success`` — the same statement as ``success_owed``, durably recorded.
+    * ``success_owed`` (Redmine #15748) — the run recorded that it owes NO compensation;
+      only the terminal record is outstanding, which makes it the same recorded decision
+      as ``completed_success``. No rail owes it a settlement at all (the rollback rail
+      answers ``nothing_owed``), so a run that died between its two final writes is
+      otherwise permanently unprovable.
 
-    All three settle-entered phases lend their token ONLY under the receipt-proof gate:
-    a caller-supplied terminal-bound ``participant_receipt_matches`` proof AND this
-    participant's own ``attestation_write_succeeded`` among the action's execution
-    events. Terminal ``completed_success`` keeps lending on the participant join alone,
-    exactly as before. Accepting a recorded debt (``rollback_owed``, #15712) while
-    refusing an unrecorded verdict (``health_check``) would be incoherent for an
-    identity question — and none of this takes the rollback rail's authority away: it
-    still claims those phases and may still close the panes.
+    Terminal ``completed_success`` keeps lending on the participant join alone, exactly
+    as before.
 
-    ``planned`` / ``launching`` stay refused because the launch set is still OPEN there
-    — ``record_participant`` can add another role, and rolling the whole run back is
-    the normal disposition. ``completed_rolled_back`` stays refused because its
-    participants were proven absent. Without the receipt proof, without the
-    participant's own attestation event, or for any of those phases, the answer stays
-    ``""`` — callers that cannot prove the terminal keep the strict
-    ``completed_success``-only behavior.
+    ``health_check`` is REFUSED, and the reason is not that it fails an identity test.
+    ``settle`` writes it BEFORE the compensation branch, so the owning run may still be
+    about to record a rollback debt: the phase is simultaneously a strand and the
+    in-flight state of a live launch, and no durable fact separates them. That matters
+    because this verdict is NOT delivery-scoped — the same token licenses the
+    offline-rollout destructive close (``capture_close_authority`` /
+    ``_present_pin_join`` gate on this token with no phase check of their own) and the
+    recovery consumers. Admitting a pre-decision phase here would hand a
+    still-launching pair to a close rail, which is a different risk class from a
+    recorded post-decision debt. Resolving the ``health_check`` strand needs a
+    delivery-scoped capability separated from this shared verifier plus an explicit
+    amendment to the mid-startup fail-closed rule — a design decision, not a widening
+    of this function.
+
+    ``planned`` / ``launching`` stay refused for the same family of reason: the launch
+    set is still open and ``record_participant`` can add another role.
+    ``completed_rolled_back`` stays refused because its participants were proven absent.
+    Without the receipt proof, without the participant's own attestation event, or for
+    any of those phases, the answer stays ``""`` — callers that cannot prove the
+    terminal keep the strict ``completed_success``-only behavior.
     """
     from mozyo_bridge.core.state.herdr_launch_generation import GENERATION_ATTESTED
     from mozyo_bridge.core.state.startup_execution_events import (
         STAGE_ATTESTATION_WRITE_SUCCEEDED, read_execution_events,
     )
     from mozyo_bridge.core.state.startup_transaction_fence import (
-        PHASE_COMPLETED_SUCCESS, PHASE_HEALTH_CHECK, PHASE_ROLLBACK_OWED,
-        PHASE_SUCCESS_OWED, StartupTransactionError, StartupTransactionFence,
+        PHASE_COMPLETED_SUCCESS, PHASE_ROLLBACK_OWED, PHASE_SUCCESS_OWED,
+        StartupTransactionError, StartupTransactionFence,
     )
 
-    #: The settle-entered phases the receipt-proof gate admits: every launch of the
-    #: action is recorded, but its books are not closed. Kept as one local set so the
+    #: The POST-DECISION phases the receipt-proof gate admits: the run recorded whether
+    #: it owes a compensation, but its books are not closed. `health_check` is
+    #: deliberately absent — it precedes that decision. Kept as one local set so the
     #: gate below can never be applied to only some of them.
-    receipt_gated_phases = (
-        PHASE_HEALTH_CHECK, PHASE_ROLLBACK_OWED, PHASE_SUCCESS_OWED,
-    )
+    receipt_gated_phases = (PHASE_ROLLBACK_OWED, PHASE_SUCCESS_OWED)
 
     token = norm(getattr(generation, "startup_action_id", "") or "")
     if norm(getattr(generation, "phase", "")) != GENERATION_ATTESTED or not token:
@@ -171,11 +176,11 @@ def verified_generation_token(
       token are never read from two files that could tear); AND
     * that token names a startup transaction that reached ``completed_success`` — or, only
       under the receipt-proof-gated acceptance documented on
-      :func:`completed_generation_startup_token`, a settle-entered ``rollback_owed``
-      (Redmine #15712), ``success_owed`` or ``health_check`` (Redmine #15748) action —
-      whose participant for ``role`` is exactly this gateway (``assigned_name`` +
-      ``locator``, not closed) — a rolled-back / open-launch-set (``planned`` /
-      ``launching``) / foreign / superseded generation never lends its token.
+      :func:`completed_generation_startup_token`, a post-decision ``rollback_owed``
+      (Redmine #15712) or ``success_owed`` (Redmine #15748) action — whose participant
+      for ``role`` is exactly this gateway (``assigned_name`` + ``locator``, not closed)
+      — a rolled-back / pre-decision (``planned`` / ``launching`` / ``health_check``) /
+      foreign / superseded generation never lends its token.
 
     ``norm`` / ``norm_lane`` are injected by the caller so this core module never imports the
     provider identity helpers (the dependency never points core -> provider). Any unreadable
