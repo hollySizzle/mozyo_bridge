@@ -105,6 +105,24 @@ documents:
     related_document_refs:
       - rule-adr-index
 
+  - id: rule-adr-0012-supported-platforms
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0012-supported-platforms.md
+    purpose: "ADR-0012: 保守対応 platform は macOS と Linux、Windows 対象外 (#15631)。"
+    audit_role: adr_0012_rule
+    related_document_refs:
+      - rule-adr-index
+
+  - id: rule-adr-0013-ui-hides-pane-operations
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0013-ui-hides-pane-operations.md
+    purpose: "ADR-0013: ユーザーに pane / 内部操作を意識させない UI (UX 要件) (#15631)。"
+    audit_role: adr_0013_rule
+    related_document_refs:
+      - rule-adr-index
+
   - id: rule-release-distribution
     type: rule
     status: active
