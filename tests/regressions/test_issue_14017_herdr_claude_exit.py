@@ -264,6 +264,10 @@ class Argv0WrapperExecTest(unittest.TestCase):
 
         envd = {
             "MOZYO_BRIDGE_HOME": str(home),
+            # #15744 (verdict j#108694): the onboarding seed now gates the exec, so the
+            # wrapped launch needs a resolvable HOME for the seed to land in. Hermetic:
+            # the seed writes into this test's own temp directory.
+            "HOME": str(home),
             "MOZYO_HERDR_BINARY": "/x/herdr",
             "MOZYO_WORKSPACE_ID": "ws1",
             "MOZYO_AGENT_ROLE": "claude",
@@ -402,6 +406,9 @@ class PreExecListerHygieneTest(unittest.TestCase):
             "os.environ",
             {
                 "MOZYO_BRIDGE_HOME": str(tmp),
+                # #15744 (verdict j#108694): the seed gates the exec; give it a
+                # hermetic HOME inside this test's temp directory.
+                "HOME": str(tmp),
                 "MOZYO_HERDR_BINARY": "/x/herdr",
                 "MOZYO_WORKSPACE_ID": "ws1",
                 "MOZYO_AGENT_ROLE": "claude",
@@ -439,6 +446,10 @@ class AttestationRecordedBeforeExecTest(unittest.TestCase):
 
         envd = {
             "MOZYO_BRIDGE_HOME": str(home),
+            # #15744 (verdict j#108694): the onboarding seed now gates the exec, so the
+            # wrapped launch needs a resolvable HOME for the seed to land in. Hermetic:
+            # the seed writes into this test's own temp directory.
+            "HOME": str(home),
             "MOZYO_HERDR_BINARY": "/x/herdr",
             "MOZYO_WORKSPACE_ID": "ws1",
             "MOZYO_AGENT_ROLE": "claude",

@@ -325,9 +325,12 @@ class ConfigSchemaVersionTest(unittest.TestCase):
 
         config = load_agent_provider_config()
         self.assertIn(config.version, SUPPORTED_SCHEMA_VERSIONS)
-        # The packaged artifact actually USES the v3 ghost_composer_signals (#14065 Phase 2)
-        # in addition to the v2 startup_blockers, so it must declare v3.
-        self.assertEqual(config.version, "3")
+        # The packaged artifact must declare the version of the NEWEST field it actually
+        # uses, because each optional block is version-gated at load: declaring less than
+        # it uses would fail closed at startup. It now carries the v4 onboarding_seed
+        # (#15744) on top of the v3 ghost_composer_signals (#14065 Phase 2) and the v2
+        # startup_blockers (#13760), so it must declare v4.
+        self.assertEqual(config.version, "4")
 
 
 class StartupBlockerSchemaTest(unittest.TestCase):

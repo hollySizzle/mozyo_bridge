@@ -1193,6 +1193,73 @@ class R2F1PreflightIdentityGuardTest(unittest.TestCase):
         )
 
 
+class OnboardingSeedBlockerBoundaryTest(unittest.TestCase):
+    """The packaged claude profile's onboarding seed did not relax screen detection.
+
+    The #13760 boundary as it stands after #15744 (moved here from the #15744
+    regression file per the tests-placement policy — these are contracts of the
+    packaged profile declaration, not recurrence pins; review j#108680
+    finding_regressionmixescontracts, verdict j#108694): the seed may close the
+    cosmetic first-run question and nothing else, so the blockers must stay declared
+    and the seeded keys must never brush an operator-resolved boundary.
+    """
+
+    #: The blocker id the #13760 classifier reports for the screen #15744 seeds past.
+    #: If the profile ever stopped declaring it, an unwrapped launch (or a failed seed)
+    #: that DID render the screen would be treated as a ready composer and the #13582
+    #: lost-request shape would return.
+    FIRST_RUN_THEME_BLOCKER = "first_run_theme"
+
+    #: The screens that are NOT in scope: a credential boundary and the two trust
+    #: confirmations. #13760 ruled that mozyo refuses to answer these and hands the
+    #: lane back to the operator, and #15744 must not have quietly widened that.
+    OPERATOR_RESOLVED_BLOCKERS = (
+        "login_required",
+        "workspace_trust_confirmation",
+        "directory_trust_confirmation",
+    )
+
+    def setUp(self) -> None:
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (  # noqa: E501
+            require_profile,
+        )
+
+        self.profile = require_profile("claude")
+
+    def test_first_run_theme_is_still_a_declared_startup_blocker(self) -> None:
+        declared = [blocker.blocker_id for blocker in self.profile.startup_blockers]
+        self.assertIn(self.FIRST_RUN_THEME_BLOCKER, declared)
+
+    def test_the_operator_resolved_screens_remain_declared_and_unseeded(self) -> None:
+        declared = [blocker.blocker_id for blocker in self.profile.startup_blockers]
+        for blocker_id in self.OPERATOR_RESOLVED_BLOCKERS:
+            with self.subTest(blocker_id=blocker_id):
+                self.assertIn(blocker_id, declared)
+
+        seeded_keys = {
+            key.casefold() for key in self.profile.onboarding_seed.completion_key_map
+        }
+        for marker in ("trust", "login", "auth", "token", "key", "permission"):
+            with self.subTest(marker=marker):
+                self.assertFalse(
+                    [key for key in seeded_keys if marker in key],
+                    f"a seeded key matching {marker!r} would mean the managed launch "
+                    f"pre-accepted an operator-resolved boundary",
+                )
+
+    def test_every_packaged_seed_key_is_on_the_exact_allowlist(self) -> None:
+        # The deciding fence after verdict j#108694: the shipped declaration must be
+        # loadable under it, and this pins that the packaged data and the allowlist
+        # never drift apart.
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_onboarding_seed import (  # noqa: E501
+            ALLOWED_SEED_KEYS,
+        )
+
+        self.assertTrue(
+            set(self.profile.onboarding_seed.completion_key_map) <= ALLOWED_SEED_KEYS
+        )
+
+
 class R1F4HostIndependenceTest(unittest.TestCase):
     """R1-F4: provider resolution never falls back to the host's ambient environment."""
 

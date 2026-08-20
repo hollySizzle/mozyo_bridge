@@ -21,7 +21,20 @@ resolves for itself here (``herdr agent list`` self-lookup), the only externally
 observable discriminant a later adopt / doctor can compare against the live
 inventory — so a stale record from a previous process generation is never re-used.
 
-Non-blocking by contract: every step is best-effort. A failed self-lookup records an
+Provider onboarding pre-seed (Redmine #15744): the wrapper's position — inside the
+spawned process, in the environment the provider will inherit, at the last instant before
+the ``exec`` — is also the only place a launch can guarantee the provider's own first-run
+onboarding defaults are already in place. :func:`seed_provider_onboarding` applies
+whatever the provider PROFILE declares (never a provider branch here) so a fresh managed
+worker boots to a composer instead of an onboarding screen. This does not weaken the
+#13760 boundary: mozyo still never answers a rendered provider UI, and the seed schema
+admits only an exact allowlist of first-run UI defaults, so the trust and login screens
+stay operator-resolved. Unlike the attestation, the seed outcome GATES the exec (verdict
+j#108694): a launch whose seed did not land refuses to boot with a typed error rather
+than booting into the onboarding screen the seed exists to remove.
+
+Non-blocking by contract for the ATTESTATION steps: each is best-effort. A failed
+self-lookup records an
 empty locator (which the read side treats as ``stale`` — fail-closed), a failed
 store write degrades to an absent record (fail-closed too), and NEITHER stops the
 ``exec``. Blocking the boot on a missing env would kill the operator's pane; the
@@ -47,6 +60,8 @@ from mozyo_bridge.core.state.lane_epoch import MOZYO_LANE_EPOCH_ENV
 from mozyo_bridge.core.state.startup_execution_events import (
     STAGE_ATTESTATION_WRITE_FAILED,
     STAGE_ATTESTATION_WRITE_SUCCEEDED,
+    STAGE_ONBOARDING_SEED_APPLIED,
+    STAGE_ONBOARDING_SEED_FAILED,
     STAGE_PROVIDER_EXEC_CALL_REACHED,
     STAGE_PROVIDER_EXEC_FAILED,
     STAGE_PROVIDER_EXEC_REJECTED,
@@ -77,6 +92,12 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.infrast
     COMMAND_TIMEOUT_SECONDS,
     TerminalTransportError,
     resolve_herdr_binary,
+)
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_onboarding_preseed import (  # noqa: E501
+    SEED_STATUS_ALREADY_COMPLETE,
+    SEED_STATUS_FAILED,
+    SEED_STATUS_NOT_DECLARED,
+    SEED_STATUS_SEEDED,
 )
 
 #: Total wall-clock budget for the pre-exec self-lookup (Redmine #14231, clarification
@@ -121,9 +142,32 @@ ATTESTATION_REASON_NATIVE_IDENTITY_MISMATCH = "native_identity_mismatch"
 #: expectation for what the process really saw would attest the launcher, not the process.
 ATTESTATION_REASON_LANE_EPOCH_NOT_INJECTED = "lane_epoch_not_injected"
 
+#: The onboarding pre-seed use case itself raised (Redmine #15744). Every failure it
+#: reports is already typed, so reaching this means an unforeseen defect in the seed path
+#: — recorded as its own token so it is never mistaken for one of the expected outcomes.
+#: :func:`seed_provider_onboarding` still never raises; since verdict j#108694 the CLI
+#: entry treats this token, like ``failed``, as a launch-refusing outcome.
+SEED_REASON_SEED_RAISED = "seed_raised"
+
+#: The seed statuses on which the provider exec PROCEEDS (Redmine #15744 verdict
+#: j#108694, overruling the r1 boot-on-failure design): the provider declared nothing,
+#: the document was already complete, or the defaults were placed (created or merged —
+#: both report ``seeded``). Everything else — ``failed``, :data:`SEED_REASON_SEED_RAISED`,
+#: or an unrecognized token — refuses the exec fail-closed, so a broken seed path
+#: surfaces as a typed startup failure instead of the silent first-run-UI stall the
+#: r1 "never gates the exec" contract would have left behind (#15722 j#108276).
+SEED_PROCEED_STATUSES: frozenset[str] = frozenset(
+    {SEED_STATUS_NOT_DECLARED, SEED_STATUS_ALREADY_COMPLETE, SEED_STATUS_SEEDED}
+)
+
 #: The injected ``MOZYO_PROVIDER_ARGV0`` alias did not re-verify as a trusted alias of the
 #: exec target at this boundary (#14017's fail-closed check), so the exec was refused.
 EXEC_REASON_ARGV0_ALIAS_UNBOUND = "argv0_alias_unbound"
+#: The provider exec was refused because the onboarding pre-seed did not land (Redmine
+#: #15744 verdict j#108694). Rides :data:`STAGE_PROVIDER_EXEC_REJECTED`, so the
+#: projection's exec row names WHY the launch stopped; the preceding
+#: ``onboarding_seed_failed`` row carries which seed step failed. Value-free.
+EXEC_REASON_ONBOARDING_SEED_FAILED = "onboarding_seed_failed"
 #: The ``exec`` call itself raised (a missing / non-executable target). Value-free.
 EXEC_REASON_EXEC_RAISED = "exec_raised"
 
@@ -468,6 +512,65 @@ def perform_self_attestation(
     return persisted
 
 
+def seed_provider_onboarding(
+    provider_id: str,
+    env: Mapping[str, str],
+    *,
+    append_event=None,
+    preseed=None,
+) -> str:
+    """Place the provider's declared first-run defaults before the exec (never raises).
+
+    Redmine #15744. Returns the typed status token; the CLI entry decides what each
+    token costs (see :data:`SEED_PROCEED_STATUSES`) — this function itself only
+    observes, records, and reports.
+
+    **Why here.** The wrapper already exists because only the spawned process can read
+    its own environment (#13637), and the provider's config location is resolved from
+    exactly that environment — ``HOME`` and any config-relocation variable, as the
+    provider itself will read them after the ``exec``. A launcher-side seed would resolve
+    the launcher's home instead and could write a document the provider never opens. This
+    is also the last moment before the provider starts, so nothing can render an
+    onboarding screen between the check and the boot.
+
+    **Provider-neutral.** ``provider_id`` comes off the wrapper's own ``--role`` and is
+    handed to the profile-driven use case unchanged; no branch here knows which providers
+    have onboarding screens, and a provider declaring no seed is a no-op (the Codex path,
+    byte-invariant with the pre-#15744 launch).
+
+    **A failed seed gates the exec — at the caller.** The r1 design let a failed seed
+    boot the provider anyway; the cross-lineage review overruled it (review j#108680
+    finding_seedfailurenotgatingexec, verdict j#108694): a launch whose seed did not
+    land boots into the exact ``first_run_theme`` screen this feature exists to remove,
+    where the #13760 admission gate then refuses to send — the silent stall of #15722
+    j#108276 with extra steps. So the caller refuses the exec on ``failed`` /
+    :data:`SEED_REASON_SEED_RAISED`, a typed startup failure the launcher's health
+    probe surfaces immediately. This function stays never-raising so the decision is
+    made in exactly one place, on the returned token.
+    """
+    emit = append_event or (lambda stage, bounded_reason="": None)
+    try:
+        run = preseed
+        if run is None:
+            from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.application.agent_provider_onboarding_preseed import (  # noqa: E501
+                preseed_provider_onboarding,
+            )
+
+            run = preseed_provider_onboarding
+        outcome = run(provider_id, env)
+    except Exception:  # noqa: BLE001 — report the defect as a token; the caller gates
+        emit(STAGE_ONBOARDING_SEED_FAILED, SEED_REASON_SEED_RAISED)
+        return SEED_REASON_SEED_RAISED
+    status = _norm(getattr(outcome, "status", ""))
+    if status == SEED_STATUS_SEEDED:
+        emit(STAGE_ONBOARDING_SEED_APPLIED)
+    elif status == SEED_STATUS_FAILED:
+        emit(STAGE_ONBOARDING_SEED_FAILED, _norm(getattr(outcome, "reason", "")))
+    # `not_declared` / `already_complete` append nothing: neither changed anything, and a
+    # row on every launch would add noise to the projection precisely in the steady state.
+    return status
+
+
 def _argv0_alias_binds_to_exec_target(argv0_alias: str, exec_target: str) -> bool:
     """True iff ``argv0_alias`` is a trusted absolute alias of ``exec_target`` (#14017).
 
@@ -510,11 +613,15 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
 
     Reached only as the wrapped managed launch argv
     (``... herdr agent-attest --assigned-name <NAME> --workspace-id <WS>
-    --role <PROVIDER> --lane <LANE> -- <provider argv...>``). Writes the
-    self-attestation (best-effort) and then ``exec``s the provider argv, replacing this
-    process — so the provider is the real herdr pane occupant and inherits exactly the
-    env this wrapper observed. A missing provider argv is the only hard error (nothing
-    to exec); every attestation step is non-blocking.
+    --role <PROVIDER> --lane <LANE> -- <provider argv...>``). Seeds the provider's
+    declared first-run onboarding defaults (#15744), writes the self-attestation
+    (best-effort), and then ``exec``s the provider argv, replacing this process — so
+    the provider is the real herdr pane occupant and inherits exactly the env this
+    wrapper observed. The hard errors are a missing provider argv (nothing to exec)
+    and a seed outcome outside :data:`SEED_PROCEED_STATUSES` (verdict j#108694: a
+    launch whose seed did not land would boot into the very onboarding screen the seed
+    exists to remove, so it fails typed here instead — see
+    :func:`seed_provider_onboarding`). Every attestation step remains non-blocking.
 
     **Exec-target / argv[0] decoupling (Redmine #14017).** ``provider_argv[0]`` is the
     provider's verified absolute exec-target realpath — the file that is run. When the
@@ -565,6 +672,32 @@ def cmd_herdr_agent_attest(args: argparse.Namespace) -> int:
         participant=_norm(getattr(args, "assigned_name", "")),
     )
     append_event(STAGE_WRAPPER_ENTERED)
+    # Redmine #15744: place the provider's declared first-run onboarding defaults BEFORE
+    # anything else the wrapper does. It runs first because the self-attestation below
+    # spends a bounded lookup budget, and the seed's whole value is being in place when
+    # the provider starts — there is no reason to hold it behind an unrelated wait.
+    seed_status = seed_provider_onboarding(
+        _norm(getattr(args, "role", "")), env, append_event=append_event
+    )
+    if seed_status not in SEED_PROCEED_STATUSES:
+        # Verdict j#108694 (review j#108680 finding_seedfailurenotgatingexec, overruling
+        # the r1 boot-on-failure design): a launch whose seed did not land must fail
+        # typed HERE, before the provider exec — booting anyway would render the exact
+        # first-run screen the seed exists to remove, where the #13760 admission gate
+        # then refuses to send and the lane stalls silently (#15722 j#108276). The
+        # membership check fails closed: an unrecognized token refuses too. Refused
+        # before the attestation spends its lookup budget — there is nothing worth
+        # attesting about a launch that will not exec.
+        from mozyo_bridge.shared.errors import die
+
+        append_event(STAGE_PROVIDER_EXEC_REJECTED, EXEC_REASON_ONBOARDING_SEED_FAILED)
+        die(
+            "the provider's first-run onboarding pre-seed did not land "
+            f"(seed status: {seed_status or 'unknown'}); refusing to launch a provider "
+            "that would boot into its onboarding screen instead of a composer "
+            "(Redmine #15744)"
+        )
+        raise AssertionError("unreachable")
     perform_self_attestation(
         assigned_name=_norm(getattr(args, "assigned_name", "")),
         workspace_id=_norm(getattr(args, "workspace_id", "")),
@@ -637,14 +770,18 @@ __all__ = (
     "ATTESTATION_REASON_STORE_WRITE_FAILED",
     "EXEC_REASON_ARGV0_ALIAS_UNBOUND",
     "EXEC_REASON_EXEC_RAISED",
+    "EXEC_REASON_ONBOARDING_SEED_FAILED",
+    "SEED_PROCEED_STATUSES",
     "SELF_LOOKUP_REASON_BINARY_UNRESOLVED",
     "SELF_LOOKUP_REASON_LIST_UNREADABLE",
     "SELF_LOOKUP_REASON_ROW_ABSENT",
     "SELF_LOOKUP_REASON_ROW_AMBIGUOUS",
     "SELF_LOOKUP_REASON_SNAPSHOT_INCOMPLETE",
     "SELF_LOOKUP_TOTAL_BUDGET_SECONDS",
+    "SEED_REASON_SEED_RAISED",
     "Lister",
     "bounded_self_lookup",
     "cmd_herdr_agent_attest",
     "perform_self_attestation",
+    "seed_provider_onboarding",
 )

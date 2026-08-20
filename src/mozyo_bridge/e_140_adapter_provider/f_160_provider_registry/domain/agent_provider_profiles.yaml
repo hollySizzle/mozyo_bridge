@@ -31,17 +31,20 @@
 # code; declaring an unknown `protocol` here fails closed rather than mis-driving
 # the pane.
 
-# schema version "3" adds the optional `ghost_composer_signals` block (#14065 Phase 2):
-# the render style_provenance value(s) that identify a provider's ghost idle composer
-# (live-admitted set: `dim`, j#82180). "2" added `startup_blockers` (#13760); "1" is the
-# #13441 shape. Older shapes still load (each new field is optional and version-gated),
-# but an unknown version fails closed (`SUPPORTED_SCHEMA_VERSIONS`).
-version: "3"
+# schema version "4" adds the optional `onboarding_seed` block (#15744): the provider's
+# own first-run defaults a managed launch places BEFORE the provider starts, so an
+# onboarding screen never renders instead of a composer. "3" added `ghost_composer_signals`
+# (#14065 Phase 2): the render style_provenance value(s) that identify a provider's ghost
+# idle composer (live-admitted set: `dim`, j#82180). "2" added `startup_blockers` (#13760);
+# "1" is the #13441 shape. Older shapes still load (each new field is optional and
+# version-gated), but an unknown version fails closed (`SUPPORTED_SCHEMA_VERSIONS`).
+version: "4"
 source: >-
   Redmine #13441 journal #76725 (Coordinator Design Answer, Increment 1);
   startup_blockers added by #13760 journal #77947 (Design Answer) with the schema
   hardened per #13760 journal #78481 (Review Result); ghost_composer_signals added by
-  #14065 Phase 2 (live admission j#82180, dim-only).
+  #14065 Phase 2 (live admission j#82180, dim-only); onboarding_seed added by #15744
+  journal #108502 (Implementation Request) after the #15722 first_run_theme blocker.
 
 profiles:
   claude:
@@ -115,6 +118,46 @@ profiles:
     # Only `dim` may empty a pending composer; normal / mixed / unknown always preserve.
     ghost_composer_signals:
       - dim
+    # Pre-launch onboarding defaults (Redmine #15744). #13760 taught the launch layer to
+    # RECOGNISE the screens above and refuse to send into them; that made the failure
+    # honest but still stopped the lane — #15722 j#108276 sat on `first_run_theme` until
+    # an operator answered it by hand, halting a whole wave. This block closes the class
+    # by making the screen never render: the managed launch writes the provider's OWN
+    # documented first-run defaults into the provider's OWN config document before the
+    # provider process starts.
+    #
+    # This is NOT auto-answering the UI, and the schema enforces the difference: only
+    # the exact known-safe UI-default keys are seedable at all (`ALLOWED_SEED_KEYS`,
+    # default deny per #15744 verdict j#108694), so no credential, no login state, and
+    # no trust / permission acceptance can be declared here. `login_required`,
+    # `workspace_trust_confirmation` and `directory_trust_confirmation` therefore remain
+    # exactly what they were — operator-resolved blockers — and only the cosmetic
+    # first-run question is pre-answered by configuration.
+    #
+    # Values below are Claude Code 2.1.220's own contract, read from the shipped binary
+    # (the same evidence standard `startup_blockers` holds itself to, never memory):
+    #   - the global config document resolves to `<CLAUDE_CONFIG_DIR or ~/.claude>/
+    #     .config.json` when that file exists, else `<CLAUDE_CONFIG_DIR or $HOME>/
+    #     .claude.json` — hence two candidates sharing one env var at different depths;
+    #   - the onboarding flow (which owns the theme step) is gated solely on the global
+    #     config's `hasCompletedOnboarding` being falsy;
+    #   - `theme: dark` is the provider's own DEFAULT_GLOBAL_CONFIG value, so seeding it
+    #     pins what the provider would itself have used, never a mozyo preference.
+    onboarding_seed:
+      documents:
+        - id: config_dir_document
+          base_env: CLAUDE_CONFIG_DIR
+          base_home_relative: .claude
+          filename: .config.json
+          create_when_absent: false
+        - id: home_document
+          base_env: CLAUDE_CONFIG_DIR
+          base_home_relative: ""
+          filename: .claude.json
+          create_when_absent: true
+      completion_keys:
+        hasCompletedOnboarding: true
+        theme: dark
 
   codex:
     protocol: interactive_cli_tui
