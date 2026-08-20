@@ -105,12 +105,13 @@ class ExistingContainerTest(unittest.TestCase):
         self.assertIsNone(store.records_readonly())
 
     def test_schema_check_and_fetch_share_one_snapshot(self):
-        # Review j#108779 finding_readonlyschemasnapshotrace: with the status check
-        # and the row fetch in separate autocommit snapshots, a schema upgrade
-        # interleaved between them handed back rows the check never recognized.
-        # The read now BEGINs one transaction across both, so an upgrade attempted
-        # mid-read either blocks on the reader's shared lock or lands invisibly in
-        # a later snapshot — the verdict and the rows can never disagree.
+        # Review j#108779 finding_readonlyschemasnapshotrace + round-2
+        # finding_regressiontestallowstwosnapshotrace: the interleaving writer must
+        # change BOTH the schema version AND a row sentinel in one atomic commit —
+        # a metadata-only upgrade left the rows identical, so the pre-fix
+        # two-snapshot read still passed (a dead pin). With the sentinel, the old
+        # implementation fetches the post-upgrade row under a pre-upgrade verdict
+        # and fails; the fixed single-snapshot read never sees the sentinel.
         import sqlite3
         from unittest import mock
 
@@ -119,6 +120,7 @@ class ExistingContainerTest(unittest.TestCase):
         store = ReconcileStateStore(path=self.path)
         store.open_cycle(_key("j#100"), issue_id="15747")
         baseline = store.records()
+        sentinel = "SENTINEL-UPGRADED-99"
         real_status = module.readonly_component_status
         upgrade_error: list[Exception] = []
 
@@ -126,9 +128,13 @@ class ExistingContainerTest(unittest.TestCase):
             status = real_status(conn)
             writer = sqlite3.connect(str(self.path), timeout=0.05)
             try:
+                writer.execute("BEGIN IMMEDIATE")
                 writer.execute(
                     "UPDATE state_schema_components SET schema_version = 99 "
                     "WHERE component = 'reconcile_state'"
+                )
+                writer.execute(
+                    "UPDATE reconcile_state_records SET issue_id = ?", (sentinel,)
                 )
                 writer.commit()
             except sqlite3.OperationalError as exc:
@@ -143,17 +149,26 @@ class ExistingContainerTest(unittest.TestCase):
             result = store.records_readonly()
 
         if upgrade_error:
-            # The reader's shared lock held the upgrade out — the returned rows
-            # are the recognized snapshot.
+            # The reader's shared lock held the writer out: that is only the
+            # single-snapshot behavior when the refusal is a lock/busy refusal.
+            message = str(upgrade_error[0]).lower()
+            self.assertTrue(
+                "locked" in message or "busy" in message,
+                f"unexpected writer refusal: {upgrade_error[0]!r}",
+            )
             self.assertEqual(result, baseline)
         else:
-            # The upgrade landed in a later snapshot: the read must still be
-            # self-consistent — recognized rows or the typed None, never rows
-            # fetched under the upgraded, unrecognized schema verdict.
+            # The upgrade committed (WAL): the read must stay on its pre-upgrade
+            # snapshot (baseline rows) or fail closed — a sentinel row under a
+            # recognized verdict is exactly the two-snapshot race.
             self.assertIn(result, (baseline, None))
-        # Whatever the interleaving produced, a FRESH read after the upgrade (if it
-        # landed) honors the downgrade guard.
+        if result:
+            self.assertFalse(
+                any(record.issue_id == sentinel for record in result),
+                "post-upgrade sentinel rows leaked into a recognized-verdict read",
+            )
         if not upgrade_error:
+            # A FRESH read after the committed upgrade honors the downgrade guard.
             self.assertIsNone(store.records_readonly())
 
 
