@@ -446,6 +446,52 @@ fail-closedする。
 前提を持つ別railであり、receipt refreshのために条件を偽装しない。この2 classの一般移行runbookは未成立で、
 専用の外部実行型refresh railまたは明示したcompatibility判断がrelease前に必要である。
 
+#### restored pair の write-side 再attest (Redmine #15769)
+
+Herdr/tmux server lossからのrestoreは、live processとserver-owned pane stamps (mzb1 assigned name) を
+保存したままserver-owned `terminal_id` (場合によりpane locatorも) を新しくする。launch-generation rowは
+launch時のterminalを記録し続けるため、read-side `verified_generation_token` のexact
+`generation.terminal_id == live_terminal_id` conjunctが恒久に不成立になり、governedな`handoff send`が
+すべて`target_unavailable`でfail-closedする実測deadlockがあった (#15631 j#108621/j#108741、#15693 j#108747)。
+
+L1設計決定 (#15769 j#108766) は **write-side governed re-attest** である。read-side受理
+(`verified_generation_token` / `completed_generation_startup_token`) は既存caseに対してbyte同一に保ち、
+広げない。代わりに `sublane rebind-restored-pair` (--execute) が、次の**server-owned事実のみ**の
+identity joinが成立したslotに限り、launch-generation rowの`terminal_id` / `locator`をlive値へ
+byte-exact CAS更新する (`HerdrLaunchGenerationStore.reattest_restored_terminal`: expected old row完全一致
+必須、upsertなし、no-opは型付き拒否):
+
+- live inventoryにそのassigned nameのrowが**ちょうど1つ** (duplicateは`duplicate_live_candidates`拒否)、
+  `SLOT_LIVE`、provider stampが期待providerに一致;
+- assigned name (server-owned stamp) のdecodeがgeneration rowの記録identity
+  (workspace / role / lane) と、rowがslotの期待identityと、それぞれexact一致
+  (不一致は`live_identity_join_failed`拒否 — foreign rowは決してre-attestされない);
+- canonical snapshotからlive terminalが一意に解決 (`terminal_identity_of_live_slot`);
+- attestation storeのjoinが`attested`、または**restore署名のstale** (identity一致・boot verdict
+  `present`・locator/terminal世代pinのみのdrift) であること。foreign (`conflict`) / `missing` /
+  absentは従来どおり`unattested_slot`拒否。
+
+callerはCASを駆動するidentity / terminal値を一切供給できない。old -> new terminal / locatorのlineageと
+成立したevidence conjunctsはstructured outcomeの`reattest_lineage` (journal貼付用payload) に永続記録する。
+`--allow-single-slot`はpairの片slotがlive inventoryに全く存在しない場合に、生存slotのみの再pin/再attestを
+許し、欠落slotを型付き事実`missing_live_slot`として報告する (欠落slotのdeclared pin / generation rowは
+byte不変)。
+
+locatorが移動したrestoreでは、`completed_generation_startup_token`の`participant.locator ==
+generation.locator` conjunctがgeneration CAS後に恒久不成立になるため、railはstartup-transaction
+participantのlocatorも同時にre-pinする (`StartupTransactionFence.repin_restored_participant_locator`)。
+これは「terminal phaseはwrite-once」規則への**明示した限定例外**である: locator fieldのみ
+(launch時のpane-bound receiptはbyte不変 — receiptは履歴的証拠でありidentityの正本ではない)、
+expected old locatorのexact CAS必須、`completed_success` / `rollback_owed`の2 phaseのみ許可。
+read-side受理をgeneration row比較へ広げる代替案は全既存consumerへの受理拡大でありL1決定が却下した。
+書き込み順はparticipant re-pin → generation CAS → declared-pin reconcileで、途中失敗は常にfail-closedに
+留まり、再実行が残段を再観測して完遂する (retry-safe)。
+
+なお`pane_bound_v2` receiptのterminal照合を要求するdelivery path (`verified_terminal_generation_token`
+供給側) は、restore後terminalがreceiptと一致しないため引き続きfail-closedする。#15769が解くのは
+receipt照合を供給しない`verified_generation_token` path (recovery / 送達admission join) のdeadlockであり、
+receipt再発行はこの節冒頭のrefresh rail未成立事項のまま残る。
+
 flow:
 
 1. herdr binary を trusted env から解決 (未設定 / 未解決 → fail-closed)。

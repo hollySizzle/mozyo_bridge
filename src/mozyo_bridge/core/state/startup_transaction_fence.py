@@ -913,6 +913,32 @@ class StartupTransactionFence:
             self._write(action_id, phase=action.phase, participants=updated)
             return self._require(action_id)
 
+    def repin_restored_participant_locator(
+        self,
+        action_id: str,
+        role: str,
+        *,
+        assigned_name: str,
+        expected_locator: str,
+        new_locator: str,
+    ) -> StartupAction:
+        """CAS-move ONE participant's ``locator`` after a server restore (Redmine #15769).
+
+        The participant-side half of the governed restored-pair re-attest (j#108766): a
+        deliberate, BOUNDED, field-scoped exception to the "terminal phase is written
+        once" rule — locator only, exact-CAS-guarded, ``completed_success`` /
+        ``rollback_owed`` only, receipt byte-untouched; only the rebind rail calls it.
+        Body + contract: :mod:`...core.state.startup_transaction_restored_repin`.
+        """
+        from mozyo_bridge.core.state.startup_transaction_restored_repin import (
+            repin_restored_participant_locator as _repin,
+        )
+
+        return _repin(
+            self, action_id, role, assigned_name=assigned_name,
+            expected_locator=expected_locator, new_locator=new_locator,
+        )
+
     # -- internals ---------------------------------------------------------
 
     def _require(self, action_id: str) -> StartupAction:

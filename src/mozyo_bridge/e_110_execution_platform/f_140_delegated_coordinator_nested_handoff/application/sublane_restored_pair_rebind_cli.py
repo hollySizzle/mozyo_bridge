@@ -39,9 +39,21 @@ def format_restored_pair_rebind_text(outcome) -> str:
             f"declared_locator={slot.declared_locator or '-'} "
             f"live_locator={slot.live_locator or '-'} "
             f"attestation={slot.attestation_state or '-'} ready={slot.ready}"
+            + (" skipped=True" if slot.skipped else "")
         )
+        if slot.generation_state:
+            lines.append(f"    generation: {slot.generation_state}")
         if slot.reason:
             lines.append(f"    reason: {slot.reason}")
+    for entry in plan.reattest_lineage:
+        lines.append(
+            f"  reattest_lineage[{entry.get('slot_role', '-')}]: "
+            f"terminal {entry.get('old_terminal_id', '-')} -> "
+            f"{entry.get('new_terminal_id', '-')}, "
+            f"locator {entry.get('old_locator', '-')} -> "
+            f"{entry.get('new_locator', '-')}, "
+            f"participant_repin={entry.get('participant_locator_repin')}"
+        )
     if plan.blocked_reasons:
         lines.append("  blocked: " + ", ".join(plan.blocked_reasons))
     if outcome.detail:
@@ -58,6 +70,7 @@ def cmd_sublane_rebind_restored_pair(args: argparse.Namespace) -> int:
         issue=getattr(args, "issue", "") or "",
         lane=getattr(args, "lane", "") or "",
         journal=getattr(args, "journal", "") or "",
+        allow_single_slot=bool(getattr(args, "allow_single_slot", False)),
     )
     use_case = SublaneRestoredPairRebindUseCase(
         LiveRestoredPairRebindOps(repo_root=repo_root)
@@ -80,9 +93,15 @@ def register_sublane_rebind_restored_pair_parser(sublane_sub: Any) -> None:
         help=(
             "Redmine #15656: CAS-replace an ACTIVE lane's stale declared_slots pair "
             "snapshot when a herdr server restart restored the SAME attested "
-            "gateway+worker sessions onto new pane locators. Default is a read-only "
-            "preflight; --execute writes only the lifecycle pin snapshot (never a "
-            "close / launch / send / worktree change; lane_generation is unchanged)."
+            "gateway+worker sessions onto new pane locators. Redmine #15769: when a "
+            "restored slot's server-owned terminal id (and possibly its locator) is "
+            "new while the launch-generation row still records the launch-time "
+            "values, additionally CAS re-attest that row (and the startup-transaction "
+            "participant locator when the pane moved) from server-owned inventory "
+            "facts, recording the old->new lineage in the outcome. Default is a "
+            "read-only preflight; --execute writes only the lifecycle pin snapshot / "
+            "generation row / participant locator (never a close / launch / send / "
+            "worktree change; lane_generation is unchanged)."
         ),
     )
     parser.add_argument(
@@ -96,6 +115,16 @@ def register_sublane_rebind_restored_pair_parser(sublane_sub: Any) -> None:
             "Optional Redmine journal id the operator records this rebind under "
             "(carried into the outcome payload; the rail's authority is the live "
             "restart evidence, not this anchor)"
+        ),
+    )
+    parser.add_argument(
+        "--allow-single-slot",
+        action="store_true",
+        help=(
+            "Redmine #15769: resolve a restored slot even when the pair's OTHER "
+            "slot has no live named row at all; the missing slot is reported as "
+            "the typed fact missing_live_slot and its declared pin stays "
+            "byte-unchanged. Every gate on the resolved slot is unchanged."
         ),
     )
     parser.add_argument(

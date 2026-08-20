@@ -769,6 +769,27 @@ class HerdrLaunchGenerationStore:
             )
         )
 
+    def reattest_restored_terminal(self, **kwargs) -> LaunchGeneration:
+        """CAS ONLY ``terminal_id`` / ``locator`` of one restored ``attested`` row (#15769).
+
+        The write side of the restored-pair re-attest (design decision #15769 j#108766;
+        measured deadlock #15631 j#108741). Only the GOVERNED rebind rail calls this,
+        after proving the identity join on server-owned inventory facts; the exact
+        expected old row is required (no upsert, no-op refused) and ``observed_at`` /
+        ``attested_at`` stay byte-untouched. Body — and the full contract — in the
+        module-health companion
+        :func:`mozyo_bridge.core.state.herdr_launch_generation_reattest
+        .reattest_restored_terminal_locked`; held under the same SHARED store lock as
+        reserve / finalize.
+        """
+        from mozyo_bridge.core.state.herdr_launch_generation_reattest import (
+            reattest_restored_terminal_locked,
+        )
+
+        return self._with_shared_write_lock(
+            lambda: reattest_restored_terminal_locked(self, **kwargs)
+        )
+
     def _finalize_locked(
         self,
         *,
