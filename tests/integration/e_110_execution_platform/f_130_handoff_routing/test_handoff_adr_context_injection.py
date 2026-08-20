@@ -182,16 +182,16 @@ class HandoffAdrContextInjectionTest(unittest.TestCase):
         self.assertIn("- proposed (NOT binding): adr-0011", stdout)
 
     def test_repo_without_adr_directory_sends_unchanged(self) -> None:
-        # Backward compatibility (#15722 AC3): an adopting repo with no ADR
-        # practice keeps the pre-#15722 payload — an explicit `None`, no body
-        # clause, no record block, and the send still succeeds.
+        # Backward compatibility (#15722 AC3, review j#108679
+        # finding_nullkeybreaksnoadrcompat): an adopting repo with no ADR practice
+        # keeps the pre-#15722 payload byte-identically — no `adr_context` key at
+        # all, no body clause, no record block, and the send still succeeds.
         result, stdout, pane_text = self._run(self._worker_argv())
         self.assertEqual(0, result)
 
         outcome = self._outcome_from_stdout(stdout)
         self.assertEqual("sent", outcome["status"])
-        self.assertIn("adr_context", outcome["role_profile"])
-        self.assertIsNone(outcome["role_profile"]["adr_context"])
+        self.assertNotIn("adr_context", outcome["role_profile"])
         self.assertNotIn("adr context:", pane_text)
         self.assertNotIn("# ADR context", stdout)
 
@@ -204,7 +204,7 @@ class HandoffAdrContextInjectionTest(unittest.TestCase):
         )
         _result, stdout, pane_text = self._run(self._worker_argv())
         outcome = self._outcome_from_stdout(stdout)
-        self.assertIsNone(outcome["role_profile"]["adr_context"])
+        self.assertNotIn("adr_context", outcome["role_profile"])
         self.assertNotIn("adr context:", pane_text)
 
     def test_send_without_role_profile_carries_no_adr_context(self) -> None:

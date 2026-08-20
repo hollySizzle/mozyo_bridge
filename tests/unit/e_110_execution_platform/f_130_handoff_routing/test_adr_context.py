@@ -88,8 +88,14 @@ class NormalizeAdrStatusTest(unittest.TestCase):
                 self.assertEqual(ref.status, STATUS_UNKNOWN)
                 self.assertFalse(ref.is_binding)
 
-    def test_case_insensitive_active_is_still_the_only_binding_input(self) -> None:
-        self.assertEqual(make_adr_ref("adr-0001", INDEX, "Active").status, STATUS_ACTIVE)
+    def test_non_literal_active_is_unknown_and_never_binding(self) -> None:
+        # Review j#108679 finding_noncanonicalstatuspromotion: only the exact
+        # literal `active` token binds; case variants are unknown, not promoted.
+        for raw in ("Active", "ACTIVE", "aCtIvE"):
+            ref = make_adr_ref("adr-0001", INDEX, raw)
+            self.assertEqual(ref.status, STATUS_UNKNOWN)
+            self.assertFalse(ref.is_binding)
+        self.assertEqual(make_adr_ref("adr-0001", INDEX, "active").status, STATUS_ACTIVE)
         self.assertEqual(BINDING_STATUSES, frozenset({STATUS_ACTIVE}))
 
 
@@ -211,7 +217,9 @@ class RoleProfileAdrContextAttachmentTest(unittest.TestCase):
     def test_without_adr_context_the_payload_is_unchanged(self) -> None:
         base = self._resolution()
         self.assertIs(with_adr_context(base, None), base)
-        self.assertIsNone(base.to_structured_dict()["adr_context"])
+        # Review j#108679 finding_nullkeybreaksnoadrcompat: the no-ADR payload
+        # carries no `adr_context` key at all (byte-identical to pre-#15722).
+        self.assertNotIn("adr_context", base.to_structured_dict())
         self.assertEqual(base.record_contract_text(), base.resolved_text)
         self.assertNotIn("adr context:", base.pointer_clause())
 

@@ -153,16 +153,22 @@ class RoleProfileResolution:
     adr_context: Optional[AdrContextPointer] = None
 
     def to_structured_dict(self) -> dict[str, object]:
-        """Structured, free-text-free pointer fields for the handoff payload."""
-        return {
+        """Structured, free-text-free pointer fields for the handoff payload.
+
+        The ``adr_context`` key is present only when a pointer was resolved
+        (review j#108679 finding_nullkeybreaksnoadrcompat): a repo without
+        ``vibes/docs/adr/`` must produce a payload byte-identical to the
+        pre-#15722 shape, so the no-ADR path adds no key at all.
+        """
+        payload: dict[str, object] = {
             "role_profile": self.role_profile,
             "profile_source": self.profile_source,
             "profile_version": self.profile_version,
             "unresolved_placeholders": list(self.unresolved_placeholders),
-            "adr_context": (
-                self.adr_context.to_structured_dict() if self.adr_context else None
-            ),
         }
+        if self.adr_context is not None:
+            payload["adr_context"] = self.adr_context.to_structured_dict()
+        return payload
 
     def record_contract_text(self) -> str:
         """The resolved contract for the durable record, plus any ADR context.

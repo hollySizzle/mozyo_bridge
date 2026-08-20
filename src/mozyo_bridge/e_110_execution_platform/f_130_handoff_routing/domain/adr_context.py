@@ -89,7 +89,10 @@ def normalize_adr_status(raw: object) -> str:
     """
     if not isinstance(raw, str):
         return STATUS_UNKNOWN
-    token = raw.strip().split()[0].strip().lower() if raw.strip() else ""
+    # Exact literal token only (review j#108679 finding_noncanonicalstatuspromotion):
+    # case-folding promoted `Active` / `ACTIVE` to the binding `active`, which the
+    # fail-closed contract forbids — a non-literal declaration is unknown, not active.
+    token = raw.strip().split()[0].strip() if raw.strip() else ""
     if token in (STATUS_ACTIVE, STATUS_PROPOSED, STATUS_SUPERSEDED):
         return token
     return STATUS_UNKNOWN

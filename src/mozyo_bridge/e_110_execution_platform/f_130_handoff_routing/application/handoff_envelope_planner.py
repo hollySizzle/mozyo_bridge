@@ -36,6 +36,7 @@ from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, cast
 
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.adr_context import (
+    AdrContextError,
     AdrContextPointer,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
@@ -529,7 +530,10 @@ class HandoffEnvelopePlanner:
                     role_profile_resolution,
                     self._ops.resolve_adr_context(repo_root),
                 )
-            except RoleProfileError as exc:
+            except (RoleProfileError, AdrContextError) as exc:
+                # AdrContextError (review j#108679 finding_adrresolutionerrorescapesplanner):
+                # a malformed ADR set (duplicate ids, unreadable index) must surface as
+                # the planner's typed blocked outcome, never as an untyped crash.
                 raise EnvelopePlanError(
                     "invalid_args",
                     str(exc),

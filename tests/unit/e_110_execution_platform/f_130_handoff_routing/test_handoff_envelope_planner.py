@@ -30,6 +30,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
     EnvelopePlannerOps,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.adr_context import (
+    AdrContextError,
     AdrContextPointer,
     make_adr_ref,
     resolvable_paths_for,
@@ -163,6 +164,7 @@ class FakeOps:
         # Default `None` keeps the pre-#15722 payload shape (the explicit "no ADR
         # context resolved" fallback); `adr_context` scripts the resolved case.
         self.calls.append(("resolve_adr_context", str(repo_root)))
+        self._maybe_raise("resolve_adr_context")
         return cast(
             "AdrContextPointer | None", self._overrides.get("adr_context", None)
         )
@@ -501,6 +503,19 @@ class PlanDeliveryEnvelopeTest(unittest.TestCase):
         self.assertEqual(exc.reason, "invalid_args")
         self.assertEqual(set(exc.outcome_extra), {"execution_root"})
         self.assertEqual(exc.emit_extra, {})
+
+    def test_adr_context_error_becomes_typed_invalid_args(self) -> None:
+        # Review j#108679 finding_adrresolutionerrorescapesplanner: a malformed
+        # ADR set (duplicate ids, unreadable index) surfaces as the planner's
+        # typed blocked outcome, never as an untyped AdrContextError crash.
+        ops = FakeOps(resolve_adr_context_raises=AdrContextError("duplicate adr id"))
+        with self.assertRaises(EnvelopePlanError) as ctx:
+            self._plan(
+                ops, _inp(workdir="/r/w", role_profile="x"), resolved_target_repo="/r"
+            )
+        exc = ctx.exception
+        self.assertEqual(exc.reason, "invalid_args")
+        self.assertEqual(set(exc.outcome_extra), {"execution_root"})
 
     def test_transition_error_carries_execution_root_and_role_profile(self) -> None:
         ops = FakeOps(resolve_transition_role_raises=TransitionRoleError("bad tr"))
