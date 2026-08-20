@@ -199,10 +199,19 @@ class ReconcileStateStore:
         if not self.path.exists():
             return ()
         try:
-            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)
+            conn = sqlite3.connect(
+                f"file:{self.path}?mode=ro", uri=True, isolation_level=None
+            )
         except sqlite3.DatabaseError:
             return None
         try:
+            # One explicit read transaction across validation AND fetch (review
+            # j#108779 finding_readonlyschemasnapshotrace): in autocommit each
+            # SELECT is its own snapshot, so a concurrent schema upgrade between
+            # the status check and the row fetch could hand back rows from a
+            # schema the check never recognized. BEGIN pins one snapshot for
+            # both, so the verdict and the rows can never disagree.
+            conn.execute("BEGIN")
             status = readonly_component_status(conn)
             if status == READONLY_COMPONENT_ABSENT:
                 return ()

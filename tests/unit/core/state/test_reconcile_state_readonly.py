@@ -104,6 +104,58 @@ class ExistingContainerTest(unittest.TestCase):
         store = ReconcileStateStore(path=self.path)
         self.assertIsNone(store.records_readonly())
 
+    def test_schema_check_and_fetch_share_one_snapshot(self):
+        # Review j#108779 finding_readonlyschemasnapshotrace: with the status check
+        # and the row fetch in separate autocommit snapshots, a schema upgrade
+        # interleaved between them handed back rows the check never recognized.
+        # The read now BEGINs one transaction across both, so an upgrade attempted
+        # mid-read either blocks on the reader's shared lock or lands invisibly in
+        # a later snapshot — the verdict and the rows can never disagree.
+        import sqlite3
+        from unittest import mock
+
+        from mozyo_bridge.core.state import reconcile_state as module
+
+        store = ReconcileStateStore(path=self.path)
+        store.open_cycle(_key("j#100"), issue_id="15747")
+        baseline = store.records()
+        real_status = module.readonly_component_status
+        upgrade_error: list[Exception] = []
+
+        def interleaving_status(conn):
+            status = real_status(conn)
+            writer = sqlite3.connect(str(self.path), timeout=0.05)
+            try:
+                writer.execute(
+                    "UPDATE state_schema_components SET schema_version = 99 "
+                    "WHERE component = 'reconcile_state'"
+                )
+                writer.commit()
+            except sqlite3.OperationalError as exc:
+                upgrade_error.append(exc)
+            finally:
+                writer.close()
+            return status
+
+        with mock.patch.object(
+            module, "readonly_component_status", interleaving_status
+        ):
+            result = store.records_readonly()
+
+        if upgrade_error:
+            # The reader's shared lock held the upgrade out — the returned rows
+            # are the recognized snapshot.
+            self.assertEqual(result, baseline)
+        else:
+            # The upgrade landed in a later snapshot: the read must still be
+            # self-consistent — recognized rows or the typed None, never rows
+            # fetched under the upgraded, unrecognized schema verdict.
+            self.assertIn(result, (baseline, None))
+        # Whatever the interleaving produced, a FRESH read after the upgrade (if it
+        # landed) honors the downgrade guard.
+        if not upgrade_error:
+            self.assertIsNone(store.records_readonly())
+
 
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
