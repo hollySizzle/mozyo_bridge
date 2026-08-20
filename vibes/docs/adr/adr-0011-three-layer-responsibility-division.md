@@ -1,9 +1,9 @@
 # ADR-0011: 3階層構造は「責務の所在の分担」であり、レビューの多重化ではない
 
-- status: proposed (owner ratify 待ち。owner は 2026-08-18 の対話で本モデルの内容を確定させたが、ADR の *file 化された exact text* はまだ ratify していない。active 化は owner の文面裁定 anchor 成立後。coordinator 直接執筆 — owner 決定 doc は relay で意図が劣化するため subagent へ dispatch しない、の境界 (#15578 誰が書くか) に従う。)
-- date: 2026-08-18 (本文整合: 2026-08-19 — ratify 前の事実更新。モデル配置の変遷・実証達成・返送経路の現状を後述の各節に反映。決定行 (規約) は変更していない)
+- status: proposed (owner ratify 待ち。owner は 2026-08-18 の対話で本モデルの内容を確定させ、2026-08-20 に各層責務を逐語で明確化した (#15631 j#109265) が、ADR の *file 化された exact text* の裁定 (active 化) はまだ残る。active 化は owner の文面裁定 anchor 成立後。coordinator 直接執筆 — owner 決定 doc は relay で意図が劣化するため subagent へ dispatch しない、の境界 (#15578 誰が書くか) に従う。)
+- date: 2026-08-18 (本文整合: 2026-08-20 — 第2層のサブレーン dispatch 最重要責務・閉じ残り氾濫責務、第1層のリリース責務を owner 逐語 #15631 j#109265 で補強。決定 (規約) の骨子は不変で、既に本文にあった責務を owner 明確化の語で精緻化した)
 - 改稿注記: 本 ADR は ADR-0009 (小規模の既定運用モデル「1階層/2役割」、1階層⇔3階層の切替) を**補完**する。ADR-0009 は「いつ1階層/いつ3階層か」を決め、本 ADR は「3階層のとき各層が何に責任を持つか」を決める。番号 0007 / 0008 / 0010 は他 branch の draft で予約されているため 0011 を採る。
-- related: #15631 (3階層を実運用可能にする取りまとめ US)、ADR-0009 (運用モデル。本 ADR がモデル配置の向きを更新: 下記)、#15578 (運用モデル ADR 文面 / 誰が書くか境界)、#15152 (単一レーン頭打ちの実証根拠)、#15629 (自律実行ログ)、中央 preset `### US-Level Audit Model` / `### Close Approval Separation` / `### Owner Close Approval Delegation`、CLAUDE.md project-local additions (project-gateway routing 境界)。
+- related: #15631 (3階層を実運用可能にする取りまとめ US)、**#15631 j#109265 (owner 各層責務の逐語明確化 = 本 ADR 裁定の正本材料)**、#15693 j#109253 (L2 bounded delegation charter — 本 ADR 裁定前の暫定発効。裁定時に本 ADR へ畳んで charter を終了)、ADR-0009 (運用モデル。本 ADR がモデル配置の向きを更新: 下記)、#15578 (運用モデル ADR 文面 / 誰が書くか境界)、#15822 (Version close MCP ツール = 第2層の閉じ残り管理責務の機械化前提)、#15152 (単一レーン頭打ちの実証根拠)、#15629 (自律実行ログ)、中央 preset `### US-Level Audit Model` / `### Close Approval Separation` / `### Owner Close Approval Delegation`、CLAUDE.md project-local additions (project-gateway routing 境界)。
 
 ## 決定 (規約行)
 
@@ -23,6 +23,8 @@
 
 その Redmine Version (スコープの器) の責務。**検証語ではなく決定語で定義する** (「確認/検証」の語は第3層で済んだ正しさの再レビューを招くため使わない)。
 
+- **サブレーンを dispatch する (最重要責務)**: このバージョンの各 US を第3層サブレーンへ実際に dispatch する。範囲・順序を決めるだけでなく、**dispatch の実行そのもの**が第2層の一番大事な責務である (owner 明確化 #15631 j#109265)。
+- **サブレーンのライフサイクルを管理する**: 統合・close 済みのサブレーンが drain されず**閉じ残りが氾濫している状態は第2層の責務**である (owner 明確化 #15631 j#109265)。Version 配下の未 close issue / 未 drain サブレーンの検出と処理は第2層が持つ (Version close の機械化は #15822 が前提。未整備の間は issue 単位 close の手動確認で代替)。
 - **範囲を決める**: このバージョンにどの US を入れる/入れないか、US 同士の境界 (重複も欠落もしないように)。
 - **順序を決める**: 第3層に何から着手させるか。
 - **進め方を決める (proportionality)**: 指摘を今やる価値がない→やらない / やりすぎ→今はやめる。
@@ -34,6 +36,7 @@
 ### 第1層 最上位コーディネーター
 
 - 複数の Redmine Version (スコープの器) に束ねた**仕事を取りまとめ、それをリリースに値するか・そのリリースに価値があるか** (プロダクトの価値判断) を決める。**リリースは Redmine Version とは別の行為**であり、実際の版番号は release gate / tag 時点で決める (Redmine Version 名 = 出す版番号ではない)。第1層が判断するのは「束ねた仕事をリリースとして切るか」であって、器の名前を版番号として採用することではない。
+- **リリースは第1層の責務**: バージョンが統合されたのにリリースされていない状態は第1層の責務である (owner 明確化 #15631 j#109265)。統合 (第2層) の後段でリリースが滞ることを第1層が持つ。
 - owner との対話窓口、意思決定の捕捉 (ADR)、owner 承認の収集、最終クローズ可否。
 
 ## 原則: なぜ多重レビューを禁止するか
@@ -46,7 +49,7 @@
 
 1. **サブレーンのレビューが唯一の網**: US の正しさを保証する検査が第3層1回になり、上位に再捕捉が無い (意図的)。ゆえに**サブレーンのレビュー役の系統独立性が load-bearing** であり、サブレーンの対が死角を共有すると誰も気づかない。冗長を削る設計は正しいが、その分だけ第3層の品質と、レビュー結果を上へ返す**返送経路の堅牢性**に賭けている。(現状更新 2026-08-19: 返送シナリオの isolation 結合不安定は #15709 で、callback 不達 3 class (precondition_not_idle 死蔵 / lane_binding_absent / receiver 導出) は #15707 で、suite の ambient home / 実 remote SSH coupling は #15711 で解消済み。残る既知穴は L2→L1 default-lane callback の `target_unavailable` (受信側 terminal generation 証明不足) で #15712 が追跡中。不達時も durable-record polling で運用は成立している。)
 
-2. **第2層が空席だと owner がボトルネックになる**: 「finding を飛ばすか/やりすぎか」の proportionality 判断は第2層の責務だが、その判断が owner 本人に上がる構造は owner をボトルネックにする。第2層を担い手 (レーン) で埋めるのが owner を外す最大のテコであり、本モデルの実効性は第2層の staffing とセットで初めて出る。(現状更新 2026-08-19: #15693 の bounded trial で L2 lane (`issue_15693_l2_trial`, delegated_coordinator) が稼働し、scheduling・並列 lane 作成・衝突 fence・state-only uptake・residual 起票まで自律実行できることを実証済み。常設化の owner 判断は未収集で #15693 を open anchor として維持。)
+2. **第2層が空席だと owner がボトルネックになる**: 「finding を飛ばすか/やりすぎか」の proportionality 判断は第2層の責務だが、その判断が owner 本人に上がる構造は owner をボトルネックにする。第2層を担い手 (レーン) で埋めるのが owner を外す最大のテコであり、本モデルの実効性は第2層の staffing とセットで初めて出る。(現状更新 2026-08-20: #15693 の bounded trial で L2 lane (`issue_15693_l2_r2`, delegated_coordinator) が稼働。charter (#15693 j#109253) 下で L2 が **サブレーンを自律 dispatch** (#15816 の L3 lane 新規作成 + 通知)・既存 lane coordination の adopt・設計相談の一次 Answer・state-only uptake を実行できることを実証 (#15693 j#109262)。これは本 ADR が第2層の最重要責務とする「サブレーン dispatch」の live 実証である。常設化の owner 判断は未収集で #15693 を open anchor として維持。)
 
 3. **「ADR 全層参照」は機構が要る**: 各層の文脈へ ADR を実際に注入・解決する仕組み (既存の role_profile / workflow_contract 注入の延長) が無いと「参照必須」が掛け声で終わる。これはハーネス整備項目 (#15631 後続)。
 
