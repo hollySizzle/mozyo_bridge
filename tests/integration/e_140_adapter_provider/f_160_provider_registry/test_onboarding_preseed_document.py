@@ -258,11 +258,13 @@ class OnboardingPreseedDocumentTests(unittest.TestCase):
 
         outcome = preseed_provider_onboarding("claude", {"HOME": locked})
 
-        # The claim is "never raises, always a declared token" — the caller is a startup
-        # wrapper that must exec the provider whatever this returns. Which token appears
-        # is left open on purpose: a suite running as root can legitimately write into a
-        # mode-0o500 directory, and pinning `failed` would make this fail there for a
-        # reason that has nothing to do with the contract.
+        # The claim is "never raises, always a declared token" — the caller is the
+        # startup wrapper, which since verdict j#108694 REFUSES the provider exec on a
+        # `failed` token (review j#108770 finding_overruledbootcontractstilldocumented:
+        # the old boot-regardless wording here described the overruled design). Which
+        # token appears is left open on purpose: a suite running as root can
+        # legitimately write into a mode-0o500 directory, and pinning `failed` would
+        # make this fail there for a reason that has nothing to do with the contract.
         self.assertIn(
             outcome.status,
             (

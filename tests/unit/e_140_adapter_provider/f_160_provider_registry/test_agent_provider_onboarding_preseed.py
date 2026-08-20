@@ -258,6 +258,19 @@ class PreseedDecisionFlowTests(unittest.TestCase):
         self.assertEqual(outcome.status, SEED_STATUS_FAILED)
         self.assertEqual(outcome.reason, SEED_REASON_WRITE_FAILED)
 
+    def test_an_unprobeable_candidate_fails_typed_instead_of_raising(self) -> None:
+        # Review j#108770 finding_filesystemportexistenceerrorescapes: an existence
+        # probe that raises (PermissionError on the parent) must become the typed
+        # failed outcome — never an escaping exception, and never a fall-through to
+        # creating a different document than the one the provider may read.
+        class UnprobeableCandidate(FakeOnboardingDocumentFilesystem):
+            def document_exists(self, path: str) -> bool:
+                raise PermissionError(path)
+
+        outcome = _preseed(UnprobeableCandidate())
+        self.assertEqual(outcome.status, SEED_STATUS_FAILED)
+        self.assertEqual(outcome.reason, SEED_REASON_DOCUMENT_UNREADABLE)
+
     # --- completion semantics at the write boundary (verdict j#108694) ------------
 
     def test_honored_flags_never_open_the_document_for_writing(self) -> None:

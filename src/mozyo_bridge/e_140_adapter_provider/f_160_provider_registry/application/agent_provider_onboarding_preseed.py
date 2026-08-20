@@ -341,8 +341,8 @@ def _select_document(
     env: Mapping[str, str],
     home: str,
     filesystem: OnboardingDocumentFilesystem,
-) -> "tuple[OnboardingSeedDocument, str]":
-    """The declared document to seed, and its absolute path.
+) -> "Optional[tuple[OnboardingSeedDocument, str]]":
+    """The declared document to seed and its absolute path, or ``None`` unprobeable.
 
     The first candidate that already EXISTS wins, mirroring how the provider resolves
     its own config: seeding a different file than the one the provider reads would
@@ -351,7 +351,16 @@ def _select_document(
     """
     for document in declaration.documents:
         path = resolve_document_path(document, env, home)
-        if filesystem.document_exists(path):
+        try:
+            exists = filesystem.document_exists(path)
+        except OSError:
+            # Review j#108770 finding_filesystemportexistenceerrorescapes: an
+            # unprobeable candidate (e.g. PermissionError on the parent) must
+            # surface as the caller's typed failed outcome — NOT fall through to
+            # the create path, which would seed a different document than the one
+            # the provider may actually read.
+            return None
+        if exists:
             return document, path
     creatable = declaration.creatable_document
     return creatable, resolve_document_path(creatable, env, home)
@@ -414,7 +423,14 @@ def preseed_provider_onboarding(
             status=SEED_STATUS_FAILED, reason=SEED_REASON_HOME_UNRESOLVED
         )
 
-    document, path = _select_document(declaration, env, home, filesystem)
+    selected = _select_document(declaration, env, home, filesystem)
+    if selected is None:
+        # A candidate could not even be probed for existence (review j#108770):
+        # fail typed instead of guessing which document the provider reads.
+        return OnboardingSeedOutcome(
+            status=SEED_STATUS_FAILED, reason=SEED_REASON_DOCUMENT_UNREADABLE
+        )
+    document, path = selected
     declared = declaration.completion_key_map
 
     # One retry: the create path can lose a race to another writer, and the honest
