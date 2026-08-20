@@ -122,7 +122,15 @@ class ResolveRoleProfileTest(unittest.TestCase):
         structured = resolution.to_structured_dict()
         self.assertEqual(
             set(structured),
-            {"role_profile", "profile_source", "profile_version", "unresolved_placeholders"},
+            {
+                "role_profile",
+                "profile_source",
+                "profile_version",
+                "unresolved_placeholders",
+                # Review j#108679 finding_nullkeybreaksnoadrcompat: no `adr_context`
+                # key when nothing was resolved — the no-ADR payload stays
+                # byte-identical to the pre-#15722 shape.
+            },
         )
         # The substituted free-text value lives only in resolved_text, never in
         # the structured pointer payload.

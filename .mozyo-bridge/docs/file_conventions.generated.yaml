@@ -183,6 +183,8 @@ rules:
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile_config.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/role_profile_templates.yaml
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/role_profile_field_resolution.py
+  - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/adr_context.py
+  - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/adr_context_resolution.py
   - src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/domain/handoff.py
   - src/mozyo_bridge/e_110_execution_platform/f_120_agent_discovery_pane_resolution/domain/agent_discovery.py
   - src/mozyo_bridge/e_120_operations_cockpit/f_140_presentation_grouping_layout/domain/cockpit_layout.py
@@ -218,7 +220,9 @@ rules:
   - tests/regressions/test_issue_13571_grandchild_realization_binding.py
   - tests/support/delegation_route_fakes.py
   - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_role_profile_field_resolution.py
+  - tests/unit/e_110_execution_platform/f_130_handoff_routing/test_adr_context.py
   - tests/integration/e_110_execution_platform/f_130_handoff_routing/test_handoff_role_profile_default_resolution.py
+  - tests/integration/e_110_execution_platform/f_130_handoff_routing/test_handoff_adr_context_injection.py
   severity: block
   message: 'このファイルを変更する場合は､ @vibes/docs/logics/role-profile-handoff-expansion.md と @vibes/docs/logics/delegated-coordinator-cockpit-display.md
     と @vibes/docs/specs/delegation-policy-project-config.md と @vibes/docs/specs/work-unit-granularity-config.md と @vibes/docs/specs/delegated-coordinator-decision-records.md

@@ -35,6 +35,10 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterable, Mapping, Protocol, cast
 
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.adr_context import (
+    AdrContextError,
+    AdrContextPointer,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AUTO_TARGET_REPO,
     AnchorError,
@@ -50,6 +54,7 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff_
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile import (
     RoleProfileError,
     RoleProfileResolution,
+    with_adr_context,
 )
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.ticketless_callback import (
     TicketlessCallback,
@@ -154,6 +159,8 @@ class EnvelopePlannerOps(Protocol):
         self, role_profile: str, profile_fields: Mapping[str, str] | None
     ) -> RoleProfileResolution: ...
 
+    def resolve_adr_context(self, repo_root: Path) -> AdrContextPointer | None: ...
+
     def resolve_transition_role(self, transition_role: str) -> TransitionRoleBoundary: ...
 
     def resolve_workflow_contract(self, workflow_contract: str) -> WorkflowContractBundle: ...
@@ -256,6 +263,14 @@ class LiveEnvelopePlannerOps:
         )
 
         return resolve_role_profile(role_profile, profile_fields)
+
+    @staticmethod
+    def resolve_adr_context(repo_root: Path) -> AdrContextPointer | None:
+        from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.adr_context_resolution import (
+            resolve_adr_context,
+        )
+
+        return resolve_adr_context(repo_root)
 
     @staticmethod
     def resolve_transition_role(transition_role: str) -> TransitionRoleBoundary:
@@ -506,7 +521,19 @@ class HandoffEnvelopePlanner:
                 role_profile_resolution = self._ops.resolve_role_profile(
                     inp.role_profile, profile_fields
                 )
-            except RoleProfileError as exc:
+                # ADR context (Redmine #15722): additive. The repo-local ADR
+                # pointer set rides the same expansion the role profile already
+                # uses, so every layer that receives a role profile also receives
+                # a resolvable, status-faithful pointer to the ADRs. `None` (no
+                # `vibes/docs/adr/` index) leaves the payload unchanged.
+                role_profile_resolution = with_adr_context(
+                    role_profile_resolution,
+                    self._ops.resolve_adr_context(repo_root),
+                )
+            except (RoleProfileError, AdrContextError) as exc:
+                # AdrContextError (review j#108679 finding_adrresolutionerrorescapesplanner):
+                # a malformed ADR set (duplicate ids, unreadable index) must surface as
+                # the planner's typed blocked outcome, never as an untyped crash.
                 raise EnvelopePlanError(
                     "invalid_args",
                     str(exc),
@@ -514,7 +541,12 @@ class HandoffEnvelopePlanner:
                 )
 
         role_profile_contract = (
-            role_profile_resolution.resolved_text if role_profile_resolution else None
+            # #15722: `record_contract_text` is `resolved_text` plus the ADR
+            # context block when one was resolved, and `resolved_text` verbatim
+            # otherwise.
+            role_profile_resolution.record_contract_text()
+            if role_profile_resolution
+            else None
         )
 
         # Transition role (Redmine #12706).

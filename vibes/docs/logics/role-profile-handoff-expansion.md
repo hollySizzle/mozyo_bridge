@@ -43,6 +43,19 @@ pure template resolver (`role_profile.py`) は IO-free を保つ (cwd / worktree
 
 runtime 実装詳細 (関数分割・error message 文言) は doc に複製しない。正本は上記 module と unit/integration test。
 
+## ADR context の注入 (Redmine #15722)
+
+ADR-0011 のトレードオフ 3 が記録するとおり、「ADR は全階層で参照必須」には各層の実行文脈へ ADR を注入・解決する機構が無かった。本節はその最小機構を定義する。role profile を載せる handoff は、同じ展開経路で repo-local ADR 集合への解決可能な pointer も運ぶ。
+
+実装: `f_130_handoff_routing/domain/adr_context.py` (pure pointer 型) + `f_130_handoff_routing/application/adr_context_resolution.py` (repo 読取の唯一の seam) + `handoff_envelope_planner` の配線 (`resolve_adr_context` port)。
+
+- **注入点は role profile 展開 1 箇所**: L2 delegated coordinator / L3 gateway / L3 worker への dispatch はいずれも `handoff send --role-profile <role>` を経由する (`sublane dispatch-worker` / gateway dispatch / `delegation launch adopt` / grandchild dispatch)。したがって planner の role profile 展開に additive で載せることで 3 階層すべてが同じ pointer を受け取る。`sublane create` 自体は role profile を展開しないため、注入点は dispatch 側である。
+- **pointer 主義**: ADR 本文は複製しない。運ぶのは ADR index (`vibes/docs/adr/README.md`) の canonical path、各 ADR の `adr-NNNN` id / canonical path / resolvable paths、そして宣言された status のみ。resolvable paths は workflow contract ref と同じく canonical 形と monorepo nested 形の両方を持つ (#12700 j#66929)。
+- **status を昇格させない**: `normalize_adr_status` は closed vocabulary (`active` / `proposed` / `superseded` / `unknown`) へ正規化し、**binding は `active` のみ**。`proposed` は `proposed` として、未知・欠落・読取不能な status は `unknown` として提示され、いずれも「拘束する規約」としては描画されない。payload 側の `binding` flag は派生値で、`adr_context_from_payload` は `status` から再計算する (payload 詐称で昇格できない)。
+- **解決は fixed path・explicit fallback**: `<repo_root>/vibes/docs/adr/README.md` を fixed path で読む (cwd / worktree 探索なし)。ADR ディレクトリまたは index が無い repo では `None` を返し、handoff は #15722 以前と同一の payload を送る。すなわち ADR 運用を持たない adopter repo は影響を受けない。
+- **後方互換 (additive)**: `RoleProfileResolution.adr_context` は default `None` の追加 field。`to_structured_dict()` は **pointer が解決された場合のみ** `adr_context` key を持つ — 未解決時は key 自体を省略し、payload は #15722 以前と byte-identical に保たれる (review j#108679 finding_nullkeybreaksnoadrcompat)。`profile_source` / `profile_version` / `unresolved_placeholders` の既存契約と template 本文は不変である。`profile_version` は template 本文の pointer であり、send 時に解決される ADR context はこれに含めない (`record_contract_text()` が別 heading で追記する)。
+- **展開先**: pane body には単一行の pointer clause (index / active 件数 / non-active 件数 / read obligation)、durable delivery record には resolved contract に続く `# ADR context` block、structured outcome には `role_profile.adr_context` payload。
+
 ## 受信側への展開と durable record
 
 実装: `src/mozyo_bridge/domain/handoff.py` (`build_notification_body` / `DeliveryOutcome` / `make_outcome` / `build_delivery_record`)、wiring は `orchestrate_handoff` (`src/mozyo_bridge/application/commands.py`)。
@@ -74,6 +87,8 @@ runtime 実装詳細 (関数分割・error message 文言) は doc に複製し�
 
 - `python3 -m unittest tests.unit.e_110_execution_platform.f_130_handoff_routing.test_handoff_role_profile`
 - `python3 -m unittest tests.unit.e_110_execution_platform.f_130_handoff_routing.test_role_profile_config`
+- `python3 -m unittest tests.unit.e_110_execution_platform.f_130_handoff_routing.test_adr_context`
+- `python3 -m unittest tests.integration.e_110_execution_platform.f_130_handoff_routing.test_handoff_adr_context_injection`
 - `mozyo-bridge docs validate --repo .`
 - `mozyo-bridge docs validate --check-file-coverage --repo .`
 - `mozyo-bridge docs generate-file-conventions --check --repo .`
