@@ -56,6 +56,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCKED,
     BLOCK_AMBIGUOUS_INVENTORY,
     BLOCK_AMBIGUOUS_OWNER,
+    BLOCK_DISPATCH_ATTRIBUTION_UNKNOWN,
     BLOCK_BRANCH_UNRESOLVED,
     BLOCK_DISPATCH_UNCERTAIN,
     BLOCK_DISPATCH_UNREADABLE,
@@ -70,11 +71,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_RESUME_ANCHOR_UNRESOLVED,
     BLOCK_RESUME_PROFILE_INCOMPLETE,
     BLOCK_STARTUP_INTERACTION,
+    BLOCK_STARTUP_SCREEN_UNVERIFIED,
     BLOCK_UNKNOWN_DISPOSITION,
     BLOCK_WORKTREE_MISSING,
     BLOCK_WORKTREE_UNBOUND,
     BLOCK_WORKTREE_UNREADABLE,
     DELEGATED_COORDINATOR_BRIEF_FIELDS,
+    DISPATCH_ATTRIBUTION_UNKNOWN,
     DISPATCH_DELIVERED,
     DISPATCH_NOT_APPLICABLE,
     DISPATCH_OWED,
@@ -90,12 +93,22 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     SKIP_PROJECT_GATEWAY_BINDING,
     SKIP_RETIRED,
     SKIP_SUPERSEDED,
+    STARTUP_SCREEN_BLOCKED,
+    STARTUP_SCREEN_CLEAR,
+    STARTUP_SCREEN_NOT_PROBED,
+    STARTUP_SCREEN_UNPROFILED,
+    STARTUP_SCREEN_UNREADABLE,
     plan_lane_rehydrate,
     summarize_rehydrate,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.fleet_rehydrate_dispatch_fold import (  # noqa: E402
+    ATTRIB_CURRENT,
+    ATTRIB_RETIRED,
+    ATTRIB_UNKNOWN,
     KIND_IMPLEMENTATION_REQUEST,
     KIND_REPLY,
+    ReceiverBinding,
+    attribute_record,
     dispatch_fact,
     fold_dispatch_state,
     latest_anchor_journal,
@@ -112,6 +125,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     FleetRehydrateUseCase,
     HealResult,
     LaneIdentityPin,
+    REFUSED_DISPATCH_STATE_MOVED,
     REFUSED_GATEWAY_UNRESOLVED,
     REFUSED_HEAL_FAILED,
     REFUSED_RESUME_BRIEF_FAILED,
@@ -313,9 +327,29 @@ class PlannerInventoryAxisTests(unittest.TestCase):
         )
         self.assertEqual(plan.reason, BLOCK_AMBIGUOUS_INVENTORY)
 
-    def test_pending_provider_startup_interaction_blocks(self):
-        plan = plan_lane_rehydrate(fleet_facts(startup_interaction_pending=True))
+    def test_a_live_startup_screen_blocks(self):
+        plan = plan_lane_rehydrate(
+            fleet_facts(startup_screen=STARTUP_SCREEN_BLOCKED)
+        )
         self.assertEqual(plan.reason, BLOCK_STARTUP_INTERACTION)
+
+    def test_an_unclassifiable_startup_screen_blocks_under_its_own_token(self):
+        """#13760: "could not tell" must never read as "no screen"."""
+        for screen in (STARTUP_SCREEN_UNREADABLE, STARTUP_SCREEN_UNPROFILED):
+            with self.subTest(screen=screen):
+                plan = plan_lane_rehydrate(fleet_facts(startup_screen=screen))
+                self.assertEqual(plan.disposition, BLOCKED)
+                self.assertEqual(plan.reason, BLOCK_STARTUP_SCREEN_UNVERIFIED)
+
+    def test_an_off_vocabulary_startup_token_fails_closed(self):
+        plan = plan_lane_rehydrate(fleet_facts(startup_screen="probably-fine"))
+        self.assertEqual(plan.reason, BLOCK_STARTUP_SCREEN_UNVERIFIED)
+
+    def test_a_clear_or_unprobed_screen_does_not_block(self):
+        for screen in (STARTUP_SCREEN_CLEAR, STARTUP_SCREEN_NOT_PROBED):
+            with self.subTest(screen=screen):
+                plan = plan_lane_rehydrate(fleet_facts(startup_screen=screen))
+                self.assertEqual(plan.disposition, REHYDRATE)
 
 
 class PlannerActionCompositionTests(unittest.TestCase):
@@ -454,6 +488,20 @@ class SummaryTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
+#: The receiver a lane would send to now, in the fold tests.
+LIVE_BINDING = ReceiverBinding(
+    role=GATEWAY_ROLE,
+    assigned_name="mzb1_gw",
+    locator="w1V:pF",
+    revision="7",
+)
+
+
+def _recorded_binding(*, assigned_name="mzb1_gw", revision="7"):
+    """The queue-enter rail's own gateway_binding, as the ledger stores it."""
+    return {"gateway_binding": {"assigned_name": assigned_name, "row_revision": revision}}
+
+
 def ledger_record(marker, *, status="sent", reason="ok", rail=RAIL_EVENT, **kw):
     base = dict(
         entry_id=kw.pop("entry_id", 1),
@@ -465,8 +513,9 @@ def ledger_record(marker, *, status="sent", reason="ok", rail=RAIL_EVENT, **kw):
         status=status,
         reason=reason,
         rail=rail,
+        target=kw.pop("target", LIVE_BINDING.locator),
         turn_start_outcome=kw.pop("turn_start_outcome", None),
-        queue_enter_observation=kw.pop("queue_enter_observation", None),
+        queue_enter_observation=kw.pop("queue_enter_observation", _recorded_binding()),
     )
     base.update(kw)
     return HerdrDeliveryLedgerRecord(**base)
@@ -479,7 +528,11 @@ class DispatchFoldTests(unittest.TestCase):
     def test_no_recorded_attempt_is_owed(self):
         self.assertEqual(
             fold_dispatch_state(
-                (), marker=IR_MARKER, kind=KIND_IMPLEMENTATION_REQUEST, receiver=GATEWAY_ROLE
+                (),
+                marker=IR_MARKER,
+                kind=KIND_IMPLEMENTATION_REQUEST,
+                receiver=GATEWAY_ROLE,
+                binding=LIVE_BINDING,
             ),
             DISPATCH_OWED,
         )
@@ -492,6 +545,7 @@ class DispatchFoldTests(unittest.TestCase):
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
+                binding=LIVE_BINDING,
             ),
             DISPATCH_DELIVERED,
         )
@@ -507,6 +561,7 @@ class DispatchFoldTests(unittest.TestCase):
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
+                binding=LIVE_BINDING,
             ),
             DISPATCH_UNCERTAIN,
         )
@@ -521,6 +576,7 @@ class DispatchFoldTests(unittest.TestCase):
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
+                binding=LIVE_BINDING,
             ),
             DISPATCH_OWED,
         )
@@ -538,6 +594,7 @@ class DispatchFoldTests(unittest.TestCase):
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
+                binding=LIVE_BINDING,
             ),
             DISPATCH_DELIVERED,
         )
@@ -592,7 +649,12 @@ class DispatchFoldTests(unittest.TestCase):
 
     def test_absent_anchor_is_not_applicable_rather_than_owed(self):
         fact = dispatch_fact(
-            (), issue="1", journal="", kind=KIND_REPLY, receiver=GATEWAY_ROLE
+            (),
+            issue="1",
+            journal="",
+            kind=KIND_REPLY,
+            receiver=GATEWAY_ROLE,
+            binding=LIVE_BINDING,
         )
         self.assertEqual(fact.state, DISPATCH_NOT_APPLICABLE)
         self.assertFalse(fact.sendable)
@@ -625,6 +687,231 @@ class DispatchFoldTests(unittest.TestCase):
         )
 
 
+class ReceiverAttributionTests(unittest.TestCase):
+    """Review j#108920 ``finding_generationfence``: evidence is bound to TODAY's receiver.
+
+    The marker carries no lane and no generation and the ledger has no generation column, so
+    without this join an old generation's confirmed delivery answered for a fresh one and the
+    relaunched pair never got its pointer.
+    """
+
+    def test_a_record_for_the_live_receiver_is_current_evidence(self):
+        record = ledger_record(IR_MARKER)
+        self.assertEqual(attribute_record(record, LIVE_BINDING), ATTRIB_CURRENT)
+
+    def test_a_record_with_no_live_receiver_at_all_is_retired(self):
+        """The post-restart main case: every recorded attempt targeted a dead process."""
+        record = ledger_record(IR_MARKER)
+        self.assertEqual(
+            attribute_record(record, ReceiverBinding.absent()), ATTRIB_RETIRED
+        )
+
+    def test_a_record_for_another_locator_is_retired(self):
+        record = ledger_record(IR_MARKER, target="w9Z:pZ")
+        self.assertEqual(attribute_record(record, LIVE_BINDING), ATTRIB_RETIRED)
+
+    def test_a_relaunch_under_the_same_locator_is_retired_not_current(self):
+        """The ABA hole: same pane id, different process. The row revision closes it."""
+        record = ledger_record(
+            IR_MARKER, queue_enter_observation=_recorded_binding(revision="6")
+        )
+        self.assertEqual(attribute_record(record, LIVE_BINDING), ATTRIB_RETIRED)
+
+    def test_a_live_locator_with_no_recorded_binding_is_unknown(self):
+        """A bare locator cannot tell the same process from a recycled one."""
+        record = ledger_record(IR_MARKER, queue_enter_observation=None)
+        self.assertEqual(attribute_record(record, LIVE_BINDING), ATTRIB_UNKNOWN)
+
+    def test_a_record_without_a_target_is_unknown(self):
+        record = ledger_record(IR_MARKER, target="")
+        self.assertEqual(attribute_record(record, LIVE_BINDING), ATTRIB_UNKNOWN)
+
+    def test_an_old_generations_confirmed_delivery_does_not_answer_for_a_fresh_pair(self):
+        """The exact defect: generation 1 delivered, generation 2 relaunched elsewhere."""
+        old = ledger_record(IR_MARKER, target="w1V:pOLD", status="sent", reason="ok")
+        self.assertEqual(
+            fold_dispatch_state(
+                (old,),
+                marker=IR_MARKER,
+                kind=KIND_IMPLEMENTATION_REQUEST,
+                receiver=GATEWAY_ROLE,
+                binding=ReceiverBinding(
+                    role=GATEWAY_ROLE,
+                    assigned_name="mzb1_gw",
+                    locator="w1V:pNEW",
+                    revision="9",
+                ),
+            ),
+            DISPATCH_OWED,
+            "a delivery to a receiver that is gone must not suppress the fresh dispatch",
+        )
+
+    def test_a_live_zero_lane_owes_its_dispatch_again_after_a_restart(self):
+        confirmed = ledger_record(IR_MARKER, status="sent", reason="ok")
+        self.assertEqual(
+            fold_dispatch_state(
+                (confirmed,),
+                marker=IR_MARKER,
+                kind=KIND_IMPLEMENTATION_REQUEST,
+                receiver=GATEWAY_ROLE,
+                binding=None,
+            ),
+            DISPATCH_OWED,
+        )
+
+    def test_an_unattributable_record_blocks_rather_than_choosing_either_answer(self):
+        record = ledger_record(IR_MARKER, queue_enter_observation=None)
+        state = fold_dispatch_state(
+            (record,),
+            marker=IR_MARKER,
+            kind=KIND_IMPLEMENTATION_REQUEST,
+            receiver=GATEWAY_ROLE,
+            binding=LIVE_BINDING,
+        )
+        self.assertEqual(state, DISPATCH_ATTRIBUTION_UNKNOWN)
+        plan = plan_lane_rehydrate(
+            fleet_facts(
+                dispatch=LaneDispatchFact(
+                    state=DISPATCH_ATTRIBUTION_UNKNOWN,
+                    anchor_issue="1",
+                    anchor_journal="900",
+                )
+            )
+        )
+        self.assertEqual(plan.disposition, BLOCKED)
+        self.assertEqual(plan.reason, BLOCK_DISPATCH_ATTRIBUTION_UNKNOWN)
+        self.assertEqual(plan.actions, ())
+
+    def test_unknown_wins_over_a_current_confirmation(self):
+        """One unplaceable attempt taints the key: fail-closed, not majority vote."""
+        confirmed = ledger_record(IR_MARKER, entry_id=1)
+        opaque = ledger_record(IR_MARKER, entry_id=2, queue_enter_observation=None)
+        self.assertEqual(
+            fold_dispatch_state(
+                (confirmed, opaque),
+                marker=IR_MARKER,
+                kind=KIND_IMPLEMENTATION_REQUEST,
+                receiver=GATEWAY_ROLE,
+                binding=LIVE_BINDING,
+            ),
+            DISPATCH_ATTRIBUTION_UNKNOWN,
+        )
+
+
+class ActionTimeRefoldTests(unittest.TestCase):
+    """Review j#108920 ``finding_actiontimefence``: re-fold immediately before each send."""
+
+    def test_the_dispatch_key_is_refolded_before_the_composed_create(self):
+        facts = fleet_facts()
+        plan = plan_lane_rehydrate(facts)
+        ops = FakeOps(identity=pin_for(facts))
+        FleetRehydrateUseCase(ops).run([facts], [plan])
+        self.assertIn(
+            (facts.lane_id, KIND_IMPLEMENTATION_REQUEST),
+            ops.refold_calls,
+            "the plan's fold is an observation; the send needs a fresh one",
+        )
+
+    def test_a_key_that_landed_during_the_window_is_not_sent(self):
+        facts = fleet_facts(
+            reboot=reboot_facts(slots=(slot(GATEWAY_ROLE), slot(WORKER_ROLE)))
+        )
+        plan = plan_lane_rehydrate(facts)
+        self.assertEqual(plan.actions, (ACTION_RESTORE_DISPATCH,))
+        ops = FakeOps(
+            identity=pin_for(facts),
+            fresh_states={KIND_IMPLEMENTATION_REQUEST: DISPATCH_DELIVERED},
+        )
+        outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
+        self.assertEqual(ops.heal_calls, [], "zero additional effect")
+        self.assertEqual(outcomes[0]["status"], STATUS_BLOCKED)
+        self.assertEqual(outcomes[0]["reason"], REFUSED_DISPATCH_STATE_MOVED)
+        self.assertEqual(outcomes[0]["applied"], [])
+
+    def test_a_landed_dispatch_still_lets_a_needed_heal_proceed_without_sending(self):
+        """Healing is additive; only the send is dropped."""
+        facts = fleet_facts()
+        plan = plan_lane_rehydrate(facts)
+        ops = FakeOps(
+            identity=pin_for(facts),
+            fresh_states={KIND_IMPLEMENTATION_REQUEST: DISPATCH_DELIVERED},
+        )
+        outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
+        self.assertEqual(ops.heal_calls, [(facts.lane_id, False)])
+        self.assertEqual(outcomes[0]["status"], STATUS_APPLIED)
+        self.assertEqual(outcomes[0]["applied"], [ACTION_HEAL_PAIR])
+
+    def test_the_brief_is_refolded_and_reidentified_after_the_heal(self):
+        facts = delegated_facts()
+        plan = plan_lane_rehydrate(facts)
+        ops = FakeOps(identity=pin_for(facts))
+        FleetRehydrateUseCase(ops).run([facts], [plan])
+        self.assertIn((facts.lane_id, KIND_REPLY), ops.refold_calls)
+        self.assertEqual(
+            len(ops.identity_calls),
+            2,
+            "once before the first effect, and again immediately before the brief send",
+        )
+
+    def test_a_brief_that_landed_during_the_heal_is_not_re_sent(self):
+        facts = delegated_facts()
+        plan = plan_lane_rehydrate(facts)
+        ops = FakeOps(
+            identity=pin_for(facts), fresh_states={KIND_REPLY: DISPATCH_DELIVERED}
+        )
+        outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
+        self.assertEqual(ops.brief_calls, [])
+        self.assertEqual(outcomes[0]["status"], STATUS_BLOCKED)
+        self.assertEqual(outcomes[0]["reason"], REFUSED_DISPATCH_STATE_MOVED)
+        self.assertEqual(
+            outcomes[0]["applied"],
+            [ACTION_HEAL_PAIR],
+            "what already landed is reported truthfully",
+        )
+
+    def test_an_unreadable_authority_at_send_time_blocks_the_brief(self):
+        facts = delegated_facts()
+        plan = plan_lane_rehydrate(facts)
+        for state in (DISPATCH_UNREADABLE, DISPATCH_ATTRIBUTION_UNKNOWN):
+            with self.subTest(state=state):
+                ops = FakeOps(
+                    identity=pin_for(facts), fresh_states={KIND_REPLY: state}
+                )
+                outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
+                self.assertEqual(ops.brief_calls, [])
+                self.assertEqual(outcomes[0]["reason"], REFUSED_DISPATCH_STATE_MOVED)
+
+    def test_a_lane_that_moved_during_the_heal_blocks_the_brief(self):
+        facts = delegated_facts()
+        plan = plan_lane_rehydrate(facts)
+        pin = pin_for(facts)
+        moved = LaneIdentityPin(
+            disposition=pin.disposition,
+            revision=pin.revision,
+            lane_generation=pin.lane_generation + 1,
+            worktree_identity=pin.worktree_identity,
+            issue_id=pin.issue_id,
+        )
+
+        class Moving(FakeOps):
+            def __init__(self):
+                super().__init__(identity=pin)
+                self._seen = 0
+
+            def current_identity(self, *, workspace_id, lane_id):
+                self._seen += 1
+                self.identity_calls.append((workspace_id, lane_id))
+                # Healthy for the first effect, moved by the time the brief would send.
+                return pin if self._seen == 1 else moved
+
+        ops = Moving()
+        outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
+        self.assertEqual(ops.heal_calls, [(facts.lane_id, False)])
+        self.assertEqual(ops.brief_calls, [])
+        self.assertEqual(outcomes[0]["reason"], BLOCK_LANE_MOVED)
+        self.assertEqual(outcomes[0]["applied"], [ACTION_HEAL_PAIR])
+
+
 class RoleProfileDriftGuardTests(unittest.TestCase):
     def test_brief_field_set_matches_the_live_template(self):
         """Adding a placeholder upstream must fail HERE, not ship an unresolved token."""
@@ -645,13 +932,16 @@ class RoleProfileDriftGuardTests(unittest.TestCase):
 
 
 class FakeOps:
-    def __init__(self, *, identity=None, heal=None, brief_code=0):
+    def __init__(self, *, identity=None, heal=None, brief_code=0, fresh_states=None):
         self._identity = identity
         self._heal = heal or (lambda facts, dispatch: HealResult(ok=True, gateway_target="w1:pF"))
         self._brief_code = brief_code
+        #: ``{kind: state}`` the action-time re-fold reports. Default: still owed.
+        self._fresh_states = dict(fresh_states or {})
         self.heal_calls = []
         self.brief_calls = []
         self.identity_calls = []
+        self.refold_calls = []
 
     def current_identity(self, *, workspace_id, lane_id):
         self.identity_calls.append((workspace_id, lane_id))
@@ -660,6 +950,10 @@ class FakeOps:
     def heal_lane(self, facts, *, dispatch):
         self.heal_calls.append((facts.lane_id, dispatch))
         return self._heal(facts, dispatch)
+
+    def current_dispatch_state(self, facts, *, kind):
+        self.refold_calls.append((facts.lane_id, kind))
+        return self._fresh_states.get(kind, DISPATCH_OWED)
 
     def send_resume_brief(self, facts, *, gateway_target):
         self.brief_calls.append((facts.lane_id, gateway_target))

@@ -577,6 +577,20 @@ status・lane の見た目は一切参照しない。
 - causal key は canonical producer (`build_marker`) が描く landing marker そのもの。ledger row の
   marker は **その row 自身の anchor / kind / receiver から再描画して byte 一致** した場合のみ
   その key の証拠と認める (marker を parse しない / 散文から作らない)。
+- ★**証拠は「今この lane が送る相手」に帰属させる** (#15745 review j#108920
+  `finding_generationfence` / verdict j#108926)。marker は lane も generation も持たず ledger にも
+  generation column が無いため、marker だけで keying すると **旧 generation への配送済み記録が
+  fresh な pair の答えになり、relaunch した gateway が pointer を受け取れない** (supersede 後の
+  successor lane でも同型)。帰属は herdr が process generation の判別子として既に名指している
+  **live locator** (`ProcessGenerationPin` docstring) を、declared pin ではなく **ledger row 自身の
+  `target` と現在の live inventory** の join で使う (実測: active 26 row 中 18 row が
+  `declared_slots` 空なので、pin 必須にすると実運用 lane の大半が block して rail が到達不能になる)。
+  - `target` が現 live slot と一致し、row の `queue_enter_observation.gateway_binding` の
+    `assigned_name` / `row_revision` も一致 → **現世代の証拠**として fold する。
+  - live slot が無い / 別 locator → その受信者は既に居ないので**証拠にならない** (drop)。dead
+    process が握っていたものを fresh process へ送っても二重にはならない。
+  - `target` が無い、または locator は live だが binding が無く **同一 locator への再 launch (ABA)
+    を判別できない** → `dispatch_attribution_unknown` で **block**。どちらにも倒さない。
 - 各 attempt は共有 `injection_stage` authority で分類する。`submitted_confirmed` が 1 件でも
   あれば `delivered` (再送しない)、`uncertain_partial` があれば `uncertain` (**block**。blind
   replay 禁止で、receiver / durable anchor の reconcile が先)、全部が `not_sent` か記録ゼロの
@@ -587,6 +601,15 @@ status・lane の見た目は一切参照しない。
   `decision_journal` は後続の disposition CAS で動くため、ledger に canonical record がある
   ときはそちらの journal を使い、1 度も dispatch されていない lane でだけ lifecycle anchor へ
   fallback する。
+- ★**fold は plan 時の 1 回では足りない** (同 review `finding_actiontimefence`)。plan の fold は
+  観測にすぎず、heal (worktree 作成 → pane launch → attestation → governed send) の間に同じ key が
+  別経路で着弾する / 受信者が入れ替わる / authority が読めなくなる。したがって **irreversible な
+  send の直前ごとに** ledger + live inventory を再取得して再 fold し、`owed` でなくなっていれば
+  `dispatch_state_moved` で **追加 effect 0** で止める (brief の直前では lifecycle も再 join する)。
+  heal だけが必要で dispatch が既に着弾していた場合は、send を落として heal は続行する — heal は
+  additive で、dispatch が別経路で届いたことに無効化されない。
+  この規律は `## live turn-ended worker の guarded refresh` / `### recover-pair の worktree binding
+  fence` と同じで、「最初の effect の前に 1 回」では守れない。
 
 ### delegated_coordinator lane の resume brief
 
@@ -605,13 +628,28 @@ relaunch する L2 lane には resume brief が必須で、固定 role profile �
   delivered な key の再利用になるので送られない。relaunch が要るのに anchor が既に delivered な
   場合は `resume_anchor_unresolved` で block する (指示のないまま L2 を起こさない)。
 
+### provider startup screen (live 観測)
+
+plan は lane の **live slot ごとに visible pane を 1 回 read-only で読み**、#13760 の共有
+evaluator (`evaluate_startup_admission`) で分類して lane 単位の closed token へ畳む。provider 固有
+文字列は provider profile 側にあり、pane 本文は outcome にも journal にも出ない。**mozyo は provider
+UI に一切回答しない** — 承諾は operator が provider の UI で行い、その後この rail を再実行する。
+
+- `blocked` (宣言された startup screen が出ている) → `startup_interaction_required` で block。
+- `unreadable` / `unprofiled` → `startup_screen_unverified` で block。**「読めなかった」を「screen は
+  出ていない」と読み替えない** (#13760 の実害はまさにこれ: startup screen へ本文を打ち込み Enter が
+  dialog の default を承諾して request body を破壊し、durable record には配送済みが残った)。
+- live slot ゼロ (再起動直後の主経路) → `not_probed`。process の無い pane に screen は無いので
+  block しないし、read も発行しない。shell residue も同様に読まない。
+
 ### 主要な block token
 
 `inventory_unreadable` / `foreign_slot` / `ambiguous_inventory` / `ambiguous_owner` /
 `worktree_missing` / `worktree_unreadable` / `branch_unresolved` / `issue_state_unknown` /
 `release_in_flight` / `replacement_in_flight` / `startup_interaction_required` /
-`dispatch_uncertain` / `dispatch_record_unreadable` / `resume_profile_incomplete` /
-`resume_anchor_unresolved` / `lane_moved`。いずれも「条件未充足」ではなく **読めなかった / 矛盾した**
+`startup_screen_unverified` / `dispatch_uncertain` / `dispatch_record_unreadable` /
+`dispatch_attribution_unknown` / `resume_profile_incomplete` / `resume_anchor_unresolved` /
+`lane_moved` / `dispatch_state_moved`。いずれも「条件未充足」ではなく **読めなかった / 矛盾した**
 ことの typed 記録であり、成功集合へ丸めない。skip 側 (`issue_closed` / `idle` / `retired` /
 `superseded` / `hibernated` / `project_gateway_binding` / `filtered`) は正常な結果である。
 

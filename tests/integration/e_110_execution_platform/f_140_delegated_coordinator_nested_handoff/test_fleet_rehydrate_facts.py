@@ -62,9 +62,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCKED,
     BLOCK_DISPATCH_UNREADABLE,
     BLOCK_RESUME_PROFILE_INCOMPLETE,
+    BLOCK_STARTUP_INTERACTION,
     DISPATCH_DELIVERED,
     DISPATCH_OWED,
     REHYDRATE,
+    SKIP,
+    SKIP_IDLE,
+    STARTUP_SCREEN_BLOCKED,
+    STARTUP_SCREEN_NOT_PROBED,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.fleet_rehydrate_dispatch_fold import (  # noqa: E402
     KIND_IMPLEMENTATION_REQUEST,
@@ -78,6 +83,8 @@ ISSUE = "15745"
 LANE = "issue_15745_demo"
 BRANCH = "issue_15745_demo"
 ANCHOR = "108799"
+GATEWAY_LOCATOR = "w1V:pF"
+GATEWAY_REVISION = "3"
 
 
 def _git(*args, cwd):
@@ -146,7 +153,14 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
             home=self.home,
         )
 
-    def _seed_delivery(self, *, journal=ANCHOR, status="sent", reason="ok"):
+    def _seed_delivery(
+        self, *, journal=ANCHOR, status="sent", reason="ok", lane=LANE, target=None
+    ):
+        """Record a delivery aimed at the lane's gateway slot, as the real rail does."""
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            encode_assigned_name,
+        )
+
         marker = redmine_marker(ISSUE, journal, KIND_IMPLEMENTATION_REQUEST, GATEWAY)
         HerdrDeliveryLedger(home=self.home).append(
             HerdrDeliveryLedgerRecord(
@@ -158,6 +172,13 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
                 status=status,
                 reason=reason,
                 rail=RAIL_EVENT,
+                target=target if target is not None else GATEWAY_LOCATOR,
+                queue_enter_observation={
+                    "gateway_binding": {
+                        "assigned_name": encode_assigned_name(WORKSPACE, GATEWAY, lane),
+                        "row_revision": GATEWAY_REVISION,
+                    }
+                },
             )
         )
 
@@ -172,14 +193,29 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
         return [
             {
                 "name": encode_assigned_name(WORKSPACE, role, lane),
-                "pane_id": f"w1V:p{role[0].upper()}",
+                "pane_id": GATEWAY_LOCATOR if role == GATEWAY else "w1V:pW",
                 "agent": role,
                 "agent_status": "awaiting_input",
+                # Real `agent list` rows carry a revision; it is what closes the
+                # recycled-locator hole in the attribution join.
+                "revision": GATEWAY_REVISION,
             }
             for role in (GATEWAY, WORKER)
         ]
 
-    def _gather(self, *, rows=None, resume_inputs=None, issue_closed=False):
+    def _gather(
+        self,
+        *,
+        rows=None,
+        resume_inputs=None,
+        issue_closed=False,
+        startup_screens=None,
+    ):
+        startup_screens = (
+            startup_screens
+            if startup_screens is not None
+            else {LANE: STARTUP_SCREEN_NOT_PROBED}
+        )
         env = mock.patch.dict(os.environ, {"MOZYO_BRIDGE_HOME": str(self.home)})
         with env, mock.patch.object(
             projection, "repo_scope_workspace_id", return_value=WORKSPACE
@@ -199,6 +235,10 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
                 home=self.home,
                 rows=rows if rows is not None else [],
                 resume_inputs=resume_inputs,
+                # No herdr binary in this hermetic suite: inject the screen verdict rather
+                # than letting the probe resolve one. `observe_startup_screen` has its own
+                # focused coverage.
+                startup_screens=startup_screens,
             )
 
     # -- the join ---------------------------------------------------------
@@ -223,13 +263,37 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
         self.assertEqual(plan.disposition, REHYDRATE)
         self.assertEqual(plan.actions, (ACTION_HEAL_PAIR, ACTION_RESTORE_DISPATCH))
 
-    def test_a_confirmed_delivery_removes_the_dispatch_action_end_to_end(self):
+    def test_a_confirmed_delivery_to_the_LIVE_gateway_removes_the_dispatch_action(self):
+        """Suppression is correct only while the receiver that got it is still there."""
         self._declare()
         self._seed_delivery()
-        facts = self._gather()
+        facts = self._gather(rows=self._rows())
         self.assertEqual(facts[0].dispatch.state, DISPATCH_DELIVERED)
         plan = rehydrate.plan_fleet(facts)[0]
-        self.assertEqual(plan.actions, (ACTION_HEAL_PAIR,))
+        self.assertNotIn(ACTION_RESTORE_DISPATCH, plan.actions)
+
+    def test_a_confirmed_delivery_to_a_GONE_gateway_does_not_suppress_the_dispatch(self):
+        """Review j#108920 finding_generationfence, end to end over the real ledger.
+
+        The pre-restart delivery landed on a process that no longer exists; the fresh pair
+        this rail is about to launch has never seen the pointer, so it is still owed.
+        """
+        self._declare()
+        self._seed_delivery()
+        facts = self._gather(rows=[])
+        self.assertEqual(facts[0].dispatch.state, DISPATCH_OWED)
+        plan = rehydrate.plan_fleet(facts)[0]
+        self.assertEqual(plan.actions, (ACTION_HEAL_PAIR, ACTION_RESTORE_DISPATCH))
+
+    def test_a_delivery_to_a_recycled_locator_is_not_current_evidence(self):
+        """Same pane id, different process: the row revision keeps them apart."""
+        self._declare()
+        self._seed_delivery()
+        rows = self._rows()
+        for row in rows:
+            row["revision"] = "99"  # the slot was re-launched under the same locator
+        facts = self._gather(rows=rows)
+        self.assertEqual(facts[0].dispatch.state, DISPATCH_OWED)
 
     def test_a_live_pair_needs_neither_heal_nor_dispatch(self):
         self._declare()
@@ -237,7 +301,8 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
         facts = self._gather(rows=self._rows())
         self.assertTrue(facts[0].pair_whole)
         plan = rehydrate.plan_fleet(facts)[0]
-        self.assertEqual(plan.disposition, "skip")
+        self.assertEqual(plan.disposition, SKIP)
+        self.assertEqual(plan.reason, SKIP_IDLE)
         self.assertEqual(plan.actions, ())
 
     def test_an_unreadable_ledger_blocks_rather_than_reading_as_undelivered(self):
@@ -284,7 +349,24 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
             dict(fact.resume_profile_fields)["parent_callback_target"], "coordinator"
         )
         plan = rehydrate.plan_fleet(facts)[0]
-        self.assertEqual(plan.actions, (ACTION_HEAL_PAIR, ACTION_RESUME_BRIEF))
+        # The lane is live-zero, so the pre-restart IR delivery no longer suppresses the
+        # dispatch either — the fresh pair needs both the pointer and its brief.
+        self.assertEqual(
+            plan.actions,
+            (ACTION_HEAL_PAIR, ACTION_RESTORE_DISPATCH, ACTION_RESUME_BRIEF),
+        )
+
+    def test_a_live_startup_screen_blocks_the_lane(self):
+        """The fence review j#108920 finding_startupinteraction found unreachable."""
+        self._declare()
+        facts = self._gather(
+            rows=self._rows(), startup_screens={LANE: STARTUP_SCREEN_BLOCKED}
+        )
+        self.assertEqual(facts[0].startup_screen, STARTUP_SCREEN_BLOCKED)
+        plan = rehydrate.plan_fleet(facts)[0]
+        self.assertEqual(plan.disposition, BLOCKED)
+        self.assertEqual(plan.reason, BLOCK_STARTUP_INTERACTION)
+        self.assertEqual(plan.actions, ())
 
     def test_a_delegated_lane_missing_only_the_parent_issue_still_blocks(self):
         """Every one of the four fields is load-bearing; three out of four is not a brief."""
@@ -356,6 +438,100 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
             with self.assertRaises(rehydrate.FleetRehydrateUnavailable) as caught:
                 rehydrate.gather_fleet_facts(self.repo, home=self.home, rows=[])
         self.assertIn("NOT the same as the store having no rows", str(caught.exception))
+
+
+class StartupScreenObservationTests(unittest.TestCase):
+    """The live half of the fence review j#108920 ``finding_startupinteraction`` found stubbed.
+
+    Wires the REAL #13760 evaluator and the REAL slot scoping against an injected pane read,
+    so what is under test is the fold this rail performs — not the provider profiles, which
+    own the screen strings and are exercised by #13760's own suite.
+    """
+
+    def _rows(self, *, lane=LANE, agent_status="awaiting_input", residue=False):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            encode_assigned_name,
+        )
+
+        row = {
+            "name": encode_assigned_name(WORKSPACE, GATEWAY, lane),
+            "pane_id": GATEWAY_LOCATOR,
+            "agent_status": agent_status,
+            "revision": GATEWAY_REVISION,
+        }
+        if not residue:
+            row["agent"] = GATEWAY
+        else:
+            # #13518 shell residue: the name survives, the provider process does not.
+            row["agent"] = ""
+        return [row]
+
+    def _observe(self, rows, reader):
+        return rehydrate.observe_startup_screen(
+            rows,
+            workspace_id=WORKSPACE,
+            lane_id=LANE,
+            managed_roles=(GATEWAY, WORKER),
+            read_visible=reader,
+        )
+
+    def test_no_live_slot_is_not_probed_and_reads_nothing(self):
+        reads = []
+        self.assertEqual(
+            self._observe([], lambda locator: reads.append(locator)),
+            STARTUP_SCREEN_NOT_PROBED,
+        )
+        self.assertEqual(reads, [], "a lane with no process is never read")
+
+    def test_an_unreadable_inventory_is_not_probed(self):
+        self.assertEqual(
+            self._observe(None, lambda locator: "composer"), STARTUP_SCREEN_NOT_PROBED
+        )
+
+    def test_a_clear_composer_is_clear(self):
+        self.assertEqual(
+            self._observe(self._rows(), lambda locator: "> type your request"),
+            "clear",
+        )
+
+    def test_a_declared_startup_screen_blocks(self):
+        from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_profile import (  # noqa: E501
+            AGENT_PROVIDER_PROFILES,
+        )
+
+        profile = AGENT_PROVIDER_PROFILES.get(GATEWAY)
+        self.assertIsNotNone(profile, "the gateway provider must be profiled")
+        blockers = getattr(profile, "startup_blockers", ())
+        self.assertTrue(blockers, "the provider declares at least one startup screen")
+        # Render a screen from the provider's OWN declared blocker, so this test asserts
+        # the fold rather than re-encoding a provider string of its own. A blocker matches
+        # when every one of its `all_of` phrases is present.
+        screen = "\n".join(blockers[0].all_of)
+        self.assertTrue(screen.strip(), "a declared blocker carries matchable phrases")
+        self.assertEqual(
+            self._observe(self._rows(), lambda locator: f"header\n{screen}\nfooter"),
+            STARTUP_SCREEN_BLOCKED,
+        )
+
+    def test_an_unreadable_pane_is_unverified_not_clear(self):
+        def boom(locator):
+            raise RuntimeError("herdr read failed")
+
+        self.assertEqual(self._observe(self._rows(), boom), "unreadable")
+
+    def test_a_blank_read_is_unreadable_not_clear(self):
+        self.assertEqual(self._observe(self._rows(), lambda locator: "   "), "unreadable")
+
+    def test_shell_residue_is_never_read_as_a_provider_screen(self):
+        reads = []
+        self.assertEqual(
+            self._observe(
+                self._rows(residue=True, agent_status="unknown"),
+                lambda locator: reads.append(locator) or "x",
+            ),
+            STARTUP_SCREEN_NOT_PROBED,
+        )
+        self.assertEqual(reads, [], "a pane with no provider process carries no screen")
 
 
 if __name__ == "__main__":  # pragma: no cover

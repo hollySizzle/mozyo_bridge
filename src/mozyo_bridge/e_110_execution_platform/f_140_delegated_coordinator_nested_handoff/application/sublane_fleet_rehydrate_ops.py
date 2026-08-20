@@ -28,6 +28,7 @@ Three properties the use case enforces and a regression pins:
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -41,9 +42,18 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTION_RESUME_BRIEF,
     BLOCKED,
     BLOCK_LANE_MOVED,
+    DISPATCH_ATTRIBUTION_UNKNOWN,
+    DISPATCH_NOT_APPLICABLE,
+    DISPATCH_OWED,
+    DISPATCH_UNREADABLE,
     FleetLaneFacts,
     FleetLanePlan,
     REHYDRATE,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.fleet_rehydrate_dispatch_fold import (  # noqa: E501
+    KIND_IMPLEMENTATION_REQUEST,
+    KIND_REPLY,
+    fold_dispatch_state,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
     SublaneCreateRequest,
@@ -67,6 +77,10 @@ REFUSED_RESUME_BRIEF_FAILED = "resume_brief_failed"
 REFUSED_GATEWAY_UNRESOLVED = "gateway_target_unresolved"
 #: The lane has no recorded worktree / branch to compose a create request from.
 REFUSED_LANE_IDENTITY_INCOMPLETE = "lane_identity_incomplete"
+#: The action-time re-fold found the causal key no longer ``owed`` (it landed by another
+#: path, its receiver was replaced, or the authority became unreadable) — Redmine #15745
+#: review j#108920 ``finding_actiontimefence``. Zero additional effect.
+REFUSED_DISPATCH_STATE_MOVED = "dispatch_state_moved"
 
 
 @dataclass(frozen=True)
@@ -144,6 +158,16 @@ class FleetRehydrateOps(Protocol):
         """Adopt-or-launch the lane's pair, optionally re-issuing its anchored dispatch.
 
         A non-``ok`` result means nothing further may be attempted for that lane.
+        """
+        ...
+
+    def current_dispatch_state(self, facts: FleetLaneFacts, *, kind: str) -> str:
+        """Re-fold ONE causal key against freshly-read authorities (Redmine #15745 j#108920).
+
+        The action-time half of the replay fence: the plan's fold is an observation, and the
+        window between it and an irreversible send is long enough for the same key to land
+        by another path, for the receiver to be replaced, or for the ledger to become
+        unreadable. Returns a :data:`...fleet_rehydrate.DISPATCH_STATES` token.
         """
         ...
 
@@ -260,6 +284,47 @@ class LiveFleetRehydrateOps:
             )
         return HealResult(ok=True, gateway_target=gateway)
 
+    def current_dispatch_state(self, facts: FleetLaneFacts, *, kind: str) -> str:
+        """Re-read ledger + live inventory and re-fold this key (action-time, read-only)."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_fleet_rehydrate import (  # noqa: E501
+            ledger_records_for_issue,
+            receiver_binding_for,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
+            list_herdr_agent_rows,
+        )
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+            HerdrSessionStartError,
+        )
+
+        key = facts.dispatch if kind == KIND_IMPLEMENTATION_REQUEST else facts.resume_brief
+        if not key.anchor_journal:
+            return DISPATCH_NOT_APPLICABLE
+        records, detail = ledger_records_for_issue(key.anchor_issue, home=None)
+        if records is None:
+            return DISPATCH_UNREADABLE
+        try:
+            rows = list_herdr_agent_rows(os.environ)
+        except HerdrSessionStartError:
+            # The inventory is the attribution authority; without it no record can be
+            # placed, and an unplaceable record is never folded into "owed".
+            return DISPATCH_ATTRIBUTION_UNKNOWN
+        receiver = facts.managed_roles[0] if facts.managed_roles else ""
+        binding = receiver_binding_for(
+            rows,
+            workspace_id=facts.workspace_id,
+            lane_id=facts.lane_id,
+            role=receiver,
+            managed_roles=facts.managed_roles,
+        )
+        return fold_dispatch_state(
+            records,
+            marker=key.marker,
+            kind=kind,
+            receiver=receiver,
+            binding=binding,
+        )
+
     def send_resume_brief(self, facts: FleetLaneFacts, *, gateway_target: str) -> int:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
             WorkflowProviderUnresolved,
@@ -366,6 +431,22 @@ class FleetRehydrateUseCase:
         restore = plan.has(ACTION_RESTORE_DISPATCH)
         gateway_target = self._observed_gateway(facts)
 
+        if restore:
+            # The LAST thing before the composed create's dispatch leg: re-fold this key
+            # against freshly-read authorities (review j#108920 finding_actiontimefence).
+            # A key that stopped being `owed` between the plan and here must not be sent.
+            fresh = self.ops.current_dispatch_state(
+                facts, kind=KIND_IMPLEMENTATION_REQUEST
+            )
+            if fresh != DISPATCH_OWED:
+                if not heal:
+                    return self._dispatch_state_moved(
+                        plan, applied, (ACTION_RESTORE_DISPATCH,), fresh, gateway_target
+                    )
+                # The pair still needs bringing up; drop only the send. Healing a lane is
+                # additive and is not invalidated by the dispatch having landed elsewhere.
+                restore = False
+
         if heal or restore:
             # ONE composed `sublane create --execute` covers both: its adopt-or-launch is
             # idempotent for a surviving pair, and its dispatch leg is the governed send.
@@ -396,6 +477,28 @@ class FleetRehydrateUseCase:
 
         if plan.has(ACTION_RESUME_BRIEF):
             attempted.append(ACTION_RESUME_BRIEF)
+            # The heal above launched processes and ran a governed send; that window is
+            # long enough for the lane to move or for this very brief to land by another
+            # path. Re-join BOTH authorities immediately before the brief's own send
+            # (review j#108920 finding_actiontimefence) — "once before the lane's first
+            # effect" is exactly the shape #14661 j#92656 F2 rejected.
+            moved = self._identity_moved(facts)
+            if moved is not None:
+                return LaneActuationOutcome(
+                    lane_id=plan.lane_id,
+                    issue_id=plan.issue_id,
+                    status=STATUS_BLOCKED,
+                    applied=tuple(applied),
+                    attempted=tuple(attempted),
+                    reason=BLOCK_LANE_MOVED,
+                    detail=moved,
+                    gateway_target=gateway_target,
+                )
+            fresh_brief = self.ops.current_dispatch_state(facts, kind=KIND_REPLY)
+            if fresh_brief != DISPATCH_OWED:
+                return self._dispatch_state_moved(
+                    plan, applied, tuple(attempted), fresh_brief, gateway_target
+                )
             if not gateway_target:
                 return LaneActuationOutcome(
                     lane_id=plan.lane_id,
@@ -425,6 +528,29 @@ class FleetRehydrateUseCase:
             status=STATUS_APPLIED,
             applied=tuple(applied),
             attempted=tuple(attempted),
+            gateway_target=gateway_target,
+        )
+
+    @staticmethod
+    def _dispatch_state_moved(
+        plan: FleetLanePlan,
+        applied: Sequence[str],
+        attempted: Sequence[str],
+        observed: str,
+        gateway_target: str,
+    ) -> LaneActuationOutcome:
+        """Zero additional effect: the key stopped being owed before its send."""
+        return LaneActuationOutcome(
+            lane_id=plan.lane_id,
+            issue_id=plan.issue_id,
+            status=STATUS_BLOCKED,
+            applied=tuple(applied),
+            attempted=tuple(attempted),
+            reason=REFUSED_DISPATCH_STATE_MOVED,
+            detail=(
+                "the causal key was re-folded immediately before its send and is no longer "
+                f"owed (observed={observed}); nothing further was sent"
+            ),
             gateway_target=gateway_target,
         )
 
@@ -466,6 +592,7 @@ __all__ = (
     "LaneIdentityPin",
     "LiveFleetRehydrateOps",
     "REFUSED_DISPATCH_FAILED",
+    "REFUSED_DISPATCH_STATE_MOVED",
     "REFUSED_GATEWAY_UNRESOLVED",
     "REFUSED_HEAL_FAILED",
     "REFUSED_LANE_IDENTITY_INCOMPLETE",

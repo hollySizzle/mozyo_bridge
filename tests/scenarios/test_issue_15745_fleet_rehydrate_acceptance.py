@@ -164,12 +164,16 @@ class FakeOps:
 
     instances: list["FakeOps"] = []
 
+    #: Class-level override for the action-time re-fold, ``{kind: state}``.
+    fresh_states: dict = {}
+
     def __init__(self, *, repo_root=None, quiet_stdout=False, fail_brief=False):
         self.repo_root = repo_root
         self.quiet_stdout = quiet_stdout
         self.fail_brief = fail_brief
         self.heal_calls = []
         self.brief_calls = []
+        self.refold_calls = []
         FakeOps.instances.append(self)
 
     def current_identity(self, *, workspace_id, lane_id):
@@ -185,14 +189,28 @@ class FakeOps:
         self.heal_calls.append((facts.lane_id, dispatch))
         return ops_module.HealResult(ok=True, gateway_target="w1V:pF")
 
+    def current_dispatch_state(self, facts, *, kind):
+        """The action-time re-fold; by default the key is still owed."""
+        self.refold_calls.append((facts.lane_id, kind))
+        return FakeOps.fresh_states.get(kind, DISPATCH_OWED)
+
     def send_resume_brief(self, facts, *, gateway_target):
         self.brief_calls.append((facts.lane_id, gateway_target))
         return 1 if self.fail_brief else 0
 
 
-def run_cli(facts, *, execute=False, lane_label="", json_mode=True, fail_brief=False):
+def run_cli(
+    facts,
+    *,
+    execute=False,
+    lane_label="",
+    json_mode=True,
+    fail_brief=False,
+    fresh_states=None,
+):
     """Drive the real CLI handler over an injected fleet, capturing stdout."""
     FakeOps.instances = []
+    FakeOps.fresh_states = dict(fresh_states or {})
     args = argparse.Namespace(
         repo=".",
         json=json_mode,

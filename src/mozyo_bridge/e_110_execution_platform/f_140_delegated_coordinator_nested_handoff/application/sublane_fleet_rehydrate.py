@@ -49,12 +49,18 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     FleetLanePlan,
     SKIP,
     SKIP_FILTERED,
+    STARTUP_SCREEN_BLOCKED,
+    STARTUP_SCREEN_CLEAR,
+    STARTUP_SCREEN_NOT_PROBED,
+    STARTUP_SCREEN_UNPROFILED,
+    STARTUP_SCREEN_UNREADABLE,
     plan_lane_rehydrate,
     summarize_rehydrate,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.fleet_rehydrate_dispatch_fold import (  # noqa: E501
     KIND_IMPLEMENTATION_REQUEST,
     KIND_REPLY,
+    ReceiverBinding,
     dispatch_fact,
     latest_anchor_journal,
 )
@@ -78,6 +84,11 @@ class FleetRehydrateUnavailable(RuntimeError):
     the rail DOES know the lane exists.
     """
 
+
+#: Bound wait for one read-only visible-pane read during the fact join. Short on purpose:
+#: the plan reads every live slot once, and a hung provider must not stall the whole fleet
+#: snapshot — an unreadable slot is a typed fail-closed block, never a value.
+_VISIBLE_READ_TIMEOUT_SECONDS = 5.0
 
 #: The callback route token a lane whose parent is the workspace coordinator briefs back to.
 #: Re-exported from the reconcile state machine so this rail names the same route the
@@ -177,7 +188,9 @@ def resume_inputs_from_args(args: argparse.Namespace) -> dict[str, ResumeBriefIn
     }
 
 
-def _ledger_records(issue: str, *, home: Optional[Path]) -> tuple[Optional[list], str]:
+def ledger_records_for_issue(
+    issue: str, *, home: Optional[Path] = None
+) -> tuple[Optional[list], str]:
     """Strictly read the durable delivery record for one issue.
 
     Returns ``(records, detail)``; ``records is None`` means the authority could not be read
@@ -192,6 +205,160 @@ def _ledger_records(issue: str, *, home: Optional[Path]) -> tuple[Optional[list]
         return HerdrDeliveryLedger(home=home).records_for_issue_strict(issue), ""
     except (HerdrDeliveryLedgerError, OSError) as exc:
         return None, f"delivery ledger unreadable ({type(exc).__name__})"
+
+
+def receiver_binding_for(
+    rows: Optional[Sequence[Mapping[str, object]]],
+    *,
+    workspace_id: str,
+    lane_id: str,
+    role: str,
+    managed_roles: Sequence[str],
+) -> ReceiverBinding:
+    """The live receiver a lane's ``role`` would be sent to now (Redmine #15745 j#108920).
+
+    Scoped with the SAME unit resolution the audit and retire rails use
+    (``plan_herdr_retire_close`` + ``expected_slot_rows``), so this join describes exactly
+    the slots those surfaces target. Returns :meth:`ReceiverBinding.absent` when the
+    inventory is unreadable, when the role has no live row, or when more than one row
+    resolves it — an ambiguous receiver is not a receiver, and the planner's own
+    ambiguity gate reports that separately.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
+        expected_slot_rows,
+        plan_herdr_retire_close,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+        AGENT_KEY_NAME,
+        AGENT_KEY_REVISION,
+    )
+
+    if rows is None or not role or not managed_roles:
+        return ReceiverBinding.absent()
+    plan = plan_herdr_retire_close(
+        rows,
+        workspace_id=workspace_id,
+        lane_id=lane_id,
+        legacy_workspace_id="",
+        managed_roles=managed_roles,
+    )
+    found = [
+        row
+        for row in expected_slot_rows(rows, plan, managed_roles=managed_roles)
+        if row.role == role and (row.locator or "").strip()
+    ]
+    if len(found) != 1:
+        return ReceiverBinding.absent()
+    row = found[0]
+    revision = row.row.get(AGENT_KEY_REVISION)
+    return ReceiverBinding(
+        role=role,
+        assigned_name=str(row.row.get(AGENT_KEY_NAME) or ""),
+        locator=str(row.locator or "").strip(),
+        # The revision is rendered exactly as the queue-enter rail records it on its own
+        # binding (a string), so the two sides compare without either coercing the other.
+        revision="" if revision is None else str(revision),
+    )
+
+
+def observe_startup_screen(
+    rows: Optional[Sequence[Mapping[str, object]]],
+    *,
+    workspace_id: str,
+    lane_id: str,
+    managed_roles: Sequence[str],
+    read_visible: Optional[Any] = None,
+) -> str:
+    """Classify the lane's LIVE slots against their providers' declared startup screens.
+
+    The reachable half of the fence #15745 j#108920 ``finding_startupinteraction`` found
+    stubbed out. It reuses #13760's shared, fail-closed evaluator
+    (:func:`...herdr_startup_admission.evaluate_startup_admission`) exactly as the read-only
+    :mod:`...operator_startup_gate_projection` does — the provider-specific strings stay in
+    the provider profiles, the pane text never leaves the evaluator, and mozyo never answers
+    a provider UI.
+
+    Fold order is fail-closed: any ``blocked`` slot wins (a screen IS up), then any
+    unclassifiable slot (``receiver_unreadable`` / ``unknown_provider``), then clear. A lane
+    with **no live slot** is :data:`STARTUP_SCREEN_NOT_PROBED` — the post-restart main case,
+    where there is no pane to be showing anything and no read is performed at all.
+    """
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
+        expected_slot_rows,
+        plan_herdr_retire_close,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_admission import (  # noqa: E501
+        ADMISSION_ADMITTED,
+        ADMISSION_BLOCKED,
+        ADMISSION_UNKNOWN_PROVIDER,
+        evaluate_startup_admission,
+    )
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
+        SLOT_LIVE,
+        classify_named_slot,
+    )
+
+    if rows is None or not managed_roles:
+        return STARTUP_SCREEN_NOT_PROBED
+    reader = read_visible if read_visible is not None else _live_visible_reader()
+    if reader is None:
+        # No read primitive is resolvable (no herdr binary on this host). Probing is not
+        # possible; that is honestly "not probed", and the lane's other fences still apply.
+        return STARTUP_SCREEN_NOT_PROBED
+    plan = plan_herdr_retire_close(
+        rows,
+        workspace_id=workspace_id,
+        lane_id=lane_id,
+        legacy_workspace_id="",
+        managed_roles=managed_roles,
+    )
+    verdicts: list[str] = []
+    for row in expected_slot_rows(rows, plan, managed_roles=managed_roles):
+        locator = (row.locator or "").strip()
+        if not locator or classify_named_slot(row.row) != SLOT_LIVE:
+            # Residue / locator-less rows carry no provider process, so they cannot be
+            # showing a provider startup screen. The audit reports them on its own axis.
+            continue
+        admission = evaluate_startup_admission(
+            provider_id=row.role,
+            read_visible=lambda locator=locator: reader(locator),
+        )
+        if admission.outcome == ADMISSION_BLOCKED:
+            return STARTUP_SCREEN_BLOCKED
+        verdicts.append(
+            STARTUP_SCREEN_CLEAR
+            if admission.outcome == ADMISSION_ADMITTED
+            else (
+                STARTUP_SCREEN_UNPROFILED
+                if admission.outcome == ADMISSION_UNKNOWN_PROVIDER
+                else STARTUP_SCREEN_UNREADABLE
+            )
+        )
+    if not verdicts:
+        return STARTUP_SCREEN_NOT_PROBED
+    if STARTUP_SCREEN_UNPROFILED in verdicts:
+        return STARTUP_SCREEN_UNPROFILED
+    if STARTUP_SCREEN_UNREADABLE in verdicts:
+        return STARTUP_SCREEN_UNREADABLE
+    return STARTUP_SCREEN_CLEAR
+
+
+def _live_visible_reader():
+    """Bind herdr's visible-pane read, or ``None`` when no binary resolves (read-only)."""
+    from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_health import (  # noqa: E501
+        live_visible_reader,
+    )
+
+    try:
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+            _resolve_binary_or_die,
+        )
+        import subprocess
+
+        binary = _resolve_binary_or_die(os.environ)
+    except (Exception, SystemExit):
+        return None
+    return live_visible_reader(binary, subprocess.run, _VISIBLE_READ_TIMEOUT_SECONDS)
 
 
 def _lifecycle_anchor(record: "LaneLifecycleRecord") -> str:
@@ -243,6 +410,8 @@ def gather_fleet_facts(
     rows: Optional[Sequence[Mapping[str, object]]] = None,
     issue_states: Optional[Mapping[str, Optional[bool]]] = None,
     ledger_by_issue: Optional[Mapping[str, Optional[Sequence[Any]]]] = None,
+    startup_screens: Optional[Mapping[str, str]] = None,
+    read_visible: Optional[Any] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> tuple[FleetLaneFacts, ...]:
     """Join every authority the rehydrate decision reads, one :class:`FleetLaneFacts` per lane.
@@ -331,7 +500,7 @@ def gather_fleet_facts(
                 )
             return (), ""
         if issue not in ledger_cache:
-            ledger_cache[issue] = _ledger_records(issue, home=home)
+            ledger_cache[issue] = ledger_records_for_issue(issue, home=home)
         return ledger_cache[issue]
 
     facts: list[FleetLaneFacts] = []
@@ -342,6 +511,17 @@ def gather_fleet_facts(
         issue = (reboot.issue_id or "").strip()
         ledger, ledger_detail = _records_for(issue) if issue else ((), "")
         unreadable = ledger is None
+
+        # The receiver this lane would send to NOW. Every ledger fold below is attributed
+        # against it, so an older generation's confirmed delivery can never answer for a
+        # fresh one (review j#108920 finding_generationfence, verdict j#108926).
+        binding = receiver_binding_for(
+            rows,
+            workspace_id=reboot.workspace_id,
+            lane_id=reboot.lane_id,
+            role=gateway_receiver,
+            managed_roles=managed_roles,
+        )
 
         dispatch_anchor = ""
         if issue and not unreadable and gateway_receiver:
@@ -359,6 +539,7 @@ def gather_fleet_facts(
             journal=dispatch_anchor,
             kind=KIND_IMPLEMENTATION_REQUEST,
             receiver=gateway_receiver,
+            binding=binding,
             unreadable=unreadable,
             detail=ledger_detail,
         )
@@ -370,6 +551,7 @@ def gather_fleet_facts(
             journal=(supplied.anchor_journal or _lifecycle_anchor(record)),
             kind=KIND_REPLY,
             receiver=gateway_receiver,
+            binding=binding,
             unreadable=unreadable,
             detail=ledger_detail,
         )
@@ -402,7 +584,17 @@ def gather_fleet_facts(
                 dispatch=dispatch,
                 resume_brief=brief,
                 resume_profile_fields=profile_fields,
-                startup_interaction_pending=False,
+                startup_screen=(
+                    startup_screens[reboot.lane_id]
+                    if startup_screens is not None
+                    else observe_startup_screen(
+                        rows,
+                        workspace_id=reboot.workspace_id,
+                        lane_id=reboot.lane_id,
+                        managed_roles=managed_roles,
+                        read_visible=read_visible,
+                    )
+                ),
             )
         )
     return tuple(facts)
@@ -665,10 +857,13 @@ __all__ = (
     "cmd_sublane_rehydrate_fleet",
     "format_rehydrate_text",
     "gather_fleet_facts",
+    "ledger_records_for_issue",
+    "observe_startup_screen",
     "parent_callback_route",
     "parse_resume_anchor",
     "parse_resume_profile_field",
     "plan_fleet",
+    "receiver_binding_for",
     "register_sublane_rehydrate_fleet_parser",
     "rehydrate_payload",
     "resume_inputs_from_args",

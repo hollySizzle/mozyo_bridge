@@ -89,6 +89,12 @@ DISPATCH_UNCERTAIN = "uncertain"
 #: The durable delivery authority could not be read. Not observing a delivery is never the
 #: same as there being none.
 DISPATCH_UNREADABLE = "unreadable"
+#: A recorded attempt exists that cannot be attributed to — or ruled out for — the receiver
+#: this lane would send to NOW (Redmine #15745 review j#108920 ``finding_generationfence``).
+#: Neither "already delivered" nor "owed" is provable, so the lane blocks. Never folded into
+#: :data:`DISPATCH_OWED`: an unattributable attempt is exactly the case where re-issuing
+#: might duplicate and skipping might strand a fresh generation.
+DISPATCH_ATTRIBUTION_UNKNOWN = "attribution_unknown"
 #: This lane owes no such send by construction (e.g. no resume brief for a non-delegated
 #: lane). Distinct from ``owed`` so an absent obligation never reads as a pending one.
 DISPATCH_NOT_APPLICABLE = "not_applicable"
@@ -99,7 +105,41 @@ DISPATCH_STATES: frozenset[str] = frozenset(
         DISPATCH_DELIVERED,
         DISPATCH_UNCERTAIN,
         DISPATCH_UNREADABLE,
+        DISPATCH_ATTRIBUTION_UNKNOWN,
         DISPATCH_NOT_APPLICABLE,
+    }
+)
+
+# ---------------------------------------------------------------------------
+# Live startup-screen observation (closed).
+#
+# Redmine #15745 review j#108920 ``finding_startupinteraction``. A bool could not carry
+# this: "no screen is up" and "we could not tell" license opposite actions, and #13760's
+# whole lesson is that an unreadable receiver must never decay into a clear one.
+# ---------------------------------------------------------------------------
+
+#: No live slot to read (the post-restart main case: a lane with no processes cannot be
+#: showing a startup screen). Not a success verdict about anything — just nothing to ask.
+STARTUP_SCREEN_NOT_PROBED = "not_probed"
+#: Every live slot was read and none matched a declared provider startup blocker.
+STARTUP_SCREEN_CLEAR = "clear"
+#: A declared startup screen (trust / login / theme) is up on a live slot. The operator owns
+#: it in the provider's own UI; mozyo never answers one.
+STARTUP_SCREEN_BLOCKED = "blocked"
+#: A live slot's visible pane could not be read. Fail-closed, and deliberately NOT
+#: :data:`STARTUP_SCREEN_BLOCKED`: it says the question is undecided, never that a screen
+#: was shown.
+STARTUP_SCREEN_UNREADABLE = "unreadable"
+#: A live slot's provider has no profile, so its startup screens cannot be described at all.
+STARTUP_SCREEN_UNPROFILED = "unprofiled"
+
+STARTUP_SCREENS: frozenset[str] = frozenset(
+    {
+        STARTUP_SCREEN_NOT_PROBED,
+        STARTUP_SCREEN_CLEAR,
+        STARTUP_SCREEN_BLOCKED,
+        STARTUP_SCREEN_UNREADABLE,
+        STARTUP_SCREEN_UNPROFILED,
     }
 )
 
@@ -199,6 +239,14 @@ BLOCK_AMBIGUOUS_INVENTORY = "ambiguous_inventory"
 #: A provider startup interaction (trust / login / theme) is pending. mozyo never answers a
 #: provider UI; the operator does, and then this rail is re-run.
 BLOCK_STARTUP_INTERACTION = "startup_interaction_required"
+#: A live slot's startup screen could not be classified (unreadable pane, or a provider with
+#: no profile). Distinct from :data:`BLOCK_STARTUP_INTERACTION`: that one says a screen WAS
+#: shown, this one says the question is undecided. #13760's failure was exactly an
+#: unclassifiable receiver being treated as clear.
+BLOCK_STARTUP_SCREEN_UNVERIFIED = "startup_screen_unverified"
+#: A recorded delivery attempt could not be attributed to the receiver this lane would send
+#: to now (review j#108920 ``finding_generationfence``).
+BLOCK_DISPATCH_ATTRIBUTION_UNKNOWN = "dispatch_attribution_unknown"
 #: The durable delivery authority could not be read for one of the lane's causal keys.
 BLOCK_DISPATCH_UNREADABLE = "dispatch_record_unreadable"
 #: A causal key classified ``uncertain_partial``: the payload may already be at the
@@ -234,8 +282,10 @@ BLOCK_REASONS: frozenset[str] = frozenset(
         BLOCK_FOREIGN_SLOT,
         BLOCK_AMBIGUOUS_INVENTORY,
         BLOCK_STARTUP_INTERACTION,
+        BLOCK_STARTUP_SCREEN_UNVERIFIED,
         BLOCK_DISPATCH_UNREADABLE,
         BLOCK_DISPATCH_UNCERTAIN,
+        BLOCK_DISPATCH_ATTRIBUTION_UNKNOWN,
         BLOCK_DISPATCH_ANCHOR_UNRESOLVED,
         BLOCK_RESUME_ANCHOR_UNRESOLVED,
         BLOCK_RESUME_PROFILE_INCOMPLETE,
@@ -337,7 +387,11 @@ class FleetLaneFacts:
     dispatch: LaneDispatchFact = field(default_factory=LaneDispatchFact)
     resume_brief: LaneDispatchFact = field(default_factory=LaneDispatchFact)
     resume_profile_fields: tuple[tuple[str, str], ...] = ()
-    startup_interaction_pending: bool = False
+    #: The lane-level fold of the live startup-screen read, one of
+    #: :data:`STARTUP_SCREENS`. A closed token rather than a bool because "no screen" and
+    #: "could not tell" license opposite actions (review j#108920
+    #: ``finding_startupinteraction``).
+    startup_screen: str = STARTUP_SCREEN_NOT_PROBED
 
     # -- convenience projections of the embedded join ------------------------
 
@@ -409,7 +463,7 @@ class FleetLaneFacts:
                 {"field": k, "resolved": bool(v)}
                 for k, v in self.resume_profile_fields
             ],
-            "startup_interaction_pending": self.startup_interaction_pending,
+            "startup_screen": self.startup_screen,
         }
 
 
@@ -615,11 +669,29 @@ def _inventory_verdict(facts: FleetLaneFacts) -> Optional[FleetLanePlan]:
                 BLOCK_AMBIGUOUS_INVENTORY,
                 f"{len(matching)} live slots resolve the {role} role",
             )
-    if facts.startup_interaction_pending:
+    if facts.startup_screen == STARTUP_SCREEN_BLOCKED:
         return _blocked(
             facts,
             BLOCK_STARTUP_INTERACTION,
-            "a provider startup interaction is pending; mozyo never answers a provider UI",
+            "a declared provider startup screen is up on a live slot; the operator clears "
+            "it in the provider's own UI and re-runs this rail",
+        )
+    if facts.startup_screen in (
+        STARTUP_SCREEN_UNREADABLE,
+        STARTUP_SCREEN_UNPROFILED,
+    ):
+        # #13760: an unclassifiable receiver must never be treated as a clear one. This is
+        # a SEPARATE token from "a screen is up" so the refusal names the real cause.
+        return _blocked(
+            facts,
+            BLOCK_STARTUP_SCREEN_UNVERIFIED,
+            f"a live slot's startup screen could not be classified ({facts.startup_screen})",
+        )
+    if facts.startup_screen not in STARTUP_SCREENS:
+        return _blocked(
+            facts,
+            BLOCK_STARTUP_SCREEN_UNVERIFIED,
+            f"startup_screen={facts.startup_screen!r} is outside the closed vocabulary",
         )
     return None
 
@@ -635,6 +707,14 @@ def _dispatch_verdict(
     """
     if fact.state == DISPATCH_UNREADABLE:
         return _blocked(facts, BLOCK_DISPATCH_UNREADABLE, fact.detail)
+    if fact.state == DISPATCH_ATTRIBUTION_UNKNOWN:
+        return _blocked(
+            facts,
+            BLOCK_DISPATCH_ATTRIBUTION_UNKNOWN,
+            fact.detail
+            or "a recorded attempt could not be attributed to the receiver this lane "
+            "would send to now; neither delivered nor owed is provable",
+        )
     if fact.state == DISPATCH_UNCERTAIN:
         return _blocked(
             facts,
@@ -765,6 +845,7 @@ __all__ = (
     "BLOCK_AMBIGUOUS_OWNER",
     "BLOCK_BRANCH_UNRESOLVED",
     "BLOCK_DISPATCH_ANCHOR_UNRESOLVED",
+    "BLOCK_DISPATCH_ATTRIBUTION_UNKNOWN",
     "BLOCK_DISPATCH_UNCERTAIN",
     "BLOCK_DISPATCH_UNREADABLE",
     "BLOCK_FOREIGN_SLOT",
@@ -779,11 +860,13 @@ __all__ = (
     "BLOCK_RESUME_ANCHOR_UNRESOLVED",
     "BLOCK_RESUME_PROFILE_INCOMPLETE",
     "BLOCK_STARTUP_INTERACTION",
+    "BLOCK_STARTUP_SCREEN_UNVERIFIED",
     "BLOCK_UNKNOWN_DISPOSITION",
     "BLOCK_WORKTREE_MISSING",
     "BLOCK_WORKTREE_UNBOUND",
     "BLOCK_WORKTREE_UNREADABLE",
     "DELEGATED_COORDINATOR_BRIEF_FIELDS",
+    "DISPATCH_ATTRIBUTION_UNKNOWN",
     "DISPATCH_DELIVERED",
     "DISPATCH_NOT_APPLICABLE",
     "DISPATCH_OWED",
@@ -803,6 +886,12 @@ __all__ = (
     "SKIP_REASONS",
     "SKIP_RETIRED",
     "SKIP_SUPERSEDED",
+    "STARTUP_SCREENS",
+    "STARTUP_SCREEN_BLOCKED",
+    "STARTUP_SCREEN_CLEAR",
+    "STARTUP_SCREEN_NOT_PROBED",
+    "STARTUP_SCREEN_UNPROFILED",
+    "STARTUP_SCREEN_UNREADABLE",
     "plan_lane_rehydrate",
     "summarize_rehydrate",
 )
