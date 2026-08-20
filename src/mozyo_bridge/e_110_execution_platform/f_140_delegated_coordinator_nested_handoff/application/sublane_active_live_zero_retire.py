@@ -422,6 +422,7 @@ def run_active_live_zero_retire(
                 issue=issue,
                 journal=journal,
                 absent_worktree=absent_worktree,
+                head_integrated=head_integrated,
             )
     except AttestationStoreLockBusy as exc:
         return _blocked(
@@ -459,6 +460,7 @@ def _terminalize_under_exclusion(
     issue: str,
     journal: str,
     absent_worktree: Optional["AbsentWorktreeEvidence"] = None,
+    head_integrated: Optional[bool] = None,
 ):
     """The action-time half, run while HOLDING the exclusive launch-exclusion lock (#14242).
 
@@ -601,9 +603,18 @@ def _terminalize_under_exclusion(
     # (verdict j#109134). Placed after the live-zero read and before the CAS, so it is the last
     # thing measured; placed after the already-retired shortcut on purpose, since that branch
     # writes nothing and failing an idempotent replay would be a behaviour change with no
-    # safety benefit. Named residual (NOT solved, same discipline as the #14242 j#85269 launcher
-    # residual): git's own worktree add / prune do not take this lock, so a restore landing in
-    # the few statements between here and the CAS is not excluded.
+    # safety benefit.
+    #
+    # Named residual (NOT solved, same discipline as the #14242 j#85269 launcher residual), and
+    # widened by R2 review j#109193 to say what it always should have: git's own `worktree add`,
+    # `prune` AND `update-ref` do not take this lock, so BOTH a checkout restored and a **branch
+    # ref moved to an unintegrated commit** in the few statements between the last measurement
+    # and the CAS are outside the exclusion. The earlier wording named only the restore, which
+    # left the ref-mutation leg undocumented — that omission is corrected here rather than
+    # defended. Closing the window outright is not achievable from user space: every check
+    # precedes the write, and no protocol reachable from here can bind an external `git`
+    # process (see the #15789 dispute record j#109195 for the measurements and the rejected
+    # `git worktree lock` mitigation).
     if absent_worktree is not None:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_absent_worktree_evidence import (  # noqa: E501
             revalidate_absent_worktree_evidence,
@@ -626,6 +637,39 @@ def _terminalize_under_exclusion(
                 workspace_id=workspace_id,
                 lane_id=lane_label,
             )
+        # R2 review j#109193, second leg: the head-integration verdict this rail acts on was
+        # measured in `dispatch_retire_intent`, BEFORE the rail was even entered, so the whole
+        # rail sat inside its check-to-act window and a `update-ref` onto an unintegrated commit
+        # reached the CAS. Re-measure the LITERAL ancestry here, symmetric with the absence
+        # re-proof above, and refuse a True -> False flip. This does not close the window (see
+        # the residual above; measured on the flag-less rail too — dispute record j#109195), it
+        # narrows the flag path's exposure from the whole rail to these few statements, which is
+        # strictly tighter than the sibling rails. Only the literal probe is repeated: the
+        # #14066 patch-equivalent route performs a credential-gated Redmine read and re-running
+        # it under the exclusive lock would hold the home's lock across a network call.
+        if head_integrated is True:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+                LiveSublaneLifecycleOps,
+            )
+
+            still_integrated = LiveSublaneLifecycleOps(
+                repo_root=repo_root
+            ).branch_integrated(
+                (getattr(args, "branch", "") or "").strip(),
+                (getattr(args, "integration_branch", "") or "").strip(),
+            )
+            if still_integrated is not True:
+                return _blocked(
+                    ACTIVE_RETIRE_HEAD_NOT_INTEGRATED,
+                    detail=(
+                        "--branch was a verified ancestor of --integration-branch when the "
+                        "intent was dispatched but is not one now (the ref moved, or the "
+                        "ancestry probe stopped answering); terminalizing would strand work "
+                        "that arrived after the first measurement"
+                    ),
+                    workspace_id=workspace_id,
+                    lane_id=lane_label,
+                )
 
     store = LaneActiveRetireStore(home=getattr(args, "home", None))
     try:

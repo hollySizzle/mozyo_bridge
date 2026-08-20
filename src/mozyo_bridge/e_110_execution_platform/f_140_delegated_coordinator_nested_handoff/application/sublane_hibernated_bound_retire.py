@@ -734,9 +734,15 @@ def run_hibernated_bound_retire(
     # past, and the review reproduced a checkout restored (and dirtied) at the recorded path
     # after that proof still producing a terminal write (verdict j#109134). This rail takes no
     # launch-exclusion lock — its second witness is the durable `released` record, not an
-    # inventory read — so the boundary here is simply "immediately before the CAS". Named
-    # residual (NOT solved): git's worktree add / prune are not serialized against this rail, so
-    # a restore landing between this re-proof and the CAS is not excluded.
+    # inventory read — so the boundary here is simply "immediately before the CAS".
+    #
+    # Named residual (NOT solved), widened by R2 review j#109193 to say what it always should
+    # have: git's `worktree add`, `prune` AND `update-ref` are not serialized against this rail,
+    # so BOTH a restored checkout and a **branch ref moved to an unintegrated commit** landing
+    # between the last measurement and the CAS are outside it. The earlier wording named only
+    # the restore. Closing the window outright is not achievable from user space — every check
+    # precedes the write and no protocol reachable from here binds an external `git` process
+    # (measurements and the rejected `git worktree lock` mitigation: dispute record j#109195).
     if absent_worktree is not None:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_absent_worktree_evidence import (  # noqa: E501
             revalidate_absent_worktree_evidence,
@@ -759,6 +765,35 @@ def run_hibernated_bound_retire(
                 workspace_id=workspace_id,
                 lane_id=lane_label,
             )
+        # R2 review j#109193, second leg: the head-integration verdict this rail acts on was
+        # measured in `dispatch_retire_intent`, before the rail was entered, so an `update-ref`
+        # onto an unintegrated commit reached the CAS. Re-measure the LITERAL ancestry here,
+        # symmetric with the absence re-proof, and refuse a True -> False flip. It narrows the
+        # flag path's exposure rather than closing it (see the residual above). Only the literal
+        # probe repeats: the #14066 patch-equivalent route reads Redmine over the network.
+        if head_integrated is True:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+                LiveSublaneLifecycleOps,
+            )
+
+            still_integrated = LiveSublaneLifecycleOps(
+                repo_root=repo_root
+            ).branch_integrated(
+                (getattr(args, "branch", "") or "").strip(),
+                (getattr(args, "integration_branch", "") or "").strip(),
+            )
+            if still_integrated is not True:
+                return _blocked(
+                    BOUND_RETIRE_HEAD_NOT_INTEGRATED,
+                    detail=(
+                        "--branch was a verified ancestor of --integration-branch when the "
+                        "intent was dispatched but is not one now (the ref moved, or the "
+                        "ancestry probe stopped answering); terminalizing would strand work "
+                        "that arrived after the first measurement"
+                    ),
+                    workspace_id=workspace_id,
+                    lane_id=lane_label,
+                )
 
     retire_store = LaneBoundRetireStore(home=getattr(args, "home", None))
     try:

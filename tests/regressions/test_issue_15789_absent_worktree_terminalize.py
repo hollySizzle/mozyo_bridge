@@ -607,6 +607,37 @@ class TheAbsenceIsReProvenAtTheTerminalMutationBoundary(_WipedCheckoutFixture):
         self.assertTrue(fired, "the concurrent event never entered the window")
         return outcome
 
+    def _run_with_event_after_the_reproof(self, event):
+        """Run the retire with ``event`` firing once, right after the absence RE-proof.
+
+        Distinct from :meth:`_run_with_event_in_the_window`, which hooks the FIRST proof: that
+        one lands before ``dispatch_retire_intent`` takes its head-integration probe, so the
+        pre-existing probe would catch a ref move and the pin would pass without exercising the
+        rail's own re-measurement at all. Measured: mutating away the active rail's head
+        re-measurement left such a pin green. Hooking the re-proof puts the event after the
+        original probe and before the re-measurement, which is the window under test.
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_absent_worktree_evidence as evidence_module,
+        )
+
+        real = evidence_module.revalidate_absent_worktree_evidence
+        fired: list[bool] = []
+
+        def hooked(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if not fired:
+                fired.append(True)
+                event()
+            return result
+
+        with mock.patch.object(
+            evidence_module, "revalidate_absent_worktree_evidence", hooked
+        ):
+            outcome = self.run_retire()
+        self.assertTrue(fired, "the concurrent event never entered the window")
+        return outcome
+
     def _restore_and_dirty(self):
         """Bring the checkout back at the exact recorded path, carrying uncommitted work."""
         result = subprocess.run(
@@ -654,6 +685,46 @@ class TheAbsenceIsReProvenAtTheTerminalMutationBoundary(_WipedCheckoutFixture):
         self.assertEqual(payload.get("retire_application", {}).get("state"), "retired")
         self.assertEqual(code, 0)
         self.assertEqual(self.disposition(), DISPOSITION_RETIRED)
+
+    def test_a_ref_moved_to_an_unintegrated_commit_blocks_the_terminal_write(self):
+        """R2 review j#109193, second leg (dispute record j#109195).
+
+        The head-integration verdict was measured in ``dispatch_retire_intent``, before the rail
+        was entered, so the WHOLE rail sat inside its check-to-act window: an ``update-ref`` onto
+        an unintegrated commit reached the CAS and the row went terminal with the head no longer
+        an ancestor. The rail now re-measures the literal ancestry at the same boundary as the
+        absence re-proof. That narrows the exposure to the statements after the last measurement
+        — it does not close it, and the residual says so; this pin covers the part that IS
+        closable, and deliberately does not enshrine the part that is not.
+        """
+        self.declare_active()
+        self.wipe_checkout()
+        unintegrated = self._commit_unintegrated_work()
+
+        _, payload = self._run_with_event_after_the_reproof(
+            lambda: _git(
+                "update-ref", f"refs/heads/{_LANE}", unintegrated, cwd=self.primary
+            )
+        )
+        self.assert_refused(payload, "head_not_integrated")
+        self.assertEqual(self.disposition(), DISPOSITION_ACTIVE)
+        self.assertEqual(
+            _git_out("rev-parse", _LANE, cwd=self.primary).strip(),
+            unintegrated,
+            "the refused retire moved the ref back",
+        )
+
+    def _commit_unintegrated_work(self) -> str:
+        """A real commit on a side ref that is NOT an ancestor of main, ready to be moved on."""
+        side = self.primary.parent / "side_unintegrated_wt"
+        _git("branch", "side_unintegrated", _LANE, cwd=self.primary)
+        _git("worktree", "add", "-q", str(side), "side_unintegrated", cwd=self.primary)
+        (side / "unintegrated.txt").write_text("not in main\n", encoding="utf-8")
+        _git("add", "-A", cwd=side)
+        _git("commit", "-qm", "unintegrated lane work", cwd=side)
+        sha = _git_out("rev-parse", "side_unintegrated", cwd=self.primary).strip()
+        _git("worktree", "remove", "--force", str(side), cwd=self.primary)
+        return sha
 
     def test_a_drifting_re_proof_is_refused_rather_than_silently_adopted(self):
         """A re-proof that verifies against a DIFFERENT lane is never adopted."""
@@ -751,6 +822,48 @@ class TheHibernatedBoundRailCarriesTheSameContract(_WipedCheckoutFixture):
             )
         self.assertTrue(fired, "the concurrent event never entered the window")
         self.assert_refused(payload, ABSENT_WT_WORKTREE_PRESENT)
+        self.assertEqual(self.disposition(), DISPOSITION_HIBERNATED)
+
+    def test_the_hibernated_bound_rail_re_measures_head_integration_too(self):
+        """R2 review j#109193 second leg, on the second rail (dispute record j#109195)."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_absent_worktree_evidence as evidence_module,
+        )
+
+        self._seed_hibernated()
+        self.wipe_checkout()
+
+        side = self.primary.parent / "side_unintegrated_hib"
+        _git("branch", "side_unintegrated_hib", _LANE, cwd=self.primary)
+        _git("worktree", "add", "-q", str(side), "side_unintegrated_hib", cwd=self.primary)
+        (side / "unintegrated.txt").write_text("not in main\n", encoding="utf-8")
+        _git("add", "-A", cwd=side)
+        _git("commit", "-qm", "unintegrated lane work", cwd=side)
+        unintegrated = _git_out(
+            "rev-parse", "side_unintegrated_hib", cwd=self.primary
+        ).strip()
+        _git("worktree", "remove", "--force", str(side), cwd=self.primary)
+
+        real = evidence_module.revalidate_absent_worktree_evidence
+        fired: list[bool] = []
+
+        def hooked(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if not fired:
+                fired.append(True)
+                _git(
+                    "update-ref", f"refs/heads/{_LANE}", unintegrated, cwd=self.primary
+                )
+            return result
+
+        with mock.patch.object(
+            evidence_module, "revalidate_absent_worktree_evidence", hooked
+        ):
+            _, payload = self.run_retire(
+                retire_active_live_zero=False, retire_hibernated_bound=True
+            )
+        self.assertTrue(fired, "the concurrent event never entered the window")
+        self.assert_refused(payload, "head_not_integrated")
         self.assertEqual(self.disposition(), DISPOSITION_HIBERNATED)
 
 
