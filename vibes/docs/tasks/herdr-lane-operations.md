@@ -519,6 +519,148 @@ forceやpending overrideを加えない。pending generationが本当に破棄�
 
 `sublane create --execute`がlaunch後にdispatchだけfailした場合は、起動済みslot、未配送anchor、失敗理由をjournalに残す。partial laneを成功扱いせず、同じcommandをblind replayしない (Redmine #13613)。
 
+## 再起動後に 3 階層 fleet を再 hydrate する (`sublane rehydrate-fleet`, #15745)
+
+PC 再起動は全 pane の terminal attestation を失効させるが、`herdr session-start` が復元するのは
+**default coordinator pair だけ**である。3 階層の再形成は #15631 j#108474 / j#108484 の実測どおり
+「coordinator 正規再起動 → L2 heal → resume brief → L3 heal → IR 再 dispatch」の手動連鎖だった。
+各 step は既に governed rail として存在していたので、#15745 が足したのは rail ではなく **決定層**
+である: manifest 上 active な lane 群について「どの lane が、どの未配送 action を負っているか」を
+durable authority だけから答える。
+
+### `reboot-audit` との関係 (どちらを使うか)
+
+両者は同じ per-lane facts を読むが **問いが違う**。混同すると誤った rail を選ぶ。
+
+- `sublane reboot-audit` — 「この lane はどの disposition へ収束すべきか」。closed issue / 消えた
+  worktree / residue pane / 二重 owner の後始末を lane ごとに名指しする read-only 監査で、
+  **all-lanes action を意図的に持たない** (#14499 Required behavior 5)。この契約は #15745 でも
+  一切変えていない。
+- `sublane rehydrate-fleet` — 「**open issue を持つ active lane** が、どの未配送 action を負って
+  いるか」。答えは `heal_pair` / `restore_dispatch` / `resume_brief` の閉じた集合だけで、
+  それ以外の形はすべて typed skip / block になる。したがって「1 つの verdict を fleet 全体へ
+  一括適用する」ものではなく、lane ごとに違う答えを出す点は `reboot-audit` と同じ規律である。
+
+再起動直後は **まず `reboot-audit`** で closed / worktree 消失 / residue の lane を片付け、
+その後 `rehydrate-fleet` で残る active lane を戻す、が標準順序である。
+
+### 二段運用
+
+```sh
+# 1. read-only plan (既定)。効果 0。
+mozyo-bridge sublane rehydrate-fleet --repo . --json
+
+# 2. plan を確認してから actuate
+mozyo-bridge sublane rehydrate-fleet --repo . --execute --json \
+  --resume-anchor <l2 lane>=<resume journal id> \
+  --resume-profile-field <l2 lane>:parent_project=<parent redmine project> \
+  --resume-profile-field <l2 lane>:child_project=<child redmine project> \
+  --resume-profile-field <l2 lane>:parent_issue=<parent issue id>
+```
+
+- plan は lane ごとに exact な issue / lane / generation / revision / branch binding、負っている
+  action、skip / block の **閉じた理由 token** を出す。branch / worktree / process / store /
+  ticket / send のいずれにも触れない (regression が effect 0 を pin する)。
+- `--execute` は各 lane の **最初の effect の直前に lifecycle row を再読** し、disposition /
+  revision / generation / worktree binding が動いていれば `lane_moved` で zero-effect 拒否する。
+- heal と dispatch restore は **1 回の `sublane create --execute` に畳む** (adopt-or-launch は
+  生存 pair に対して冪等で、dispatch leg は既存の governed send)。2 本の rail に分けると
+  double-adopt か第二の dispatch 経路の新設になる。
+- exit code: plan は常に 0 (action が要る lane は *finding* であって command 失敗ではない)。
+  `--execute` は rehydrate できなかった lane が 1 つでもあれば 1。
+
+### replay fence (送信済み key を再利用しない)
+
+dispatch / brief を出すかは **durable delivery record の fold** だけで決まる。pane 表示・issue
+status・lane の見た目は一切参照しない。
+
+- causal key は canonical producer (`build_marker`) が描く landing marker そのもの。ledger row の
+  marker は **その row 自身の anchor / kind / receiver から再描画して byte 一致** した場合のみ
+  その key の証拠と認める (marker を parse しない / 散文から作らない)。
+- ★**証拠は「今この lane が送る相手」に帰属させる** (#15745 review j#108920 → j#108953
+  `finding_generationfence` / verdict j#108926・j#108968)。marker は lane も generation も持たず
+  ledger にも generation column が無いため、marker だけで keying すると **旧 generation への配送済み
+  記録が fresh な pair の答えになり、relaunch した gateway が pointer を受け取れない** (supersede 後の
+  successor lane でも同型)。
+  - **同一世代の証明は自前で組まない**。判別子に inventory の `row_revision` を使うのは誤りである —
+    `herdr_identity.process_generation_of_locator` が「`AgentInfo.revision` は process-generation id
+    ではなく、title / metadata 等の presentation 変更でも進む」と明示しており、同 docstring は
+    revision drift では **withhold 側へ倒す** (送らない) のが正しいとも書いている。revision 差分で
+    「別世代」と断定すると confirmed record を捨てて `owed` へ戻し、**同じ生きている receiver へ本文を
+    再送**することになる (ADR-0002 の本文 exactly-once 違反)。
+  - 証明は #15227 の共有 authority をそのまま使う: `herdr_live_attestation_time.fresh_attestation_identity`
+    が 1 つの fresh inventory snapshot から locator / row_revision / terminal_id を取り、attestation を
+    terminal-verified に join し、verified generation token (`startup_action_id`) を解決して
+    `FreshGenerationBoundary` を返す (1 軸でも欠落・不読なら `None`)。
+    `FreshGenerationBoundary.matches_delivery` が ledger row の `gateway_binding` を 6 軸すべて非空
+    exact 一致で照合する。
+  - 帰属は 3 値で、**判定不能は常に「送らない」側へ倒す**:
+    - `matches_delivery` 成立 → **現世代の証拠**として fold する。
+    - 不成立で、record の `target` locator が readable な snapshot に**一件も存在しない**
+      (positive absence) → **証拠にならない** (drop)。既に居ない process が握っていたものを fresh
+      process へ送っても二重にはならない。
+    - それ以外 — inventory 不読、`target` 欠落、locator は live だが同一世代を証明できない (同一
+      locator への再 launch、attestation 不読、revision drift) → `dispatch_attribution_unknown` で
+      **block**。`retired` (= 再送許可) へは倒さない。
+- 各 attempt は共有 `injection_stage` authority で分類する。`submitted_confirmed` が 1 件でも
+  あれば `delivered` (再送しない)、`uncertain_partial` があれば `uncertain` (**block**。blind
+  replay 禁止で、receiver / durable anchor の reconcile が先)、全部が `not_sent` か記録ゼロの
+  ときだけ `owed` になる。
+- ledger が読めない場合は `dispatch_record_unreadable` で **block**。「観測できなかった」を
+  「配送されていない」と読み替えない。
+- **dispatch anchor は ledger が実際に送った anchor に束縛する**。lifecycle row の
+  `decision_journal` は後続の disposition CAS で動くため、ledger に canonical record がある
+  ときはそちらの journal を使い、1 度も dispatch されていない lane でだけ lifecycle anchor へ
+  fallback する。
+- ★**fold は plan 時の 1 回では足りず、fence は「send の直前」でなければならない** (同 review
+  `finding_actiontimefence`)。plan の fold は観測にすぎない。さらに **composed create の入口に置いた
+  fence も不十分**である — `sublane create --execute` の送信は worktree create/adopt、pane
+  append/adopt、identity stamp / read-back、startup health、**gateway readiness wait (既定 10 秒)** の
+  後に来るため、その窓で同じ key が別経路から着弾しても create 内に ledger fence は無い。
+  - したがって heal は **常に `--no-dispatch` 相当** (create の dispatch leg を止める) で走らせ、
+    gateway を得たあとに **lifecycle と ledger を fresh 再取得して再 fold し、その直後に** canonical な
+    dispatch composer を呼ぶ。送信自体は `sublane create` の dispatch leg と同一の composer / argv を
+    使うので、rail も argv も増えない (`## lane 作成 (標準形)` の「fallback (旧二段運用)」と同じ形)。
+  - brief も同様に、send の直前で lifecycle 再 join + 当該 key の再 fold を行う。
+  - 再 fold の結果が **`delivered` (positively 討ち取られた)** なら、その action だけを `dropped` として
+    落として lane の残作業は続行する (失敗ではない)。`uncertain` / `unreadable` /
+    `attribution_unknown` / `not_applicable` は `dispatch_state_moved` で **追加 effect 0** で停止し、
+    既に landed した action は `applied` に残して truthful に報告する。
+  - トレードオフ: create 内蔵 dispatch が持つ **self-heal** (dispatch 失敗 → gateway 消滅を read-back
+    して lane column を 1 回 relaunch → 再 dispatch) は二段化で働かない。代わりに exactly-once fence を
+    得る。送達失敗は typed block として記録し、次回実行が durable state から再判断する。
+  この規律は `## live turn-ended worker の guarded refresh` / `### recover-pair の worktree binding
+  fence` と同じで、「最初の effect の前に 1 回」でも「長い composed 操作の入口で 1 回」でも守れない。
+
+### provider startup screen (live 観測)
+
+plan は lane の **live slot ごとに visible pane を 1 回 read-only で読み**、#13760 の共有
+evaluator (`evaluate_startup_admission`) で分類して lane 単位の closed token へ畳む。provider 固有
+文字列は provider profile 側にあり、pane 本文は outcome にも journal にも出ない。**mozyo は provider
+UI に一切回答しない** — 承諾は operator が provider の UI で行い、その後この rail を再実行する。
+
+- `blocked` (宣言された startup screen が出ている) → `startup_interaction_required` で block。
+- `unreadable` / `unprofiled` → `startup_screen_unverified` で block。**「読めなかった」を「screen は
+  出ていない」と読み替えない** (#13760 の実害はまさにこれ: startup screen へ本文を打ち込み Enter が
+  dialog の default を承諾して request body を破壊し、durable record には配送済みが残った)。
+- live slot ゼロ (再起動直後の主経路) → `not_probed`。process の無い pane に screen は無いので
+  block しないし、read も発行しない。shell residue も同様に読まない。
+
+### 主要な block token
+
+`inventory_unreadable` / `foreign_slot` / `ambiguous_inventory` / `ambiguous_owner` /
+`worktree_missing` / `worktree_unreadable` / `branch_unresolved` / `issue_state_unknown` /
+`release_in_flight` / `replacement_in_flight` / `startup_interaction_required` /
+`startup_screen_unverified` / `dispatch_uncertain` / `dispatch_record_unreadable` /
+`dispatch_attribution_unknown` / `resume_profile_incomplete` / `resume_anchor_unresolved` /
+`lane_moved` / `dispatch_state_moved`。いずれも「条件未充足」ではなく **読めなかった / 矛盾した**
+ことの typed 記録であり、成功集合へ丸めない。skip 側 (`issue_closed` / `idle` / `retired` /
+`superseded` / `hibernated` / `project_gateway_binding` / `filtered`) は正常な結果である。
+
+- 実装正本: `domain/fleet_rehydrate.py` (pure planner) / `domain/fleet_rehydrate_dispatch_fold.py`
+  (causal-key fold) / `application/sublane_fleet_rehydrate.py` (fact join + CLI) /
+  `application/sublane_fleet_rehydrate_ops.py` (actuation port + live adapter)。
+
 ## live smoke の原則
 
 - **本番機構で行う**: lane の smoke は必ず linked git worktree で。scratch 単独 repo は registry canonicalization の差を隠す (#13331 j#73348 の教訓)。

@@ -474,6 +474,26 @@ class HerdrDeliveryLedger:
             (issue_id,),
         )
 
+    def records_for_issue_strict(
+        self, issue_id: str
+    ) -> list[HerdrDeliveryLedgerRecord]:
+        """By-issue lookup that preserves unreadable instead of reporting absence.
+
+        The by-issue sibling of :meth:`records_for_marker_strict`, for the same reason
+        (Redmine #15745): a control-plane caller that decides whether to RE-ISSUE a send
+        must not read an unknown-schema / corrupt ledger as "nothing was ever delivered".
+        The observational :meth:`records_for_issue` keeps its legacy best-effort contract.
+
+        An absent file stays an empty result — a home where no herdr send has ever been
+        recorded genuinely holds no delivery, and that is the one shape which is a positive
+        absence rather than a read failure.
+        """
+        return self._read_strict(
+            f"SELECT {_SELECT_COLUMNS} FROM herdr_delivery_ledger "
+            "WHERE issue_id = ? ORDER BY id",
+            (issue_id,),
+        )
+
     @staticmethod
     def _row_to_record(row: tuple) -> HerdrDeliveryLedgerRecord:
         return HerdrDeliveryLedgerRecord(
