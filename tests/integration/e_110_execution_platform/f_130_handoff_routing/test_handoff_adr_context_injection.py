@@ -12,8 +12,9 @@ What is pinned here (the acceptance criteria of #15722):
    the durable delivery record;
 2. a ``proposed`` ADR is presented as ``proposed`` and marked non-binding — and
    an unrecognised status becomes ``unknown``, never ``active``;
-3. a repo without ``vibes/docs/adr/`` sends exactly as before (``adr_context``
-   is an explicit ``None``, no clause in the body, no record block).
+3. a repo without ``vibes/docs/adr/`` sends exactly as before — the payload
+   carries no ``adr_context`` key at all (byte-identical to the pre-#15722
+   shape, review j#108679), no clause in the body, no record block.
 
 Everything runs against a fake tmux rail + a temp repo — no real tmux, no
 external send, no real ``~/.mozyo_bridge``.
