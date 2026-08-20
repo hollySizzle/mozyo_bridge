@@ -190,6 +190,7 @@ _PROFILE_ENTRY_KEYS: frozenset[str] = frozenset(
         "managed_flags",
         "startup_blockers",
         "ghost_composer_signals",
+        "onboarding_seed",
     }
 )
 
@@ -214,6 +215,14 @@ from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_pr
     normalize_ghost_composer_signals,
 )
 
+# The onboarding pre-seed schema (Redmine #15744) is a leaf module for the same
+# module-health reason, and it owns its own version lock-step gate so this module only
+# calls one parser (see `parse_onboarding_seed`).
+from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_onboarding_seed import (  # noqa: E501
+    OnboardingSeedDeclaration,
+    parse_onboarding_seed,
+)
+
 
 _CONFIG_KEYS: frozenset[str] = frozenset({"version", "source", "profiles"})
 
@@ -226,7 +235,7 @@ _CONFIG_KEYS: frozenset[str] = frozenset({"version", "source", "profiles"})
 #: (the design gate j#77947 Q1 required version to be fail-closed validated, not merely
 #: non-empty). Adding a version here is the deliberate, reviewable act of teaching the
 #: loader a new shape.
-SUPPORTED_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1", "2", "3"})
+SUPPORTED_SCHEMA_VERSIONS: frozenset[str] = frozenset({"1", "2", "3", "4"})
 
 #: Schema versions whose shape predates ``startup_blockers`` (Redmine #13760 review
 #: j#78529 finding 2). The field is the v2 addition, so a ``version: "1"`` artifact that
@@ -251,7 +260,7 @@ _GHOST_SIGNALS_MIN_VERSION = "3"
 #: version — a context-free parse is not artificially restricted; the artifact-level
 #: version gate is enforced by :meth:`AgentProviderProfileConfig.from_record`, which always
 #: passes the real declared version.
-_DEFAULT_PARSE_VERSION = "3"
+_DEFAULT_PARSE_VERSION = "4"
 
 #: Wheel-packaged resource (a sibling of the registry module) shipping the built-in
 #: profiles. Read via ``importlib.resources`` in :mod:`.agent_provider_profile` — a
@@ -418,6 +427,12 @@ class AgentProviderProfile:
     #: preserved, never emptied. That absence is the fail-closed default (a provider not
     #: using this field is unchanged).
     ghost_composer_signals: tuple[str, ...] = ()
+    #: Redmine #15744: the first-run onboarding defaults a managed launch may place in
+    #: this provider's own config document BEFORE the provider starts, so an onboarding
+    #: screen never renders instead of a composer. ``None`` for a provider declaring none,
+    #: which leaves the managed launch byte-invariant. Declaring a seed never authorises
+    #: answering a rendered screen — the schema refuses any credential or trust key.
+    onboarding_seed: Optional[OnboardingSeedDeclaration] = None
 
     def __post_init__(self) -> None:
         if not isinstance(self.provider_id, str) or not self.provider_id.strip():
@@ -508,6 +523,16 @@ class AgentProviderProfile:
                 f"agent provider profile {self.provider_id!r} declares "
                 f"{len(self.ghost_composer_signals)} ghost_composer_signals; the bound is "
                 f"{MAX_GHOST_COMPOSER_SIGNALS}"
+            )
+        # Same single-validator posture the ghost signals take: a directly-built profile
+        # must not hold a seed that never went through the schema (the j#78481 lesson).
+        if self.onboarding_seed is not None and not isinstance(
+            self.onboarding_seed, OnboardingSeedDeclaration
+        ):
+            raise AgentProviderProfileError(
+                f"agent provider profile {self.provider_id!r} 'onboarding_seed' must be "
+                f"an OnboardingSeedDeclaration, got "
+                f"{type(self.onboarding_seed).__name__}"
             )
         concepts = {concept for concept, _ in self.managed_flags}
         has_permission_flag = ManagedFlagConcept.PERMISSION_MODE in concepts
@@ -718,6 +743,9 @@ class AgentProviderProfile:
             managed_flags=tuple(sorted(managed, key=lambda pair: pair[0].value)),
             startup_blockers=startup_blockers,
             ghost_composer_signals=ghost_composer_signals,
+            onboarding_seed=parse_onboarding_seed(
+                record, provider_id=provider_id, schema_version=schema_version
+            ),
         )
 
     def match_startup_blocker(self, content: object) -> Optional[StartupBlocker]:

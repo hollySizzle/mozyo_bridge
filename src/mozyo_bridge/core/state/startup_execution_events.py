@@ -128,6 +128,13 @@ STAGE_ATTESTATION_WRITE_FAILED = "attestation_write_failed"
 STAGE_PROVIDER_EXEC_CALL_REACHED = "provider_exec_call_reached"
 STAGE_PROVIDER_EXEC_REJECTED = "provider_exec_rejected"
 STAGE_PROVIDER_EXEC_FAILED = "provider_exec_failed"
+#: Redmine #15744: the wrapper wrote the provider's declared first-run onboarding
+#: defaults into the provider's own config document before the exec.
+STAGE_ONBOARDING_SEED_APPLIED = "onboarding_seed_applied"
+#: The seed could not be applied, with a value-free reason. Recorded because the operator
+#: may then meet an onboarding screen, and "why was the pane blocked" must be answerable
+#: from the projection rather than from a guess.
+STAGE_ONBOARDING_SEED_FAILED = "onboarding_seed_failed"
 
 #: The closed, ordered set of recognized stage tokens. An unrecognized stage is refused
 #: by :func:`append_execution_event` (fail-closed on the CALLER's mistake, still
@@ -143,6 +150,12 @@ EXECUTION_EVENT_STAGES: tuple[str, ...] = (
     STAGE_PROVIDER_EXEC_CALL_REACHED,
     STAGE_PROVIDER_EXEC_REJECTED,
     STAGE_PROVIDER_EXEC_FAILED,
+    # Redmine #15744. Appended at the end, and neither token is ever the LAST event of a
+    # completed wrapper run (both are recorded before the exec stages), so
+    # `classify_startup_evidence` — which folds on specific tokens, not on position —
+    # returns exactly what it returned before these existed.
+    STAGE_ONBOARDING_SEED_APPLIED,
+    STAGE_ONBOARDING_SEED_FAILED,
 )
 _EXECUTION_EVENT_STAGE_SET: frozenset[str] = frozenset(EXECUTION_EVENT_STAGES)
 
@@ -602,6 +615,8 @@ __all__ = (
     "STAGE_ATTESTATION_WRITE_FAILED",
     "STAGE_ATTESTATION_WRITE_SUCCEEDED",
     "STAGE_NO_EVIDENCE",
+    "STAGE_ONBOARDING_SEED_APPLIED",
+    "STAGE_ONBOARDING_SEED_FAILED",
     "STAGE_PROVIDER_EXEC_CALL_REACHED",
     "STAGE_PROVIDER_EXEC_FAILED",
     "STAGE_PROVIDER_EXEC_REJECTED",
