@@ -182,6 +182,51 @@ class ReconcileStateStore:
             conn.close()
         return tuple(_record(row) for row in rows)
 
+    def records_readonly(self) -> Optional[tuple[ReconcileStateRecord, ...]]:
+        """Every row via a NON-CREATING read (Redmine #15747; the #13681 R2-F2 mirror).
+
+        Unlike :meth:`records` — whose :meth:`_connect` runs the schema ensure through
+        ``connect_state_container_rw``, minting ``state.sqlite`` (and its parent
+        directories) when absent, the side effect Redmine #15711 j#108206 measured on the
+        read-only ``workflow glance`` — this read never writes and never touches an absent
+        filesystem path: an absent state file, or an existing container with no
+        ``reconcile_state`` component yet, yields ``()`` (typed empty, nothing created).
+        It honours the same downgrade guard as the write path
+        (:func:`readonly_component_status`): an unknown / newer / malformed / partial
+        component schema, or an unreadable file, yields ``None`` (fail closed — never a
+        silent rebuild, never read as "no records").
+        """
+        if not self.path.exists():
+            return ()
+        try:
+            conn = sqlite3.connect(
+                f"file:{self.path}?mode=ro", uri=True, isolation_level=None
+            )
+        except sqlite3.DatabaseError:
+            return None
+        try:
+            # One explicit read transaction across validation AND fetch (review
+            # j#108779 finding_readonlyschemasnapshotrace): in autocommit each
+            # SELECT is its own snapshot, so a concurrent schema upgrade between
+            # the status check and the row fetch could hand back rows from a
+            # schema the check never recognized. BEGIN pins one snapshot for
+            # both, so the verdict and the rows can never disagree.
+            conn.execute("BEGIN")
+            status = readonly_component_status(conn)
+            if status == READONLY_COMPONENT_ABSENT:
+                return ()
+            if status != READONLY_COMPONENT_RECOGNIZED:
+                return None
+            rows = conn.execute(
+                f"SELECT {_COLUMNS} FROM {_TABLE} "
+                "ORDER BY workspace_id, lane_id, dispatch_anchor"
+            ).fetchall()
+        except sqlite3.DatabaseError:
+            return None
+        finally:
+            conn.close()
+        return tuple(_record(row) for row in rows)
+
     # -- writes (CAS) --------------------------------------------------------
 
     def open_cycle(
