@@ -34,6 +34,7 @@ from mozyo_bridge.core.state.startup_execution_events import (
 )
 from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_COMPLETED_ROLLED_BACK,
+    PHASE_COMPLETED_SUCCESS,
     PHASE_HEALTH_CHECK,
     PHASE_LAUNCHING,
     PHASE_ROLLBACK_OWED,
@@ -177,8 +178,8 @@ class LivePreservedRollbackOwedDelivery(unittest.TestCase):
         home = _tmp()
         token = _seed_action(home, phase=PHASE_HEALTH_CHECK)
         fence = StartupTransactionFence(home=home)
-        fence.set_phase(token, "success_owed")
-        fence.set_phase(token, "completed_success")
+        fence.set_phase(token, PHASE_SUCCESS_OWED)
+        fence.set_phase(token, PHASE_COMPLETED_SUCCESS)
         _seed_generation(home, token)
         self.assertEqual(_delivery_token(home), token)
         self.assertEqual(_bare_token(home), token)
@@ -227,7 +228,11 @@ class RollbackOwedRefusalBoundaries(unittest.TestCase):
         self.assertEqual(_delivery_token(home), "")
 
     def test_mid_startup_phases_stay_refused(self):
-        for phase in (PHASE_LAUNCHING, PHASE_HEALTH_CHECK, PHASE_SUCCESS_OWED):
+        # `success_owed` left this list in Redmine #15748 j#108902: it is a settled
+        # all-healthy verdict, not a mid-startup phase, and is now admitted under the
+        # SAME receipt-proof gate. Its pins live in the #15748 regression file; the
+        # `rollback_owed` acceptance and every boundary below are byte-unchanged.
+        for phase in (PHASE_LAUNCHING, PHASE_HEALTH_CHECK):
             with self.subTest(phase=phase):
                 home = _tmp()
                 token = _seed_action(home, phase=phase)

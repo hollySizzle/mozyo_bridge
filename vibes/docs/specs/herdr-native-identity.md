@@ -427,6 +427,30 @@ participant exact一致 (assigned_name / locator / not closed)、caller供給の
 participant自身の`attestation_write_succeeded`があること。`completed_rolled_back` / mid-startup phase /
 foreign・stale terminal / pending generationは従来どおりfail-closedであり、caller主張はどこにも入らない。
 
+**`success_owed` strandも同じgateで受理する (Redmine #15748)。** `StartupTransaction.settle`は
+`owed=False`の枝でのみ`success_owed`を書く。つまりこのphaseのdurable宣言は「probeはall-healthyを返し、この
+runは補償債務を負わず、残るはterminalなsuccess記帳だけ」であり、`rollback_owed` (未清算のhealth-completion
+債務) より**強い**。さらに`success_owed`はrollback railの`ACTIONABLE_PHASES`に含まれないため、受理したtoken
+の下でpaneが後から補償closeされるraceが構造的に存在しない。一方でそのphaseを清算できるrailも存在せず
+(rollback railは`nothing_owed`を返す)、2つの最終phase書込みの間でrunが死ぬと恒久に証明不能になる。よって
+照合側で受理し、書込み側の昇格は採らない — 外部から`completed_success`を書くことは「healthyに立ち上がり
+**かつそれをdurableに宣言した**」という主張になり、`success_owed`の定義そのものと矛盾する (加えてowning run
+が生存していれば、その最終`set_phase`がterminal判定でraiseする)。規約行は
+`completed_generation_startup_token`側で1本に閉じている: **terminalな`completed_success`はparticipant join
+だけでtokenを貸す。settled-but-uncleared phase (`rollback_owed` / `success_owed`) の受理はreceipt proofと自
+participantの`attestation_write_succeeded`を必須とする。**
+
+**`health_check`は受理しない (Redmine #15748、明示決定)。** `settle`はhealth分岐の**前**に`health_check`を
+書くため、このrecordはprobeの結果を一切持たず、かつ健全なlaunchがすべて通過するin-flight phaseである。
+durable factだけではstrandとin-flightを区別できないので、受理は「記録されていないprobe結果」の推定になる。
+書込み側清算も採らない: `completed_success`への昇格はhealth verdictの捏造、`rollback_owed`への降格は存在
+しない補償債務の捏造であり、後者はconditional-close primitiveを持つruntimeで健全なpairを実際に閉じさせる。
+`health_check`の正規清算路は**既存の公開rollback rail**である (同phaseは`ACTIONABLE_PHASES`に含まれる)。
+conditional-closeを持つruntimeでは完走し、持たない現runtimeではpresent participantを保存して`incomplete`を
+返す — 証明できないので成功を差し控える、という正しい終端。live strandが実測された場合の修正は供給側
+(probe verdictをphase書込み前にdurable化する、または`health_check`とverdictを1 writeに畳む) に属し、照合側
+では原理的に解けない。
+
 lifecycle rowを持たない**非default scratch pair**だけは、exact candidate runtimeを使い、次の公開railでv2へ
 置き換えられる。1行目はread-only preflightであり、green判定とこのpairを閉じる明示承認の後にだけ2行目を実行する。
 positive absence / retired proofを確認してからfresh startへ進む。
