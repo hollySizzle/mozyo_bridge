@@ -484,6 +484,11 @@ def format_audit_text(
             lines.append(f"    alternatives: {', '.join(plan.alternatives)}")
         for step in plan.steps:
             lines.append(f"    $ {step}")
+        # Redmine #15789: the alternative's runnable form, marked so it can never read as one
+        # more step of the primary rail. Naming an alternative with no invocation is what left
+        # the coordinator to infer a command that did not exist (#15151 j#108983).
+        for step in plan.alternative_steps:
+            lines.append(f"    [alternative] $ {step}")
     lines.append("  summary: " + json.dumps(summarize_convergences(plans), sort_keys=True))
     lines.append(
         "  note: each lane names its own rail. There is deliberately no all-lanes action — "

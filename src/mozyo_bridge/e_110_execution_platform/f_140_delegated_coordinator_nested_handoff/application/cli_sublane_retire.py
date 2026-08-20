@@ -462,6 +462,30 @@ def register_sublane_retire(
         ),
     )
     sublane_retire.add_argument(
+        "--worktree-absent",
+        dest="worktree_absent",
+        action="store_true",
+        help=(
+            "Redmine #15789: run the BOUND metadata-only terminal retire "
+            "(--retire-active-live-zero / --retire-hibernated-bound) against a lane whose "
+            "recorded checkout is GONE — the reboot shape `sublane reboot-audit` prescribes as "
+            "`terminalize_bound_metadata`, the equally safe alternative to restoring the "
+            "checkout, and that those rails otherwise refuse with `integration_blocked` / "
+            "`worktree_missing_after_reboot` (#15151 j#108983). The checkout leaves preflight "
+            "scope (a wiped path can be neither dirty nor cleaned up), and the two facts it "
+            "carried are read instead from git's own SURVIVING worktree administrative entry "
+            "(`git worktree list --porcelain`): the entry must exist for the exact --worktree "
+            "path, be reported `prunable`, and record `refs/heads/<--branch>`. An already-"
+            "pruned entry, a locked / non-prunable one, a detached or differently-branched "
+            "one, and a --worktree that still EXISTS are each a zero-write refusal. Nothing "
+            "else is relaxed: head integration is still measured from real refs, and the "
+            "canonical worktree binding must still attest byte-for-byte against the durable "
+            "row. Removes no worktree entry, deletes no branch or commit, prunes nothing, "
+            "launches / closes / resumes no process. Ignored-and-refused with any other retire "
+            "intent."
+        ),
+    )
+    sublane_retire.add_argument(
         "--expect-lane-generation",
         dest="expect_lane_generation",
         type=int,

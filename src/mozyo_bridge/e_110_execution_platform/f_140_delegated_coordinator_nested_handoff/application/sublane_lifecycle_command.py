@@ -826,6 +826,8 @@ def cmd_sublane_retire(args: argparse.Namespace) -> int:
             expect_lane_revision=getattr(args, "expect_lane_revision", 0),
             integration_journal=getattr(args, "integration_journal", None),
             expected_identity=identity,
+            # Redmine #15789: the bound terminal retires' absent-checkout opt-in.
+            worktree_absent=bool(getattr(args, "worktree_absent", False)),
         )
     )
     outcome = application.preflight

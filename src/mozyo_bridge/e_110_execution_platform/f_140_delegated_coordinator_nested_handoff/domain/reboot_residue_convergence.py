@@ -284,6 +284,13 @@ class RebootLanePlan:
     ``cleanup_permitted`` gates Required behavior 8: worktree / git-administrative cleanup
     is offered ONLY once the lifecycle row is terminal. ``steps`` never contains a branch
     or commit deletion.
+
+    ``alternative_steps`` (Redmine #15789) carries the runnable form of ``alternatives`` — the
+    commands for the OTHER rail, never to be run alongside ``steps``. Naming an alternative
+    without its command is what left the coordinator to infer an invocation that did not exist:
+    the audit called ``terminalize_bound_metadata`` "equally safe" for a wiped checkout while
+    every bound retire refused that shape (#15151 j#108983). Empty for every plan that offers no
+    alternative, so no existing plan's payload moves.
     """
 
     workspace_id: str
@@ -293,6 +300,7 @@ class RebootLanePlan:
     reason: str = ""
     detail: str = ""
     alternatives: tuple[str, ...] = ()
+    alternative_steps: tuple[str, ...] = ()
     residue_slots: tuple[str, ...] = ()
     live_slots: tuple[str, ...] = ()
     foreign_slots: tuple[str, ...] = ()
@@ -318,6 +326,7 @@ class RebootLanePlan:
             "reason": self.reason,
             "detail": self.detail,
             "alternatives": list(self.alternatives),
+            "alternative_steps": list(self.alternative_steps),
             "residue_slots": list(self.residue_slots),
             "live_slots": list(self.live_slots),
             "foreign_slots": list(self.foreign_slots),
@@ -732,6 +741,22 @@ def plan_lane_convergence(facts: RebootLaneFacts) -> RebootLanePlan:
         if facts.recorded_worktree and facts.branch
         else "git worktree add <recorded worktree> <lane branch>"
     )
+    # Redmine #15789: the alternative's own invocation. `--worktree-absent` opts the bound
+    # terminal retire onto git's surviving worktree administrative entry for the recorded path,
+    # so the branch tie and the `wt_` binding family are read without the checkout. It refuses
+    # if that entry was already pruned, if it is locked / not prunable, if it records a
+    # different branch, or if the path in fact still exists — so this line is an alternative to
+    # `steps`, never a step within it.
+    alternative_retire_step = (
+        f"mozyo-bridge sublane retire --issue {facts.issue_id} "
+        f"--lane-label {facts.lane_id} --worktree {facts.recorded_worktree} "
+        f"--branch {facts.branch} --worktree-absent "
+        + (
+            "--retire-hibernated-bound ..."
+            if disposition == DISPOSITION_HIBERNATED
+            else "--retire-active-live-zero ..."
+        )
+    )
     return RebootLanePlan(
         workspace_id=facts.workspace_id,
         lane_id=facts.lane_id,
@@ -743,9 +768,12 @@ def plan_lane_convergence(facts: RebootLaneFacts) -> RebootLanePlan:
             "(the reboot shape). Its branch and commits survived. Restoring the EXACT "
             "recorded path re-enables the bound rails' worktree attestation; the "
             "metadata-only terminalization is the equally safe alternative when the "
-            "checkout is not wanted back"
+            "checkout is not wanted back — run it with `--worktree-absent` (#15789), which "
+            "reads the branch tie and the binding family from git's surviving worktree "
+            "administrative entry; see alternative_steps"
         ),
         alternatives=(CONVERGE_TERMINALIZE_BOUND,),
+        alternative_steps=(alternative_retire_step,),
         steps=(
             restore_step,
             f"mozyo-bridge sublane retire --issue {facts.issue_id} "

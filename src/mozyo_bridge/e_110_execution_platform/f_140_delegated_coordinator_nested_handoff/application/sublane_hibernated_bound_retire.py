@@ -93,6 +93,9 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
 if TYPE_CHECKING:  # pragma: no cover - typing only, no runtime import cycle
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_absent_worktree_evidence import (  # noqa: E501
+        AbsentWorktreeEvidence,
+    )
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_patch_equivalent_integration import (  # noqa: E501
         PatchEquivalentResolution,
     )
@@ -160,6 +163,10 @@ BOUND_RETIRE_LANE_NOT_DECLARED = "lane_not_declared"
 BOUND_RETIRE_REVISION_RACE = "revision_race"
 #: The bounded CAS raised a store error (surfaced, not swallowed).
 BOUND_RETIRE_STORE_ERROR = "store_error"
+#: ``--worktree-absent`` (Redmine #15789) was supplied but the absent-checkout evidence did not
+#: verify and produced no typed reason of its own. The resolver names its own refusals and those
+#: are reported verbatim (the #14695 j#93807 F2 discipline); this is only the fallback.
+BOUND_RETIRE_ABSENT_WORKTREE_UNPROVEN = "absent_worktree_unproven"
 
 
 @dataclass(frozen=True)
@@ -233,6 +240,7 @@ def run_hibernated_bound_retire(
     head_integrated: Optional[bool],
     worktree_branch: Optional[str],
     patch_equivalent: Optional["PatchEquivalentResolution"] = None,
+    absent_worktree: Optional["AbsentWorktreeEvidence"] = None,
 ):
     """Metadata-only terminalize a hibernated / released BOUND lane (Redmine #13845 / #14066).
 
@@ -251,6 +259,15 @@ def run_hibernated_bound_retire(
     --abbrev-ref HEAD``, ``None`` when unresolvable / detached): it must equal ``--branch``, so
     the clean + integrated evidence describes the worktree's real head and not an unrelated
     branch name.
+
+    ``absent_worktree`` (Redmine #15789) is the opt-in evidence for the reboot shape whose
+    recorded checkout is GONE. When supplied and admissible it substitutes exactly TWO facts,
+    both re-derived from git's own surviving worktree administrative entry rather than from the
+    checkout: the worktree ↔ branch tie above, and the ``wt_`` binding-token family a live disk
+    probe can no longer determine. Head integration, the byte-for-byte binding attestation, the
+    live-zero read and the CAS are unchanged. An inadmissible evidence is reported with the
+    resolver's own typed reason and writes nothing. See
+    :mod:`...sublane_absent_worktree_evidence`.
 
     The command runs this only when its ``may_retire`` preflight already passed (issue closed,
     worktree clean, latest review admissible, callbacks drained, target identity known), so
@@ -308,6 +325,16 @@ def run_hibernated_bound_retire(
             ),
             lane_id=lane_label,
         )
+    # Redmine #15789: the absent-checkout opt-in proves its own premises or the run ends here,
+    # before any lane resolution, inventory read or lock acquisition. The resolver's typed reason
+    # is reported verbatim so `worktree_present` (use the ordinary rail) is never confused with
+    # `worktree_not_registered` (the tie to --branch is genuinely gone).
+    if absent_worktree is not None and not absent_worktree.admissible:
+        return _blocked(
+            absent_worktree.reason or BOUND_RETIRE_ABSENT_WORKTREE_UNPROVEN,
+            detail=absent_worktree.detail,
+            lane_id=lane_label,
+        )
     # Resolve the lane unit from the --worktree anchor exactly as the #13754 guarded close
     # does: the worktree inherits the project workspace identity (#13377), a legacy pre-#13377
     # lane keeps its path-derived ``wt_`` token, and a non-git (#13392) lane collapsed to the
@@ -316,8 +343,13 @@ def run_hibernated_bound_retire(
     # same way the create site recorded it.
     try:
         resolved_worktree = Path(worktree).expanduser().resolve()
+        # #15789: a wiped path is not a linked worktree, so asking IT for the inherited project
+        # workspace id yields "" and keys the lane as unresolvable. The evidence has already
+        # proven the path is a worktree OF THIS REPO, so the id it inherits IS the repo's — ask
+        # the repo root, the same authority the present-checkout case walks back to.
         workspace_id = herdr_workspace_segment(
-            resolved_worktree, home=getattr(args, "home", None)
+            repo_root if absent_worktree is not None else resolved_worktree,
+            home=getattr(args, "home", None),
         )
     except (OSError, ValueError) as exc:
         return _blocked(
@@ -330,9 +362,18 @@ def run_hibernated_bound_retire(
     # own kind. The retired ``resolved_worktree == repo_root`` proxy keyed it on the
     # operator's cwd, so a normal run from inside a linked worktree (``--repo`` omitted)
     # derived ``dl_`` for a ``wt_``-bound row and this retire refused its own lane.
-    identity = declared_lane_root_identity(resolved_worktree, lane_label)
-    legacy_token = identity.legacy_token
-    metadata_token = identity.metadata_token
+    if absent_worktree is not None:
+        # #15789: the `wt_` family is ASSERTED from git's surviving entry rather than probed on a
+        # path that is no longer a directory (`is_git_worktree_root` would answer `dl_` and no
+        # `wt_` row could ever attest). Asserting the family is not admitting the binding: the
+        # token must still equal the row's recorded one byte-for-byte at `attest_retire_target`,
+        # and again inside the CAS under the exclusion lock.
+        legacy_token = absent_worktree.legacy_token
+        metadata_token = absent_worktree.metadata_token
+    else:
+        identity = declared_lane_root_identity(resolved_worktree, lane_label)
+        legacy_token = identity.legacy_token
+        metadata_token = identity.metadata_token
     if not workspace_id and not legacy_token:
         return _blocked(
             REASON_WORKSPACE_UNRESOLVED,
@@ -349,9 +390,14 @@ def run_hibernated_bound_retire(
     # unrelated branch's clean / integrated evidence could then license the retire. Require the
     # worktree's real branch to equal --branch; a mismatch, a detached HEAD ("HEAD"), an
     # unresolvable checkout (None), or an empty --branch fails closed zero-write.
+    #
+    # #15789: with no checkout there is no HEAD to read, so the tie comes from git's surviving
+    # administrative entry instead — the resolver has already refused unless that entry exists
+    # for this exact path, is prunable, and records `refs/heads/<--branch>`. The requirement is
+    # not dropped, only read from the surviving half of the same authority.
     want_branch = (getattr(args, "branch", "") or "").strip()
     actual_branch = (worktree_branch or "").strip()
-    if (
+    if absent_worktree is None and (
         not want_branch
         or not actual_branch
         or actual_branch == "HEAD"
@@ -683,6 +729,72 @@ def run_hibernated_bound_retire(
         lifecycle_migration_payload,
     )
 
+    # Redmine #15789 review j#109127 finding_actiontimerace: re-prove the absent-checkout
+    # evidence at the terminal mutation boundary. The preflight's copy is a statement about the
+    # past, and the review reproduced a checkout restored (and dirtied) at the recorded path
+    # after that proof still producing a terminal write (verdict j#109134). This rail takes no
+    # launch-exclusion lock — its second witness is the durable `released` record, not an
+    # inventory read — so the boundary here is simply "immediately before the CAS".
+    #
+    # Named residual (NOT solved), widened by R2 review j#109193 to say what it always should
+    # have: git's `worktree add`, `prune` AND `update-ref` are not serialized against this rail,
+    # so BOTH a restored checkout and a **branch ref moved to an unintegrated commit** landing
+    # between the last measurement and the CAS are outside it. The earlier wording named only
+    # the restore. Closing the window outright is not achievable from user space — every check
+    # precedes the write and no protocol reachable from here binds an external `git` process
+    # (measurements and the rejected `git worktree lock` mitigation: dispute record j#109195).
+    if absent_worktree is not None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_absent_worktree_evidence import (  # noqa: E501
+            revalidate_absent_worktree_evidence,
+        )
+
+        reproof = revalidate_absent_worktree_evidence(
+            repo_root,
+            prior=absent_worktree,
+            worktree=getattr(args, "worktree", None),
+            branch=getattr(args, "branch", None),
+            lane_label=lane_label,
+        )
+        if not reproof.admissible:
+            return _blocked(
+                reproof.reason or BOUND_RETIRE_ABSENT_WORKTREE_UNPROVEN,
+                detail=(
+                    "the absent-checkout evidence no longer holds at the terminal mutation "
+                    f"boundary: {reproof.detail}"
+                ),
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+            )
+        # R2 review j#109193, second leg: the head-integration verdict this rail acts on was
+        # measured in `dispatch_retire_intent`, before the rail was entered, so an `update-ref`
+        # onto an unintegrated commit reached the CAS. Re-measure the LITERAL ancestry here,
+        # symmetric with the absence re-proof, and refuse a True -> False flip. It narrows the
+        # flag path's exposure rather than closing it (see the residual above). Only the literal
+        # probe repeats: the #14066 patch-equivalent route reads Redmine over the network.
+        if head_integrated is True:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
+                LiveSublaneLifecycleOps,
+            )
+
+            still_integrated = LiveSublaneLifecycleOps(
+                repo_root=repo_root
+            ).branch_integrated(
+                (getattr(args, "branch", "") or "").strip(),
+                (getattr(args, "integration_branch", "") or "").strip(),
+            )
+            if still_integrated is not True:
+                return _blocked(
+                    BOUND_RETIRE_HEAD_NOT_INTEGRATED,
+                    detail=(
+                        "--branch was a verified ancestor of --integration-branch when the "
+                        "intent was dispatched but is not one now (the ref moved, or the "
+                        "ancestry probe stopped answering); terminalizing would strand work "
+                        "that arrived after the first measurement"
+                    ),
+                    workspace_id=workspace_id,
+                    lane_id=lane_label,
+                )
+
     retire_store = LaneBoundRetireStore(home=getattr(args, "home", None))
     try:
         outcome = retire_store.retire_released_hibernated_bound(
@@ -798,6 +910,7 @@ __all__ = (
     "BOUND_RETIRE_LANE_NOT_DECLARED",
     "BOUND_RETIRE_REVISION_RACE",
     "BOUND_RETIRE_STORE_ERROR",
+    "BOUND_RETIRE_ABSENT_WORKTREE_UNPROVEN",
     "HibernatedBoundRetireVerdict",
     "run_hibernated_bound_retire",
     "format_bound_retire_text",
