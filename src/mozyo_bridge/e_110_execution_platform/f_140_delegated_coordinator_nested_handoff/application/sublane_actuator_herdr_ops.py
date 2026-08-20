@@ -537,6 +537,12 @@ class HerdrSublaneActuatorOps:
             lane_id=lane_id,
             providers=providers,
             rows=rows,
+            # Redmine #15774: the creating caller's --lane-kind assertion reaches the
+            # ADOPT declaration too, so a supersede-minted row (deliberately kind-empty,
+            # lane_lifecycle.supersede_and_activate) can receive its geometry kind from
+            # the coordinator's own governed re-create instead of staying kind-less and
+            # refusing every delegated child create.
+            lane_kind=self.lane_kind or "",
         )
         if outcome == ADOPT_DECL_DECLARE_ERROR:
             print(

@@ -380,6 +380,7 @@ def declare_adopted_owner_row(
     lane_id: str,
     providers: tuple[str, str],
     rows: Sequence[Mapping[str, object]],
+    lane_kind: str = "",
     attestation_home: Optional[Path] = None,
     store_factory: Callable[[], LaneDeclarationStore] = LaneDeclarationStore,
     attestation_store_factory: Optional[Callable[[], object]] = None,
@@ -451,6 +452,9 @@ def declare_adopted_owner_row(
                 issue_id=issue,
                 declared_slots=pins,
                 worktree_identity=token,
+                # Redmine #15774: a fresh adopt declaration carries the creating
+                # caller's geometry-kind assertion the same way the create path does.
+                lane_kind=lane_kind,
             )
             # ``applied`` is true for a fresh declare AND an idempotent exact-duplicate
             # adopt (same live pins); a refusal wrote nothing.
@@ -471,6 +475,10 @@ def declare_adopted_owner_row(
                 issue_id=issue,
                 worktree_identity=token,
                 declared_slots=pins,
+                # Redmine #15774: also fill an EMPTY lane_kind (a supersede-minted
+                # recovery row deliberately starts kind-less) from the caller's
+                # asserted kind; a non-empty different kind stays a zero-write refusal.
+                lane_kind=lane_kind,
             )
         except (LaneLifecycleError, DecisionPointerError, OSError, ProcessPinError):
             return ADOPT_DECL_DECLARE_ERROR
