@@ -64,7 +64,13 @@ def build_workflow_runtime_store(store_path: Optional[str] = None):
 
 
 def build_reconcile_store(store_path: Optional[str] = None):
-    """The reconcile-state store for the central projection (fail-open)."""
+    """The reconcile-state store for the central projection (fail-open).
+
+    Construction never touches the filesystem, and the glance read path goes through the
+    store's NON-CREATING ``records_readonly`` (Redmine #15747) — so building this adapter
+    in a fresh home mints nothing (#15711 j#108206 measured the old ``records()`` read
+    creating ``state.sqlite``). Only the reconcile write side creates the store.
+    """
     try:
         from mozyo_bridge.core.state.reconcile_state import (
             ReconcileStateStore,

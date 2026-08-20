@@ -792,6 +792,12 @@ _RECONCILE_TERMINAL_PHASES = frozenset({"notified", "closed"})
 def _reconcile_index(reconcile_store) -> dict[str, ReconcileFacts]:
     """Index the reconcile-state store by issue -> the most relevant record's facts. (fail-open)
 
+    Redmine #15747: the read is the store's NON-CREATING ``records_readonly`` — the previous
+    ``records()`` ran the read-write schema ensure, so a glance in a fresh home minted
+    ``state.sqlite`` as a side effect of a pure read (#15711 j#108206 measured this exact
+    call path). An absent store reads as the typed empty index; only the reconcile write
+    side (lane declaration / reconcile supervisor) may create the store.
+
     A store read failure or an unreadable component degrades to an empty index (every lane
     projects the fail-closed empty reconcile facts — never a fabricated attempt count). Among
     an issue's records, a non-terminal (active reconcile) record wins over a terminal one, and
@@ -801,8 +807,10 @@ def _reconcile_index(reconcile_store) -> dict[str, ReconcileFacts]:
     if reconcile_store is None:
         return {}
     try:
-        records = reconcile_store.records()
+        records = reconcile_store.records_readonly()
     except Exception:  # noqa: BLE001 - the reconcile store is a rebuildable_cache; degrade
+        return {}
+    if records is None:  # unsupported / unreadable component: fail closed to no join
         return {}
     best: dict[str, object] = {}
     for rec in records:
