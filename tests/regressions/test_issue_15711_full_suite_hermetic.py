@@ -278,22 +278,30 @@ class FullSuiteAmbientCouplingTest(unittest.TestCase):
         )
 
     def test_disk_pressure_module_resolves_its_own_runtime(self) -> None:
-        # Scrub every sys.path entry that already offers a mozyo_bridge package (an
-        # installed runtime), keeping the rest of the interpreter (yaml etc.) intact.
-        # The only way the module can then import mozyo_bridge is the corpus
-        # self-insert header; without it, standalone discovery silently verified
-        # whatever installed runtime the interpreter happened to see.
-        # Import the module exactly as `discover -s tests` does — top_level_dir is the
-        # tests dir, so the module name carries no `tests.` prefix and the package
-        # __init__ bootstrap (which also inserts src/) never runs.
+        # The guarded failure: without its self-insert header, standalone discovery
+        # silently verifies whatever installed runtime the interpreter happens to
+        # see. The original pin scrubbed every sys.path entry offering mozyo_bridge,
+        # but where the runtime is pip-installed that entry IS site-packages, so the
+        # scrub also dropped third-party deps (yaml) and broke the package import
+        # chain (Redmine #15750). Instead: keep the interpreter intact, import the
+        # module exactly as `discover -s tests` does (top_level_dir is the tests
+        # dir, so the name carries no `tests.` prefix), and assert the runtime it
+        # resolved is THIS checkout's src/ — an installed runtime would win only if
+        # the self-insert header were gone, which is exactly the regression.
         bootstrap = (
             "import pathlib, sys, unittest\n"
-            "sys.path[:] = ['tests'] + [p for p in sys.path\n"
-            "               if p and not (pathlib.Path(p) / 'mozyo_bridge').exists()]\n"
+            "sys.path.insert(0, 'tests')\n"
             "module = ('unit.e_150_quality_architecture."
             "f_150_ci_verification.test_test_disk_pressure')\n"
             "program = unittest.main(module=None, argv=['x', module], exit=False,\n"
             "                        verbosity=0)\n"
+            "import mozyo_bridge\n"
+            "resolved = pathlib.Path(mozyo_bridge.__file__).resolve()\n"
+            "expected = (pathlib.Path.cwd() / 'src' / 'mozyo_bridge').resolve()\n"
+            "if not resolved.is_relative_to(expected):\n"
+            "    print('runtime resolved outside this checkout:', resolved,\n"
+            "          file=sys.stderr)\n"
+            "    sys.exit(2)\n"
             "sys.exit(0 if program.result.wasSuccessful() else 1)\n"
         )
         proc = subprocess.run(
@@ -309,6 +317,56 @@ class FullSuiteAmbientCouplingTest(unittest.TestCase):
             0,
             "test_test_disk_pressure does not resolve the repo runtime by itself:\n"
             + proc.stderr[-2000:],
+        )
+
+    def test_disk_pressure_origin_pin_fires_without_the_self_insert_header(self) -> None:
+        # Negative control for the origin assertion above: mirror the unit module
+        # into a temp tests tree with its self-insert header stripped. The import
+        # must then either fail outright (no runtime anywhere) or resolve a runtime
+        # outside this checkout's src/ — both are non-zero exits. A zero exit means
+        # the pin can no longer detect a header regression and the guard is dead.
+        unit_rel = Path(
+            "unit/e_150_quality_architecture/f_150_ci_verification/test_test_disk_pressure.py"
+        )
+        source = (ROOT / "tests" / unit_rel).read_text(encoding="utf-8")
+        stripped = source.replace('sys.path.insert(0, str(ROOT / "src"))', "pass")
+        self.assertNotEqual(stripped, source, "self-insert header not found to strip")
+        with tempfile.TemporaryDirectory() as tmp:
+            tests_dir = Path(tmp) / "tests"
+            target = tests_dir / unit_rel
+            target.parent.mkdir(parents=True)
+            for pkg in [tests_dir, *target.parent.relative_to(tests_dir).parents][::-1]:
+                init = (tests_dir / pkg / "__init__.py") if pkg != tests_dir else (tests_dir / "__init__.py")
+                init.parent.mkdir(parents=True, exist_ok=True)
+                init.write_text("", encoding="utf-8")
+            (target.parent / "__init__.py").write_text("", encoding="utf-8")
+            target.write_text(stripped, encoding="utf-8")
+            bootstrap = (
+                "import pathlib, sys, unittest\n"
+                f"sys.path.insert(0, {str(tests_dir)!r})\n"
+                "module = ('unit.e_150_quality_architecture."
+                "f_150_ci_verification.test_test_disk_pressure')\n"
+                "program = unittest.main(module=None, argv=['x', module], exit=False,\n"
+                "                        verbosity=0)\n"
+                "import mozyo_bridge\n"
+                "resolved = pathlib.Path(mozyo_bridge.__file__).resolve()\n"
+                f"expected = (pathlib.Path({str(ROOT)!r}) / 'src' / 'mozyo_bridge').resolve()\n"
+                "if not resolved.is_relative_to(expected):\n"
+                "    sys.exit(2)\n"
+                "sys.exit(0 if program.result.wasSuccessful() else 1)\n"
+            )
+            proc = subprocess.run(
+                [sys.executable, "-c", bootstrap],
+                cwd=tmp,
+                env=hermetic_python_env(),
+                capture_output=True,
+                text=True,
+                timeout=300,
+            )
+        self.assertNotEqual(
+            proc.returncode,
+            0,
+            "stripping the self-insert header still exits 0 — the origin pin is dead",
         )
 
 
