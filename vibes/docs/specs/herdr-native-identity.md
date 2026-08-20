@@ -446,6 +446,67 @@ fail-closedする。
 前提を持つ別railであり、receipt refreshのために条件を偽装しない。この2 classの一般移行runbookは未成立で、
 専用の外部実行型refresh railまたは明示したcompatibility判断がrelease前に必要である。
 
+#### restored pair の write-side 再attest (Redmine #15769)
+
+Herdr/tmux server lossからのrestoreは、live processとserver-owned pane stamps (mzb1 assigned name) を
+保存したままserver-owned `terminal_id` (場合によりpane locatorも) を新しくする。launch-generation rowは
+launch時のterminalを記録し続けるため、read-side `verified_generation_token` のexact
+`generation.terminal_id == live_terminal_id` conjunctが恒久に不成立になり、governedな`handoff send`が
+すべて`target_unavailable`でfail-closedする実測deadlockがあった (#15631 j#108621/j#108741、#15693 j#108747)。
+
+L1設計決定 (#15769 j#108766) は **write-side governed re-attest** である。read-side受理
+(`verified_generation_token` / `completed_generation_startup_token`) は既存caseに対してbyte同一に保ち、
+広げない。代わりに `sublane rebind-restored-pair` (--execute) が、次の**server-owned事実のみ**の
+identity joinが成立したslotに限り、launch-generation rowの`terminal_id` / `locator`をlive値へ
+byte-exact CAS更新する (`HerdrLaunchGenerationStore.reattest_restored_terminal`: expected old row完全一致
+必須、upsertなし、no-opは型付き拒否):
+
+- live inventoryにそのassigned nameのrowが**ちょうど1つ** (duplicateは`duplicate_live_candidates`拒否)、
+  `SLOT_LIVE`、provider stampが期待providerに一致;
+- assigned name (server-owned stamp) のdecodeがgeneration rowの記録identity
+  (workspace / role / lane) と、rowがslotの期待identityと、それぞれexact一致
+  (不一致は`live_identity_join_failed`拒否 — foreign rowは決してre-attestされない);
+- canonical snapshotからlive terminalが一意に解決 (`terminal_identity_of_live_slot`);
+- attestation storeのjoinが`attested`、または**restore署名のstale** (identity一致・boot verdict
+  `present`・locator/terminal世代pinのみのdrift) であること。foreign (`conflict`) / `missing` /
+  absentは従来どおり`unattested_slot`拒否。
+
+callerはCASを駆動するidentity / terminal値を一切供給できない。old -> new terminal / locatorのlineageと
+成立したevidence conjunctsはstructured outcomeの`reattest_lineage` (journal貼付用payload) に永続記録する。
+`--allow-single-slot`はpairの片slotがlive inventoryに全く存在しない場合に、生存slotのみの再pin/再attestを
+許し、欠落slotを型付き事実`missing_live_slot`として報告する (欠落slotのdeclared pin / generation rowは
+byte不変)。
+
+read-side受理は一切広げないため、production delivery conjunctが読む**stale-boundなauthorityはすべて
+write-sideでre-pinされる** (#15769 round 2):
+
+- **startup-transaction participant** (`StartupTransactionFence.repin_restored_participant`):
+  `completed_generation_startup_token`の`participant.locator == generation.locator` conjunctのための
+  locator re-pinと、`verified_terminal_generation_token`のreceipt照合のための`pane_bound_v2` receipt
+  re-mint。これは「terminal phaseはwrite-once」規則への**明示した限定例外**である: locatorとreceiptの
+  2 fieldのみ、expected old bytes (locator / receipt) のexact CAS必須、`completed_success` /
+  `rollback_owed`の2 phaseのみ許可。**receipt re-mintの根拠**: receiptのconjunct上の役割は「現在の
+  terminalがこのlaunch自身のside effectである」証明であり、server restore後はその命題をlaunch時probe
+  ではなくrailのserver-owned join (unique live named slot / SLOT_LIVE / exact stamps / unique canonical
+  terminal) から再導出する。新receiptのterminalはserver inventoryから取り (caller供給値は一切入らない)、
+  container / native fieldはlaunch receiptからbyte同一に引き継ぐ。旧receiptがv1・解析不能・foreign name・
+  restore lineage外のterminalである場合はre-mintせずfail-closedする (v1 provenanceのv2昇格禁止は維持)。
+- **attestation record** (`HerdrIdentityAttestationStore.reattest_restored_terminal`): queue-enter
+  bindingのattestation locator/terminal equality conjunctのため、restore署名のstale record (identity
+  一致・boot verdict `present`・generation pinのみのdrift) のlocator/terminalをlive値へexact CAS移動する。
+  verdict / detail / observed_at等のboot観測はbyte不変、upsertなし、no-opは型付き拒否。
+
+**participant lineage join は generation rowが受理に参加するすべてのpin書き込みpathの前提条件**である
+(`live_bound`含む): fence actionが受理phaseで存在し、open participantがexact slotで、そのlocatorと
+receipt terminalがrestore lineage (live値、またはgeneration rowの旧値でre-pin待ち) で説明できること。
+捏造された`live_bound` rowはこのjoinで型付き拒否となり、declared pinを含む一切の書き込みに到達しない。
+書き込み順はparticipant re-pin → attestation re-pin → generation CAS → declared-pin reconcileで、
+途中失敗は常にfail-closedに留まり、再実行が残段を再観測して完遂する (retry-safe)。
+
+以上により、rail実行後はreceipt照合を供給しないrecovery path (`verified_generation_token`) と
+receipt照合を要求するproduction queue-enter delivery path (`verified_terminal_generation_token` +
+attestation equality) の両方が、無変更のread-side verifierのまま自然に成立する。
+
 flow:
 
 1. herdr binary を trusted env から解決 (未設定 / 未解決 → fail-closed)。

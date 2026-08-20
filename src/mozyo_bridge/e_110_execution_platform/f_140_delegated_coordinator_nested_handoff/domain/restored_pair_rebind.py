@@ -68,6 +68,28 @@ REBIND_SLOT_NOT_DRIFTED = "locator_not_drifted"
 REBIND_SLOT_DECLARED_STILL_LIVE = "declared_locator_still_live"
 REBIND_SLOT_UNATTESTED = "unattested_slot"
 
+# -- #15769 restored-terminal re-attest vocabulary (per slot) ------------------
+#: The server-owned identity join for the launch-generation re-attest could not
+#: be established exactly: the live name does not decode to the generation row's
+#: recorded workspace/role/lane, the generation row's identity is foreign to the
+#: expected slot, or the live terminal identity is not uniquely resolvable from
+#: the canonical inventory snapshot. Never a guess (#15769 j#108766).
+REBIND_SLOT_LIVE_IDENTITY_JOIN_FAILED = "live_identity_join_failed"
+#: The launch-generation store exists but cannot be read; an unreadable
+#: authority is never folded into "no generation" while a re-attest is decided.
+REBIND_SLOT_GENERATION_UNREADABLE = "generation_unreadable"
+#: The declared pin is not drifted AND the attested generation row already
+#: binds the live terminal + locator: there is nothing to re-attest.
+REBIND_SLOT_TERMINAL_UNCHANGED = "terminal_unchanged_noop"
+#: The generation row's locator moved, but the startup-transaction participant
+#: that must be re-pinned alongside it could not be resolved exactly (unreadable
+#: fence, wrong phase, closed / foreign / already-diverged participant).
+REBIND_SLOT_PARTICIPANT_REPIN_UNRESOLVED = "participant_repin_unresolved"
+#: Single-slot mode only (#15769): this slot has NO live named row at all. It is
+#: a typed per-slot fact carried on the slot plan — under
+#: ``allow_single_slot`` it does not block the other slot's re-attest.
+REBIND_SLOT_MISSING_LIVE = "missing_live_slot"
+
 
 def slot_reason(token: str, slot_role: str) -> str:
     """The slot-scoped spelling of a per-slot reason token (``token:slot_role``)."""
@@ -82,11 +104,19 @@ class RestoredPairRebindRequest:
     the rebind under; it is carried into the outcome payload for the journal
     write-back and is never itself an approval gate — the rail's authority is
     the live restart evidence (attested same-name pair on drifted locators).
+
+    ``allow_single_slot`` (#15769) admits resolving ONE slot when the pair's
+    other slot has no live named row at all: the missing slot is reported as
+    the typed per-slot fact :data:`REBIND_SLOT_MISSING_LIVE` (its declared pin
+    stays byte-unchanged) instead of refusing the whole pair. It widens only
+    the pair-completeness rule — every identity / liveness / attestation gate
+    on the RESOLVED slot is unchanged.
     """
 
     issue: str
     lane: str
     journal: str = ""
+    allow_single_slot: bool = False
 
 
 @dataclass(frozen=True)
@@ -95,6 +125,13 @@ class RebindSlotPlan:
 
     ``ready`` is True only when every per-slot gate passed; ``reason`` then is
     empty, otherwise a comma-joined list of slot-scoped reason tokens.
+
+    ``skipped`` (#15769) marks a slot that ``allow_single_slot`` excused from
+    the pair (no live named row): it is not ready, but its reasons do not block
+    the other slot. ``generation_state`` reports the launch-generation join for
+    the display / regression record: ``""`` (no usable attested row),
+    ``reattest_needed`` (attested row bound to stale terminal / locator), or
+    ``live_bound`` (attested row already binds the live values).
     """
 
     slot_role: str
@@ -106,6 +143,8 @@ class RebindSlotPlan:
     attestation_state: str = ""
     ready: bool = False
     reason: str = ""
+    skipped: bool = False
+    generation_state: str = ""
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -118,6 +157,8 @@ class RebindSlotPlan:
             "attestation_state": self.attestation_state,
             "ready": self.ready,
             "reason": self.reason,
+            "skipped": self.skipped,
+            "generation_state": self.generation_state,
         }
 
 
@@ -127,6 +168,16 @@ class RestoredPairRebindPlan:
 
     ``may_rebind`` is True only when EVERY gate passed for BOTH slots
     (all-or-nothing: a half-proven pair never authorizes a partial pin update).
+    Under ``allow_single_slot`` (#15769) a slot with NO live named row is
+    ``skipped`` — reported as a typed per-slot fact — and the completeness rule
+    applies to the remaining resolved slot.
+
+    ``reattest_lineage`` (#15769) is the durable, journal-ready record of every
+    launch-generation re-attest this plan authorizes: one dict per slot with the
+    old -> new terminal id and locator, the startup action token, whether a
+    participant-side locator re-pin accompanies it, and the server-owned
+    evidence conjuncts that held. It rides the structured outcome payload so an
+    operator can paste it into the Redmine journal verbatim.
     """
 
     issue: str
@@ -139,6 +190,7 @@ class RestoredPairRebindPlan:
     blocked_reasons: tuple[str, ...] = ()
     gateway: Optional[RebindSlotPlan] = None
     worker: Optional[RebindSlotPlan] = None
+    reattest_lineage: tuple[dict, ...] = ()
 
     @property
     def may_rebind(self) -> bool:
@@ -157,6 +209,7 @@ class RestoredPairRebindPlan:
             "blocked_reasons": list(self.blocked_reasons),
             "gateway": self.gateway.as_payload() if self.gateway else None,
             "worker": self.worker.as_payload() if self.worker else None,
+            "reattest_lineage": [dict(entry) for entry in self.reattest_lineage],
         }
 
 
@@ -227,6 +280,11 @@ __all__ = (
     "REBIND_SLOT_NOT_DRIFTED",
     "REBIND_SLOT_DECLARED_STILL_LIVE",
     "REBIND_SLOT_UNATTESTED",
+    "REBIND_SLOT_LIVE_IDENTITY_JOIN_FAILED",
+    "REBIND_SLOT_GENERATION_UNREADABLE",
+    "REBIND_SLOT_TERMINAL_UNCHANGED",
+    "REBIND_SLOT_PARTICIPANT_REPIN_UNRESOLVED",
+    "REBIND_SLOT_MISSING_LIVE",
     "slot_reason",
     "RestoredPairRebindRequest",
     "RebindSlotPlan",
