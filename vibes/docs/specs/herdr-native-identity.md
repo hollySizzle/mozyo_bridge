@@ -477,20 +477,35 @@ callerはCASを駆動するidentity / terminal値を一切供給できない。o
 許し、欠落slotを型付き事実`missing_live_slot`として報告する (欠落slotのdeclared pin / generation rowは
 byte不変)。
 
-locatorが移動したrestoreでは、`completed_generation_startup_token`の`participant.locator ==
-generation.locator` conjunctがgeneration CAS後に恒久不成立になるため、railはstartup-transaction
-participantのlocatorも同時にre-pinする (`StartupTransactionFence.repin_restored_participant_locator`)。
-これは「terminal phaseはwrite-once」規則への**明示した限定例外**である: locator fieldのみ
-(launch時のpane-bound receiptはbyte不変 — receiptは履歴的証拠でありidentityの正本ではない)、
-expected old locatorのexact CAS必須、`completed_success` / `rollback_owed`の2 phaseのみ許可。
-read-side受理をgeneration row比較へ広げる代替案は全既存consumerへの受理拡大でありL1決定が却下した。
-書き込み順はparticipant re-pin → generation CAS → declared-pin reconcileで、途中失敗は常にfail-closedに
-留まり、再実行が残段を再観測して完遂する (retry-safe)。
+read-side受理は一切広げないため、production delivery conjunctが読む**stale-boundなauthorityはすべて
+write-sideでre-pinされる** (#15769 round 2):
 
-なお`pane_bound_v2` receiptのterminal照合を要求するdelivery path (`verified_terminal_generation_token`
-供給側) は、restore後terminalがreceiptと一致しないため引き続きfail-closedする。#15769が解くのは
-receipt照合を供給しない`verified_generation_token` path (recovery / 送達admission join) のdeadlockであり、
-receipt再発行はこの節冒頭のrefresh rail未成立事項のまま残る。
+- **startup-transaction participant** (`StartupTransactionFence.repin_restored_participant`):
+  `completed_generation_startup_token`の`participant.locator == generation.locator` conjunctのための
+  locator re-pinと、`verified_terminal_generation_token`のreceipt照合のための`pane_bound_v2` receipt
+  re-mint。これは「terminal phaseはwrite-once」規則への**明示した限定例外**である: locatorとreceiptの
+  2 fieldのみ、expected old bytes (locator / receipt) のexact CAS必須、`completed_success` /
+  `rollback_owed`の2 phaseのみ許可。**receipt re-mintの根拠**: receiptのconjunct上の役割は「現在の
+  terminalがこのlaunch自身のside effectである」証明であり、server restore後はその命題をlaunch時probe
+  ではなくrailのserver-owned join (unique live named slot / SLOT_LIVE / exact stamps / unique canonical
+  terminal) から再導出する。新receiptのterminalはserver inventoryから取り (caller供給値は一切入らない)、
+  container / native fieldはlaunch receiptからbyte同一に引き継ぐ。旧receiptがv1・解析不能・foreign name・
+  restore lineage外のterminalである場合はre-mintせずfail-closedする (v1 provenanceのv2昇格禁止は維持)。
+- **attestation record** (`HerdrIdentityAttestationStore.reattest_restored_terminal`): queue-enter
+  bindingのattestation locator/terminal equality conjunctのため、restore署名のstale record (identity
+  一致・boot verdict `present`・generation pinのみのdrift) のlocator/terminalをlive値へexact CAS移動する。
+  verdict / detail / observed_at等のboot観測はbyte不変、upsertなし、no-opは型付き拒否。
+
+**participant lineage join は generation rowが受理に参加するすべてのpin書き込みpathの前提条件**である
+(`live_bound`含む): fence actionが受理phaseで存在し、open participantがexact slotで、そのlocatorと
+receipt terminalがrestore lineage (live値、またはgeneration rowの旧値でre-pin待ち) で説明できること。
+捏造された`live_bound` rowはこのjoinで型付き拒否となり、declared pinを含む一切の書き込みに到達しない。
+書き込み順はparticipant re-pin → attestation re-pin → generation CAS → declared-pin reconcileで、
+途中失敗は常にfail-closedに留まり、再実行が残段を再観測して完遂する (retry-safe)。
+
+以上により、rail実行後はreceipt照合を供給しないrecovery path (`verified_generation_token`) と
+receipt照合を要求するproduction queue-enter delivery path (`verified_terminal_generation_token` +
+attestation equality) の両方が、無変更のread-side verifierのまま自然に成立する。
 
 flow:
 

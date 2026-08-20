@@ -34,21 +34,22 @@ canonical live terminal), the rail CAS-updates the generation row's
 lineage durably in the structured outcome (``reattest_lineage``). A caller can
 never supply the identity or terminal values that drive the CAS.
 
-Design point (#15769 item 3, decided from the code): when the LOCATOR moved,
+Design point (#15769 item 3, decided from the code; round 2 j-verdict): the
+read-side verifiers must not be widened, so every stale-bound authority the
+production delivery conjunct reads is re-pinned WRITE-side instead:
 ``completed_generation_startup_token``'s ``participant.locator ==
-generation.locator`` conjunct would fail forever after the generation CAS, and
-that verifier must not be widened. The smallest sound change is a
-participant-side locator re-pin on the startup-transaction fence
-(:meth:`...startup_transaction_fence.StartupTransactionFence
-.repin_restored_participant_locator`): field-scoped (locator only — the
-launch-time receipt stays byte-identical), CAS-guarded on the exact old
-locator, and admitted only for ``completed_success`` / ``rollback_owed``
-actions. The alternative — comparing acceptance against the generation row only
-— would widen the read-side verifier for every existing consumer, exactly what
-the L1 decision rejected. Write order is retry-safe: participant re-pin, then
-the generation CAS, then the declared-pin reconcile; a partial failure leaves
-every read-side join fail-closed and a re-run re-observes and completes the
-remaining steps.
+generation.locator`` equality via the fence participant re-pin, the
+``verified_terminal_generation_token`` receipt proof via the CAS-guarded
+``pane_bound_v2`` receipt re-mint (terminal taken from the server inventory,
+never a caller — reasoning documented on
+:mod:`...core.state.startup_transaction_restored_repin`), and the queue-enter
+attestation locator/terminal equality via
+:meth:`...herdr_identity_attestation.HerdrIdentityAttestationStore
+.reattest_restored_terminal`. The join / repair derivation and the retry-safe
+execution order live in :mod:`.sublane_restored_pair_reattest`; the participant
+lineage join is a prerequisite for EVERY path where a generation row
+participates in the acceptance (``live_bound`` included — a fabricated row
+never bypasses it into a pin write).
 """
 
 from __future__ import annotations
@@ -67,12 +68,9 @@ from mozyo_bridge.core.state.herdr_identity_attestation import (
     evaluate_attestation,
 )
 from mozyo_bridge.core.state.herdr_launch_generation import (
-    GENERATION_ATTESTED,
     HerdrLaunchGenerationStore,
 )
 from mozyo_bridge.core.state.startup_transaction_fence import (
-    PHASE_COMPLETED_SUCCESS,
-    PHASE_ROLLBACK_OWED,
     StartupTransactionFence,
 )
 from mozyo_bridge.core.state.lane_lifecycle import (
@@ -99,6 +97,14 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     list_herdr_agent_rows,
     probe_worktree_resolved,
     repo_scope_workspace_id,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_reattest import (  # noqa: E501
+    GEN_LIVE_BOUND,
+    GEN_REATTEST_NEEDED,
+    SlotReattestPlan,
+    apply_slot_reattest,
+    generation_join,
+    participant_repair,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_rebind import (  # noqa: E501
     SublaneRestoredPairRebindUseCase,
@@ -128,9 +134,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REBIND_BLOCK_WORKTREE_UNRESOLVED,
     REBIND_SLOT_DECLARED_STILL_LIVE,
     REBIND_SLOT_DUPLICATE_LIVE,
-    REBIND_SLOT_GENERATION_UNREADABLE,
     REBIND_SLOT_LIVE_ABSENT,
-    REBIND_SLOT_LIVE_IDENTITY_JOIN_FAILED,
     REBIND_SLOT_LIVE_LOCATOR_UNRESOLVED,
     REBIND_SLOT_LIVE_PROVIDER_MISMATCH,
     REBIND_SLOT_MISSING_LIVE,
@@ -150,7 +154,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     _agent_locator,
     _norm,
     _norm_lane,
-    decode_assigned_name,
     terminal_identity_of_live_slot,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_slot_liveness import (  # noqa: E501
@@ -161,54 +164,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
 _PIN_ROLE_GATEWAY = "gateway"
 _PIN_ROLE_WORKER = "worker"
 
-#: ``RebindSlotPlan.generation_state`` values (#15769): the attested generation
-#: row already binds the live terminal + locator / needs the re-attest CAS.
-_GEN_LIVE_BOUND = "live_bound"
-_GEN_REATTEST_NEEDED = "reattest_needed"
-
-
-@dataclass(frozen=True)
-class _SlotReattestPlan:
-    """One slot's authorized launch-generation re-attest write (#15769).
-
-    Every value is re-derived from the action-time observation (never carried
-    from a caller): the CAS keys are the exact old row values and the new
-    values are the server-owned live inventory facts. ``participant_repin``
-    marks whether the startup-transaction participant's locator must be
-    CAS-moved alongside (only when the locator itself moved and the participant
-    still records the old one).
-    """
-
-    slot_role: str
-    provider: str
-    assigned_name: str
-    startup_action_id: str
-    workspace_id: str
-    lane_id: str
-    verdict: str
-    old_locator: str
-    old_terminal_id: str
-    new_locator: str
-    new_terminal_id: str
-    participant_repin: bool
-    evidence: tuple[str, ...]
-
-    def lineage_payload(self) -> dict:
-        """The journal-ready durable lineage record (#15769 acceptance)."""
-        return {
-            "redmine": "#15769",
-            "slot_role": self.slot_role,
-            "provider": self.provider,
-            "assigned_name": self.assigned_name,
-            "startup_action_id": self.startup_action_id,
-            "old_terminal_id": self.old_terminal_id,
-            "new_terminal_id": self.new_terminal_id,
-            "old_locator": self.old_locator,
-            "new_locator": self.new_locator,
-            "participant_locator_repin": self.participant_repin,
-            "evidence": list(self.evidence),
-        }
-
 
 @dataclass(frozen=True)
 class _SlotResult:
@@ -217,7 +172,7 @@ class _SlotResult:
     plan: RebindSlotPlan
     pin: Optional[ProcessGenerationPin]
     reasons: list
-    reattest: Optional[_SlotReattestPlan] = None
+    reattest: Optional[SlotReattestPlan] = None
     skipped: bool = False
 
 
@@ -233,7 +188,7 @@ class _RebindContext:
     decision: Optional[DecisionPointer] = None
     old_slots: tuple[ProcessGenerationPin, ...] = ()
     new_slots: tuple[ProcessGenerationPin, ...] = ()
-    slot_reattests: tuple[_SlotReattestPlan, ...] = ()
+    slot_reattests: tuple[SlotReattestPlan, ...] = ()
     pins_changed: bool = False
 
 
@@ -307,18 +262,37 @@ class LiveRestoredPairRebindOps:
         """The startup-transaction action a generation token names (raises on damage)."""
         return StartupTransactionFence(home=self.attestation_home).read(action_id)
 
-    def _repin_participant(self, plan: _SlotReattestPlan) -> None:
-        StartupTransactionFence(
-            home=self.attestation_home
-        ).repin_restored_participant_locator(
-            plan.startup_action_id,
-            plan.provider,
-            assigned_name=plan.assigned_name,
-            expected_locator=plan.old_locator,
-            new_locator=plan.new_locator,
+    def _repin_participant(self, plan: SlotReattestPlan) -> None:
+        repair = plan.participant
+        assert repair is not None and repair.needs_write
+        kwargs = {
+            "assigned_name": plan.assigned_name,
+            "expected_locator": repair.expected_locator,
+        }
+        if repair.locator_repin:
+            kwargs["new_locator"] = plan.new_locator
+        if repair.receipt_remint:
+            kwargs["expected_receipt"] = repair.expected_receipt
+            kwargs["new_receipt"] = repair.new_receipt
+        StartupTransactionFence(home=self.attestation_home).repin_restored_participant(
+            plan.startup_action_id, plan.provider, **kwargs
         )
 
-    def _reattest_generation(self, plan: _SlotReattestPlan) -> None:
+    def _reattest_attestation(self, plan: SlotReattestPlan) -> None:
+        HerdrIdentityAttestationStore(
+            home=self.attestation_home
+        ).reattest_restored_terminal(
+            assigned_name=plan.assigned_name,
+            workspace_id=plan.attestation_workspace_id,
+            role=plan.attestation_role,
+            lane_id=plan.attestation_lane_id,
+            expected_locator=plan.attestation_expected_locator,
+            expected_terminal_id=plan.attestation_expected_terminal_id,
+            live_locator=plan.new_locator,
+            live_terminal_id=plan.new_terminal_id,
+        )
+
+    def _reattest_generation(self, plan: SlotReattestPlan) -> None:
         HerdrLaunchGenerationStore(
             home=self.attestation_home
         ).reattest_restored_terminal(
@@ -335,123 +309,6 @@ class LiveRestoredPairRebindOps:
         )
 
     # -- per-slot gate --------------------------------------------------------
-
-    def _generation_join(
-        self,
-        *,
-        assigned: str,
-        want_provider: str,
-        slot_role: str,
-        workspace_id: str,
-        lane: str,
-        live_locator: str,
-        live_terminal_id,
-        reasons: list,
-    ):
-        """The #15769 launch-generation join -> ``(generation, gen_state)``.
-
-        ``gen_state`` is ``""`` (no usable attested row — the pre-#15769 rail
-        shape), ``_GEN_LIVE_BOUND``, or ``_GEN_REATTEST_NEEDED``. Every identity
-        conjunct is a SERVER-OWNED fact or the durable row itself; a foreign /
-        ambiguous / undecodable join appends a typed refusal and never guesses.
-        """
-        try:
-            generation = self._read_generation(assigned)
-        except Exception:  # noqa: BLE001 - an unreadable authority is never "absent"
-            reasons.append(slot_reason(REBIND_SLOT_GENERATION_UNREADABLE, slot_role))
-            return None, ""
-        if generation is None:
-            return None, ""
-        token = _norm(getattr(generation, "startup_action_id", ""))
-        if (
-            _norm(getattr(generation, "phase", "")) != GENERATION_ATTESTED
-            or not token
-            or _norm(getattr(generation, "verdict", "")) != VERDICT_PRESENT
-        ):
-            # A pending / superseded / non-present row is launch-rail property;
-            # it is never re-attested and lends no drift evidence here.
-            return None, ""
-        decoded = decode_assigned_name(assigned)
-        stamps_match = bool(
-            decoded.ok
-            and decoded.identity is not None
-            and _norm(decoded.identity.workspace_id)
-            == _norm(generation.workspace_id)
-            and _norm(decoded.identity.role) == _norm(generation.role)
-            and _norm_lane(decoded.identity.lane_id)
-            == _norm_lane(generation.lane_id)
-        )
-        row_matches_slot = bool(
-            _norm(generation.assigned_name) == assigned
-            and _norm(generation.workspace_id) == _norm(workspace_id)
-            and _norm(generation.role) == want_provider
-            and _norm_lane(generation.lane_id) == _norm_lane(lane)
-        )
-        if not (stamps_match and row_matches_slot):
-            # The server-owned name stamp does not decode to the generation
-            # row's identity, or the row is foreign to this slot: never
-            # re-attested (#15769 security invariant — foreign rejection).
-            reasons.append(
-                slot_reason(REBIND_SLOT_LIVE_IDENTITY_JOIN_FAILED, slot_role)
-            )
-            return generation, ""
-        if live_terminal_id is None:
-            # No unique canonical server-owned terminal for this name+locator
-            # (duplicate claims / malformed snapshot): the join has no answer.
-            reasons.append(
-                slot_reason(REBIND_SLOT_LIVE_IDENTITY_JOIN_FAILED, slot_role)
-            )
-            return generation, ""
-        if (
-            generation.terminal_id == live_terminal_id
-            and _norm(generation.locator) == live_locator
-        ):
-            return generation, _GEN_LIVE_BOUND
-        return generation, _GEN_REATTEST_NEEDED
-
-    def _participant_repin_needed(
-        self, *, generation, want_provider: str, assigned: str, live_locator: str
-    ):
-        """Whether the fence participant needs the locator re-pin -> bool or ``None``.
-
-        ``None`` means the participant-side join could not be established
-        exactly (unreadable fence, non-terminal-acceptable phase, closed /
-        foreign / already-diverged participant) — the caller refuses typed.
-        """
-        try:
-            action = self._read_startup_action(
-                _norm(generation.startup_action_id)
-            )
-        except Exception:  # noqa: BLE001 - an unreadable fence is never proof
-            return None
-        if action is None or _norm(getattr(action, "phase", "")) not in (
-            PHASE_COMPLETED_SUCCESS,
-            PHASE_ROLLBACK_OWED,
-        ):
-            return None
-        unit = getattr(action, "unit", None)
-        if not (
-            unit is not None
-            and _norm(getattr(unit, "workspace_id", ""))
-            == _norm(generation.workspace_id)
-            and _norm_lane(getattr(unit, "lane_id", ""))
-            == _norm_lane(generation.lane_id)
-            and want_provider in tuple(getattr(unit, "providers", ()) or ())
-        ):
-            return None
-        participant = action.participant_for(want_provider)
-        if (
-            participant is None
-            or getattr(participant, "closed", True)
-            or _norm(getattr(participant, "assigned_name", "")) != assigned
-        ):
-            return None
-        participant_locator = _norm(getattr(participant, "locator", ""))
-        if participant_locator == live_locator:
-            return False  # an earlier partial run already re-pinned it
-        if participant_locator == _norm(generation.locator):
-            return True
-        return None
 
     def _slot(
         self,
@@ -481,11 +338,16 @@ class LiveRestoredPairRebindOps:
         row: Optional[Mapping[str, object]] = None
         live_locator = ""
         live_revision = ""
+        live_terminal_id = None
         attestation = None
         attestation_state = ATTEST_ABSENT
+        attested = False
+        attestation_restore_stale = False
+        attestation_repin = False
         generation = None
         gen_state = ""
-        attestation_restore_stale = False
+        repair = None
+        repairs_needed = False
         if len(named) > 1:
             # A duplicate assigned name is a herdr name-uniqueness violation this
             # rail never guesses past (the adopt-gate discipline).
@@ -536,7 +398,8 @@ class LiveRestoredPairRebindOps:
                 live_terminal_id = terminal_identity_of_live_slot(
                     assigned, live_locator, rows
                 )
-                generation, gen_state = self._generation_join(
+                generation, gen_state = generation_join(
+                    self,
                     assigned=assigned,
                     want_provider=want_provider,
                     slot_role=slot_role,
@@ -546,13 +409,85 @@ class LiveRestoredPairRebindOps:
                     live_terminal_id=live_terminal_id,
                     reasons=reasons,
                 )
+                try:
+                    attestation = self._read_attestation(assigned)
+                    join = evaluate_attestation(
+                        attestation,
+                        live_locator=live_locator,
+                        live_terminal_id=live_terminal_id,
+                        expected_workspace_id=workspace_id,
+                        expected_role=want_provider,
+                        expected_lane=lane,
+                    )
+                    attestation_state = join.state
+                    attested = bool(
+                        join.ok
+                        and _norm(getattr(attestation, "assigned_name", ""))
+                        == assigned
+                    )
+                    # #15769: the restore signature on the attestation store —
+                    # the recorded identity matched (a conflict precedes stale
+                    # in `evaluate_attestation`), the agent's own boot verdict
+                    # was `present`, and ONLY the recorded, canonical locator /
+                    # terminal generation pin drifted. Accepted solely when the
+                    # launch-generation row independently binds (or is being
+                    # re-attested to) the live slot AND the participant lineage
+                    # join holds; foreign / missing / conflicting records stay
+                    # refused exactly as before.
+                    recorded_locator = _norm(getattr(attestation, "locator", ""))
+                    recorded_terminal = getattr(attestation, "terminal_id", "")
+                    attestation_restore_stale = bool(
+                        join.state == ATTEST_STALE
+                        and attestation is not None
+                        and _norm(getattr(attestation, "verdict", ""))
+                        == VERDICT_PRESENT
+                        and _norm(getattr(attestation, "assigned_name", ""))
+                        == assigned
+                        and recorded_locator
+                        and type(recorded_terminal) is str
+                        and recorded_terminal
+                        and recorded_terminal.strip() == recorded_terminal
+                    )
+                except Exception:  # noqa: BLE001 - unreadable store is never proof
+                    attested = False
+                    attestation_restore_stale = False
+                if gen_state:
+                    # Round-2 finding 2: the participant lineage join is a
+                    # PREREQUISITE for every path where a generation row
+                    # participates in the acceptance — `live_bound` included. A
+                    # fabricated row whose fence participants cannot be
+                    # explained by this restore's lineage refuses typed with
+                    # zero writes.
+                    repair = participant_repair(
+                        self,
+                        generation=generation,
+                        want_provider=want_provider,
+                        assigned=assigned,
+                        live_locator=live_locator,
+                        live_terminal_id=live_terminal_id,
+                    )
+                    if repair is None:
+                        reasons.append(
+                            slot_reason(
+                                REBIND_SLOT_PARTICIPANT_REPIN_UNRESOLVED, slot_role
+                            )
+                        )
+                attestation_repin = bool(
+                    gen_state and not attested and attestation_restore_stale
+                )
+                repairs_needed = bool(gen_state) and (
+                    gen_state == GEN_REATTEST_NEEDED
+                    or (repair is not None and repair.needs_write)
+                    or attestation_repin
+                )
                 if live_locator == declared_locator:
-                    if gen_state == _GEN_REATTEST_NEEDED:
-                        # #15769: the pane survived on its own locator but the
-                        # server-owned terminal identity is new — the row's
-                        # re-attest IS the evidence to act on.
+                    if gen_state and repairs_needed:
+                        # #15769: the pane survived on its own locator but a
+                        # restore-stale axis remains (terminal / participant /
+                        # receipt / attestation) — the repair IS the evidence
+                        # to act on.
                         pass
-                    elif gen_state == _GEN_LIVE_BOUND:
+                    elif gen_state == GEN_LIVE_BOUND:
                         # Nothing is stale on any axis: typed no-op.
                         reasons.append(
                             slot_reason(REBIND_SLOT_TERMINAL_UNCHANGED, slot_role)
@@ -574,100 +509,73 @@ class LiveRestoredPairRebindOps:
                     reasons.append(
                         slot_reason(REBIND_SLOT_DECLARED_STILL_LIVE, slot_role)
                     )
-                attested = False
-                try:
-                    attestation = self._read_attestation(assigned)
-                    join = evaluate_attestation(
-                        attestation,
-                        live_locator=live_locator,
-                        live_terminal_id=live_terminal_id,
-                        expected_workspace_id=workspace_id,
-                        expected_role=want_provider,
-                        expected_lane=lane,
-                    )
-                    attestation_state = join.state
-                    attested = bool(
-                        join.ok
-                        and _norm(getattr(attestation, "assigned_name", ""))
-                        == assigned
-                    )
-                    # #15769: the restore signature on the attestation store —
-                    # the recorded identity matched (a conflict precedes stale
-                    # in `evaluate_attestation`), the agent's own boot verdict
-                    # was `present`, and ONLY the locator / terminal generation
-                    # pin drifted. Accepted solely when the launch-generation
-                    # row independently binds (or is being re-attested to) the
-                    # live slot; foreign / missing / conflicting records stay
-                    # refused exactly as before.
-                    attestation_restore_stale = bool(
-                        join.state == ATTEST_STALE
-                        and attestation is not None
-                        and _norm(getattr(attestation, "verdict", ""))
-                        == VERDICT_PRESENT
-                        and _norm(getattr(attestation, "assigned_name", ""))
-                        == assigned
-                    )
-                except Exception:  # noqa: BLE001 - unreadable store is never proof
-                    attested = False
-                    attestation_restore_stale = False
-                if not (
-                    attested
-                    or (
-                        attestation_restore_stale
-                        and gen_state in (_GEN_REATTEST_NEEDED, _GEN_LIVE_BOUND)
-                    )
-                ):
+                if not (attested or (attestation_restore_stale and gen_state)):
                     reasons.append(slot_reason(REBIND_SLOT_UNATTESTED, slot_role))
 
-        reattest: Optional[_SlotReattestPlan] = None
-        if not reasons and gen_state == _GEN_REATTEST_NEEDED:
-            assert generation is not None
-            old_locator = _norm(generation.locator)
-            locator_moved = old_locator != live_locator
-            participant_repin = False
-            if locator_moved:
-                needed = self._participant_repin_needed(
-                    generation=generation,
-                    want_provider=want_provider,
-                    assigned=assigned,
-                    live_locator=live_locator,
-                )
-                if needed is None:
-                    reasons.append(
-                        slot_reason(
-                            REBIND_SLOT_PARTICIPANT_REPIN_UNRESOLVED, slot_role
-                        )
-                    )
-                else:
-                    participant_repin = needed
-            if not reasons:
-                reattest = _SlotReattestPlan(
-                    slot_role=slot_role,
-                    provider=want_provider,
-                    assigned_name=assigned,
-                    startup_action_id=_norm(generation.startup_action_id),
-                    workspace_id=_norm(generation.workspace_id),
-                    lane_id=_norm(generation.lane_id),
-                    verdict=_norm(generation.verdict),
-                    old_locator=old_locator,
-                    old_terminal_id=generation.terminal_id,
-                    new_locator=live_locator,
-                    new_terminal_id=live_terminal_id,
-                    participant_repin=participant_repin,
-                    evidence=(
-                        "unique_live_named_slot",
-                        "slot_live",
-                        "live_provider_stamp_match",
-                        "assigned_name_decodes_generation_identity",
-                        "generation_identity_matches_slot",
-                        "unique_live_terminal_identity",
-                        (
-                            "attestation_ok_live_join"
-                            if attested
-                            else "attestation_restore_stale_present"
-                        ),
-                    ),
-                )
+        reattest: Optional[SlotReattestPlan] = None
+        if not reasons and gen_state and repairs_needed:
+            assert generation is not None and repair is not None
+            evidence = [
+                "unique_live_named_slot",
+                "slot_live",
+                "live_provider_stamp_match",
+                "assigned_name_decodes_generation_identity",
+                "generation_identity_matches_slot",
+                "unique_live_terminal_identity",
+                (
+                    "attestation_ok_live_join"
+                    if attested
+                    else "attestation_restore_stale_present"
+                ),
+                "participant_lineage_join",
+                (
+                    "participant_receipt_reminted"
+                    if repair.receipt_remint
+                    else "participant_receipt_reproven"
+                ),
+            ]
+            reattest = SlotReattestPlan(
+                slot_role=slot_role,
+                provider=want_provider,
+                assigned_name=assigned,
+                startup_action_id=_norm(generation.startup_action_id),
+                workspace_id=_norm(generation.workspace_id),
+                lane_id=_norm(generation.lane_id),
+                verdict=_norm(generation.verdict),
+                old_locator=_norm(generation.locator),
+                old_terminal_id=generation.terminal_id,
+                new_locator=live_locator,
+                new_terminal_id=live_terminal_id,
+                generation_cas=(gen_state == GEN_REATTEST_NEEDED),
+                participant=repair,
+                attestation_repin=attestation_repin,
+                attestation_expected_locator=(
+                    _norm(getattr(attestation, "locator", ""))
+                    if attestation_repin
+                    else ""
+                ),
+                attestation_expected_terminal_id=(
+                    getattr(attestation, "terminal_id", "")
+                    if attestation_repin
+                    else ""
+                ),
+                attestation_workspace_id=(
+                    _norm(getattr(attestation, "workspace_id", ""))
+                    if attestation_repin
+                    else ""
+                ),
+                attestation_role=(
+                    _norm(getattr(attestation, "role", ""))
+                    if attestation_repin
+                    else ""
+                ),
+                attestation_lane_id=(
+                    _norm(getattr(attestation, "lane_id", ""))
+                    if attestation_repin
+                    else ""
+                ),
+                evidence=tuple(evidence),
+            )
 
         pin: Optional[ProcessGenerationPin] = None
         if not reasons:
@@ -891,33 +799,21 @@ class LiveRestoredPairRebindOps:
             )
         assert context.key is not None and context.decision is not None
         # #15769 write order (retry-safe; every step is its own byte-exact CAS
-        # re-derived from THIS action-time observation): (1) the fence
-        # participant locator re-pin, (2) the launch-generation re-attest,
-        # (3) the declared-pin reconcile. A failure at any step leaves every
-        # read-side join fail-closed, and a re-run re-observes the remaining
-        # steps (a re-pinned participant is observed as no longer needing the
-        # re-pin; a re-attested row reads live-bound).
+        # re-derived from THIS action-time observation): per slot, (1) the fence
+        # participant re-pin (locator + receipt in one CAS), (2) the attestation
+        # record re-pin, (3) the launch-generation re-attest; then (4) the
+        # declared-pin reconcile. A failure at any step leaves every read-side
+        # join fail-closed, and a re-run re-observes and performs only the
+        # remaining steps (a re-pinned participant / attestation / row is
+        # observed as no longer needing its repair).
         for plan in context.slot_reattests:
-            if not plan.participant_repin:
-                continue
             try:
-                self._repin_participant(plan)
+                apply_slot_reattest(self, plan)
             except (Exception, SystemExit) as exc:  # noqa: BLE001 - typed zero-write
                 return (
                     False,
                     None,
-                    f"participant_repin_refused:{plan.slot_role}:"
-                    f"{type(exc).__name__}",
-                )
-        for plan in context.slot_reattests:
-            try:
-                self._reattest_generation(plan)
-            except (Exception, SystemExit) as exc:  # noqa: BLE001 - typed refusal
-                return (
-                    False,
-                    None,
-                    f"generation_reattest_refused:{plan.slot_role}:"
-                    f"{type(exc).__name__}",
+                    f"slot_reattest_refused:{plan.slot_role}:{type(exc).__name__}",
                 )
         if not context.pins_changed:
             # A pure terminal re-attest (pane locators and pin content

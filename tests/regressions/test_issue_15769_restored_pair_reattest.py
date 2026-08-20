@@ -32,6 +32,7 @@ import unittest
 from pathlib import Path
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (
+    HerdrIdentityAttestationError,
     HerdrIdentityAttestationStore,
     IdentityAttestationRecord,
     VERDICT_MISSING,
@@ -78,6 +79,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     STATUS_BLOCKED,
     STATUS_COMPLETED,
     RestoredPairRebindRequest,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
+    verified_terminal_generation_token,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
     pane_bound_receipt,
@@ -471,8 +475,13 @@ class MovedPaneReattest(_Base):
         action = StartupTransactionFence(home=self.home).read(token)
         self.assertEqual(action.participant_for(GW_PROVIDER).locator, GW_NEW)
         self.assertEqual(action.participant_for(WK_PROVIDER).locator, WK_NEW)
-        # The launch-time receipts stay byte-identical (history, not identity).
-        self.assertIn(GW_TERM_OLD, action.participant_for(GW_PROVIDER).receipt)
+        # Round 2: the receipts were re-minted from server-owned facts — the
+        # terminal field is the LIVE terminal, container / native fields are
+        # carried byte-identically from the launch receipt.
+        gw_receipt = action.participant_for(GW_PROVIDER).receipt
+        self.assertIn(f"terminal={GW_TERM_NEW}", gw_receipt)
+        self.assertNotIn(GW_TERM_OLD, gw_receipt)
+        self.assertIn("workspace=w1 tab=w1:t1", gw_receipt)
         self.assertEqual(
             self.send_level_token(
                 name=GW_NAME, provider=GW_PROVIDER, locator=GW_NEW,
@@ -700,7 +709,7 @@ class ParticipantRepinFailClosed(_Base):
         token = self.seed_launch_time_pair()
         fence = StartupTransactionFence(home=self.home)
         with self.assertRaises(StartupTransactionError):
-            fence.repin_restored_participant_locator(
+            fence.repin_restored_participant(
                 token, GW_PROVIDER, assigned_name=GW_NAME,
                 expected_locator="w1:%99", new_locator=GW_NEW,
             )
@@ -711,7 +720,7 @@ class ParticipantRepinFailClosed(_Base):
         token = self.seed_launch_time_pair()
         fence = StartupTransactionFence(home=self.home)
         with self.assertRaises(StartupTransactionError):
-            fence.repin_restored_participant_locator(
+            fence.repin_restored_participant(
                 token, GW_PROVIDER, assigned_name=WK_NAME,
                 expected_locator=GW_OLD, new_locator=GW_NEW,
             )
@@ -721,7 +730,7 @@ class ParticipantRepinFailClosed(_Base):
         token = self.seed_action(phase=PHASE_LAUNCHING)
         fence = StartupTransactionFence(home=self.home)
         with self.assertRaises(StartupTransactionError):
-            fence.repin_restored_participant_locator(
+            fence.repin_restored_participant(
                 token, GW_PROVIDER, assigned_name=GW_NAME,
                 expected_locator=GW_OLD, new_locator=GW_NEW,
             )
@@ -730,7 +739,7 @@ class ParticipantRepinFailClosed(_Base):
         token = self.seed_launch_time_pair()
         fence = StartupTransactionFence(home=self.home)
         before = fence.read(token).participant_for(GW_PROVIDER)
-        fence.repin_restored_participant_locator(
+        fence.repin_restored_participant(
             token, GW_PROVIDER, assigned_name=GW_NAME,
             expected_locator=GW_OLD, new_locator=GW_NEW,
         )
@@ -743,6 +752,312 @@ class ParticipantRepinFailClosed(_Base):
         self.assertEqual(
             fence.read(token).participant_for(WK_PROVIDER).locator, WK_OLD
         )
+
+    def test_wrong_expected_receipt_refuses_the_remint(self):
+        token = self.seed_launch_time_pair()
+        fence = StartupTransactionFence(home=self.home)
+        before = fence.read(token).participant_for(GW_PROVIDER)
+        with self.assertRaises(StartupTransactionError):
+            fence.repin_restored_participant(
+                token, GW_PROVIDER, assigned_name=GW_NAME,
+                expected_locator=GW_OLD,
+                expected_receipt="pane_bound_v2 workspace=w1 tab=w1:t1 "
+                "native=other terminal=term-x",
+                new_receipt="whatever",
+            )
+        self.assertEqual(
+            fence.read(token).participant_for(GW_PROVIDER).receipt, before.receipt
+        )
+
+    def test_receipt_only_remint_swaps_only_the_receipt(self):
+        token = self.seed_launch_time_pair()
+        fence = StartupTransactionFence(home=self.home)
+        before = fence.read(token).participant_for(GW_PROVIDER)
+        new_receipt = pane_bound_receipt(
+            target_workspace="w1", target_tab="w1:t1",
+            native_name=native_name_for(GW_NAME), terminal_id=GW_TERM_NEW,
+        )
+        fence.repin_restored_participant(
+            token, GW_PROVIDER, assigned_name=GW_NAME,
+            expected_locator=GW_OLD,
+            expected_receipt=before.receipt, new_receipt=new_receipt,
+        )
+        after = fence.read(token).participant_for(GW_PROVIDER)
+        self.assertEqual(after.receipt, new_receipt)
+        self.assertEqual(after.locator, GW_OLD)
+
+    def test_half_specified_receipt_swap_refuses(self):
+        token = self.seed_launch_time_pair()
+        fence = StartupTransactionFence(home=self.home)
+        with self.assertRaises(StartupTransactionError):
+            fence.repin_restored_participant(
+                token, GW_PROVIDER, assigned_name=GW_NAME,
+                expected_locator=GW_OLD, new_receipt="orphan-new-receipt",
+            )
+
+
+class AttestationCasFailClosed(_Base):
+    """The attestation-store re-pin: exact expected old row, no upsert."""
+
+    def _store(self):
+        return HerdrIdentityAttestationStore(home=self.home)
+
+    def test_wrong_expected_terminal_refuses(self):
+        self.seed_launch_time_pair()
+        with self.assertRaises(HerdrIdentityAttestationError):
+            self._store().reattest_restored_terminal(
+                assigned_name=GW_NAME, workspace_id=WS, role=GW_PROVIDER,
+                lane_id=LANE, expected_locator=GW_OLD,
+                expected_terminal_id="term-wrong",
+                live_locator=GW_OLD, live_terminal_id=GW_TERM_NEW,
+            )
+        record = self._store().read(GW_NAME)
+        self.assertEqual((record.locator, record.terminal_id), (GW_OLD, GW_TERM_OLD))
+
+    def test_non_present_record_is_never_repinned(self):
+        self.seed_launch_time_pair()
+        self.attest(
+            GW_NAME, GW_PROVIDER, GW_OLD, GW_TERM_OLD, verdict=VERDICT_MISSING
+        )
+        with self.assertRaises(HerdrIdentityAttestationError):
+            self._store().reattest_restored_terminal(
+                assigned_name=GW_NAME, workspace_id=WS, role=GW_PROVIDER,
+                lane_id=LANE, expected_locator=GW_OLD,
+                expected_terminal_id=GW_TERM_OLD,
+                live_locator=GW_OLD, live_terminal_id=GW_TERM_NEW,
+            )
+        record = self._store().read(GW_NAME)
+        self.assertEqual(record.terminal_id, GW_TERM_OLD)
+
+    def test_absent_record_is_never_upserted(self):
+        self.seed_launch_time_pair()
+        ghost = encode_assigned_name(WS, "codex", "ghost_lane")
+        with self.assertRaises(HerdrIdentityAttestationError):
+            self._store().reattest_restored_terminal(
+                assigned_name=ghost, workspace_id=WS, role=GW_PROVIDER,
+                lane_id=LANE, expected_locator=GW_OLD,
+                expected_terminal_id=GW_TERM_OLD,
+                live_locator=GW_OLD, live_terminal_id=GW_TERM_NEW,
+            )
+        self.assertIsNone(self._store().read(ghost))
+
+    def test_noop_repin_is_refused_typed(self):
+        self.seed_launch_time_pair()
+        with self.assertRaises(HerdrIdentityAttestationError):
+            self._store().reattest_restored_terminal(
+                assigned_name=GW_NAME, workspace_id=WS, role=GW_PROVIDER,
+                lane_id=LANE, expected_locator=GW_OLD,
+                expected_terminal_id=GW_TERM_OLD,
+                live_locator=GW_OLD, live_terminal_id=GW_TERM_OLD,
+            )
+
+
+class ProductionQueueEnterConjunct(_Base):
+    """Round-2 finding 1: the PRODUCTION delivery conjunct passes post-rail.
+
+    ``verified_terminal_generation_token`` is the exact function the queue-enter
+    binding (`handoff_herdr_queue_enter_rail.observe_queue_enter_gateway_binding`)
+    calls, with the terminal-bound receipt proof it always supplies; the binding
+    additionally requires the ATTESTATION record's locator / terminal to equal
+    the live slot. Both legs are pinned here on the server-swap fixture: empty
+    before the rail, the real token after.
+    """
+
+    def _production_token(self, *, name, provider, locator, terminal) -> str:
+        return verified_terminal_generation_token(
+            self.home,
+            assigned_name=name,
+            workspace_id=WS,
+            role=provider,
+            lane_id=LANE,
+            locator=locator,
+            terminal_id=terminal,
+        )
+
+    def test_preserved_pane_conjunct_is_empty_before_and_token_after(self):
+        token = self.seed_launch_time_pair()
+        # Launch-time sanity: the production conjunct holds for the OLD terminal.
+        self.assertEqual(
+            self._production_token(
+                name=GW_NAME, provider=GW_PROVIDER, locator=GW_OLD,
+                terminal=GW_TERM_OLD,
+            ),
+            token,
+        )
+        # The reviewer's probe: after the swap, the production conjunct refuses.
+        self.assertEqual(
+            self._production_token(
+                name=GW_NAME, provider=GW_PROVIDER, locator=GW_OLD,
+                terminal=GW_TERM_NEW,
+            ),
+            "",
+        )
+        outcome = self.run_rail(
+            _TestOps(self.home, _preserved_pane_rows()), execute=True
+        )
+        self.assertEqual(outcome.status, STATUS_COMPLETED, outcome.detail)
+        # Post-rail: the production conjunct passes with the NEW live terminal...
+        self.assertEqual(
+            self._production_token(
+                name=GW_NAME, provider=GW_PROVIDER, locator=GW_OLD,
+                terminal=GW_TERM_NEW,
+            ),
+            token,
+        )
+        self.assertEqual(
+            self._production_token(
+                name=WK_NAME, provider=WK_PROVIDER, locator=WK_OLD,
+                terminal=WK_TERM_NEW,
+            ),
+            token,
+        )
+        # ...and the OLD terminal no longer borrows the token.
+        self.assertEqual(
+            self._production_token(
+                name=GW_NAME, provider=GW_PROVIDER, locator=GW_OLD,
+                terminal=GW_TERM_OLD,
+            ),
+            "",
+        )
+        # The queue-enter binding's attestation legs: the record now pins the
+        # live locator + terminal (equality conjuncts at the binding site).
+        record = HerdrIdentityAttestationStore(home=self.home).read(GW_NAME)
+        self.assertEqual(record.locator, GW_OLD)
+        self.assertEqual(record.terminal_id, GW_TERM_NEW)
+        self.assertEqual(record.verdict, VERDICT_PRESENT)
+        self.assertEqual(record.observed_at, OBSERVED_AT)  # boot observation kept
+
+    def test_moved_pane_conjunct_passes_with_new_locator_and_terminal(self):
+        token = self.seed_launch_time_pair()
+        self.assertEqual(
+            self._production_token(
+                name=GW_NAME, provider=GW_PROVIDER, locator=GW_NEW,
+                terminal=GW_TERM_NEW,
+            ),
+            "",
+        )
+        outcome = self.run_rail(_TestOps(self.home, _moved_pane_rows()), execute=True)
+        self.assertEqual(outcome.status, STATUS_COMPLETED, outcome.detail)
+        self.assertEqual(
+            self._production_token(
+                name=GW_NAME, provider=GW_PROVIDER, locator=GW_NEW,
+                terminal=GW_TERM_NEW,
+            ),
+            token,
+        )
+        record = HerdrIdentityAttestationStore(home=self.home).read(GW_NAME)
+        self.assertEqual((record.locator, record.terminal_id), (GW_NEW, GW_TERM_NEW))
+
+    def test_rollback_owed_production_conjunct_passes_post_rail(self):
+        # The #15712 live-preserved rollback_owed shape: the production wrapper
+        # supplies the receipt proof AND requires the participant's own
+        # attestation event — both must hold after the re-mint.
+        token = self.seed_launch_time_pair(phase=PHASE_ROLLBACK_OWED)
+        self.assertEqual(
+            self._production_token(
+                name=GW_NAME, provider=GW_PROVIDER, locator=GW_OLD,
+                terminal=GW_TERM_NEW,
+            ),
+            "",
+        )
+        outcome = self.run_rail(
+            _TestOps(self.home, _preserved_pane_rows()), execute=True
+        )
+        self.assertEqual(outcome.status, STATUS_COMPLETED, outcome.detail)
+        self.assertEqual(
+            self._production_token(
+                name=GW_NAME, provider=GW_PROVIDER, locator=GW_OLD,
+                terminal=GW_TERM_NEW,
+            ),
+            token,
+        )
+
+    def test_lineage_reports_the_receipt_and_attestation_repins(self):
+        self.seed_launch_time_pair()
+        outcome = self.run_rail(
+            _TestOps(self.home, _preserved_pane_rows()), execute=True
+        )
+        lineage = {e["slot_role"]: e for e in outcome.plan.reattest_lineage}
+        gw = lineage["gateway"]
+        self.assertTrue(gw["participant_receipt_reminted"])
+        self.assertTrue(gw["attestation_repin"])
+        self.assertTrue(gw["generation_reattested"])
+        self.assertFalse(gw["participant_locator_repin"])
+        self.assertIn("participant_lineage_join", gw["evidence"])
+        self.assertIn("participant_receipt_reminted", gw["evidence"])
+        # Receipt BYTES never ride any payload.
+        self.assertNotIn("pane_bound", str(outcome.as_payload()))
+
+
+class FabricatedLiveBoundZeroWrite(_Base):
+    """Round-2 finding 2: a fabricated `live_bound` row never bypasses the join."""
+
+    def _seed_fabricated(self, *, moved: bool) -> str:
+        """Fence + attestation at the launch-time truth, generation row FABRICATED
+        to already claim the live values (the probe shape: nothing else moved)."""
+        self.declare()
+        token = self.seed_action()
+        gw_locator = GW_NEW if moved else GW_OLD
+        self.seed_generation(
+            token, name=GW_NAME, provider=GW_PROVIDER, locator=gw_locator,
+            terminal=GW_TERM_NEW,
+        )
+        self.seed_generation(
+            token, name=WK_NAME, provider=WK_PROVIDER, locator=WK_OLD,
+            terminal=WK_TERM_OLD,
+        )
+        self.attest(GW_NAME, GW_PROVIDER, GW_OLD, GW_TERM_OLD)
+        self.attest(WK_NAME, WK_PROVIDER, WK_OLD, WK_TERM_OLD)
+        return token
+
+    def _assert_zero_write(self, token: str, *, gw_locator: str):
+        record = LaneLifecycleStore(home=self.home).get(KEY)
+        self.assertEqual(record.revision, 1)
+        pair = read_declared_pin_pair(record)
+        self.assertEqual(pair.gateway.locator, GW_OLD)
+        self.assertEqual(pair.worker.locator, WK_OLD)
+        action = StartupTransactionFence(home=self.home).read(token)
+        self.assertEqual(action.participant_for(GW_PROVIDER).locator, GW_OLD)
+        self.assertIn(
+            f"terminal={GW_TERM_OLD}", action.participant_for(GW_PROVIDER).receipt
+        )
+        attestation = HerdrIdentityAttestationStore(home=self.home).read(GW_NAME)
+        self.assertEqual(
+            (attestation.locator, attestation.terminal_id), (GW_OLD, GW_TERM_OLD)
+        )
+        generation = self.generation(GW_NAME)
+        self.assertEqual(
+            (generation.locator, generation.terminal_id),
+            (gw_locator, GW_TERM_NEW),
+        )
+
+    def test_moved_pane_fabricated_row_is_a_typed_refusal_with_zero_writes(self):
+        # The reviewer's probe: participants remain at the OLD locators, the
+        # generation row fabricates the live binding, the pane moved. The pins
+        # must NOT be rewritten.
+        token = self._seed_fabricated(moved=True)
+        outcome = self.run_rail(_TestOps(self.home, _moved_pane_rows()), execute=True)
+        self.assertEqual(outcome.status, STATUS_BLOCKED)
+        self.assertIn(
+            "participant_repin_unresolved:gateway",
+            ",".join(outcome.plan.blocked_reasons),
+        )
+        self._assert_zero_write(token, gw_locator=GW_NEW)
+
+    def test_preserved_pane_fabricated_row_is_refused_on_the_receipt_leg(self):
+        # Same fabrication with an unmoved pane: the participant locator is
+        # consistent by accident, but the receipt's terminal is neither the
+        # live one nor the fabricated row's — the lineage join still refuses.
+        token = self._seed_fabricated(moved=False)
+        outcome = self.run_rail(
+            _TestOps(self.home, _preserved_pane_rows()), execute=True
+        )
+        self.assertEqual(outcome.status, STATUS_BLOCKED)
+        self.assertIn(
+            "participant_repin_unresolved:gateway",
+            ",".join(outcome.plan.blocked_reasons),
+        )
+        self._assert_zero_write(token, gw_locator=GW_OLD)
 
 
 class CliContract(unittest.TestCase):

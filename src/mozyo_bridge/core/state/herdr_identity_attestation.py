@@ -516,6 +516,108 @@ class HerdrIdentityAttestationStore:
             terminal_id=record.terminal_id,
         )
 
+    def reattest_restored_terminal(
+        self,
+        *,
+        assigned_name: str,
+        workspace_id: str,
+        role: str,
+        lane_id: str,
+        expected_locator: str,
+        expected_terminal_id: str,
+        live_locator: str,
+        live_terminal_id: str,
+    ) -> None:
+        """CAS ONLY ``locator`` / ``terminal_id`` of one restored slot's record (#15769).
+
+        A Herdr/tmux server loss restores the SAME booted process under a NEW
+        server-owned terminal id (and possibly a moved pane), while this record keeps
+        the boot-time generation pin, so :func:`evaluate_attestation` — deliberately
+        unchanged — reads ``stale`` forever and the queue-enter delivery join refuses.
+        The record's *observation* (the agent verified its own identity env at boot)
+        is still true of the still-running process; only the generation pin moved with
+        the server restore. Only the GOVERNED restored-pair rebind rail calls this,
+        after proving the identity join on server-owned inventory facts (the same join
+        that drives the launch-generation CAS); a caller can never supply the values
+        that drive the write.
+
+        Fail-closed, mirroring the launch-generation re-attest CAS: the exact expected
+        old row is required — identity (assigned name / workspace / role / lane), the
+        expected old ``locator`` / ``terminal_id``, and ``verdict == present`` must all
+        match byte-exactly or zero rows update and this raises. Never an upsert, a
+        no-op request is refused, and ``verdict`` / ``detail`` / ``observed_at`` /
+        ``replacement_action_id`` / ``lane_epoch`` stay byte-untouched (they remain
+        the boot observation). Requires the terminal-bound v4 store — an older schema
+        cannot even hold the pin being re-attested and refuses byte-unchanged.
+        """
+        fields = {
+            "assigned_name": _norm(assigned_name),
+            "workspace_id": _norm(workspace_id),
+            "role": _norm(role),
+            "lane_id": _norm(lane_id),
+            "expected_locator": _norm(expected_locator),
+            "expected_terminal_id": _norm(expected_terminal_id),
+            "live_locator": _norm(live_locator),
+            "live_terminal_id": _norm(live_terminal_id),
+        }
+        required = dict(fields)
+        required.pop("lane_id")  # an empty lane is the workspace-default lane
+        if any(not value for value in required.values()):
+            raise HerdrIdentityAttestationError(
+                "restored-terminal attestation re-attest requires every identity and "
+                "generation token to be non-empty; refusing a blank axis"
+            )
+        if (
+            fields["expected_locator"] == fields["live_locator"]
+            and fields["expected_terminal_id"] == fields["live_terminal_id"]
+        ):
+            raise HerdrIdentityAttestationError(
+                "restored-terminal attestation re-attest refused: the expected and "
+                "live values are identical (nothing to re-attest)"
+            )
+        with attestation_store_lock(self.path.parent, exclusive=False, blocking=True):
+            if not self.path.exists():
+                raise HerdrIdentityAttestationError(
+                    "cannot re-attest an attestation: the store does not exist"
+                )
+            conn, version = _connect_rw(self.path)
+            try:
+                if write_drops_terminal_id(version, fields["live_terminal_id"]):
+                    raise HerdrIdentityAttestationError(
+                        f"herdr identity attestation store {self.path} is schema "
+                        f"v{version}, which cannot hold the server-owned terminal pin "
+                        "this re-attest moves; the store is left untouched. Migrate it "
+                        "first: `mozyo-bridge herdr attestation-store migrate --write`."
+                    )
+                with conn:
+                    cursor = conn.execute(
+                        "UPDATE herdr_identity_attestations "
+                        "SET locator = ?, terminal_id = ? "
+                        "WHERE assigned_name = ? AND workspace_id = ? AND role = ? "
+                        "AND lane_id = ? AND locator = ? AND terminal_id = ? "
+                        "AND verdict = ?",
+                        (
+                            fields["live_locator"],
+                            fields["live_terminal_id"],
+                            fields["assigned_name"],
+                            fields["workspace_id"],
+                            fields["role"],
+                            fields["lane_id"],
+                            fields["expected_locator"],
+                            fields["expected_terminal_id"],
+                            VERDICT_PRESENT,
+                        ),
+                    )
+                    if cursor.rowcount != 1:
+                        raise HerdrIdentityAttestationError(
+                            "restored-terminal attestation re-attest compare-and-set "
+                            "was refused (no present record matches this exact "
+                            "identity and expected old locator / terminal — the row "
+                            "may be absent, foreign, non-present, or already moved)"
+                        )
+            finally:
+                conn.close()
+
     def assigned_names(self) -> Optional[frozenset]:
         """The assigned names carrying a record here, or ``None`` when **unmeasurable**.
 
