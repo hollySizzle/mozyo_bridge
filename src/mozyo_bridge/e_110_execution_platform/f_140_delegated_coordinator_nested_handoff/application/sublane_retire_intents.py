@@ -63,9 +63,17 @@ def dispatch_retire_intent(
     may_retire: bool,
     worktree: Optional[str],
     evidence_target=None,
+    absent_worktree=None,
 ) -> RetireIntentResults:
     """Run the one selected retire intent, or none (preflight-only). Never raises for a
     non-selected intent: an unset flag simply does not enter its branch.
+
+    ``absent_worktree`` (Redmine #15789) is the already-resolved, already-admissible
+    absent-checkout evidence for the two BOUND terminal retires, or ``None``. It is resolved by
+    the caller — :func:`...sublane_retire_application.run_retire_application` — because the
+    retire preflight's checkout scope depends on it: proving the absence only here would leave
+    that preflight deciding scope from an unproven assertion. Passing it through unchanged keeps
+    the single resolution point.
     """
     from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_lifecycle_command import (  # noqa: E501
         LiveSublaneLifecycleOps,
@@ -181,6 +189,7 @@ def dispatch_retire_intent(
                 head_integrated=head_integrated,
                 worktree_branch=worktree_branch,
                 patch_equivalent=patch_equivalent,
+                absent_worktree=absent_worktree,
             )
     elif getattr(args, "retire_active_live_zero", False):
         # Redmine #14242: the metadata-only TERMINAL retire for an ACTIVE bound row whose live
@@ -216,6 +225,7 @@ def dispatch_retire_intent(
                 head_integrated=head_integrated,
                 worktree_branch=worktree_branch,
                 patch_equivalent=patch_equivalent,
+                absent_worktree=absent_worktree,
             )
     elif getattr(args, "retire_active_unbound_live_zero", False):
         # Redmine #14499: the metadata-only TERMINAL retire for an ACTIVE row that records NO

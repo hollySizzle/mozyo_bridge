@@ -53,6 +53,23 @@ REASON_IDENTITY_UNRESOLVED = "retire_identity_unresolved"
 REASON_IDENTITY_CHANGED = "retire_identity_changed"
 REASON_APPLICATION_ERROR = "retire_application_error"
 REASON_CLEANUP_ATOMIC_GUARD_UNAVAILABLE = "cleanup_atomic_guard_unavailable"
+#: ``--worktree-absent`` (Redmine #15789) was combined with an intent it does not apply to. It
+#: modifies exactly the two BOUND terminal retires; the unbound rails never had a checkout in
+#: scope to begin with, and the guarded close / migration / reconcile intents genuinely need one.
+#: Rejected as a zero-write refusal rather than silently ignored, so the flag never reads as
+#: honoured where it changed nothing.
+REASON_WORKTREE_ABSENT_NOT_APPLICABLE = "worktree_absent_intent_not_applicable"
+#: ``--worktree-absent`` was supplied but its evidence did not verify and named no typed reason
+#: of its own. The resolver's own reason is reported verbatim whenever it has one (the #14695
+#: j#93807 F2 discipline); this is only the fallback.
+REASON_ABSENT_WORKTREE_UNPROVEN = "absent_worktree_unproven"
+
+#: The intents ``--worktree-absent`` modifies: the BOUND metadata-only terminal retires, whose
+#: whole effect is a lifecycle CAS and whose only use for the checkout was the two facts
+#: :mod:`...sublane_absent_worktree_evidence` re-derives from git's surviving entry.
+_WORKTREE_ABSENT_INTENTS = frozenset(
+    {RETIRE_INTENT_ACTIVE_LIVE_ZERO, RETIRE_INTENT_HIBERNATED_BOUND}
+)
 
 
 @dataclass(frozen=True)
@@ -111,6 +128,11 @@ class RetireApplicationRequest:
     expect_lane_revision: int = 0
     integration_journal: Optional[str] = None
     expected_identity: Optional[RetireIdentity] = None
+    #: Redmine #15789: the caller asserts the recorded checkout is GONE and opts the BOUND
+    #: terminal retire onto the git-administrative-entry evidence path. Default ``False`` keeps
+    #: every existing caller byte-for-byte: the checkout stays in preflight scope and a wiped
+    #: path still blocks with ``worktree_missing_after_reboot`` exactly as before.
+    worktree_absent: bool = False
 
     def __post_init__(self) -> None:
         if self.intent not in RETIRE_INTENTS:
@@ -148,6 +170,7 @@ class RetireApplicationRequest:
             retire_hibernated_unbound_live_zero=(
                 selected == RETIRE_INTENT_HIBERNATED_UNBOUND_LIVE_ZERO
             ),
+            worktree_absent=self.worktree_absent,
         )
 
 
@@ -233,6 +256,13 @@ def run_retire_application(request: RetireApplicationRequest) -> RetireApplicati
     )
 
     args = request.as_namespace()
+    # Redmine #15789: the flag is refused ahead of every read and every probe, so a
+    # non-applicable combination costs nothing and cannot be mistaken for a run that honoured it.
+    if request.worktree_absent and request.intent not in _WORKTREE_ABSENT_INTENTS:
+        return RetireApplicationResult(
+            state=RETIRE_RESULT_BLOCKED,
+            reason=REASON_WORKTREE_ABSENT_NOT_APPLICABLE,
+        )
     try:
         target = resolve_retire_evidence_target(
             args, request.repo_root, home=request.home
@@ -248,9 +278,39 @@ def run_retire_application(request: RetireApplicationRequest) -> RetireApplicati
                     state=RETIRE_RESULT_BLOCKED, reason=REASON_IDENTITY_CHANGED
                 )
 
-        checkout_in_scope = request.intent not in (
-            RETIRE_INTENT_ACTIVE_UNBOUND_LIVE_ZERO,
-            RETIRE_INTENT_HIBERNATED_UNBOUND_LIVE_ZERO,
+        # Redmine #15789: the absent-checkout evidence is resolved HERE, before the preflight
+        # decides scope, and a refusal ends the run. Deciding scope from the caller's assertion
+        # and leaving the proof to the intent rail was measurably wrong: a `--worktree-absent`
+        # preflight-only run (or one against a non-herdr repo, where the rail returns "not
+        # applicable" before its own guard) reported `retire_ok` for a checkout that was in fact
+        # PRESENT and dirty. The checkout only leaves scope once its absence is proven.
+        absent_worktree = None
+        if request.worktree_absent:
+            from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_absent_worktree_evidence import (  # noqa: E501
+                resolve_absent_worktree_evidence,
+            )
+
+            absent_worktree = resolve_absent_worktree_evidence(
+                request.repo_root,
+                worktree=request.worktree,
+                branch=request.branch,
+                lane_label=request.lane_label,
+            )
+            if not absent_worktree.admissible:
+                return RetireApplicationResult(
+                    state=RETIRE_RESULT_BLOCKED,
+                    reason=absent_worktree.reason or REASON_ABSENT_WORKTREE_UNPROVEN,
+                )
+        # A proven-absent checkout leaves preflight scope for the same reason the unbound rails'
+        # never entered it: a path that is not there can be neither dirty nor cleaned up, so
+        # neither probe describes the lane being terminalized.
+        checkout_in_scope = (
+            request.intent
+            not in (
+                RETIRE_INTENT_ACTIVE_UNBOUND_LIVE_ZERO,
+                RETIRE_INTENT_HIBERNATED_UNBOUND_LIVE_ZERO,
+            )
+            and absent_worktree is None
         )
         worktree_dirty_override = None
         worktree_missing = False
@@ -295,6 +355,7 @@ def run_retire_application(request: RetireApplicationRequest) -> RetireApplicati
             may_retire=True,
             worktree=request.worktree,
             evidence_target=target,
+            absent_worktree=absent_worktree,
         )
         verdict = intents.actuated
         if verdict is None:
@@ -349,5 +410,7 @@ __all__ = (
     "RETIRE_RESULT_ALREADY_RETIRED",
     "REASON_CLEANUP_ATOMIC_GUARD_UNAVAILABLE",
     "REASON_INTENT_NOT_APPLICABLE",
+    "REASON_ABSENT_WORKTREE_UNPROVEN",
+    "REASON_WORKTREE_ABSENT_NOT_APPLICABLE",
     "run_retire_application",
 )
