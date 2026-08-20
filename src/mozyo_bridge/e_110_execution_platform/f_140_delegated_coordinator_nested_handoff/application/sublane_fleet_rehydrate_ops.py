@@ -203,6 +203,11 @@ class LiveFleetRehydrateOps:
     repo_root: Path
     quiet_stdout: bool = False
     target_repo: str = "auto"
+    #: Managed-state home every action-time authority read resolves against (the lifecycle
+    #: row, the delivery ledger, the attestation store). ``None`` resolves the operator
+    #: default; a test points it at a temp home so the REAL methods can be exercised
+    #: hermetically — the gap that let a broken production fence ship green (j#109007).
+    home: Optional[Path] = None
 
     # -- identity -----------------------------------------------------------
 
@@ -216,7 +221,9 @@ class LiveFleetRehydrateOps:
         from mozyo_bridge.core.state.lane_lifecycle_schema import LaneLifecycleError
 
         try:
-            record = LaneLifecycleReader().get(LaneLifecycleKey(workspace_id, lane_id))
+            record = LaneLifecycleReader(home=self.home).get(
+                LaneLifecycleKey(workspace_id, lane_id)
+            )
         except (LaneLifecycleError, OSError):
             # Unreadable is NOT absent: returning None here makes the use case refuse,
             # which is the fail-closed direction (an unreadable authority never licenses
@@ -331,7 +338,7 @@ class LiveFleetRehydrateOps:
         """Re-read ledger + live inventory and re-fold this key (action-time, read-only)."""
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_fleet_rehydrate import (  # noqa: E501
             ledger_records_for_issue,
-            receiver_binding_for,
+            receiver_generation_for,
         )
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
             list_herdr_agent_rows,
@@ -343,7 +350,7 @@ class LiveFleetRehydrateOps:
         key = facts.dispatch if kind == KIND_IMPLEMENTATION_REQUEST else facts.resume_brief
         if not key.anchor_journal:
             return DISPATCH_NOT_APPLICABLE
-        records, detail = ledger_records_for_issue(key.anchor_issue, home=None)
+        records, _detail = ledger_records_for_issue(key.anchor_issue, home=self.home)
         if records is None:
             return DISPATCH_UNREADABLE
         try:
@@ -353,19 +360,19 @@ class LiveFleetRehydrateOps:
             # placed, and an unplaceable record is never folded into "owed".
             return DISPATCH_ATTRIBUTION_UNKNOWN
         receiver = facts.managed_roles[0] if facts.managed_roles else ""
-        binding = receiver_binding_for(
+        generation = receiver_generation_for(
             rows,
+            home=self.home,
             workspace_id=facts.workspace_id,
             lane_id=facts.lane_id,
             role=receiver,
-            managed_roles=facts.managed_roles,
         )
         return fold_dispatch_state(
             records,
             marker=key.marker,
             kind=kind,
             receiver=receiver,
-            binding=binding,
+            generation=generation,
         )
 
     def send_resume_brief(self, facts: FleetLaneFacts, *, gateway_target: str) -> int:

@@ -66,7 +66,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCK_STARTUP_INTERACTION,
     DISPATCH_ATTRIBUTION_UNKNOWN,
     DISPATCH_DELIVERED,
+    DISPATCH_NOT_APPLICABLE,
     DISPATCH_OWED,
+    DISPATCH_UNREADABLE,
     REHYDRATE,
     SKIP,
     SKIP_IDLE,
@@ -597,6 +599,186 @@ class StartupScreenObservationTests(unittest.TestCase):
             STARTUP_SCREEN_NOT_PROBED,
         )
         self.assertEqual(reads, [], "a pane with no provider process carries no screen")
+
+
+class LiveOpsProductionWiringTests(unittest.TestCase):
+    """The REAL adapter, through the REAL imports (Redmine #15745 review j#109007).
+
+    Every other suite for this rail substitutes a fake ops port, so the production
+    ``LiveFleetRehydrateOps`` methods were never executed — and an action-time fence that
+    raised ``ImportError`` on its first line shipped with 117 green tests. These exercise the
+    adapter itself against a temp home, and add a drift guard over the whole defect class:
+    a name that only a method body imports must still resolve.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.home = Path(self._tmp.name) / "home"
+        self.home.mkdir()
+        self.addCleanup(self._tmp.cleanup)
+
+    def _ops(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_fleet_rehydrate_ops import (  # noqa: E501
+            LiveFleetRehydrateOps,
+        )
+
+        return LiveFleetRehydrateOps(repo_root=Path.cwd(), home=self.home)
+
+    def _facts(self, *, journal=ANCHOR, roles=(GATEWAY, WORKER)):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.fleet_rehydrate import (  # noqa: E501
+            FleetLaneFacts,
+            LaneDispatchFact,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.reboot_residue_convergence import (  # noqa: E501
+            RebootLaneFacts,
+        )
+
+        marker = redmine_marker(ISSUE, journal, KIND_IMPLEMENTATION_REQUEST, GATEWAY)
+        return FleetLaneFacts(
+            reboot=RebootLaneFacts(
+                workspace_id=WORKSPACE, lane_id=LANE, issue_id=ISSUE
+            ),
+            managed_roles=tuple(roles),
+            dispatch=LaneDispatchFact(
+                state=DISPATCH_OWED,
+                anchor_issue=ISSUE,
+                anchor_journal=journal,
+                marker=marker,
+            ),
+        )
+
+    def _state(self, facts, *, rows):
+        """Drive the real method with only the live-herdr edge faked."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_herdr_projection as live_projection,
+        )
+
+        with mock.patch.object(
+            live_projection, "list_herdr_agent_rows", return_value=rows
+        ):
+            return self._ops().current_dispatch_state(
+                facts, kind=KIND_IMPLEMENTATION_REQUEST
+            )
+
+    # -- the finding itself ------------------------------------------------
+
+    def test_the_action_time_fence_runs_and_returns_a_typed_state(self):
+        """j#109007: this raised ImportError before the send on every execute run."""
+        state = self._state(self._facts(), rows=[])
+        self.assertIn(
+            state,
+            {
+                DISPATCH_OWED,
+                DISPATCH_DELIVERED,
+                DISPATCH_ATTRIBUTION_UNKNOWN,
+            },
+            "the fence must return a closed token, not raise",
+        )
+        self.assertEqual(state, DISPATCH_OWED, "nothing recorded for this key")
+
+    def test_an_unreadable_inventory_is_attribution_unknown_not_owed(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_session_start import (  # noqa: E501
+            HerdrSessionStartError,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_herdr_projection as live_projection,
+        )
+
+        with mock.patch.object(
+            live_projection,
+            "list_herdr_agent_rows",
+            side_effect=HerdrSessionStartError("no herdr"),
+        ):
+            state = self._ops().current_dispatch_state(
+                self._facts(), kind=KIND_IMPLEMENTATION_REQUEST
+            )
+        self.assertEqual(state, DISPATCH_ATTRIBUTION_UNKNOWN)
+
+    def test_an_absent_anchor_is_not_applicable(self):
+        facts = self._facts(journal="")
+        self.assertEqual(self._state(facts, rows=[]), DISPATCH_NOT_APPLICABLE)
+
+    def test_an_unreadable_ledger_is_unreadable_not_owed(self):
+        (self.home / "herdr-delivery-ledger.sqlite").write_bytes(b"not a database")
+        self.assertEqual(
+            self._state(self._facts(), rows=[]), DISPATCH_UNREADABLE
+        )
+
+    def test_a_confirmed_delivery_to_a_dead_receiver_is_still_owed(self):
+        """The R3 attribution, exercised through the production fence rather than a fake."""
+        self._seed_delivery_for_wiring()
+        self.assertEqual(self._state(self._facts(), rows=[]), DISPATCH_OWED)
+
+    def _seed_delivery_for_wiring(self):
+        from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
+            encode_assigned_name,
+        )
+
+        marker = redmine_marker(ISSUE, ANCHOR, KIND_IMPLEMENTATION_REQUEST, GATEWAY)
+        HerdrDeliveryLedger(home=self.home).append(
+            HerdrDeliveryLedgerRecord(
+                notification_marker=marker,
+                receiver=GATEWAY,
+                source="redmine",
+                issue_id=ISSUE,
+                journal_id=ANCHOR,
+                status="sent",
+                reason="ok",
+                rail=RAIL_EVENT,
+                target=GATEWAY_LOCATOR,
+                queue_enter_observation={
+                    "gateway_binding": {
+                        "assigned_name": encode_assigned_name(WORKSPACE, GATEWAY, LANE),
+                        "row_revision": GATEWAY_REVISION,
+                    }
+                },
+            )
+        )
+
+    def test_current_identity_reads_the_injected_home(self):
+        """The other real adapter method, so it is not the next one to drift unnoticed."""
+        self.assertIsNone(
+            self._ops().current_identity(workspace_id=WORKSPACE, lane_id=LANE),
+            "an empty home has no row for this lane",
+        )
+
+    # -- the defect CLASS --------------------------------------------------
+
+    def test_every_lazy_import_in_the_rail_resolves(self):
+        """A name only a method body imports must still exist (the j#109007 class).
+
+        Module-level imports are checked when the module loads; names imported inside a
+        function are not, so a rename can leave a production call site broken while every
+        module still imports cleanly and every fake-backed test stays green. This walks the
+        rail's own modules and resolves each imported name.
+        """
+        import ast
+        import importlib
+
+        modules = (
+            "domain/fleet_rehydrate.py",
+            "domain/fleet_rehydrate_dispatch_fold.py",
+            "application/sublane_fleet_rehydrate.py",
+            "application/sublane_fleet_rehydrate_ops.py",
+        )
+        root = (
+            ROOT
+            / "src/mozyo_bridge/e_110_execution_platform"
+            / "f_140_delegated_coordinator_nested_handoff"
+        )
+        unresolved = []
+        for relative in modules:
+            tree = ast.parse((root / relative).read_text())
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.ImportFrom) or node.level:
+                    continue
+                imported = importlib.import_module(node.module)
+                for alias in node.names:
+                    if not hasattr(imported, alias.name):
+                        unresolved.append(
+                            f"{relative}:{node.lineno} {node.module}.{alias.name}"
+                        )
+        self.assertEqual(unresolved, [], "a lazy import names something that is gone")
 
 
 if __name__ == "__main__":  # pragma: no cover
