@@ -537,9 +537,7 @@ class HerdrSublaneActuatorOps:
             lane_id=lane_id,
             providers=providers,
             rows=rows,
-            # #15774: the --lane-kind assertion reaches the adopt declaration too, so a
-            # supersede-minted kind-empty row regains its kind via a governed re-create.
-            lane_kind=self.lane_kind or "",
+            lane_kind=self.lane_kind or "",  # #15774: kind reaches the adopt declare/backfill
         )
         if outcome == ADOPT_DECL_DECLARE_ERROR:
             print(
