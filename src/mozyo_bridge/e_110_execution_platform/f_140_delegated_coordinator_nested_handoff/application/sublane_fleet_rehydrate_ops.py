@@ -43,6 +43,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     BLOCKED,
     BLOCK_LANE_MOVED,
     DISPATCH_ATTRIBUTION_UNKNOWN,
+    DISPATCH_DELIVERED,
     DISPATCH_NOT_APPLICABLE,
     DISPATCH_OWED,
     DISPATCH_UNREADABLE,
@@ -92,6 +93,9 @@ class LaneActuationOutcome:
     status: str
     applied: tuple[str, ...] = ()
     attempted: tuple[str, ...] = ()
+    #: Planned actions the action-time re-fold found already discharged. Not failures and
+    #: not applications — naming them keeps `attempted` minus `applied` unambiguous.
+    dropped: tuple[str, ...] = ()
     reason: str = ""
     detail: str = ""
     gateway_target: str = ""
@@ -103,6 +107,7 @@ class LaneActuationOutcome:
             "status": self.status,
             "applied": list(self.applied),
             "attempted": list(self.attempted),
+            "dropped": list(self.dropped),
             "reason": self.reason,
             "detail": self.detail,
             "gateway_target": self.gateway_target,
@@ -154,10 +159,23 @@ class FleetRehydrateOps(Protocol):
         """The lane's lifecycle identity right now (``None`` when unreadable / absent)."""
         ...
 
-    def heal_lane(self, facts: FleetLaneFacts, *, dispatch: bool) -> HealResult:
-        """Adopt-or-launch the lane's pair, optionally re-issuing its anchored dispatch.
+    def heal_lane(self, facts: FleetLaneFacts) -> HealResult:
+        """Adopt-or-launch the lane's pair — and NOTHING else (review j#108953).
+
+        The composed create is driven with its dispatch leg OFF. Its own send sits behind
+        worktree create/adopt, pane append, stamping and a bounded readiness wait, so a
+        fence at the create's entry is not a fence before the send. The dispatch is issued
+        separately by :meth:`send_dispatch`, immediately after its own fresh re-fold.
 
         A non-``ok`` result means nothing further may be attempted for that lane.
+        """
+        ...
+
+    def send_dispatch(self, facts: FleetLaneFacts, *, gateway_target: str) -> int:
+        """Issue the lane's anchored implementation_request to ``gateway_target``.
+
+        Uses the SAME canonical composer the create's dispatch leg uses, so no second
+        transport, argv or rail is introduced — only the fence in front of it moves.
         """
         ...
 
@@ -250,10 +268,19 @@ class LiveFleetRehydrateOps:
             lane_kind=facts.lane_kind,
         )
 
-    def heal_lane(self, facts: FleetLaneFacts, *, dispatch: bool) -> HealResult:
+    def _sublane_ops(self, request: SublaneCreateRequest):
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator import (  # noqa: E501
             _resolve_sublane_ops,
         )
+
+        return _resolve_sublane_ops(
+            SimpleNamespace(),
+            repo_root=self.repo_root,
+            request=request,
+            quiet_stdout=self.quiet_stdout,
+        )
+
+    def heal_lane(self, facts: FleetLaneFacts) -> HealResult:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_use_case import (  # noqa: E501
             SublaneActuateUseCase,
         )
@@ -261,16 +288,11 @@ class LiveFleetRehydrateOps:
         request = self._create_request(facts)
         if request is None:
             return HealResult(ok=False, reason=REFUSED_LANE_IDENTITY_INCOMPLETE)
-        ops = _resolve_sublane_ops(
-            SimpleNamespace(),
-            repo_root=self.repo_root,
-            request=request,
-            quiet_stdout=self.quiet_stdout,
-        )
-        outcome = SublaneActuateUseCase(ops).run(
+        outcome = SublaneActuateUseCase(self._sublane_ops(request)).run(
             request,
             execute=True,
-            dispatch=dispatch,
+            # ALWAYS off: the dispatch is fenced and issued separately (j#108953).
+            dispatch=False,
             target_repo=self.target_repo,
             fill_inputs=None,
             override_fill_stop=None,
@@ -278,11 +300,32 @@ class LiveFleetRehydrateOps:
         gateway = (getattr(outcome, "gateway_pane", "") or "").strip()
         if outcome.is_blocked:
             return HealResult(
-                ok=False,
-                gateway_target=gateway,
-                reason=REFUSED_DISPATCH_FAILED if dispatch else REFUSED_HEAL_FAILED,
+                ok=False, gateway_target=gateway, reason=REFUSED_HEAL_FAILED
             )
         return HealResult(ok=True, gateway_target=gateway)
+
+    def send_dispatch(self, facts: FleetLaneFacts, *, gateway_target: str) -> int:
+        """Drive the canonical create-side dispatch composer against a resolved gateway."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_actuator_ops import (  # noqa: E501
+            drive_dispatch_implementation_request,
+        )
+
+        request = self._create_request(facts)
+        if request is None or not gateway_target:
+            return 1
+        try:
+            attempt = drive_dispatch_implementation_request(
+                self._sublane_ops(request),
+                issue=request.issue,
+                journal=(request.journal or ""),
+                gateway_pane=gateway_target,
+                lane_label=request.lane_label,
+                upstream_coordinator=request.resolved_upstream_coordinator(),
+                target_repo=self.target_repo,
+            )
+        except SystemExit as exc:  # a tmux-era primitive's die() is a refusal, not a crash
+            return int(exc.code or 1)
+        return int(getattr(attempt, "exit_code", 1) or 0)
 
     def current_dispatch_state(self, facts: FleetLaneFacts, *, kind: str) -> str:
         """Re-read ledger + live inventory and re-fold this key (action-time, read-only)."""
@@ -427,35 +470,15 @@ class FleetRehydrateUseCase:
 
         applied: list[str] = []
         attempted: list[str] = []
-        heal = plan.has(ACTION_HEAL_PAIR)
-        restore = plan.has(ACTION_RESTORE_DISPATCH)
+        dropped: list[str] = []
         gateway_target = self._observed_gateway(facts)
 
-        if restore:
-            # The LAST thing before the composed create's dispatch leg: re-fold this key
-            # against freshly-read authorities (review j#108920 finding_actiontimefence).
-            # A key that stopped being `owed` between the plan and here must not be sent.
-            fresh = self.ops.current_dispatch_state(
-                facts, kind=KIND_IMPLEMENTATION_REQUEST
-            )
-            if fresh != DISPATCH_OWED:
-                if not heal:
-                    return self._dispatch_state_moved(
-                        plan, applied, (ACTION_RESTORE_DISPATCH,), fresh, gateway_target
-                    )
-                # The pair still needs bringing up; drop only the send. Healing a lane is
-                # additive and is not invalidated by the dispatch having landed elsewhere.
-                restore = False
-
-        if heal or restore:
-            # ONE composed `sublane create --execute` covers both: its adopt-or-launch is
-            # idempotent for a surviving pair, and its dispatch leg is the governed send.
-            # Running them as two rails would either double-adopt or invent a second
-            # dispatch path.
-            attempted.append(ACTION_HEAL_PAIR if heal else ACTION_RESTORE_DISPATCH)
-            if heal and restore:
-                attempted.append(ACTION_RESTORE_DISPATCH)
-            result = self.ops.heal_lane(facts, dispatch=restore)
+        if plan.has(ACTION_HEAL_PAIR):
+            # Adopt-or-launch ONLY. The create's own dispatch leg stays off, because its
+            # send sits behind pane append, stamping and a bounded readiness wait — a fence
+            # at the create's entry is not a fence before the send (review j#108953).
+            attempted.append(ACTION_HEAL_PAIR)
+            result = self.ops.heal_lane(facts)
             if result.gateway_target:
                 gateway_target = result.gateway_target
             if not result.ok:
@@ -470,57 +493,28 @@ class FleetRehydrateUseCase:
                     "remaining actions were not attempted",
                     gateway_target=gateway_target,
                 )
-            if heal:
-                applied.append(ACTION_HEAL_PAIR)
-            if restore:
-                applied.append(ACTION_RESTORE_DISPATCH)
+            applied.append(ACTION_HEAL_PAIR)
 
-        if plan.has(ACTION_RESUME_BRIEF):
-            attempted.append(ACTION_RESUME_BRIEF)
-            # The heal above launched processes and ran a governed send; that window is
-            # long enough for the lane to move or for this very brief to land by another
-            # path. Re-join BOTH authorities immediately before the brief's own send
-            # (review j#108920 finding_actiontimefence) — "once before the lane's first
-            # effect" is exactly the shape #14661 j#92656 F2 rejected.
-            moved = self._identity_moved(facts)
-            if moved is not None:
-                return LaneActuationOutcome(
-                    lane_id=plan.lane_id,
-                    issue_id=plan.issue_id,
-                    status=STATUS_BLOCKED,
-                    applied=tuple(applied),
-                    attempted=tuple(attempted),
-                    reason=BLOCK_LANE_MOVED,
-                    detail=moved,
-                    gateway_target=gateway_target,
-                )
-            fresh_brief = self.ops.current_dispatch_state(facts, kind=KIND_REPLY)
-            if fresh_brief != DISPATCH_OWED:
-                return self._dispatch_state_moved(
-                    plan, applied, tuple(attempted), fresh_brief, gateway_target
-                )
-            if not gateway_target:
-                return LaneActuationOutcome(
-                    lane_id=plan.lane_id,
-                    issue_id=plan.issue_id,
-                    status=STATUS_BLOCKED,
-                    applied=tuple(applied),
-                    attempted=tuple(attempted),
-                    reason=REFUSED_GATEWAY_UNRESOLVED,
-                    detail="no gateway target resolved for the brief; nothing was sent",
-                )
-            if self.ops.send_resume_brief(facts, gateway_target=gateway_target) != 0:
-                return LaneActuationOutcome(
-                    lane_id=plan.lane_id,
-                    issue_id=plan.issue_id,
-                    status=STATUS_BLOCKED,
-                    applied=tuple(applied),
-                    attempted=tuple(attempted),
-                    reason=REFUSED_RESUME_BRIEF_FAILED,
-                    detail="the composed resume `handoff send` refused",
-                    gateway_target=gateway_target,
-                )
-            applied.append(ACTION_RESUME_BRIEF)
+        for action, kind, send in (
+            (ACTION_RESTORE_DISPATCH, KIND_IMPLEMENTATION_REQUEST, self.ops.send_dispatch),
+            (ACTION_RESUME_BRIEF, KIND_REPLY, self.ops.send_resume_brief),
+        ):
+            if not plan.has(action):
+                continue
+            attempted.append(action)
+            outcome = self._send_fenced(
+                facts,
+                plan,
+                action=action,
+                kind=kind,
+                send=send,
+                applied=applied,
+                attempted=attempted,
+                dropped=dropped,
+                gateway_target=gateway_target,
+            )
+            if outcome is not None:
+                return outcome
 
         return LaneActuationOutcome(
             lane_id=plan.lane_id,
@@ -528,24 +522,103 @@ class FleetRehydrateUseCase:
             status=STATUS_APPLIED,
             applied=tuple(applied),
             attempted=tuple(attempted),
+            dropped=tuple(dropped),
+            detail=(
+                "no longer owed at send time: " + ", ".join(dropped) if dropped else ""
+            ),
             gateway_target=gateway_target,
         )
+
+    def _send_fenced(
+        self,
+        facts: FleetLaneFacts,
+        plan: FleetLanePlan,
+        *,
+        action: str,
+        kind: str,
+        send,
+        applied: list,
+        attempted: list,
+        dropped: list,
+        gateway_target: str,
+    ) -> Optional[LaneActuationOutcome]:
+        """Re-join both authorities and send — or refuse with zero further effect.
+
+        The re-reads are the LAST thing before the irreversible call (review j#108953 /
+        #14661 j#92656 F2): the lifecycle row, then this key's own fold against a freshly
+        read ledger and inventory. Returns ``None`` when the caller should continue, or the
+        terminal outcome when the lane stops here.
+        """
+        moved = self._identity_moved(facts)
+        if moved is not None:
+            return LaneActuationOutcome(
+                lane_id=plan.lane_id,
+                issue_id=plan.issue_id,
+                status=STATUS_BLOCKED,
+                applied=tuple(applied),
+                attempted=tuple(attempted),
+                dropped=tuple(dropped),
+                reason=BLOCK_LANE_MOVED,
+                detail=moved,
+                gateway_target=gateway_target,
+            )
+        fresh = self.ops.current_dispatch_state(facts, kind=kind)
+        if fresh == DISPATCH_DELIVERED:
+            # Positively discharged in the window. Not a failure: drop just this action and
+            # let the lane's remaining work continue, reported truthfully.
+            dropped.append(action)
+            return None
+        if fresh != DISPATCH_OWED:
+            return self._dispatch_state_moved(
+                plan, applied, attempted, dropped, fresh, gateway_target
+            )
+        if not gateway_target:
+            return LaneActuationOutcome(
+                lane_id=plan.lane_id,
+                issue_id=plan.issue_id,
+                status=STATUS_BLOCKED,
+                applied=tuple(applied),
+                attempted=tuple(attempted),
+                dropped=tuple(dropped),
+                reason=REFUSED_GATEWAY_UNRESOLVED,
+                detail="no gateway target resolved; nothing was sent",
+            )
+        if send(facts, gateway_target=gateway_target) != 0:
+            return LaneActuationOutcome(
+                lane_id=plan.lane_id,
+                issue_id=plan.issue_id,
+                status=STATUS_BLOCKED,
+                applied=tuple(applied),
+                attempted=tuple(attempted),
+                dropped=tuple(dropped),
+                reason=(
+                    REFUSED_DISPATCH_FAILED
+                    if action == ACTION_RESTORE_DISPATCH
+                    else REFUSED_RESUME_BRIEF_FAILED
+                ),
+                detail="the composed governed send refused",
+                gateway_target=gateway_target,
+            )
+        applied.append(action)
+        return None
 
     @staticmethod
     def _dispatch_state_moved(
         plan: FleetLanePlan,
         applied: Sequence[str],
         attempted: Sequence[str],
+        dropped: Sequence[str],
         observed: str,
         gateway_target: str,
     ) -> LaneActuationOutcome:
-        """Zero additional effect: the key stopped being owed before its send."""
+        """Zero additional effect: the key stopped being provably owed before its send."""
         return LaneActuationOutcome(
             lane_id=plan.lane_id,
             issue_id=plan.issue_id,
             status=STATUS_BLOCKED,
             applied=tuple(applied),
             attempted=tuple(attempted),
+            dropped=tuple(dropped),
             reason=REFUSED_DISPATCH_STATE_MOVED,
             detail=(
                 "the causal key was re-folded immediately before its send and is no longer "

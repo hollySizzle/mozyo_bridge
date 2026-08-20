@@ -60,9 +60,11 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ACTION_RESTORE_DISPATCH,
     ACTION_RESUME_BRIEF,
     BLOCKED,
+    BLOCK_DISPATCH_ATTRIBUTION_UNKNOWN,
     BLOCK_DISPATCH_UNREADABLE,
     BLOCK_RESUME_PROFILE_INCOMPLETE,
     BLOCK_STARTUP_INTERACTION,
+    DISPATCH_ATTRIBUTION_UNKNOWN,
     DISPATCH_DELIVERED,
     DISPATCH_OWED,
     REHYDRATE,
@@ -73,6 +75,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.fleet_rehydrate_dispatch_fold import (  # noqa: E402
     KIND_IMPLEMENTATION_REQUEST,
+    ReceiverGeneration,
     redmine_marker,
 )
 
@@ -203,6 +206,19 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
             for role in (GATEWAY, WORKER)
         ]
 
+    def _proven_generation(self, *, locators=(GATEWAY_LOCATOR,)):
+        """A live receiver whose #15227 proof holds for a record aimed at it.
+
+        The proof itself belongs to `fresh_attestation_identity` (attestation store +
+        terminal id + verified generation token) and is tested by #15227; this suite pins
+        the JOIN around it, so it is injected rather than re-staged here.
+        """
+        return ReceiverGeneration(
+            inventory_readable=True,
+            live_locators=frozenset(locators),
+            matches=lambda record: (record.target or "") in locators,
+        )
+
     def _gather(
         self,
         *,
@@ -210,6 +226,7 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
         resume_inputs=None,
         issue_closed=False,
         startup_screens=None,
+        receiver_generations=None,
     ):
         startup_screens = (
             startup_screens
@@ -239,6 +256,7 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
                 # than letting the probe resolve one. `observe_startup_screen` has its own
                 # focused coverage.
                 startup_screens=startup_screens,
+                receiver_generations=receiver_generations,
             )
 
     # -- the join ---------------------------------------------------------
@@ -267,7 +285,10 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
         """Suppression is correct only while the receiver that got it is still there."""
         self._declare()
         self._seed_delivery()
-        facts = self._gather(rows=self._rows())
+        facts = self._gather(
+            rows=self._rows(),
+            receiver_generations={LANE: self._proven_generation()},
+        )
         self.assertEqual(facts[0].dispatch.state, DISPATCH_DELIVERED)
         plan = rehydrate.plan_fleet(facts)[0]
         self.assertNotIn(ACTION_RESTORE_DISPATCH, plan.actions)
@@ -285,20 +306,64 @@ class FleetRehydrateFactJoinTests(unittest.TestCase):
         plan = rehydrate.plan_fleet(facts)[0]
         self.assertEqual(plan.actions, (ACTION_HEAL_PAIR, ACTION_RESTORE_DISPATCH))
 
-    def test_a_delivery_to_a_recycled_locator_is_not_current_evidence(self):
-        """Same pane id, different process: the row revision keeps them apart."""
+    def test_a_live_locator_without_a_generation_proof_blocks(self):
+        """Review j#108953: unprovable is never a licence to resend.
+
+        A live locator whose same-generation proof does not hold (a re-launch under the
+        same pane id, an unreadable attestation, a mere revision drift) must block, not
+        drop the record and re-promote the key to `owed`.
+        """
         self._declare()
         self._seed_delivery()
-        rows = self._rows()
-        for row in rows:
-            row["revision"] = "99"  # the slot was re-launched under the same locator
-        facts = self._gather(rows=rows)
-        self.assertEqual(facts[0].dispatch.state, DISPATCH_OWED)
+        facts = self._gather(
+            rows=self._rows(),
+            receiver_generations={
+                LANE: ReceiverGeneration(
+                    inventory_readable=True,
+                    live_locators=frozenset({GATEWAY_LOCATOR}),
+                    matches=lambda record: False,
+                )
+            },
+        )
+        self.assertEqual(facts[0].dispatch.state, DISPATCH_ATTRIBUTION_UNKNOWN)
+        plan = rehydrate.plan_fleet(facts)[0]
+        self.assertEqual(plan.disposition, BLOCKED)
+        self.assertEqual(plan.reason, BLOCK_DISPATCH_ATTRIBUTION_UNKNOWN)
+        self.assertEqual(plan.actions, ())
+
+    def test_the_real_resolver_yields_no_proof_without_an_attestation(self):
+        """The production default is fail-closed: no boundary resolves, so nothing is proven."""
+        generation = rehydrate.receiver_generation_for(
+            self._rows(),
+            home=self.home,
+            workspace_id=WORKSPACE,
+            lane_id=LANE,
+            role=GATEWAY,
+        )
+        self.assertTrue(generation.inventory_readable)
+        self.assertIn(GATEWAY_LOCATOR, generation.live_locators)
+        self.assertIsNone(
+            generation.matches, "an absent attestation proves no generation"
+        )
+        self.assertFalse(generation.proves_current(object()))
+
+    def test_the_real_resolver_reports_an_unreadable_inventory(self):
+        generation = rehydrate.receiver_generation_for(
+            None,
+            home=self.home,
+            workspace_id=WORKSPACE,
+            lane_id=LANE,
+            role=GATEWAY,
+        )
+        self.assertFalse(generation.inventory_readable)
 
     def test_a_live_pair_needs_neither_heal_nor_dispatch(self):
         self._declare()
         self._seed_delivery()
-        facts = self._gather(rows=self._rows())
+        facts = self._gather(
+            rows=self._rows(),
+            receiver_generations={LANE: self._proven_generation()},
+        )
         self.assertTrue(facts[0].pair_whole)
         plan = rehydrate.plan_fleet(facts)[0]
         self.assertEqual(plan.disposition, SKIP)

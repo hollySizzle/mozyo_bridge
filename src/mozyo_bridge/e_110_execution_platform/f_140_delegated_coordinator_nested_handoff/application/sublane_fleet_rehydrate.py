@@ -60,7 +60,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.fleet_rehydrate_dispatch_fold import (  # noqa: E501
     KIND_IMPLEMENTATION_REQUEST,
     KIND_REPLY,
-    ReceiverBinding,
+    ReceiverGeneration,
     dispatch_fact,
     latest_anchor_journal,
 )
@@ -207,57 +207,65 @@ def ledger_records_for_issue(
         return None, f"delivery ledger unreadable ({type(exc).__name__})"
 
 
-def receiver_binding_for(
+def receiver_generation_for(
     rows: Optional[Sequence[Mapping[str, object]]],
     *,
+    home: Optional[Path] = None,
     workspace_id: str,
     lane_id: str,
     role: str,
-    managed_roles: Sequence[str],
-) -> ReceiverBinding:
-    """The live receiver a lane's ``role`` would be sent to now (Redmine #15745 j#108920).
+) -> ReceiverGeneration:
+    """What can be PROVEN about the receiver this lane would send to now (#15745 j#108953).
 
-    Scoped with the SAME unit resolution the audit and retire rails use
-    (``plan_herdr_retire_close`` + ``expected_slot_rows``), so this join describes exactly
-    the slots those surfaces target. Returns :meth:`ReceiverBinding.absent` when the
-    inventory is unreadable, when the role has no live row, or when more than one row
-    resolves it — an ambiguous receiver is not a receiver, and the planner's own
-    ambiguity gate reports that separately.
+    The same-generation proof is the shared #15227 authority
+    (:func:`...herdr_live_attestation_time.fresh_attestation_identity`), which joins ONE
+    fresh inventory snapshot with the terminal-verified attestation record and the verified
+    startup-action generation token, and returns ``None`` if any axis is missing or
+    unreadable. This rail supplies its ``matches_delivery`` predicate and adds nothing of its
+    own — in particular it no longer compares the inventory ``row_revision``, which is not a
+    process-generation id (review j#108953 ``finding_generationfence``).
+
+    ``live_locators`` is every locator the same snapshot showed, used only for the positive
+    absence direction. An unreadable snapshot yields
+    :meth:`ReceiverGeneration.unreadable`, under which nothing can be attributed at all.
     """
-    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_retire import (  # noqa: E501
-        expected_slot_rows,
-        plan_herdr_retire_close,
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.herdr_live_attestation_time import (  # noqa: E501
+        fresh_attestation_identity,
     )
     from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-        AGENT_KEY_NAME,
-        AGENT_KEY_REVISION,
+        _agent_locator,
+        encode_assigned_name,
     )
 
-    if rows is None or not role or not managed_roles:
-        return ReceiverBinding.absent()
-    plan = plan_herdr_retire_close(
-        rows,
-        workspace_id=workspace_id,
-        lane_id=lane_id,
-        legacy_workspace_id="",
-        managed_roles=managed_roles,
+    if rows is None:
+        return ReceiverGeneration.unreadable()
+    locators = frozenset(
+        locator
+        for row in rows
+        if isinstance(row, Mapping)
+        for locator in (_agent_locator(row),)
+        if locator
     )
-    found = [
-        row
-        for row in expected_slot_rows(rows, plan, managed_roles=managed_roles)
-        if row.role == role and (row.locator or "").strip()
-    ]
-    if len(found) != 1:
-        return ReceiverBinding.absent()
-    row = found[0]
-    revision = row.row.get(AGENT_KEY_REVISION)
-    return ReceiverBinding(
+    if not role:
+        # Without a resolved receiver role there is no slot to prove anything about; the
+        # planner blocks on the same missing binding through its own inventory gate.
+        return ReceiverGeneration(inventory_readable=True, live_locators=locators)
+    try:
+        assigned_name = encode_assigned_name(workspace_id, role, lane_id)
+    except Exception:  # noqa: BLE001 - an unencodable identity proves nothing
+        return ReceiverGeneration(inventory_readable=True, live_locators=locators)
+    boundary = fresh_attestation_identity(
+        home=home,
+        rows=rows,
+        assigned_name=assigned_name,
+        workspace_id=workspace_id,
         role=role,
-        assigned_name=str(row.row.get(AGENT_KEY_NAME) or ""),
-        locator=str(row.locator or "").strip(),
-        # The revision is rendered exactly as the queue-enter rail records it on its own
-        # binding (a string), so the two sides compare without either coercing the other.
-        revision="" if revision is None else str(revision),
+        lane=lane_id,
+    )
+    return ReceiverGeneration(
+        inventory_readable=True,
+        live_locators=locators,
+        matches=(boundary.matches_delivery if boundary is not None else None),
     )
 
 
@@ -412,6 +420,7 @@ def gather_fleet_facts(
     ledger_by_issue: Optional[Mapping[str, Optional[Sequence[Any]]]] = None,
     startup_screens: Optional[Mapping[str, str]] = None,
     read_visible: Optional[Any] = None,
+    receiver_generations: Optional[Mapping[str, ReceiverGeneration]] = None,
     environ: Optional[Mapping[str, str]] = None,
 ) -> tuple[FleetLaneFacts, ...]:
     """Join every authority the rehydrate decision reads, one :class:`FleetLaneFacts` per lane.
@@ -515,12 +524,17 @@ def gather_fleet_facts(
         # The receiver this lane would send to NOW. Every ledger fold below is attributed
         # against it, so an older generation's confirmed delivery can never answer for a
         # fresh one (review j#108920 finding_generationfence, verdict j#108926).
-        binding = receiver_binding_for(
-            rows,
-            workspace_id=reboot.workspace_id,
-            lane_id=reboot.lane_id,
-            role=gateway_receiver,
-            managed_roles=managed_roles,
+        generation = (
+            receiver_generations[reboot.lane_id]
+            if receiver_generations is not None
+            and reboot.lane_id in receiver_generations
+            else receiver_generation_for(
+                rows,
+                home=home,
+                workspace_id=reboot.workspace_id,
+                lane_id=reboot.lane_id,
+                role=gateway_receiver,
+            )
         )
 
         dispatch_anchor = ""
@@ -539,7 +553,7 @@ def gather_fleet_facts(
             journal=dispatch_anchor,
             kind=KIND_IMPLEMENTATION_REQUEST,
             receiver=gateway_receiver,
-            binding=binding,
+            generation=generation,
             unreadable=unreadable,
             detail=ledger_detail,
         )
@@ -551,7 +565,7 @@ def gather_fleet_facts(
             journal=(supplied.anchor_journal or _lifecycle_anchor(record)),
             kind=KIND_REPLY,
             receiver=gateway_receiver,
-            binding=binding,
+            generation=generation,
             unreadable=unreadable,
             detail=ledger_detail,
         )
@@ -863,7 +877,7 @@ __all__ = (
     "parse_resume_anchor",
     "parse_resume_profile_field",
     "plan_fleet",
-    "receiver_binding_for",
+    "receiver_generation_for",
     "register_sublane_rehydrate_fleet_parser",
     "rehydrate_payload",
     "resume_inputs_from_args",

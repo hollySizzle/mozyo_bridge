@@ -173,6 +173,7 @@ class FakeOps:
         self.fail_brief = fail_brief
         self.heal_calls = []
         self.brief_calls = []
+        self.dispatch_calls = []
         self.refold_calls = []
         FakeOps.instances.append(self)
 
@@ -185,9 +186,13 @@ class FakeOps:
             issue_id=lane_id.split("_")[1],
         )
 
-    def heal_lane(self, facts, *, dispatch):
-        self.heal_calls.append((facts.lane_id, dispatch))
+    def heal_lane(self, facts):
+        self.heal_calls.append(facts.lane_id)
         return ops_module.HealResult(ok=True, gateway_target="w1V:pF")
+
+    def send_dispatch(self, facts, *, gateway_target):
+        self.dispatch_calls.append((facts.lane_id, gateway_target))
+        return 0
 
     def current_dispatch_state(self, facts, *, kind):
         """The action-time re-fold; by default the key is still owed."""
@@ -299,15 +304,16 @@ class PlanStageAcceptance(unittest.TestCase):
 
 
 class ExecuteStageAcceptance(unittest.TestCase):
-    def test_heal_and_dispatch_are_one_composed_create_and_the_brief_follows(self):
+    def test_heal_then_fenced_send_and_the_brief_follows(self):
         rc, payload, _ = run_cli(mixed_fleet(), execute=True)
         self.assertEqual(rc, 1, "the uncertain lane could not be rehydrated")
         self.assertEqual(payload["state"], "executed")
         ops = FakeOps.instances[0]
+        self.assertEqual(ops.heal_calls, ["issue_101_impl", "issue_102_l2"])
         self.assertEqual(
-            ops.heal_calls,
-            [("issue_101_impl", True), ("issue_102_l2", False)],
-            "the L3 lane heals+dispatches in one action; the L2 lane only heals",
+            ops.dispatch_calls,
+            [("issue_101_impl", "w1V:pF")],
+            "the send is its own fenced step, never the create's dispatch leg",
         )
         self.assertEqual(ops.brief_calls, [("issue_102_l2", "w1V:pF")])
 
@@ -348,7 +354,10 @@ class ExecuteStageAcceptance(unittest.TestCase):
         first = (_lane("issue_101_impl", "101"),)
         rc, payload, _ = run_cli(first, execute=True)
         self.assertEqual(rc, 0)
-        self.assertEqual(FakeOps.instances[0].heal_calls, [("issue_101_impl", True)])
+        self.assertEqual(FakeOps.instances[0].heal_calls, ["issue_101_impl"])
+        self.assertEqual(
+            FakeOps.instances[0].dispatch_calls, [("issue_101_impl", "w1V:pF")]
+        )
 
         # Second pass: the create landed the pair and the ledger now records the delivery.
         second = (

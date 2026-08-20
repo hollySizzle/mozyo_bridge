@@ -577,20 +577,31 @@ status・lane の見た目は一切参照しない。
 - causal key は canonical producer (`build_marker`) が描く landing marker そのもの。ledger row の
   marker は **その row 自身の anchor / kind / receiver から再描画して byte 一致** した場合のみ
   その key の証拠と認める (marker を parse しない / 散文から作らない)。
-- ★**証拠は「今この lane が送る相手」に帰属させる** (#15745 review j#108920
-  `finding_generationfence` / verdict j#108926)。marker は lane も generation も持たず ledger にも
-  generation column が無いため、marker だけで keying すると **旧 generation への配送済み記録が
-  fresh な pair の答えになり、relaunch した gateway が pointer を受け取れない** (supersede 後の
-  successor lane でも同型)。帰属は herdr が process generation の判別子として既に名指している
-  **live locator** (`ProcessGenerationPin` docstring) を、declared pin ではなく **ledger row 自身の
-  `target` と現在の live inventory** の join で使う (実測: active 26 row 中 18 row が
-  `declared_slots` 空なので、pin 必須にすると実運用 lane の大半が block して rail が到達不能になる)。
-  - `target` が現 live slot と一致し、row の `queue_enter_observation.gateway_binding` の
-    `assigned_name` / `row_revision` も一致 → **現世代の証拠**として fold する。
-  - live slot が無い / 別 locator → その受信者は既に居ないので**証拠にならない** (drop)。dead
-    process が握っていたものを fresh process へ送っても二重にはならない。
-  - `target` が無い、または locator は live だが binding が無く **同一 locator への再 launch (ABA)
-    を判別できない** → `dispatch_attribution_unknown` で **block**。どちらにも倒さない。
+- ★**証拠は「今この lane が送る相手」に帰属させる** (#15745 review j#108920 → j#108953
+  `finding_generationfence` / verdict j#108926・j#108968)。marker は lane も generation も持たず
+  ledger にも generation column が無いため、marker だけで keying すると **旧 generation への配送済み
+  記録が fresh な pair の答えになり、relaunch した gateway が pointer を受け取れない** (supersede 後の
+  successor lane でも同型)。
+  - **同一世代の証明は自前で組まない**。判別子に inventory の `row_revision` を使うのは誤りである —
+    `herdr_identity.process_generation_of_locator` が「`AgentInfo.revision` は process-generation id
+    ではなく、title / metadata 等の presentation 変更でも進む」と明示しており、同 docstring は
+    revision drift では **withhold 側へ倒す** (送らない) のが正しいとも書いている。revision 差分で
+    「別世代」と断定すると confirmed record を捨てて `owed` へ戻し、**同じ生きている receiver へ本文を
+    再送**することになる (ADR-0002 の本文 exactly-once 違反)。
+  - 証明は #15227 の共有 authority をそのまま使う: `herdr_live_attestation_time.fresh_attestation_identity`
+    が 1 つの fresh inventory snapshot から locator / row_revision / terminal_id を取り、attestation を
+    terminal-verified に join し、verified generation token (`startup_action_id`) を解決して
+    `FreshGenerationBoundary` を返す (1 軸でも欠落・不読なら `None`)。
+    `FreshGenerationBoundary.matches_delivery` が ledger row の `gateway_binding` を 6 軸すべて非空
+    exact 一致で照合する。
+  - 帰属は 3 値で、**判定不能は常に「送らない」側へ倒す**:
+    - `matches_delivery` 成立 → **現世代の証拠**として fold する。
+    - 不成立で、record の `target` locator が readable な snapshot に**一件も存在しない**
+      (positive absence) → **証拠にならない** (drop)。既に居ない process が握っていたものを fresh
+      process へ送っても二重にはならない。
+    - それ以外 — inventory 不読、`target` 欠落、locator は live だが同一世代を証明できない (同一
+      locator への再 launch、attestation 不読、revision drift) → `dispatch_attribution_unknown` で
+      **block**。`retired` (= 再送許可) へは倒さない。
 - 各 attempt は共有 `injection_stage` authority で分類する。`submitted_confirmed` が 1 件でも
   あれば `delivered` (再送しない)、`uncertain_partial` があれば `uncertain` (**block**。blind
   replay 禁止で、receiver / durable anchor の reconcile が先)、全部が `not_sent` か記録ゼロの
@@ -601,32 +612,25 @@ status・lane の見た目は一切参照しない。
   `decision_journal` は後続の disposition CAS で動くため、ledger に canonical record がある
   ときはそちらの journal を使い、1 度も dispatch されていない lane でだけ lifecycle anchor へ
   fallback する。
-- ★**fold は plan 時の 1 回では足りない** (同 review `finding_actiontimefence`)。plan の fold は
-  観測にすぎず、heal (worktree 作成 → pane launch → attestation → governed send) の間に同じ key が
-  別経路で着弾する / 受信者が入れ替わる / authority が読めなくなる。したがって **irreversible な
-  send の直前ごとに** ledger + live inventory を再取得して再 fold し、`owed` でなくなっていれば
-  `dispatch_state_moved` で **追加 effect 0** で止める (brief の直前では lifecycle も再 join する)。
-  heal だけが必要で dispatch が既に着弾していた場合は、send を落として heal は続行する — heal は
-  additive で、dispatch が別経路で届いたことに無効化されない。
+- ★**fold は plan 時の 1 回では足りず、fence は「send の直前」でなければならない** (同 review
+  `finding_actiontimefence`)。plan の fold は観測にすぎない。さらに **composed create の入口に置いた
+  fence も不十分**である — `sublane create --execute` の送信は worktree create/adopt、pane
+  append/adopt、identity stamp / read-back、startup health、**gateway readiness wait (既定 10 秒)** の
+  後に来るため、その窓で同じ key が別経路から着弾しても create 内に ledger fence は無い。
+  - したがって heal は **常に `--no-dispatch` 相当** (create の dispatch leg を止める) で走らせ、
+    gateway を得たあとに **lifecycle と ledger を fresh 再取得して再 fold し、その直後に** canonical な
+    dispatch composer を呼ぶ。送信自体は `sublane create` の dispatch leg と同一の composer / argv を
+    使うので、rail も argv も増えない (`## lane 作成 (標準形)` の「fallback (旧二段運用)」と同じ形)。
+  - brief も同様に、send の直前で lifecycle 再 join + 当該 key の再 fold を行う。
+  - 再 fold の結果が **`delivered` (positively 討ち取られた)** なら、その action だけを `dropped` として
+    落として lane の残作業は続行する (失敗ではない)。`uncertain` / `unreadable` /
+    `attribution_unknown` / `not_applicable` は `dispatch_state_moved` で **追加 effect 0** で停止し、
+    既に landed した action は `applied` に残して truthful に報告する。
+  - トレードオフ: create 内蔵 dispatch が持つ **self-heal** (dispatch 失敗 → gateway 消滅を read-back
+    して lane column を 1 回 relaunch → 再 dispatch) は二段化で働かない。代わりに exactly-once fence を
+    得る。送達失敗は typed block として記録し、次回実行が durable state から再判断する。
   この規律は `## live turn-ended worker の guarded refresh` / `### recover-pair の worktree binding
-  fence` と同じで、「最初の effect の前に 1 回」では守れない。
-
-### delegated_coordinator lane の resume brief
-
-L2 lane を relaunch するのは **cold restart** であり provider の会話 context は戻らない。したがって
-relaunch する L2 lane には resume brief が必須で、固定 role profile の 4 placeholder
-(`parent_project` / `child_project` / `parent_callback_target` / `parent_issue`) を欠落なく運ぶ。
-1 つでも解決できなければ `resume_profile_incomplete` で block する (半分だけ解決した委譲契約は、
-権威ある contract として読まれるぶん無いより悪い)。
-
-- `parent_callback_target` は durable に導出する: `parent_lane_id` が空 (default-lane coordinator が
-  作った lane) なら stable route token `coordinator`、そうでなければ `lane_gateway:<parent lane>`。
-- `parent_issue` は `parent_lane_id` がある場合だけ親 lane の row から解決できる。空の場合は
-  child の row から導出不能なので **明示指定が必要**で、推測しない。
-- brief の causal key は **current 資料 anchor** に束縛される。再起動のたびに新しい resume anchor
-  journal を記録すれば key が変わって owed になり、同じ anchor で rehydrate を再実行すれば
-  delivered な key の再利用になるので送られない。relaunch が要るのに anchor が既に delivered な
-  場合は `resume_anchor_unresolved` で block する (指示のないまま L2 を起こさない)。
+  fence` と同じで、「最初の effect の前に 1 回」でも「長い composed 操作の入口で 1 回」でも守れない。
 
 ### provider startup screen (live 観測)
 

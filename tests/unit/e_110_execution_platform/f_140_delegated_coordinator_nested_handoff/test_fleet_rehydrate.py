@@ -107,7 +107,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     ATTRIB_UNKNOWN,
     KIND_IMPLEMENTATION_REQUEST,
     KIND_REPLY,
-    ReceiverBinding,
+    ReceiverGeneration,
     attribute_record,
     dispatch_fact,
     fold_dispatch_state,
@@ -488,18 +488,60 @@ class SummaryTests(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-#: The receiver a lane would send to now, in the fold tests.
-LIVE_BINDING = ReceiverBinding(
-    role=GATEWAY_ROLE,
-    assigned_name="mzb1_gw",
-    locator="w1V:pF",
-    revision="7",
-)
+GATEWAY_LOCATOR = "w1V:pF"
 
 
-def _recorded_binding(*, assigned_name="mzb1_gw", revision="7"):
+STARTUP_ACTION = "startup-aaaa"
+
+
+def _recorded_binding(
+    *, assigned_name="mzb1_gw", revision="7", startup=STARTUP_ACTION,
+    locator=GATEWAY_LOCATOR,
+):
     """The queue-enter rail's own gateway_binding, as the ledger stores it."""
-    return {"gateway_binding": {"assigned_name": assigned_name, "row_revision": revision}}
+    return {
+        "gateway_binding": {
+            "assigned_name": assigned_name,
+            "row_revision": revision,
+            "startup_action_id": startup,
+            "locator": locator,
+        }
+    }
+
+
+def live_generation(
+    *, assigned_name="mzb1_gw", revision="7", startup=STARTUP_ACTION,
+    locators=(GATEWAY_LOCATOR,), readable=True,
+):
+    """A readable snapshot plus a proof shaped like the real #15227 authority.
+
+    The production proof is `FreshGenerationBoundary.matches_delivery`, which requires the
+    ledger row's own ``gateway_binding`` to match on all six axes including the verified
+    startup-action token. These tests inject an equivalent predicate so what is pinned here
+    is the ATTRIBUTION around the proof, not the shared authority itself (which #15227 owns
+    and tests).
+    """
+
+    def matches(record):
+        observation = getattr(record, "queue_enter_observation", None) or {}
+        binding = observation.get("gateway_binding") or {}
+        return (
+            binding.get("assigned_name") == assigned_name
+            and binding.get("row_revision") == revision
+            and binding.get("startup_action_id") == startup
+            and binding.get("locator") in locators
+        )
+
+    return ReceiverGeneration(
+        inventory_readable=readable,
+        live_locators=frozenset(locators),
+        matches=matches,
+    )
+
+
+#: The receiver a lane would send to now, in the fold tests: live, and provably the same
+#: generation as the recorded attempt.
+LIVE_BINDING = live_generation()
 
 
 def ledger_record(marker, *, status="sent", reason="ok", rail=RAIL_EVENT, **kw):
@@ -513,7 +555,7 @@ def ledger_record(marker, *, status="sent", reason="ok", rail=RAIL_EVENT, **kw):
         status=status,
         reason=reason,
         rail=rail,
-        target=kw.pop("target", LIVE_BINDING.locator),
+        target=kw.pop("target", GATEWAY_LOCATOR),
         turn_start_outcome=kw.pop("turn_start_outcome", None),
         queue_enter_observation=kw.pop("queue_enter_observation", _recorded_binding()),
     )
@@ -532,7 +574,7 @@ class DispatchFoldTests(unittest.TestCase):
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
-                binding=LIVE_BINDING,
+                generation=LIVE_BINDING,
             ),
             DISPATCH_OWED,
         )
@@ -545,7 +587,7 @@ class DispatchFoldTests(unittest.TestCase):
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
-                binding=LIVE_BINDING,
+                generation=LIVE_BINDING,
             ),
             DISPATCH_DELIVERED,
         )
@@ -561,7 +603,7 @@ class DispatchFoldTests(unittest.TestCase):
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
-                binding=LIVE_BINDING,
+                generation=LIVE_BINDING,
             ),
             DISPATCH_UNCERTAIN,
         )
@@ -576,7 +618,7 @@ class DispatchFoldTests(unittest.TestCase):
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
-                binding=LIVE_BINDING,
+                generation=LIVE_BINDING,
             ),
             DISPATCH_OWED,
         )
@@ -594,7 +636,7 @@ class DispatchFoldTests(unittest.TestCase):
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
-                binding=LIVE_BINDING,
+                generation=LIVE_BINDING,
             ),
             DISPATCH_DELIVERED,
         )
@@ -654,7 +696,7 @@ class DispatchFoldTests(unittest.TestCase):
             journal="",
             kind=KIND_REPLY,
             receiver=GATEWAY_ROLE,
-            binding=LIVE_BINDING,
+            generation=LIVE_BINDING,
         )
         self.assertEqual(fact.state, DISPATCH_NOT_APPLICABLE)
         self.assertFalse(fact.sendable)
@@ -703,44 +745,91 @@ class ReceiverAttributionTests(unittest.TestCase):
         """The post-restart main case: every recorded attempt targeted a dead process."""
         record = ledger_record(IR_MARKER)
         self.assertEqual(
-            attribute_record(record, ReceiverBinding.absent()), ATTRIB_RETIRED
+            attribute_record(record, ReceiverGeneration.absent()), ATTRIB_RETIRED
         )
 
     def test_a_record_for_another_locator_is_retired(self):
-        record = ledger_record(IR_MARKER, target="w9Z:pZ")
-        self.assertEqual(attribute_record(record, LIVE_BINDING), ATTRIB_RETIRED)
-
-    def test_a_relaunch_under_the_same_locator_is_retired_not_current(self):
-        """The ABA hole: same pane id, different process. The row revision closes it."""
         record = ledger_record(
-            IR_MARKER, queue_enter_observation=_recorded_binding(revision="6")
+            IR_MARKER,
+            target="w9Z:pZ",
+            queue_enter_observation=_recorded_binding(locator="w9Z:pZ"),
         )
         self.assertEqual(attribute_record(record, LIVE_BINDING), ATTRIB_RETIRED)
+
+    def test_a_relaunch_under_the_same_locator_is_unknown_not_retired(self):
+        """The ABA shape, and the R2 correction (review j#108953).
+
+        A live locator whose generation cannot be verified must NOT be ruled out: calling it
+        `retired` dropped the record and re-promoted the key to `owed`, which would re-send
+        the body to a possibly-identical live receiver. It blocks instead.
+        """
+        record = ledger_record(
+            IR_MARKER, queue_enter_observation=_recorded_binding(startup="startup-bbbb")
+        )
+        self.assertEqual(attribute_record(record, LIVE_BINDING), ATTRIB_UNKNOWN)
+
+    def test_a_revision_drift_alone_never_licenses_a_resend(self):
+        """`AgentInfo.revision` is not a generation id: it advances on presentation changes.
+
+        The shared authority folds it in as one of six axes, so a drift makes the proof fail
+        — and a failed proof on a LIVE locator is `unknown` (block), never `retired` (send).
+        """
+        record = ledger_record(
+            IR_MARKER, queue_enter_observation=_recorded_binding(revision="8")
+        )
+        self.assertEqual(attribute_record(record, LIVE_BINDING), ATTRIB_UNKNOWN)
+        self.assertEqual(
+            fold_dispatch_state(
+                (record,),
+                marker=IR_MARKER,
+                kind=KIND_IMPLEMENTATION_REQUEST,
+                receiver=GATEWAY_ROLE,
+                generation=LIVE_BINDING,
+            ),
+            DISPATCH_ATTRIBUTION_UNKNOWN,
+        )
+
+    def test_an_unreadable_snapshot_places_nothing(self):
+        record = ledger_record(IR_MARKER)
+        self.assertEqual(
+            attribute_record(record, ReceiverGeneration.unreadable()), ATTRIB_UNKNOWN
+        )
 
     def test_a_live_locator_with_no_recorded_binding_is_unknown(self):
         """A bare locator cannot tell the same process from a recycled one."""
         record = ledger_record(IR_MARKER, queue_enter_observation=None)
         self.assertEqual(attribute_record(record, LIVE_BINDING), ATTRIB_UNKNOWN)
 
+    def test_no_resolvable_proof_at_all_is_unknown_for_a_live_locator(self):
+        """`matches=None` (no boundary resolved) is "cannot prove", never "not current"."""
+        record = ledger_record(IR_MARKER)
+        blind = ReceiverGeneration(
+            inventory_readable=True, live_locators=frozenset({GATEWAY_LOCATOR})
+        )
+        self.assertEqual(attribute_record(record, blind), ATTRIB_UNKNOWN)
+
     def test_a_record_without_a_target_is_unknown(self):
-        record = ledger_record(IR_MARKER, target="")
+        record = ledger_record(
+            IR_MARKER, target="", queue_enter_observation=_recorded_binding(locator="")
+        )
         self.assertEqual(attribute_record(record, LIVE_BINDING), ATTRIB_UNKNOWN)
 
     def test_an_old_generations_confirmed_delivery_does_not_answer_for_a_fresh_pair(self):
         """The exact defect: generation 1 delivered, generation 2 relaunched elsewhere."""
-        old = ledger_record(IR_MARKER, target="w1V:pOLD", status="sent", reason="ok")
+        old = ledger_record(
+            IR_MARKER,
+            target="w1V:pOLD",
+            status="sent",
+            reason="ok",
+            queue_enter_observation=_recorded_binding(locator="w1V:pOLD"),
+        )
         self.assertEqual(
             fold_dispatch_state(
                 (old,),
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
-                binding=ReceiverBinding(
-                    role=GATEWAY_ROLE,
-                    assigned_name="mzb1_gw",
-                    locator="w1V:pNEW",
-                    revision="9",
-                ),
+                generation=live_generation(locators=("w1V:pNEW",)),
             ),
             DISPATCH_OWED,
             "a delivery to a receiver that is gone must not suppress the fresh dispatch",
@@ -754,7 +843,7 @@ class ReceiverAttributionTests(unittest.TestCase):
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
-                binding=None,
+                generation=ReceiverGeneration.absent(),
             ),
             DISPATCH_OWED,
         )
@@ -766,7 +855,7 @@ class ReceiverAttributionTests(unittest.TestCase):
             marker=IR_MARKER,
             kind=KIND_IMPLEMENTATION_REQUEST,
             receiver=GATEWAY_ROLE,
-            binding=LIVE_BINDING,
+            generation=LIVE_BINDING,
         )
         self.assertEqual(state, DISPATCH_ATTRIBUTION_UNKNOWN)
         plan = plan_lane_rehydrate(
@@ -792,7 +881,7 @@ class ReceiverAttributionTests(unittest.TestCase):
                 marker=IR_MARKER,
                 kind=KIND_IMPLEMENTATION_REQUEST,
                 receiver=GATEWAY_ROLE,
-                binding=LIVE_BINDING,
+                generation=LIVE_BINDING,
             ),
             DISPATCH_ATTRIBUTION_UNKNOWN,
         )
@@ -801,16 +890,19 @@ class ReceiverAttributionTests(unittest.TestCase):
 class ActionTimeRefoldTests(unittest.TestCase):
     """Review j#108920 ``finding_actiontimefence``: re-fold immediately before each send."""
 
-    def test_the_dispatch_key_is_refolded_before_the_composed_create(self):
+    def test_the_dispatch_key_is_refolded_immediately_before_the_send(self):
         facts = fleet_facts()
         plan = plan_lane_rehydrate(facts)
         ops = FakeOps(identity=pin_for(facts))
         FleetRehydrateUseCase(ops).run([facts], [plan])
-        self.assertIn(
-            (facts.lane_id, KIND_IMPLEMENTATION_REQUEST),
+        self.assertEqual(
             ops.refold_calls,
+            [(facts.lane_id, KIND_IMPLEMENTATION_REQUEST)],
             "the plan's fold is an observation; the send needs a fresh one",
         )
+        # And the fence is AFTER the heal, so it sits immediately before the send rather
+        # than in front of a create that would send much later (review j#108953).
+        self.assertEqual(ops.heal_calls, [facts.lane_id])
 
     def test_a_key_that_landed_during_the_window_is_not_sent(self):
         facts = fleet_facts(
@@ -823,10 +915,35 @@ class ActionTimeRefoldTests(unittest.TestCase):
             fresh_states={KIND_IMPLEMENTATION_REQUEST: DISPATCH_DELIVERED},
         )
         outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
-        self.assertEqual(ops.heal_calls, [], "zero additional effect")
-        self.assertEqual(outcomes[0]["status"], STATUS_BLOCKED)
-        self.assertEqual(outcomes[0]["reason"], REFUSED_DISPATCH_STATE_MOVED)
+        self.assertEqual(ops.dispatch_calls, [], "zero additional effect")
+        # Positively discharged in the window is not a failure: the action is dropped and
+        # named, and the lane's other work (none here) would still proceed.
+        self.assertEqual(outcomes[0]["status"], STATUS_APPLIED)
         self.assertEqual(outcomes[0]["applied"], [])
+        self.assertEqual(outcomes[0]["dropped"], [ACTION_RESTORE_DISPATCH])
+        self.assertEqual(outcomes[0]["attempted"], [ACTION_RESTORE_DISPATCH])
+
+    def test_an_unprovable_key_at_send_time_blocks_rather_than_dropping(self):
+        """Only a POSITIVE `delivered` is a drop; everything else stops the lane."""
+        facts = fleet_facts(
+            reboot=reboot_facts(slots=(slot(GATEWAY_ROLE), slot(WORKER_ROLE)))
+        )
+        plan = plan_lane_rehydrate(facts)
+        for state in (
+            DISPATCH_UNCERTAIN,
+            DISPATCH_UNREADABLE,
+            DISPATCH_ATTRIBUTION_UNKNOWN,
+            DISPATCH_NOT_APPLICABLE,
+        ):
+            with self.subTest(state=state):
+                ops = FakeOps(
+                    identity=pin_for(facts),
+                    fresh_states={KIND_IMPLEMENTATION_REQUEST: state},
+                )
+                outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
+                self.assertEqual(ops.dispatch_calls, [])
+                self.assertEqual(outcomes[0]["status"], STATUS_BLOCKED)
+                self.assertEqual(outcomes[0]["reason"], REFUSED_DISPATCH_STATE_MOVED)
 
     def test_a_landed_dispatch_still_lets_a_needed_heal_proceed_without_sending(self):
         """Healing is additive; only the send is dropped."""
@@ -837,8 +954,53 @@ class ActionTimeRefoldTests(unittest.TestCase):
             fresh_states={KIND_IMPLEMENTATION_REQUEST: DISPATCH_DELIVERED},
         )
         outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
-        self.assertEqual(ops.heal_calls, [(facts.lane_id, False)])
+        self.assertEqual(ops.heal_calls, [facts.lane_id])
+        self.assertEqual(ops.dispatch_calls, [], "the send is dropped, not issued")
         self.assertEqual(outcomes[0]["status"], STATUS_APPLIED)
+        self.assertEqual(outcomes[0]["applied"], [ACTION_HEAL_PAIR])
+        self.assertEqual(outcomes[0]["dropped"], [ACTION_RESTORE_DISPATCH])
+
+    def test_a_key_that_lands_DURING_the_heal_is_not_sent(self):
+        """Review j#108953's exact scenario, against the restructured flow.
+
+        The previous shape fenced at the entry of a composed create whose own send came
+        much later (after pane append, stamping and a bounded readiness wait), so a key
+        landing inside that window was still re-sent. The heal now carries no send, and the
+        fence is re-evaluated after it — so a key that lands while the heal runs is caught.
+        """
+        facts = fleet_facts()
+        plan = plan_lane_rehydrate(facts)
+
+        class LandsDuringHeal(FakeOps):
+            def heal_lane(self, f):
+                # A peer path delivers the same causal key while the pair comes up.
+                self._fresh_states[KIND_IMPLEMENTATION_REQUEST] = DISPATCH_DELIVERED
+                return super().heal_lane(f)
+
+        ops = LandsDuringHeal(identity=pin_for(facts))
+        outcomes = ops_run = FleetRehydrateUseCase(ops).run([facts], [plan])
+        self.assertEqual(ops.heal_calls, [facts.lane_id])
+        self.assertEqual(ops.dispatch_calls, [], "the send must not be issued")
+        self.assertEqual(outcomes[0]["applied"], [ACTION_HEAL_PAIR])
+        self.assertEqual(outcomes[0]["dropped"], [ACTION_RESTORE_DISPATCH])
+        self.assertEqual(ops_run[0]["status"], STATUS_APPLIED)
+
+    def test_a_key_that_becomes_unprovable_DURING_the_heal_blocks(self):
+        facts = fleet_facts()
+        plan = plan_lane_rehydrate(facts)
+
+        class DriftsDuringHeal(FakeOps):
+            def heal_lane(self, f):
+                self._fresh_states[KIND_IMPLEMENTATION_REQUEST] = (
+                    DISPATCH_ATTRIBUTION_UNKNOWN
+                )
+                return super().heal_lane(f)
+
+        ops = DriftsDuringHeal(identity=pin_for(facts))
+        outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
+        self.assertEqual(ops.dispatch_calls, [])
+        self.assertEqual(outcomes[0]["status"], STATUS_BLOCKED)
+        self.assertEqual(outcomes[0]["reason"], REFUSED_DISPATCH_STATE_MOVED)
         self.assertEqual(outcomes[0]["applied"], [ACTION_HEAL_PAIR])
 
     def test_the_brief_is_refolded_and_reidentified_after_the_heal(self):
@@ -847,6 +1009,7 @@ class ActionTimeRefoldTests(unittest.TestCase):
         ops = FakeOps(identity=pin_for(facts))
         FleetRehydrateUseCase(ops).run([facts], [plan])
         self.assertIn((facts.lane_id, KIND_REPLY), ops.refold_calls)
+        self.assertEqual(ops.heal_calls, [facts.lane_id])
         self.assertEqual(
             len(ops.identity_calls),
             2,
@@ -861,13 +1024,13 @@ class ActionTimeRefoldTests(unittest.TestCase):
         )
         outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
         self.assertEqual(ops.brief_calls, [])
-        self.assertEqual(outcomes[0]["status"], STATUS_BLOCKED)
-        self.assertEqual(outcomes[0]["reason"], REFUSED_DISPATCH_STATE_MOVED)
+        self.assertEqual(outcomes[0]["status"], STATUS_APPLIED)
         self.assertEqual(
             outcomes[0]["applied"],
             [ACTION_HEAL_PAIR],
             "what already landed is reported truthfully",
         )
+        self.assertEqual(outcomes[0]["dropped"], [ACTION_RESUME_BRIEF])
 
     def test_an_unreadable_authority_at_send_time_blocks_the_brief(self):
         facts = delegated_facts()
@@ -906,7 +1069,7 @@ class ActionTimeRefoldTests(unittest.TestCase):
 
         ops = Moving()
         outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
-        self.assertEqual(ops.heal_calls, [(facts.lane_id, False)])
+        self.assertEqual(ops.heal_calls, [facts.lane_id])
         self.assertEqual(ops.brief_calls, [])
         self.assertEqual(outcomes[0]["reason"], BLOCK_LANE_MOVED)
         self.assertEqual(outcomes[0]["applied"], [ACTION_HEAL_PAIR])
@@ -932,14 +1095,18 @@ class RoleProfileDriftGuardTests(unittest.TestCase):
 
 
 class FakeOps:
-    def __init__(self, *, identity=None, heal=None, brief_code=0, fresh_states=None):
+    def __init__(
+        self, *, identity=None, heal=None, brief_code=0, dispatch_code=0, fresh_states=None
+    ):
         self._identity = identity
-        self._heal = heal or (lambda facts, dispatch: HealResult(ok=True, gateway_target="w1:pF"))
+        self._heal = heal or (lambda facts: HealResult(ok=True, gateway_target="w1:pF"))
         self._brief_code = brief_code
+        self._dispatch_code = dispatch_code
         #: ``{kind: state}`` the action-time re-fold reports. Default: still owed.
         self._fresh_states = dict(fresh_states or {})
         self.heal_calls = []
         self.brief_calls = []
+        self.dispatch_calls = []
         self.identity_calls = []
         self.refold_calls = []
 
@@ -947,9 +1114,13 @@ class FakeOps:
         self.identity_calls.append((workspace_id, lane_id))
         return self._identity
 
-    def heal_lane(self, facts, *, dispatch):
-        self.heal_calls.append((facts.lane_id, dispatch))
-        return self._heal(facts, dispatch)
+    def heal_lane(self, facts):
+        self.heal_calls.append(facts.lane_id)
+        return self._heal(facts)
+
+    def send_dispatch(self, facts, *, gateway_target):
+        self.dispatch_calls.append((facts.lane_id, gateway_target))
+        return self._dispatch_code
 
     def current_dispatch_state(self, facts, *, kind):
         self.refold_calls.append((facts.lane_id, kind))
@@ -975,12 +1146,14 @@ class UseCaseTests(unittest.TestCase):
         self.assertEqual(ops.brief_calls, [])
         self.assertEqual(ops.identity_calls, [])
 
-    def test_heal_and_restore_are_one_composed_create(self):
+    def test_heal_and_restore_are_separate_fenced_steps(self):
+        """The create no longer carries the send: the fence must sit in front of it."""
         facts = fleet_facts()
         plan = plan_lane_rehydrate(facts)
         ops = FakeOps(identity=pin_for(facts))
         outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
-        self.assertEqual(ops.heal_calls, [(facts.lane_id, True)])
+        self.assertEqual(ops.heal_calls, [facts.lane_id])
+        self.assertEqual(ops.dispatch_calls, [(facts.lane_id, "w1:pF")])
         self.assertEqual(outcomes[0]["status"], STATUS_APPLIED)
         self.assertEqual(
             outcomes[0]["applied"], [ACTION_HEAL_PAIR, ACTION_RESTORE_DISPATCH]
@@ -995,7 +1168,8 @@ class UseCaseTests(unittest.TestCase):
         plan = plan_lane_rehydrate(facts)
         ops = FakeOps(identity=pin_for(facts))
         FleetRehydrateUseCase(ops).run([facts], [plan])
-        self.assertEqual(ops.heal_calls, [(facts.lane_id, False)])
+        self.assertEqual(ops.heal_calls, [facts.lane_id])
+        self.assertEqual(ops.dispatch_calls, [])
 
     def test_identity_moved_between_plan_and_effect_refuses_zero_effect(self):
         facts = fleet_facts()
@@ -1029,7 +1203,7 @@ class UseCaseTests(unittest.TestCase):
         plan = plan_lane_rehydrate(facts)
         ops = FakeOps(
             identity=pin_for(facts),
-            heal=lambda f, dispatch: HealResult(ok=False, reason=REFUSED_HEAL_FAILED),
+            heal=lambda f: HealResult(ok=False, reason=REFUSED_HEAL_FAILED),
         )
         outcomes = FleetRehydrateUseCase(ops).run([facts], [plan])
         self.assertEqual(outcomes[0]["status"], STATUS_BLOCKED)
@@ -1092,7 +1266,7 @@ class UseCaseTests(unittest.TestCase):
         self.assertEqual(outcomes[1]["status"], STATUS_BLOCKED)
         self.assertEqual(outcomes[1]["reason"], BLOCK_DISPATCH_UNCERTAIN)
         self.assertEqual(outcomes[1]["attempted"], [])
-        self.assertEqual(ops.heal_calls, [(healthy.lane_id, True)])
+        self.assertEqual(ops.heal_calls, [healthy.lane_id])
 
     def test_a_deliberate_scope_skip_is_not_a_block(self):
         facts = fleet_facts(reboot=reboot_facts(issue_closed=True))

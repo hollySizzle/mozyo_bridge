@@ -27,22 +27,35 @@ Three decisions carry the safety:
   restatement of the record, not an inference — and it is the SAFE direction besides: it can
   only demote an unproven ``ok`` to ``uncertain_partial``, never promote anything.
 - **Evidence is attributed to the receiver that would be sent to NOW** (Redmine #15745
-  review j#108920 ``finding_generationfence``, verdict j#108926). The marker carries no lane
-  and no generation, and the ledger has no generation column, so keying on the marker alone
-  let an OLD generation's confirmed delivery answer for a fresh one: a relaunched pair — or
-  a supersede successor — read as ``delivered`` and never received the pointer. The join is
-  made on the discriminant the codebase already names for herdr process generations
-  (:class:`...lane_declared_slots.ProcessGenerationPin`: *"the herdr process-generation
-  discriminant is the live locator"*), taken from the ledger row's own ``target`` against
-  the CURRENT live inventory rather than from a declared pin — measured: 18 of 26 live
-  active rows carry an empty ``declared_slots``, so requiring a pin would block the majority
-  of real lanes. Attribution is three-valued and unknown never decays into either answer.
+  review j#108920 then j#108953 ``finding_generationfence``; verdicts j#108926 / j#108968).
+  The marker carries no lane and no generation and the ledger has no generation column, so
+  keying on the marker alone let an OLD generation's confirmed delivery answer for a fresh
+  one: a relaunched pair — or a supersede successor — read as ``delivered`` and never
+  received the pointer.
+
+  The same-generation proof is **not** re-invented here and is **not** a row revision. The
+  first attempt at this fence compared the inventory ``row_revision``, which
+  :func:`...herdr_identity.process_generation_of_locator` documents is *not* a
+  process-generation id (it mirrors ``terminal.revision`` and advances on presentation
+  changes such as a title update). Treating a revision drift as "a different generation"
+  dropped a confirmed record and re-promoted the key to ``owed`` — i.e. it would have
+  **re-sent the body to the same live receiver**, against ADR-0002's exactly-once body and
+  the issue's no-blind-replay condition. The proof is now the shared #15227 authority
+  :func:`...herdr_live_attestation_time.fresh_attestation_identity` /
+  :meth:`FreshGenerationBoundary.matches_delivery`, which joins one fresh inventory
+  snapshot, the terminal-verified attestation, and the verified startup-action generation
+  token against the ledger row's own ``gateway_binding`` on all six axes.
+
+  Attribution is three-valued and **failure is always towards not-sending**: only a
+  positively verified same generation is evidence, only a locator that is positively absent
+  from a readable snapshot is ruled out, and everything else — including any axis this rail
+  cannot read — is :data:`ATTRIB_UNKNOWN`, which blocks the lane.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional, Sequence
+from typing import Any, Callable, Optional, Sequence
 
 from mozyo_bridge.core.state.herdr_delivery_ledger import (
     ENTRY_DELIVERY_OUTCOME,
@@ -91,83 +104,49 @@ ATTRIB_UNKNOWN = "unknown_receiver"
 
 
 @dataclass(frozen=True)
-class ReceiverBinding:
-    """The live receiver a lane would send to now, as the attribution join reads it.
+class ReceiverGeneration:
+    """What this rail can prove about the receiver a lane would send to now (pure value).
 
-    ``locator`` is the herdr process-generation discriminant; ``assigned_name`` is the
-    stable per-``(workspace, role, lane)`` handle (it does NOT move across generations, so
-    it never discriminates alone); ``revision`` is the live inventory row revision, which
-    DOES move when a slot is re-launched and is what closes the recycled-locator (ABA) hole.
+    Deliberately NOT a set of identity fields to compare here: the same-generation proof is
+    the shared #15227 authority, injected as :attr:`matches` (normally
+    :meth:`...herdr_live_attestation_time.FreshGenerationBoundary.matches_delivery`), so
+    this module owns no second opinion about what a generation is. ``matches`` is ``None``
+    when no boundary could be resolved at all — an honest "cannot prove", never a "no".
 
-    An **absent** binding (:meth:`absent`) is a real, useful fact — the post-restart main
-    case — and means every recorded attempt targeted a receiver that is gone.
+    ``live_locators`` is every locator the fresh snapshot showed, used ONLY for the positive
+    absence direction: a locator no row claims belongs to a receiver that is gone.
+    ``inventory_readable`` False means the snapshot itself could not be read, and then
+    nothing can be placed on either side.
     """
 
-    role: str = ""
-    assigned_name: str = ""
-    locator: str = ""
-    revision: str = ""
+    inventory_readable: bool = False
+    live_locators: frozenset = frozenset()
+    matches: Optional[Callable[[Any], bool]] = None
 
     @classmethod
-    def absent(cls) -> "ReceiverBinding":
-        return cls()
+    def unreadable(cls) -> "ReceiverGeneration":
+        """The live inventory could not be read: no record can be placed."""
+        return cls(inventory_readable=False)
 
-    @property
-    def present(self) -> bool:
-        return bool(self.locator)
+    @classmethod
+    def absent(cls) -> "ReceiverGeneration":
+        """A readable snapshot with no live slot for this lane — the post-restart case."""
+        return cls(inventory_readable=True)
+
+    def proves_current(self, record: Any) -> bool:
+        if self.matches is None:
+            return False
+        try:
+            return bool(self.matches(record))
+        except Exception:  # noqa: BLE001 - an authority that raises proves nothing
+            return False
 
     def as_payload(self) -> dict:
         return {
-            "role": self.role,
-            "assigned_name": self.assigned_name,
-            "locator": self.locator,
-            "revision": self.revision,
+            "inventory_readable": self.inventory_readable,
+            "live_locator_count": len(self.live_locators),
+            "generation_proof_available": self.matches is not None,
         }
-
-
-def _gateway_binding_of(record: Any) -> Optional[Mapping[str, object]]:
-    """The queue-enter rail's recorded receiver binding, when the row carries one."""
-    observation = getattr(record, "queue_enter_observation", None)
-    if not isinstance(observation, Mapping):
-        return None
-    binding = observation.get("gateway_binding")
-    return binding if isinstance(binding, Mapping) else None
-
-
-def attribute_record(record: Any, binding: ReceiverBinding) -> str:
-    """Place one recorded attempt relative to the CURRENT receiver (pure, three-valued).
-
-    - no usable ``target`` on the record -> :data:`ATTRIB_UNKNOWN` (we cannot say who got it);
-    - no live receiver at all -> :data:`ATTRIB_RETIRED` (whoever got it is gone);
-    - a different locator -> :data:`ATTRIB_RETIRED`;
-    - the same locator AND a recorded binding whose ``assigned_name`` / ``row_revision``
-      match the live slot -> :data:`ATTRIB_CURRENT`;
-    - the same locator but a recorded binding that disagrees -> :data:`ATTRIB_RETIRED` (the
-      slot was re-launched under the same locator: a genuinely different process);
-    - the same locator with NO recorded binding -> :data:`ATTRIB_UNKNOWN`. A bare locator
-      cannot tell "the same process" from a recycled one, and guessing either way is exactly
-      the error this join exists to remove.
-    """
-    target = getattr(record, "target", None)
-    target = target.strip() if isinstance(target, str) else ""
-    if not target:
-        return ATTRIB_UNKNOWN
-    if not binding.present:
-        return ATTRIB_RETIRED
-    if target != binding.locator:
-        return ATTRIB_RETIRED
-    recorded = _gateway_binding_of(record)
-    if recorded is None:
-        return ATTRIB_UNKNOWN
-    name = recorded.get("assigned_name")
-    revision = recorded.get("row_revision")
-    if not isinstance(name, str) or not isinstance(revision, str):
-        return ATTRIB_UNKNOWN
-    if not name or not revision:
-        return ATTRIB_UNKNOWN
-    if name != binding.assigned_name or revision != binding.revision:
-        return ATTRIB_RETIRED
-    return ATTRIB_CURRENT
 
 
 def redmine_marker(issue: str, journal: str, kind: str, receiver: str) -> str:
@@ -211,6 +190,35 @@ def _stage_of(record: Any) -> str:
     )
 
 
+def attribute_record(record: Any, generation: ReceiverGeneration) -> str:
+    """Place one recorded attempt relative to the CURRENT receiver (pure, three-valued).
+
+    The ordering IS the safety property (review j#108953): the only path to
+    :data:`ATTRIB_CURRENT` is a positively verified same generation, and the only path to
+    :data:`ATTRIB_RETIRED` is a locator positively absent from a readable snapshot. Every
+    other shape — an unreadable snapshot, a missing target, a live locator whose generation
+    cannot be proven — is :data:`ATTRIB_UNKNOWN`. Nothing about a record's *fields* can
+    license a resend on its own.
+    """
+    if not generation.inventory_readable:
+        return ATTRIB_UNKNOWN
+    if generation.proves_current(record):
+        return ATTRIB_CURRENT
+    target = getattr(record, "target", None)
+    target = target.strip() if isinstance(target, str) else ""
+    if not target:
+        return ATTRIB_UNKNOWN
+    if target not in generation.live_locators:
+        # Positive absence over a readable snapshot: whoever received this is gone, so it
+        # is not evidence about the receiver we are about to stand up, and re-issuing to a
+        # fresh process cannot duplicate what a dead one held.
+        return ATTRIB_RETIRED
+    # The locator is live but the same generation could not be verified. That is exactly
+    # the shape a re-launch under a recycled locator produces, and also the shape an
+    # unreadable attestation produces; neither may license a resend.
+    return ATTRIB_UNKNOWN
+
+
 def select_key_records(
     records: Sequence[Any], *, marker: str, kind: str, receiver: str
 ) -> tuple[Any, ...]:
@@ -238,7 +246,7 @@ def fold_dispatch_state(
     marker: str,
     kind: str,
     receiver: str,
-    binding: Optional[ReceiverBinding] = None,
+    generation: Optional[ReceiverGeneration] = None,
 ) -> str:
     """Fold one causal key's recorded attempts into a closed dispatch state (pure).
 
@@ -247,7 +255,8 @@ def fold_dispatch_state(
     :data:`DISPATCH_ATTRIBUTION_UNKNOWN` for the whole key, and an attempt aimed at a
     receiver that is gone is dropped rather than folded — it is not evidence about a process
     that does not exist yet, and re-issuing to a fresh one cannot duplicate what a dead one
-    held. ``binding=None`` means "no live receiver", the post-restart main case.
+    held. ``generation=None`` is read as an unreadable snapshot — the fail-closed default,
+    so a caller that forgets to supply one can never get a send licensed by omission.
 
     Then, over the CURRENT-receiver attempts only, fail-closed by ordering: a single
     ``submitted_confirmed`` makes the key delivered, a single ``uncertain_partial`` makes it
@@ -255,9 +264,9 @@ def fold_dispatch_state(
     That mirrors :func:`...injection_stage.blind_retry_prohibited`, which admits a retry for
     :data:`STAGE_NOT_SENT` alone.
     """
-    binding = binding if binding is not None else ReceiverBinding.absent()
+    generation = generation if generation is not None else ReceiverGeneration.unreadable()
     selected = select_key_records(records, marker=marker, kind=kind, receiver=receiver)
-    attributions = [attribute_record(record, binding) for record in selected]
+    attributions = [attribute_record(record, generation) for record in selected]
     if ATTRIB_UNKNOWN in attributions:
         return DISPATCH_ATTRIBUTION_UNKNOWN
     stages = {
@@ -283,7 +292,7 @@ def dispatch_fact(
     journal: str,
     kind: str,
     receiver: str,
-    binding: Optional[ReceiverBinding] = None,
+    generation: Optional[ReceiverGeneration] = None,
     unreadable: bool = False,
     detail: str = "",
 ) -> LaneDispatchFact:
@@ -313,14 +322,15 @@ def dispatch_fact(
     marker = redmine_marker(issue_s, journal_s, kind, receiver)
     selected = select_key_records(records, marker=marker, kind=kind, receiver=receiver)
     state = fold_dispatch_state(
-        records, marker=marker, kind=kind, receiver=receiver, binding=binding
+        records, marker=marker, kind=kind, receiver=receiver, generation=generation
     )
     resolved_detail = detail
     if state == DISPATCH_ATTRIBUTION_UNKNOWN and not resolved_detail:
         resolved_detail = (
-            "a recorded attempt targets a receiver this rail cannot place relative to the "
-            "live slot (missing target, or a live locator with no recorded binding to rule "
-            "out a re-launch under the same locator)"
+            "a recorded attempt could not be placed relative to the receiver this lane "
+            "would send to now: the live inventory was unreadable, the record names no "
+            "target, or the locator is live but the terminal-verified same-generation "
+            "proof did not hold"
         )
     return LaneDispatchFact(
         state=state,
@@ -368,7 +378,7 @@ __all__ = (
     "ATTRIB_UNKNOWN",
     "KIND_IMPLEMENTATION_REQUEST",
     "KIND_REPLY",
-    "ReceiverBinding",
+    "ReceiverGeneration",
     "attribute_record",
     "dispatch_fact",
     "fold_dispatch_state",
