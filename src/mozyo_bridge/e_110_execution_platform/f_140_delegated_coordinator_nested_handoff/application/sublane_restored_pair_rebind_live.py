@@ -55,23 +55,15 @@ never bypasses it into a pin write).
 from __future__ import annotations
 
 import os
-import subprocess
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Optional, Sequence
+from typing import Mapping, Optional
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     ATTEST_ABSENT,
     ATTEST_STALE,
-    HerdrIdentityAttestationStore,
     VERDICT_PRESENT,
     evaluate_attestation,
-)
-from mozyo_bridge.core.state.herdr_launch_generation import (
-    HerdrLaunchGenerationStore,
-)
-from mozyo_bridge.core.state.startup_transaction_fence import (
-    StartupTransactionFence,
 )
 from mozyo_bridge.core.state.lane_lifecycle import (
     BINDING_KIND_ISSUE,
@@ -80,7 +72,6 @@ from mozyo_bridge.core.state.lane_lifecycle import (
     DecisionPointer,
     DecisionPointerError,
     LaneLifecycleKey,
-    LaneLifecycleStore,
     ProcessGenerationPin,
     ProcessPinError,
     replacement_settled,
@@ -90,13 +81,8 @@ from mozyo_bridge.core.state.lane_pin_role import read_declared_pin_pair
 from mozyo_bridge.core.state.lane_recovered_pair_pin_reconcile import (
     LaneRecoveredPairPinReconcileStore,
 )
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
-    declared_worktree_identity,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_herdr_projection import (  # noqa: E501
-    list_herdr_agent_rows,
-    probe_worktree_resolved,
-    repo_scope_workspace_id,
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.restored_pair_store_seams import (  # noqa: E501
+    RestoredPairStoreSeams,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_reattest import (  # noqa: E501
     GEN_LIVE_BOUND,
@@ -108,10 +94,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_rebind import (  # noqa: E501
     SublaneRestoredPairRebindUseCase,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workflow_provider_resolution import (  # noqa: E501
-    resolve_gateway_provider,
-    resolve_worker_provider,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.restored_pair_rebind import (  # noqa: E501
     REBIND_BLOCK_AMBIGUOUS_LOCATORS,
@@ -198,120 +180,14 @@ class _RebindContext:
 
 
 @dataclass
-class LiveRestoredPairRebindOps:
-    """Live fail-closed observation + bounded CAS write (test seams are methods)."""
+class LiveRestoredPairRebindOps(RestoredPairStoreSeams):
+    """Live fail-closed observation + bounded CAS write.
 
-    repo_root: Path
-    env: Mapping[str, str] = field(default_factory=lambda: dict(os.environ))
-    lifecycle_home: Optional[Path] = None
-    attestation_home: Optional[Path] = None
-
-    # -- overridable authority seams (fakes subclass these; the join stays real) --
-
-    def _resolve_root(self) -> Optional[Path]:
-        try:
-            root = self.repo_root.expanduser().resolve(strict=True)
-        except OSError:
-            return None
-        return root if root.is_dir() else None
-
-    def _workspace_id(self, root: Path) -> str:
-        return _norm(repo_scope_workspace_id(root))
-
-    def _lifecycle_record(self, workspace_id: str, lane: str):
-        return LaneLifecycleStore(home=self.lifecycle_home).get(
-            LaneLifecycleKey(workspace_id, lane)
-        )
-
-    def _worktree_identity(self, root: Path, lane: str) -> Optional[str]:
-        return declared_worktree_identity(str(root), lane)
-
-    def _worktree_readable(self, root: Path) -> bool:
-        try:
-            return probe_worktree_resolved(str(root)) is True
-        except Exception:  # noqa: BLE001 - unreadable worktree authority fails closed
-            return False
-
-    def _branch(self, root: Path) -> str:
-        try:
-            result = subprocess.run(
-                ["git", "-C", str(root), "rev-parse", "--abbrev-ref", "HEAD"],
-                text=True,
-                capture_output=True,
-            )
-        except OSError:
-            return ""
-        return result.stdout.strip() if result.returncode == 0 else ""
-
-    def _providers(self, root: Path) -> tuple[str, str]:
-        return (
-            _norm(resolve_gateway_provider(str(root))),
-            _norm(resolve_worker_provider(str(root))),
-        )
-
-    def _rows(self) -> Sequence[Mapping[str, object]]:
-        return list_herdr_agent_rows(self.env)
-
-    def _read_attestation(self, assigned_name: str):
-        return HerdrIdentityAttestationStore(home=self.attestation_home).read(
-            assigned_name
-        )
-
-    def _read_generation(self, assigned_name: str):
-        """The current launch-generation row for this slot (raises when unreadable)."""
-        return HerdrLaunchGenerationStore(home=self.attestation_home).read(
-            assigned_name
-        )
-
-    def _read_startup_action(self, action_id: str):
-        """The startup-transaction action a generation token names (raises on damage)."""
-        return StartupTransactionFence(home=self.attestation_home).read(action_id)
-
-    def _repin_participant(self, plan: SlotReattestPlan) -> None:
-        repair = plan.participant
-        assert repair is not None and repair.needs_write
-        kwargs = {
-            "assigned_name": plan.assigned_name,
-            "expected_locator": repair.expected_locator,
-        }
-        if repair.locator_repin:
-            kwargs["new_locator"] = plan.new_locator
-        if repair.receipt_remint:
-            kwargs["expected_receipt"] = repair.expected_receipt
-            kwargs["new_receipt"] = repair.new_receipt
-        StartupTransactionFence(home=self.attestation_home).repin_restored_participant(
-            plan.startup_action_id, plan.provider, **kwargs
-        )
-
-    def _reattest_attestation(self, plan: SlotReattestPlan) -> None:
-        HerdrIdentityAttestationStore(
-            home=self.attestation_home
-        ).reattest_restored_terminal(
-            assigned_name=plan.assigned_name,
-            workspace_id=plan.attestation_workspace_id,
-            role=plan.attestation_role,
-            lane_id=plan.attestation_lane_id,
-            expected_locator=plan.attestation_expected_locator,
-            expected_terminal_id=plan.attestation_expected_terminal_id,
-            live_locator=plan.new_locator,
-            live_terminal_id=plan.new_terminal_id,
-        )
-
-    def _reattest_generation(self, plan: SlotReattestPlan) -> None:
-        HerdrLaunchGenerationStore(
-            home=self.attestation_home
-        ).reattest_restored_terminal(
-            assigned_name=plan.assigned_name,
-            startup_action_id=plan.startup_action_id,
-            workspace_id=plan.workspace_id,
-            role=plan.provider,
-            lane_id=plan.lane_id,
-            verdict=plan.verdict,
-            expected_locator=plan.old_locator,
-            expected_terminal_id=plan.old_terminal_id,
-            live_locator=plan.new_locator,
-            live_terminal_id=plan.new_terminal_id,
-        )
+    The host probes and durable-store joins are the shared
+    :class:`...restored_pair_store_seams.RestoredPairStoreSeams` (#15811 extraction —
+    byte-identical to the seams this class declared inline through #15769); only the rail's
+    own gate / plan / write logic lives here.
+    """
 
     # -- per-slot gate --------------------------------------------------------
 

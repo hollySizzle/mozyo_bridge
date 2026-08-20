@@ -507,6 +507,43 @@ receipt terminalがrestore lineage (live値、またはgeneration rowの旧値�
 receipt照合を要求するproduction queue-enter delivery path (`verified_terminal_generation_token` +
 attestation equality) の両方が、無変更のread-side verifierのまま自然に成立する。
 
+#### declared pin が ABSENT な restored pair の初回宣言 (Redmine #15811)
+
+`sublane rebind-restored-pair` は「stale な declared pair を exact に置換する」railであり、置換対象の
+old pairをCASのkeyに要求する。しかし **lane lifecycle rowのpinは create path では書かれない**:
+`declare_created_lane_lifecycle` はowner rowを**空の`declared_slots`**で宣言し、pinはadopt / repair rail
+がlive pairを観測したときにのみ着地する。したがってcreate pathで起こしたlaneがserver世代交代を跨いで
+restoreされると、rowは`read_declared_pin_pair` = `declared_pins_absent` のままとなり、4 railすべてが
+それぞれ正しく拒否する (実測 2026-08-20、#15811: rebind=`declared_slots_unresolved` /
+create adopt=`unattested_slot` (caller視点 `adopt_owner_unbound`) / rehydrate と retire drainは
+current-generation proofが空)。**これは #15774 型の record 劣化ではなく、pinが一度も宣言されていない
+状態**であり、「置換すべき旧pair」は原理的に存在しない。
+
+`sublane adopt-restored-pair` (Redmine #15811) はこのpin-absent siblingである。**対象はpin snapshotが
+exactに absent なrowだけ**とし、resolvableなpairも、非空で疑わしいsnapshot (unreadable / foreign /
+mixed / duplicate / 片側だけ) も `declared_pins_present:<pin_pair_reason>` で拒否する — 劣化したsnapshotを
+live観測で上書きすると`sublane repair-pins` / owner判断が必要とする証拠を破壊するため、「pin解決不能」を
+「何でも回収してよい」に読み替えない。
+
+その対象範囲の中では、宣言のproof chainは隣接2 railの**いずれよりも厳しい** (declared pinという照合先が
+存在しないため):
+
+- slotは caller供給名との照合ではなく、raw inventoryのserver-owned mzb1 nameを**decodeして**特定する
+  (`select_named_slot_candidate` — #13809 adopt pathのraw multiplicity / liveness / provider stamp
+  gateをそのまま共有する);
+- **attested な launch-generation row を必須とする** (欠落・pending・非`present`は
+  `generation_absent:<slot>` で hard refusal)。rebind railは「usableなattested rowなし」をpre-#15769
+  shapeとしてdeclared pin側の証拠へfall throughできるが、本railにはfall through先がない;
+- participant lineage joinを全slotで必須とする (捏造された`live_bound` rowはここで型付き拒否);
+- attestation recordはidentity一致の上で`attested`または#15769のrestore署名staleであること。
+
+書き込みは #15769 と同じ retry-safe 順 (participant re-pin → attestation re-pin → generation CAS) の後、
+**既存の empty-only CAS** `LaneDeclarationStore.backfill_active_binding` による初回pin宣言である
+(非空で異なるsnapshotは`already_declared`でzero-write、`expected_revision`不一致は`stale_revision`)。
+`lane_generation`は動かさず (restoreされたprocessは同一agent-session incarnation)、close / launch / send /
+worktree変更は一切行わない。pairの片側だけを宣言するmode は持たない: declared pinが無いrowには
+「もう片方が何であったか」の記録が無く、半分の観測をpairとして宣言できないためである。
+
 flow:
 
 1. herdr binary を trusted env から解決 (未設定 / 未解決 → fail-closed)。
