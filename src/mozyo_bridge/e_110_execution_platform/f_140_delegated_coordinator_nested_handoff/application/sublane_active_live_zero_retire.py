@@ -421,6 +421,7 @@ def run_active_live_zero_retire(
                 lane_label=lane_label,
                 issue=issue,
                 journal=journal,
+                absent_worktree=absent_worktree,
             )
     except AttestationStoreLockBusy as exc:
         return _blocked(
@@ -457,6 +458,7 @@ def _terminalize_under_exclusion(
     lane_label: str,
     issue: str,
     journal: str,
+    absent_worktree: Optional["AbsentWorktreeEvidence"] = None,
 ):
     """The action-time half, run while HOLDING the exclusive launch-exclusion lock (#14242).
 
@@ -592,6 +594,39 @@ def _terminalize_under_exclusion(
             workspace_id=workspace_id,
             lane_id=lane_label,
         )
+    # Redmine #15789 review j#109127 finding_actiontimerace: the absent-checkout evidence is
+    # re-proved HERE, at the terminal mutation boundary, because the preflight's copy is a
+    # statement about the past. The review reproduced the consequence — a checkout restored (and
+    # dirtied) at the recorded path after the first proof still produced a terminal write
+    # (verdict j#109134). Placed after the live-zero read and before the CAS, so it is the last
+    # thing measured; placed after the already-retired shortcut on purpose, since that branch
+    # writes nothing and failing an idempotent replay would be a behaviour change with no
+    # safety benefit. Named residual (NOT solved, same discipline as the #14242 j#85269 launcher
+    # residual): git's own worktree add / prune do not take this lock, so a restore landing in
+    # the few statements between here and the CAS is not excluded.
+    if absent_worktree is not None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_absent_worktree_evidence import (  # noqa: E501
+            revalidate_absent_worktree_evidence,
+        )
+
+        reproof = revalidate_absent_worktree_evidence(
+            repo_root,
+            prior=absent_worktree,
+            worktree=getattr(args, "worktree", None),
+            branch=getattr(args, "branch", None),
+            lane_label=lane_label,
+        )
+        if not reproof.admissible:
+            return _blocked(
+                reproof.reason or ACTIVE_RETIRE_ABSENT_WORKTREE_UNPROVEN,
+                detail=(
+                    "the absent-checkout evidence no longer holds at the terminal mutation "
+                    f"boundary: {reproof.detail}"
+                ),
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+            )
+
     store = LaneActiveRetireStore(home=getattr(args, "home", None))
     try:
         outcome = store.retire_active_live_zero(

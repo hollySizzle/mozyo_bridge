@@ -729,6 +729,37 @@ def run_hibernated_bound_retire(
         lifecycle_migration_payload,
     )
 
+    # Redmine #15789 review j#109127 finding_actiontimerace: re-prove the absent-checkout
+    # evidence at the terminal mutation boundary. The preflight's copy is a statement about the
+    # past, and the review reproduced a checkout restored (and dirtied) at the recorded path
+    # after that proof still producing a terminal write (verdict j#109134). This rail takes no
+    # launch-exclusion lock — its second witness is the durable `released` record, not an
+    # inventory read — so the boundary here is simply "immediately before the CAS". Named
+    # residual (NOT solved): git's worktree add / prune are not serialized against this rail, so
+    # a restore landing between this re-proof and the CAS is not excluded.
+    if absent_worktree is not None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_absent_worktree_evidence import (  # noqa: E501
+            revalidate_absent_worktree_evidence,
+        )
+
+        reproof = revalidate_absent_worktree_evidence(
+            repo_root,
+            prior=absent_worktree,
+            worktree=getattr(args, "worktree", None),
+            branch=getattr(args, "branch", None),
+            lane_label=lane_label,
+        )
+        if not reproof.admissible:
+            return _blocked(
+                reproof.reason or BOUND_RETIRE_ABSENT_WORKTREE_UNPROVEN,
+                detail=(
+                    "the absent-checkout evidence no longer holds at the terminal mutation "
+                    f"boundary: {reproof.detail}"
+                ),
+                workspace_id=workspace_id,
+                lane_id=lane_label,
+            )
+
     retire_store = LaneBoundRetireStore(home=getattr(args, "home", None))
     try:
         outcome = retire_store.retire_released_hibernated_bound(

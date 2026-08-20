@@ -27,7 +27,11 @@ What is pinned here, in one file per the R3-c same-issue grouping rule:
    entry, a locked / non-prunable entry, a detached or differently-branched entry, an unreadable
    ``git worktree list``, and a non-applicable intent are each zero-write;
 4. **the default is unchanged** — without the flag the bound rails block on a missing worktree
-   exactly as #14499 pinned them to.
+   exactly as #14499 pinned them to;
+5. **the absence is re-proven at the terminal mutation boundary** — review j#109127
+   ``finding_actiontimerace`` (verdict j#109134, accepted after independent reproduction): a
+   checkout restored and dirtied at the recorded path AFTER the preflight's proof must not reach
+   a terminal write.
 
 Boundary: synthetic lifecycle sqlite under a task-specific temp home, fabricated inventory rows,
 real temporary git repos where a git fact is under test. Never the operator's shared
@@ -59,6 +63,7 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 from mozyo_bridge.core.state.lane_lifecycle import LaneLifecycleStore  # noqa: E402
 from mozyo_bridge.core.state.lane_lifecycle_model import (  # noqa: E402
     DISPOSITION_ACTIVE,
+    DISPOSITION_HIBERNATED,
     DISPOSITION_RETIRED,
     DecisionPointer,
     LaneLifecycleKey,
@@ -71,6 +76,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_absent_worktree_evidence import (  # noqa: E402
     ABSENT_WT_BRANCH_MISMATCH,
+    ABSENT_WT_DRIFT,
     ABSENT_WT_LIST_UNREADABLE,
     ABSENT_WT_NOT_PRUNABLE,
     ABSENT_WT_NOT_REGISTERED,
@@ -561,6 +567,191 @@ class TheEvidencePathRefusesEveryUnprovenShape(_WipedCheckoutFixture):
         )
         self.assert_refused(payload, REASON_WORKTREE_ABSENT_NOT_APPLICABLE)
         self.assertEqual(self.disposition(), DISPOSITION_ACTIVE)
+
+
+class TheAbsenceIsReProvenAtTheTerminalMutationBoundary(_WipedCheckoutFixture):
+    """Review j#109127 ``finding_actiontimerace``, verdict j#109134 (accepted, reproduced).
+
+    The preflight needs the evidence EARLY — that is what keeps a wiped path out of the dirty /
+    missing gates — but an early proof is a statement about the past. Measured before the fix:
+    restoring the checkout at the recorded path (with uncommitted work) after that proof and
+    before the CAS still produced ``exit_code=0`` / ``retired`` / ``worktree_present=true`` /
+    ``dirty_file_present=true``.
+
+    The concurrent event is injected with a one-shot hook around the evidence resolver; the code
+    under test is unmodified. A real restore cannot be quiet — ``git worktree add`` refuses
+    while the entry is still registered — so these fixtures perform the prune-then-add sequence
+    git actually forces, which is exactly why the re-proof sees a changed world.
+    """
+
+    def _run_with_event_in_the_window(self, event):
+        """Run the retire with ``event`` firing once, right after the first absence proof."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_absent_worktree_evidence as evidence_module,
+        )
+
+        real = evidence_module.resolve_absent_worktree_evidence
+        fired: list[bool] = []
+
+        def hooked(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if not fired:
+                fired.append(True)
+                event()
+            return result
+
+        with mock.patch.object(
+            evidence_module, "resolve_absent_worktree_evidence", hooked
+        ):
+            outcome = self.run_retire()
+        self.assertTrue(fired, "the concurrent event never entered the window")
+        return outcome
+
+    def _restore_and_dirty(self):
+        """Bring the checkout back at the exact recorded path, carrying uncommitted work."""
+        result = subprocess.run(
+            ["git", "worktree", "add", "-q", str(self.lane_wt), _LANE],
+            cwd=str(self.primary), capture_output=True, text=True,
+        )
+        self.assertNotEqual(
+            result.returncode, 0,
+            "precondition: git must refuse to add over a still-registered entry",
+        )
+        self.assertIn("already registered", result.stderr)
+        _git("worktree", "prune", cwd=self.primary)
+        _git("worktree", "add", "-q", str(self.lane_wt), _LANE, cwd=self.primary)
+        (self.lane_wt / "uncommitted.txt").write_text("precious\n", encoding="utf-8")
+
+    def test_a_checkout_restored_after_the_initial_proof_blocks_the_terminal_write(self):
+        self.declare_active()
+        self.wipe_checkout()
+        _, payload = self._run_with_event_in_the_window(self._restore_and_dirty)
+
+        self.assert_refused(payload, ABSENT_WT_WORKTREE_PRESENT)
+        self.assertEqual(
+            self.disposition(),
+            DISPOSITION_ACTIVE,
+            "a terminal write landed against a checkout that came back",
+        )
+        # The uncommitted work is still there and was never this rail's to touch.
+        self.assertTrue((self.lane_wt / "uncommitted.txt").exists())
+
+    def test_an_entry_pruned_after_the_initial_proof_blocks_the_terminal_write(self):
+        """The prune alone already destroys the evidence, before any re-add."""
+        self.declare_active()
+        self.wipe_checkout()
+        _, payload = self._run_with_event_in_the_window(
+            lambda: _git("worktree", "prune", cwd=self.primary)
+        )
+        self.assert_refused(payload, ABSENT_WT_NOT_REGISTERED)
+        self.assertEqual(self.disposition(), DISPOSITION_ACTIVE)
+
+    def test_the_re_proof_does_not_disturb_a_run_with_no_concurrent_event(self):
+        """Control: the second read must not become a second way to fail a good run."""
+        self.declare_active()
+        self.wipe_checkout()
+        code, payload = self.run_retire()
+        self.assertEqual(payload.get("retire_application", {}).get("state"), "retired")
+        self.assertEqual(code, 0)
+        self.assertEqual(self.disposition(), DISPOSITION_RETIRED)
+
+    def test_a_drifting_re_proof_is_refused_rather_than_silently_adopted(self):
+        """A re-proof that verifies against a DIFFERENT lane is never adopted."""
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_absent_worktree_evidence import (  # noqa: E501
+            AbsentWorktreeEvidence,
+            revalidate_absent_worktree_evidence,
+        )
+
+        self.wipe_checkout()
+        prior = AbsentWorktreeEvidence(
+            admissible=True,
+            worktree_path=str(self.lane_wt),
+            branch=_LANE,
+            metadata_token="wt_a_different_token",
+            legacy_token="wt_a_different_token",
+        )
+        result = revalidate_absent_worktree_evidence(
+            self.primary,
+            prior=prior,
+            worktree=str(self.lane_wt),
+            branch=_LANE,
+            lane_label=_LANE,
+        )
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, ABSENT_WT_DRIFT)
+        self.assertIn("metadata_token", result.detail)
+
+
+class TheHibernatedBoundRailCarriesTheSameContract(_WipedCheckoutFixture):
+    """The second BOUND rail, driven for real rather than assumed symmetric.
+
+    ``--worktree-absent`` modifies two rails and the planner emits the flag for both
+    dispositions, so the hibernated / released rail is exercised end to end here too — the same
+    substitution and the same action-time re-proof. Seeding reuses #13845's real store
+    transitions (`_seed_hibernated_released_bound`) rather than a re-derived fixture; only the
+    helper is imported, so its TestCases are not collected twice.
+    """
+
+    def _seed_hibernated(self) -> None:
+        from regressions.test_issue_13845_hibernated_bound_live_zero_retire import (  # noqa: E501
+            _seed_hibernated_released_bound,
+        )
+
+        _seed_hibernated_released_bound(
+            path=None,
+            key=LaneLifecycleKey(_WORKSPACE_ID, _LANE),
+            issue=_ISSUE,
+            worktree_identity=self.recorded_binding,
+            declared_slots=(),
+        )
+
+    def test_the_hibernated_bound_rail_terminalizes_a_wiped_checkout(self):
+        self._seed_hibernated()
+        self.wipe_checkout()
+        code, payload = self.run_retire(
+            retire_active_live_zero=False, retire_hibernated_bound=True
+        )
+        self.assertEqual(
+            payload.get("retire_application", {}).get("state"),
+            "retired",
+            json.dumps(payload, sort_keys=True)[:800],
+        )
+        self.assertEqual(code, 0)
+        self.assertEqual(self.disposition(), DISPOSITION_RETIRED)
+        self.assertEqual(
+            _git_out("rev-parse", _LANE, cwd=self.primary).strip(),
+            self.lane_head,
+            "the lane branch moved",
+        )
+
+    def test_the_hibernated_bound_rail_re_proves_absence_before_its_cas(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E501
+            sublane_absent_worktree_evidence as evidence_module,
+        )
+
+        self._seed_hibernated()
+        self.wipe_checkout()
+        real = evidence_module.resolve_absent_worktree_evidence
+        fired: list[bool] = []
+
+        def hooked(*args, **kwargs):
+            result = real(*args, **kwargs)
+            if not fired:
+                fired.append(True)
+                _git("worktree", "prune", cwd=self.primary)
+                _git("worktree", "add", "-q", str(self.lane_wt), _LANE, cwd=self.primary)
+                (self.lane_wt / "uncommitted.txt").write_text("x\n", encoding="utf-8")
+            return result
+
+        with mock.patch.object(
+            evidence_module, "resolve_absent_worktree_evidence", hooked
+        ):
+            _, payload = self.run_retire(
+                retire_active_live_zero=False, retire_hibernated_bound=True
+            )
+        self.assertTrue(fired, "the concurrent event never entered the window")
+        self.assert_refused(payload, ABSENT_WT_WORKTREE_PRESENT)
+        self.assertEqual(self.disposition(), DISPOSITION_HIBERNATED)
 
 
 class TheEvidenceResolverIsFailClosed(unittest.TestCase):

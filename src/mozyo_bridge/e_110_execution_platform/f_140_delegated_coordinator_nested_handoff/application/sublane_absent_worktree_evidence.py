@@ -85,6 +85,11 @@ ABSENT_WT_NOT_PRUNABLE = "worktree_not_prunable"
 #: The surviving entry names a different branch than ``--branch`` (or is detached, which
 #: carries no ``branch`` line at all).
 ABSENT_WT_BRANCH_MISMATCH = "worktree_branch_mismatch"
+#: The action-time re-proof (Redmine #15789 review j#109127 finding_actiontimerace) still
+#: verified, but against a DIFFERENT path / branch / binding token than the one the preflight
+#: was scoped on. The evidence no longer describes the same lane, so the terminal write is
+#: refused rather than applied on the earlier reading.
+ABSENT_WT_DRIFT = "absent_worktree_drift"
 
 ABSENT_WT_REASONS = frozenset(
     {
@@ -95,6 +100,7 @@ ABSENT_WT_REASONS = frozenset(
         ABSENT_WT_NOT_REGISTERED,
         ABSENT_WT_NOT_PRUNABLE,
         ABSENT_WT_BRANCH_MISMATCH,
+        ABSENT_WT_DRIFT,
     }
 )
 
@@ -333,8 +339,76 @@ def resolve_absent_worktree_evidence(
     )
 
 
+def revalidate_absent_worktree_evidence(
+    repo_root: Path,
+    *,
+    prior: AbsentWorktreeEvidence,
+    worktree: Optional[str],
+    branch: Optional[str],
+    lane_label: str,
+    runner: Optional[Callable[[Path, Sequence[str]], object]] = None,
+) -> AbsentWorktreeEvidence:
+    """Re-prove the absence at the terminal mutation boundary (Redmine #15789 j#109127).
+
+    The preflight scope decision needs the evidence EARLY — that is what keeps a wiped path out
+    of the dirty / missing gates. But an early proof is a statement about the past, and the
+    review reproduced the consequence: restoring the checkout at the recorded path (with
+    uncommitted work) after that proof and before the CAS still produced a terminal write
+    (``exit_code=0`` / ``retired`` / ``worktree_present=true`` / ``dirty_file_present=true``,
+    verdict j#109134). So the rails call this again immediately before the write, and refuse if
+    the world moved.
+
+    Why re-reading the same source closes THIS path rather than merely narrowing it: restoring a
+    checkout at a still-registered path is not something git will do quietly. ``git worktree
+    add`` refuses with *"missing but already registered worktree; use 'add -f' to override, or
+    'prune'"* — measured in the verdict's reproduction — so a real restore must either
+
+    - ``prune`` first, which DELETES the administrative entry this evidence is made of, and the
+      re-proof then refuses with :data:`ABSENT_WT_NOT_REGISTERED`; or
+    - ``add -f``, which turns the entry into a live, non-prunable worktree, and the re-proof
+      refuses with :data:`ABSENT_WT_WORKTREE_PRESENT` / :data:`ABSENT_WT_NOT_PRUNABLE`.
+
+    Either way the second read sees a different world than the first.
+
+    **Named residual, not solved** (same discipline as the #14242 j#85269 launcher residual):
+    ``git worktree add`` / ``prune`` do not take this home's attestation-store lock, so a
+    restore landing between this re-proof and the CAS a few statements later is not excluded.
+    That window is inside the exclusion lock and is not claimed to be closed. It is strictly
+    tighter than the pre-existing bound rail, whose ``worktree_dirty`` probe is taken at
+    preflight time and outside any lock (measured as the same outcome in verdict j#109134 E2,
+    tracked separately — it is not this issue's scope).
+
+    ``prior`` is the evidence the preflight was scoped on. A re-proof that verifies against a
+    different path / branch / binding token is :data:`ABSENT_WT_DRIFT`, never silently adopted.
+    """
+    fresh = resolve_absent_worktree_evidence(
+        repo_root,
+        worktree=worktree,
+        branch=branch,
+        lane_label=lane_label,
+        runner=runner,
+    )
+    if not fresh.admissible:
+        return fresh
+    drifted = [
+        f"{name}: {getattr(prior, name)!r} -> {getattr(fresh, name)!r}"
+        for name in ("worktree_path", "branch", "metadata_token", "legacy_token")
+        if getattr(prior, name) != getattr(fresh, name)
+    ]
+    if drifted:
+        return _refused(
+            ABSENT_WT_DRIFT,
+            "the action-time re-proof describes a different lane than the preflight was "
+            "scoped on (" + "; ".join(drifted) + "); the terminal write is refused rather "
+            "than applied on the earlier reading",
+            worktree_path=fresh.worktree_path,
+        )
+    return fresh
+
+
 __all__ = (
     "ABSENT_WT_BRANCH_MISMATCH",
+    "ABSENT_WT_DRIFT",
     "ABSENT_WT_LIST_UNREADABLE",
     "ABSENT_WT_NOT_PRUNABLE",
     "ABSENT_WT_NOT_REGISTERED",
@@ -345,4 +419,5 @@ __all__ = (
     "AbsentWorktreeEvidence",
     "parse_worktree_list_porcelain",
     "resolve_absent_worktree_evidence",
+    "revalidate_absent_worktree_evidence",
 )
