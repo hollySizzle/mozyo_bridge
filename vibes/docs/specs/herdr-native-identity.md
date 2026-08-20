@@ -427,29 +427,44 @@ participant exact一致 (assigned_name / locator / not closed)、caller供給の
 participant自身の`attestation_write_succeeded`があること。`completed_rolled_back` / mid-startup phase /
 foreign・stale terminal / pending generationは従来どおりfail-closedであり、caller主張はどこにも入らない。
 
-**`success_owed` strandも同じgateで受理する (Redmine #15748)。** `StartupTransaction.settle`は
-`owed=False`の枝でのみ`success_owed`を書く。つまりこのphaseのdurable宣言は「probeはall-healthyを返し、この
-runは補償債務を負わず、残るはterminalなsuccess記帳だけ」であり、`rollback_owed` (未清算のhealth-completion
-債務) より**強い**。さらに`success_owed`はrollback railの`ACTIONABLE_PHASES`に含まれないため、受理したtoken
-の下でpaneが後から補償closeされるraceが構造的に存在しない。一方でそのphaseを清算できるrailも存在せず
-(rollback railは`nothing_owed`を返す)、2つの最終phase書込みの間でrunが死ぬと恒久に証明不能になる。よって
-照合側で受理し、書込み側の昇格は採らない — 外部から`completed_success`を書くことは「healthyに立ち上がり
-**かつそれをdurableに宣言した**」という主張になり、`success_owed`の定義そのものと矛盾する (加えてowning run
-が生存していれば、その最終`set_phase`がterminal判定でraiseする)。規約行は
-`completed_generation_startup_token`側で1本に閉じている: **terminalな`completed_success`はparticipant join
-だけでtokenを貸す。settled-but-uncleared phase (`rollback_owed` / `success_owed`) の受理はreceipt proofと自
-participantの`attestation_write_succeeded`を必須とする。**
+**`success_owed` / `health_check` strandも同じgateで受理する (Redmine #15748)。** 前提としてまず用語を正す
+(review #15748 j#108919 / verdict j#108925): **startup transactionのphaseはどれもhealth verdictではない。**
+`settle`のowedには`SessionStartResult.owes_rollback`が渡り (`herdr_session_start_completion`)、これは
+`not ok`より意図的に狭く「この runが自ら launchした slotの補償債務」だけを表す。adopted / surfacedな
+unhealthy slot、ratio / column失敗では`ok=false`でも`owes_rollback=false`になる。したがって
+`completed_success`ですら「pairがhealthy」ではなく「この runは fresh-launchの補償債務を負わないと記帳した」
+以上を意味しない。read side (`completed_generation_startup_token`) が問うのは**identity** — 「この locatorの
+live terminalは この launch自身の side effectか」 — であり、記帳phaseはその反証にならない。
 
-**`health_check`は受理しない (Redmine #15748、明示決定)。** `settle`はhealth分岐の**前**に`health_check`を
-書くため、このrecordはprobeの結果を一切持たず、かつ健全なlaunchがすべて通過するin-flight phaseである。
-durable factだけではstrandとin-flightを区別できないので、受理は「記録されていないprobe結果」の推定になる。
-書込み側清算も採らない: `completed_success`への昇格はhealth verdictの捏造、`rollback_owed`への降格は存在
-しない補償債務の捏造であり、後者はconditional-close primitiveを持つruntimeで健全なpairを実際に閉じさせる。
-`health_check`の正規清算路は**既存の公開rollback rail**である (同phaseは`ACTIONABLE_PHASES`に含まれる)。
-conditional-closeを持つruntimeでは完走し、持たない現runtimeではpresent participantを保存して`incomplete`を
-返す — 証明できないので成功を差し控える、という正しい終端。live strandが実測された場合の修正は供給側
-(probe verdictをphase書込み前にdurable化する、または`health_check`とverdictを1 writeに畳む) に属し、照合側
-では原理的に解けない。
+受理の線は「terminalか否か」ではなく **「settleに進入したか (launch setが閉じたか)」** である。`settle`は
+`health_check` / `success_owed`の唯一のwriterで、`health_check`は**進入時**、すなわちこのactionが行う launchが
+すべて記録された後に書かれる。そこから先の3 phaseはいずれも「launchは全て済み、帳簿だけが閉じていない」:
+
+- `health_check` — 補償judgementが未記帳。offline rollout restore経路の`completion_fence` raiseで到達可能。
+- `rollback_owed` — 補償債務を記帳済み (#15712で受理済み)。
+- `success_owed` — 補償債務なしを記帳済みだが terminal記帳が未了。清算できるrailは**存在しない**
+  (rollback railは`nothing_owed`を返す)。
+
+この3 phaseは**receipt proof gate** — caller供給のterminal-bound receipt照合の成立、および同actionの
+execution eventsに当該participant自身の`attestation_write_succeeded`があること — を全て満たす場合に限り
+tokenを貸す。terminalな`completed_success`は従来どおりparticipant joinだけで貸す。**補償債務が記帳された
+case (`rollback_owed`) を受理しておきながら、judgementが未記帳のcase (`health_check`) をidentity問題で拒む
+一貫した根拠はない。** `planned` / `launching`は launch setがまだ開いており (`record_participant`がroleを
+追加でき、run全体のrollbackが正常なdisposition)、`completed_rolled_back`はparticipantが不在と証明済みなので、
+いずれも従来どおりfail-closedのままである。
+
+**書込み側の昇格・降格は採らない。** 外部から`completed_success`を書くことは「この runが補償債務なしと
+**記帳した**」というprovenanceの捏造であり、owning runが生存していればその最終`set_phase`がterminal判定で
+raiseして、稀なstrandをlaunch時failureへ格上げしてしまう。`health_check`を`rollback_owed`へ降格させる案は
+存在しない補償債務の捏造で、conditional-close primitiveを持つruntimeでは健全なpairを実際に閉じさせる。
+本受理は**新しいmutation authorityを一切導入しない**。
+
+**受理はrollback railの権限を奪わない。** `health_check` / `rollback_owed`は引き続き
+`herdr_session_rollback.ACTIONABLE_PHASES`に属し、明示rollbackの対象である。ただし現runtimeの実挙動として、
+live participantがあり conditional-close primitiveが無い場合、railは全live participantを
+`conditional_close_unavailable`にして`blocked` / effect 0を返し、actionをterminalizeしない。つまり
+**現runtimeではこの3 phaseのstrandを終端させるrailは存在せず**、照合側受理だけが live paneのgoverned送達を
+回復させる。将来 conditional-close primitiveが入ればrailが本来の清算を完遂する。
 
 lifecycle rowを持たない**非default scratch pair**だけは、exact candidate runtimeを使い、次の公開railでv2へ
 置き換えられる。1行目はread-only preflightであり、green判定とこのpairを閉じる明示承認の後にだけ2行目を実行する。

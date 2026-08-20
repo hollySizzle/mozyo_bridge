@@ -227,17 +227,17 @@ class RollbackOwedRefusalBoundaries(unittest.TestCase):
         _seed_generation(home, token)
         self.assertEqual(_delivery_token(home), "")
 
-    def test_mid_startup_phases_stay_refused(self):
-        # `success_owed` left this list in Redmine #15748 j#108902: it is a settled
-        # all-healthy verdict, not a mid-startup phase, and is now admitted under the
-        # SAME receipt-proof gate. Its pins live in the #15748 regression file; the
+    def test_an_open_launch_set_stays_refused(self):
+        # `success_owed` and `health_check` left this pin in Redmine #15748 (verdict
+        # j#108925): both are written only once `settle` has been entered, so the
+        # action's launch set is closed, and both are now admitted under the SAME
+        # receipt-proof gate. `launching` — where `record_participant` can still add a
+        # role — stays refused. The #15748 regression file owns the new pins; the
         # `rollback_owed` acceptance and every boundary below are byte-unchanged.
-        for phase in (PHASE_LAUNCHING, PHASE_HEALTH_CHECK):
-            with self.subTest(phase=phase):
-                home = _tmp()
-                token = _seed_action(home, phase=phase)
-                _seed_generation(home, token)
-                self.assertEqual(_delivery_token(home), "")
+        home = _tmp()
+        token = _seed_action(home, phase=PHASE_LAUNCHING)
+        _seed_generation(home, token)
+        self.assertEqual(_delivery_token(home), "")
 
     def test_a_closed_participant_stays_refused(self):
         home = _tmp()

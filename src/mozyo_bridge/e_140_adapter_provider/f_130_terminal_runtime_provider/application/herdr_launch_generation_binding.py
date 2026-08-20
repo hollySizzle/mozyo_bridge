@@ -248,15 +248,17 @@ def verified_terminal_generation_token(
     written from the prepared pane's own response.  Requiring the current terminal id
     to match that receipt prevents a restored terminal from borrowing the stale token
     of the process that previously occupied the same name and locator.  Because this
-    wrapper always supplies the receipt proof, it also accepts the two settled-but-
-    uncleared shapes that
+    wrapper always supplies the receipt proof, it also accepts the three SETTLE-ENTERED
+    shapes that
     :func:`~mozyo_bridge.core.state.herdr_launch_generation.completed_generation_startup_token`
-    documents — the live-preserved ``rollback_owed`` settle-time health debt (Redmine
-    #15712) and the ``success_owed`` all-healthy run whose only outstanding item is the
-    terminal success record (Redmine #15748) — in both cases of a pair whose launched
-    slot verifiably attested and still owns its exact terminal.  ``health_check`` is not
-    among them: that phase precedes the health branch, so it records no verdict to
-    accept (#15748).
+    documents — the live-preserved ``rollback_owed`` compensation debt (Redmine #15712),
+    and the ``success_owed`` / ``health_check`` strands left by a run that died before
+    closing its books (Redmine #15748) — in every case of a pair whose launched slot
+    verifiably attested and still owns its exact terminal.  None of those phases is a
+    health verdict (``settle`` is driven by ``owes_rollback``, not by ``ok``), and this
+    conjunct asks only whether the terminal is this launch's own side effect.
+    ``planned`` / ``launching`` are not among them: there the action's launch set is
+    still open (#15748).
     """
     expected_terminal = norm(terminal_id)
     if not expected_terminal:

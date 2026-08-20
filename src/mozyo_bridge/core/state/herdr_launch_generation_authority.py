@@ -21,57 +21,71 @@ from pathlib import Path
 def completed_generation_startup_token(
     home, generation, *, norm, norm_lane, participant_receipt_matches=None
 ) -> str:
-    """Return the generation token only after exact startup success.
+    """Return the generation token only for a launch whose terminal is proven ours.
 
-    The rule, in one line: **a terminal ``completed_success`` lends its token on the
-    participant join alone; a SETTLED-BUT-UNCLEARED phase lends it only under the
-    receipt-proof gate** — a caller-supplied terminal-bound
-    ``participant_receipt_matches`` proof AND this participant's own
-    ``attestation_write_succeeded`` among the action's execution events. Two phases sit
-    on that second line, and both record a bookkeeping debt rather than a disproof of
-    the launched terminal's identity:
+    **What the phases actually say.** None of them is a health verdict, and this
+    authority consumes none (review #15748 j#108919 / verdict j#108925). ``settle`` is
+    driven by ``SessionStartResult.owes_rollback`` — deliberately narrower than
+    ``not ok``: an adopted or read-only surfaced slot that is unhealthy, or a failed
+    ratio / column check, leaves ``ok`` False while owing nothing. So
+    ``completed_success`` means "this run recorded that it owes no fresh-launch
+    compensation", NOT "the pair is healthy", and the same is true of every phase
+    below. What this function asks is an IDENTITY question — *is the live terminal at
+    this locator this launch's own side effect?* — so a bookkeeping phase is never a
+    disproof.
 
-    * ``rollback_owed`` (Redmine #15712) — a pair-level health-completion debt. On a
-      runtime without a conditional-close primitive the rollback rail preserves every
-      present participant, so a slot whose boot outlived the settle-time probe
-      (measured: the default-lane coordinator relaunch) stays live, attested, and
-      generation-finalized while its action can never reach ``completed_success``.
-    * ``success_owed`` (Redmine #15748) — the launcher's probe reported all-healthy and
-      the run owes NO compensation; only the terminal success record is outstanding
-      (``StartupTransaction.settle`` writes this phase on the ``owed=False`` branch
-      alone). It is a strictly STRONGER durable statement than ``rollback_owed``, and
-      unlike it the phase is not in the rollback rail's actionable set — nothing can
-      later close the pane out from under an accepted token — so refusing the stronger
-      statement while accepting the weaker one would be incoherent. No rail owes it a
-      settlement either: the rollback rail answers ``nothing_owed``, so a run that died
-      between its two final phase writes is otherwise permanently unprovable.
+    **The line is whether the launch set is closed**, not whether the phase is
+    terminal. ``settle`` is the only writer of ``health_check`` / ``success_owed``, and
+    it writes ``health_check`` on entry, once every launch this action will make has
+    been made and recorded. From there the action is one of:
 
-    ``health_check`` is deliberately NOT on that line (Redmine #15748). ``settle``
-    writes it BEFORE the health branch, so the record carries no verdict at all, and
-    every healthy launch passes through it — a strand and an in-flight probe are
-    indistinguishable from anything durable here. Accepting it would infer a probe
-    result that was never recorded; promoting it write-side would fabricate one (and
-    demoting it to ``rollback_owed`` would fabricate a compensation debt that closes
-    healthy pairs on a runtime that HAS conditional close). Its canonical settlement
-    path stays the explicit public rollback rail, which already claims it.
+    * ``health_check`` (Redmine #15748) — settle was entered; the compensation verdict
+      is not recorded yet. A run that died in that window (measured reachable: the
+      offline-rollout restore path's ``completion_fence`` raising between the two
+      writes) strands here.
+    * ``rollback_owed`` (Redmine #15712) — the run recorded a fresh-launch compensation
+      debt. On a runtime without a conditional-close primitive the rollback rail
+      preserves every present participant, so a slot whose boot outlived the
+      settle-time probe (measured: the default-lane coordinator relaunch) stays live,
+      attested and generation-finalized while its action can never terminalize.
+    * ``success_owed`` (Redmine #15748) — the run recorded that it owes no compensation;
+      only the terminal record is outstanding. No rail owes it a settlement at all (the
+      rollback rail answers ``nothing_owed``), so a run that died between its two final
+      writes is otherwise permanently unprovable.
+    * ``completed_success`` — the same statement as ``success_owed``, durably recorded.
 
-    Without the receipt proof, or without the participant's own attestation event, or
-    for any other phase (``completed_rolled_back`` / ``planned`` / ``launching`` /
-    ``health_check``), the answer stays ``""`` exactly as before — callers that cannot
-    prove the terminal keep the strict ``completed_success``-only behavior.
+    All three settle-entered phases lend their token ONLY under the receipt-proof gate:
+    a caller-supplied terminal-bound ``participant_receipt_matches`` proof AND this
+    participant's own ``attestation_write_succeeded`` among the action's execution
+    events. Terminal ``completed_success`` keeps lending on the participant join alone,
+    exactly as before. Accepting a recorded debt (``rollback_owed``, #15712) while
+    refusing an unrecorded verdict (``health_check``) would be incoherent for an
+    identity question — and none of this takes the rollback rail's authority away: it
+    still claims those phases and may still close the panes.
+
+    ``planned`` / ``launching`` stay refused because the launch set is still OPEN there
+    — ``record_participant`` can add another role, and rolling the whole run back is
+    the normal disposition. ``completed_rolled_back`` stays refused because its
+    participants were proven absent. Without the receipt proof, without the
+    participant's own attestation event, or for any of those phases, the answer stays
+    ``""`` — callers that cannot prove the terminal keep the strict
+    ``completed_success``-only behavior.
     """
     from mozyo_bridge.core.state.herdr_launch_generation import GENERATION_ATTESTED
     from mozyo_bridge.core.state.startup_execution_events import (
         STAGE_ATTESTATION_WRITE_SUCCEEDED, read_execution_events,
     )
     from mozyo_bridge.core.state.startup_transaction_fence import (
-        PHASE_COMPLETED_SUCCESS, PHASE_ROLLBACK_OWED, PHASE_SUCCESS_OWED,
-        StartupTransactionError, StartupTransactionFence,
+        PHASE_COMPLETED_SUCCESS, PHASE_HEALTH_CHECK, PHASE_ROLLBACK_OWED,
+        PHASE_SUCCESS_OWED, StartupTransactionError, StartupTransactionFence,
     )
 
-    #: The settled-but-uncleared phases the receipt-proof gate admits. Kept as one
-    #: local set so the gate below can never be applied to only half of them.
-    receipt_gated_phases = (PHASE_ROLLBACK_OWED, PHASE_SUCCESS_OWED)
+    #: The settle-entered phases the receipt-proof gate admits: every launch of the
+    #: action is recorded, but its books are not closed. Kept as one local set so the
+    #: gate below can never be applied to only some of them.
+    receipt_gated_phases = (
+        PHASE_HEALTH_CHECK, PHASE_ROLLBACK_OWED, PHASE_SUCCESS_OWED,
+    )
 
     token = norm(getattr(generation, "startup_action_id", "") or "")
     if norm(getattr(generation, "phase", "")) != GENERATION_ATTESTED or not token:
@@ -157,11 +171,11 @@ def verified_generation_token(
       token are never read from two files that could tear); AND
     * that token names a startup transaction that reached ``completed_success`` — or, only
       under the receipt-proof-gated acceptance documented on
-      :func:`completed_generation_startup_token`, a settled-but-uncleared
-      ``rollback_owed`` (Redmine #15712) or ``success_owed`` (Redmine #15748) action —
+      :func:`completed_generation_startup_token`, a settle-entered ``rollback_owed``
+      (Redmine #15712), ``success_owed`` or ``health_check`` (Redmine #15748) action —
       whose participant for ``role`` is exactly this gateway (``assigned_name`` +
-      ``locator``, not closed) — a rolled-back / mid-startup / foreign / superseded
-      generation never lends its token.
+      ``locator``, not closed) — a rolled-back / open-launch-set (``planned`` /
+      ``launching``) / foreign / superseded generation never lends its token.
 
     ``norm`` / ``norm_lane`` are injected by the caller so this core module never imports the
     provider identity helpers (the dependency never points core -> provider). Any unreadable
