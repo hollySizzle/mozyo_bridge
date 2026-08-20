@@ -122,8 +122,18 @@ class ResolveRoleProfileTest(unittest.TestCase):
         structured = resolution.to_structured_dict()
         self.assertEqual(
             set(structured),
-            {"role_profile", "profile_source", "profile_version", "unresolved_placeholders"},
+            {
+                "role_profile",
+                "profile_source",
+                "profile_version",
+                "unresolved_placeholders",
+                # #15722: additive ADR pointer set. Present as an explicit `None`
+                # when nothing was resolved, so the key set is stable and the
+                # "no ADR context" state is recorded rather than inferred.
+                "adr_context",
+            },
         )
+        self.assertIsNone(structured["adr_context"])
         # The substituted free-text value lives only in resolved_text, never in
         # the structured pointer payload.
         self.assertNotIn("secret-value", repr(structured))

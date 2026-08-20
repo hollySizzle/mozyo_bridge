@@ -32,12 +32,15 @@ when a template body changes, bump ``version`` there so the persisted
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from importlib import resources
 from typing import Iterable, Mapping, Optional
 
 import yaml
 
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.adr_context import (
+    AdrContextPointer,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.role_profile_config import (
     ROLE_COORDINATOR,
     ROLE_DELEGATED_COORDINATOR,
@@ -134,6 +137,12 @@ class RoleProfileResolution:
     :attr:`resolved_text` may embed supplied field values, so callers keep it to
     the stdout / pasteable record and out of any unvetted auto-persist body,
     mirroring the ``--record-command`` precedent.
+
+    :attr:`adr_context` (Redmine #15722) is the optional repo-local ADR pointer
+    set resolved at send time. It is an ADDITIVE companion: ``None`` means "no
+    ADR context resolved" and reproduces the pre-#15722 payload byte for byte, so
+    a receiver that does not know the field is unaffected. It is not part of the
+    template body and therefore does not participate in :attr:`profile_version`.
     """
 
     role_profile: str
@@ -141,6 +150,7 @@ class RoleProfileResolution:
     profile_version: str
     resolved_text: str
     unresolved_placeholders: tuple[str, ...]
+    adr_context: Optional[AdrContextPointer] = None
 
     def to_structured_dict(self) -> dict[str, object]:
         """Structured, free-text-free pointer fields for the handoff payload."""
@@ -149,7 +159,25 @@ class RoleProfileResolution:
             "profile_source": self.profile_source,
             "profile_version": self.profile_version,
             "unresolved_placeholders": list(self.unresolved_placeholders),
+            "adr_context": (
+                self.adr_context.to_structured_dict() if self.adr_context else None
+            ),
         }
+
+    def record_contract_text(self) -> str:
+        """The resolved contract for the durable record, plus any ADR context.
+
+        The template body is unchanged; the ADR pointer is appended under its own
+        heading (:meth:`AdrContextPointer.contract_lines`) so the receiver reads
+        the repo's ADR set from the durable record without a path guess, and can
+        still tell send-time repo state apart from the versioned template text.
+        Without an ADR context this returns :attr:`resolved_text` unchanged.
+        """
+        if self.adr_context is None:
+            return self.resolved_text
+        return "\n".join(
+            [*self.resolved_text.splitlines(), *self.adr_context.contract_lines()]
+        )
 
     def pointer_clause(self) -> str:
         """Compact single-line clause for the pane notification body.
@@ -172,6 +200,11 @@ class RoleProfileResolution:
                 + ", ".join(self.unresolved_placeholders)
                 + "]"
             )
+        if self.adr_context is not None:
+            # #15722: the ADR pointer rides the same single line (its own clause
+            # is newline-free by construction) so the injected execution context
+            # names the ADR set, not only the role contract.
+            clause += f"; {self.adr_context.pointer_clause()}"
         return clause
 
 
@@ -214,6 +247,23 @@ def resolve_role_profile(
         resolved_text=resolved,
         unresolved_placeholders=tuple(unresolved),
     )
+
+
+def with_adr_context(
+    resolution: RoleProfileResolution,
+    adr_context: Optional[AdrContextPointer],
+) -> RoleProfileResolution:
+    """Attach a resolved ADR pointer set to a role profile resolution (#15722).
+
+    Pure: returns a new resolution, and returns ``resolution`` unchanged when
+    ``adr_context`` is ``None``, so "no ADR context resolved" is a byte-identical
+    no-op rather than a differently-shaped payload. Kept here (rather than a
+    ``dataclasses.replace`` at the call site) so the additive field has one
+    documented seam.
+    """
+    if adr_context is None:
+        return resolution
+    return replace(resolution, adr_context=adr_context)
 
 
 #: Structured placeholder name with a send-time auto-fill source AND a record-static explicit
@@ -281,6 +331,8 @@ __all__: Iterable[str] = (
     "ROLE_PROFILE_TEMPLATES",
     "ROLE_PROFILE_TOKENS",
     "RoleProfileResolution",
+    "AdrContextPointer",
+    "with_adr_context",
     "template_placeholders",
     "resolve_role_profile",
     "parse_profile_fields",

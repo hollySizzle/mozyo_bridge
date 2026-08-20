@@ -29,6 +29,11 @@ from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.han
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_envelope_planner import (
     EnvelopePlannerOps,
 )
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.adr_context import (
+    AdrContextPointer,
+    make_adr_ref,
+    resolvable_paths_for,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     AnchorError,
     AsanaAnchor,
@@ -151,6 +156,15 @@ class FakeOps:
             profile_version="1",
             resolved_text=f"contract::{role_profile}",
             unresolved_placeholders=(),
+        )
+
+    def resolve_adr_context(self, repo_root: Path) -> AdrContextPointer | None:
+        # #15722: the ADR pointer set the planner attaches to the role profile.
+        # Default `None` keeps the pre-#15722 payload shape (the explicit "no ADR
+        # context resolved" fallback); `adr_context` scripts the resolved case.
+        self.calls.append(("resolve_adr_context", str(repo_root)))
+        return cast(
+            "AdrContextPointer | None", self._overrides.get("adr_context", None)
         )
 
     def resolve_transition_role(self, transition_role: str) -> TransitionRoleBoundary:
