@@ -105,6 +105,15 @@ documents:
     related_document_refs:
       - rule-adr-index
 
+  - id: rule-adr-0011-three-layer-responsibility-division
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0011-three-layer-responsibility-division.md
+    purpose: "ADR-0011: 3階層は責務の所在の分担であり多重レビューではない (サブレーン=実装+自己完結監査 / プロジェクトコーディネーター=drain 最重要+dispatch+統合 / コーディネーター=構成+リリース+Redmine ベース ADR 確認) (#15631)。"
+    audit_role: adr_0011_rule
+    related_document_refs:
+      - rule-adr-index
+
   - id: rule-adr-0012-supported-platforms
     type: rule
     status: active
