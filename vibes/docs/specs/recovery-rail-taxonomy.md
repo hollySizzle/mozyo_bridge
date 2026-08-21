@@ -56,6 +56,35 @@ surface で、retire / kill / route を一切行わない。比較のために�
 | `recover-restored-pair` | reboot 復元で cwd / startup identity proof が不整合になった ACTIVE lane の exact idle 世代を検査 | ACTIVE + pin あり + 両 slot live + cwd drift または attestation non-green | reboot restoration (#15227) | **preflight のみ** (下記 GAP-1 参照) | `managed_slot_busy` / `managed_pair_already_healthy` / `pending_composer_loss_not_approved` / `generation_conditional_close_unavailable` |
 | `list` (**回収レールではない / 本数外**) | pane inventory から live sublane を列挙し stale/retire hint を出す | 任意 | 日常運用 | advisory hint のみ。retire / kill / route は一切しない | — |
 
+**effect 述語による fidelity 分類 (design_consultation_answer j#109802 の裁定 1)**:
+`strict_fidelity_rails` = 次のいずれかの effect を持つ rail。(i) process を close / launch /
+release する、(ii) lane lifecycle を terminal 化する / ownership を移管する、(iii) lane 外へ send する。
+下記は `## 1` の全 27 の (section, rail) 組をこの述語で分類したもので、`## 3.3` の検算 17 が
+`rail_admission` / `delivery_rails` の `fidelity_class` 宣言と突き合わせる。
+
+```yaml
+effect_predicates:
+  process_close_launch_release:        # (i)
+    - {section: "1.C", rails: [recover-stale, recover-gateway, refresh-worker, recover-pair,
+                               converge-bound-pair, prepare-bound-pair, quarantine, close-residue]}
+    - {section: "1.E", rails: [hibernate, supersede, retire]}
+  lifecycle_terminalize_or_handover:   # (ii)
+    - {section: "1.E", rails: [supersede, retire]}
+  send_outside_lane:                   # (iii)
+    - {section: "1.D", rails: [recover-pair-delivery, recover-worker-delivery, rehydrate-fleet]}
+  none:                                # 述語に該当しない = routing
+    - {section: "1.A", rails: [reboot-audit, rehydrate-fleet, quarantine-inspect,
+                               callback-recovery, recover-restored-pair, list]}
+    - {section: "1.B", rails: [adopt-restored-pair, rebind-restored-pair, repair-pins,
+                               repair-worktree-binding, reconcile-recovered-pair-pins]}
+    - {section: "1.E", rails: [resume, audit-failure-terminal]}
+```
+
+**分類は command 単位ではなく (section, rail) 単位である** — `rehydrate-fleet` は 1.A の plan 行が
+routing、1.D の `--execute` 行が strict になる。行数では **strict 20 行 / routing 13 行**
+(1.C 8 + 1.D 3 + `hibernate` 1 + `supersede` 1 + `retire` 7 = 20 / 1.A 6 + 1.B 5 + `resume` 1 +
+`audit-failure-terminal` 1 = 13。合計 33 行)。
+
 **診断専用 rail (rule を持たない理由の明示)**: 次の 4 本は read-only の診断 surface で、
 決定木の `rail` にはならない。`reboot-audit` は precursor `P0` の `step`、`quarantine-inspect` は
 `R8` の `requires`、`callback-recovery` は stall 分類の入口、`audit-failure-terminal` は
@@ -192,7 +221,20 @@ pair_shape:
   original_idle:      [true, false, unknown]
   single_slot_mode:   [requested, not_requested]      # rebind の `--allow-single-slot`
   dispatch_anchor:    [present, absent, unknown]      # LaneDispatchFact.sendable は anchor_journal の非空も要求する
-  ownership_handed_to_recovery: [true, false, unknown]  # supersede の `already_handed_over` (原 row が superseded かつ owner が recovery lane)
+  ownership_handed_to_recovery: [true, false, unknown]
+  # hibernate preflight の fail-closed gate (application/sublane_hibernate_preflight.py の block 語彙)
+  callback_debt:      [none, outstanding, unknown]        # `callback_debt_outstanding`
+  review_state:       [settled, pending, unknown]         # `review_pending`
+  owner_approval:     [not_pending, pending, unknown]     # `owner_approval_pending`
+  integration_state:  [settled, pending, unknown]         # `integration_pending`
+  work_in_flight:     [false, true, unknown]              # `work_in_flight`
+  worktree_boundary:  [clean_or_recorded, dirty_unrecorded, unknown]  # `dirty_worktree_without_boundary_journal`
+  unpushed_commits:   [none, present, unknown]            # `unpushed_commits` (early hibernate は統合済みを前提とするため fail-closed)
+  # quarantine の approval readiness (domain/quarantine_approval.py の 10 値)
+  quarantine_approval: [ready, workspace_unresolved, inventory_unreadable, composer_unreadable,
+                        receiver_absent, duplicate_receiver, revision_unreadable,
+                        attestation_unreadable, known_marker_requires_q_enter,
+                        not_quarantine_candidate, unknown]  # supersede の `already_handed_over` (原 row が superseded かつ owner が recovery lane)
   recovered_pair_pins: [stale_exact_pair, current, unresolved, unknown]  # `reconcile-recovered-pair-pins` の subject (旧 2 件 exact 必須の置換専用 CAS)
 
   # --- E. 配送 authority。action-scoped な valid-for 述語 ---
@@ -250,109 +292,154 @@ slot_verdict(slot):        # 上から最初に成立したもの。すべて単
 preserve_newer_generation, preserve_productive, preserve_pending_composer,
 preserve_worktree_unreadable]`。`slot_verdict` は rule の条件 key として使ってよい。
 
-### 2.2 rail ごとの admission 契約 (`when` は routing であって admit の証明ではない)
+### 2.2 rail ごとの admission 契約 (fidelity は 2 層。`when` は routing であって admit の証明ではない)
 
-**決定木は routing を決めるだけで、admit を主張しない。** 各 rail の最終判定は実装の
-ordered gate が行う。`when` はその rail を**候補として選ぶための discriminator** であり、
-実装の refusal 集合を再現したものではない。`--execute` の前には必ず当該 rail の preflight を
-実行し、typed refusal に従うこと。
+design_consultation_answer **j#109802** (literal 訂正 j#109803) の裁定に従い、決定木の主張を
+**`fidelity_class` で 2 層に書き分ける**。分類の正本は `## 1` の `effect_predicates` で、
+`## 3.3` の検算 17 が両者の一致を機械確認する。
 
-この契約を置く理由は 2 つある。(a) 下表 16 rail の admission 語彙は実測で **合計 266 token
-(distinct 192)** あり、
-決定木がそれを全再現すると**実装と doc の二重正本**になって drift 源になる (本 doc が Phase 1 で
-避けようとしている形そのもの)。(b) round 3-5 で「gate を手で選んで書き足す」方式を続けた結果、
-毎 round 取り落としが見つかった (`finding_railadmissionclosure` / `finding_deliverysendability`) —
-**手選択である限り完全性は担保できない**。
+**`fidelity_class: strict` (strict_fidelity_rails)** — process の close / launch / release、
+lane lifecycle の terminal 化 / ownership 移管、lane 外への send のいずれかを行う rail。
 
-そこで doc は各 rail について「どの module が admission の正本か」「その refusal 語彙が何 token あるか」
-「決定木が routing のために符号化した軸はどれか」を宣言し、`## 3.3` の検算 13 / 14 が
-**実装 source から token を再抽出して count を照合**し、**符号化したと宣言した軸が実際に
-`when` にあるか**を検算する。gate の完全性は主張せず、**正本の所在と符号化の実在**を機械保証する。
+> 決定木は、当該 rail が **refuse する shape を推奨しない**ことを主張する。
+> **admit の完全性は主張しない** (実装が admit する shape を決定木が取りこぼすことはありうる)。
+> 誤って推奨した場合は破壊側の rail へ operator を誘導する実害があるため、これは material である。
+
+**`fidelity_class: routing`** — 上記のいずれの effect も持たない rail (read-only 診断、
+empty-only backfill / exact CAS の metadata、`resume` の verify + flip、何も authorize しない記録)。
+
+> 決定木は**候補選択の discriminator にすぎない。admit も refuse も主張しない。**
+> `--execute` 前に当該 rail の preflight を実行し typed refusal に従うことが operator 契約である。
+> 誤推奨は typed refusal と zero-write で止まるため、ここでの取りこぼし・誤推奨は routing 品質の
+> 問題であって material ではない (裁定 1)。
+
+**共通**: どちらの層でも、決定木は実装の refusal 集合を再現しない。各 rail の最終判定は実装の
+ordered gate が行う。doc は `admission_source` (正本 module) / `admission_gate_count` (実測値) /
+`routing_conditions_encoded` (決定木が符号化した軸) を宣言し、検算 13 が **実装 source から
+token を再抽出して count を照合**、検算 14 が **符号化したと宣言した軸が実際に `when` にあるか**を
+検算する。**gate の完全再現は主張せず、正本の所在と符号化の実在を機械保証する。**
+
+実測 (base `289343db`): **19 rail / 合計 302 token / distinct 222**。うち
+`fidelity_class: strict` が 12 rail、`routing` が 7 rail。strict の残り 2 rail
+(`recover-pair-delivery` / `recover-worker-delivery`) は `## 3.1d` の `delivery_rails` 側で
+`admission` を宣言しており、検算 17(c) が **strict 集合の全件が `rail_admission` ∪ `delivery_rails`
+に現れる**ことを確認する。
 
 ```yaml
 rail_admission:
   - rail: adopt-restored-pair
     rule: R2
+    fidelity_class: routing
     admission_source: ['domain/restored_pair_adopt.py']
     admission_gate_count: 19
     routing_conditions_encoded: ['disposition', 'declared_pins', 'live_pair', 'liveness', 'membership', 'attestation', 'launch_generation_row', 'participant_lineage']
   - rail: rebind-restored-pair
     rule: R3a
+    fidelity_class: routing
     admission_source: ['domain/restored_pair_rebind.py']
     admission_gate_count: 34
     routing_conditions_encoded: ['disposition', 'declared_pins', 'single_slot_mode', 'rebind_readiness', 'liveness', 'membership', 'attestation']
   - rail: recover-restored-pair
     rule: R4
+    fidelity_class: routing
     admission_source: ['domain/restored_pair_recovery.py']
-    admission_gate_count: 15
+    admission_gate_count: 17
     routing_conditions_encoded: ['disposition', 'declared_pins', 'liveness', 'membership', 'cwd']
   - rail: recover-gateway
     rule: R5
+    fidelity_class: strict
     admission_source: ['domain/gateway_turn_recovery.py']
     admission_gate_count: 17
     routing_conditions_encoded: ['disposition', 'resume_anchor', 'issue_lane_match', 'launch_authority', 'counterpart_distinguished', 'authority_conflict', 'liveness', 'membership', 'generation_rank', 'productivity', 'composer', 'turn_class']
   - rail: refresh-worker
     rule: R6
+    fidelity_class: strict
     admission_source: ['domain/worker_turn_recovery.py', 'domain/gateway_turn_recovery.py']
     admission_gate_count: 19
     routing_conditions_encoded: ['disposition', 'resume_anchor', 'issue_lane_match', 'launch_authority', 'counterpart_distinguished', 'authority_conflict', 'liveness', 'membership', 'generation_rank', 'productivity', 'composer', 'turn_class', 'worktree']
   - rail: recover-stale
     rule: R7
+    fidelity_class: strict
     admission_source: ['domain/stale_worker_recovery.py']
     admission_gate_count: 9
     routing_conditions_encoded: ['disposition', 'stale_signal', 'issue_lane_match', 'counterpart_distinguished', 'authority_conflict', 'liveness', 'membership', 'generation_rank', 'productivity', 'worktree']
   - rail: recover-pair
     rule: R12
+    fidelity_class: strict
     admission_source: ['domain/hibernated_pair_recovery.py']
     admission_gate_count: 8
     routing_conditions_encoded: ['disposition', 'declared_pins', 'slot_verdict']
   - rail: repair-pins
     rule: R9a
+    fidelity_class: routing
     admission_source: ['application/sublane_hibernated_pin_repair.py']
     admission_gate_count: 13
     routing_conditions_encoded: ['disposition', 'worktree_identity', 'declared_pins', 'process_release', 'slot_verdict']
   - rail: repair-worktree-binding
     rule: R11
+    fidelity_class: routing
     admission_source: ['application/sublane_worktree_binding_repair.py']
     admission_gate_count: 22
     routing_conditions_encoded: ['disposition', 'worktree_identity', 'declared_pins', 'process_release']
   - rail: converge-bound-pair
     rule: R9b
+    fidelity_class: strict
     admission_source: ['domain/hibernated_bound_pair_convergence.py']
-    admission_gate_count: 23
+    admission_gate_count: 28
     routing_conditions_encoded: ['disposition', 'worktree_identity', 'declared_pins', 'process_release', 'slot_verdict']
   - rail: prepare-bound-pair
     rule: R10
+    fidelity_class: strict
     admission_source: ['domain/hibernated_bound_pair_composer_discard.py']
-    admission_gate_count: 18
+    admission_gate_count: 21
     routing_conditions_encoded: ['disposition', 'worktree_identity', 'declared_pins', 'slot_verdict']
   - rail: close-residue
     rule: P1
+    fidelity_class: strict
     admission_source: ['application/sublane_residue_close.py']
     admission_gate_count: 16
     routing_conditions_encoded: ['live_pair', 'liveness']
   - rail: supersede
     rule: T3a
+    fidelity_class: strict
     admission_source: ['application/sublane_supersede.py']
     admission_gate_count: 4
     routing_conditions_encoded: ['disposition', 'successor_attested', 'successor_same_issue', 'original_idle']
   - rail: retire
     rule: T1
+    fidelity_class: strict
     admission_source: ['application/sublane_retire_application.py']
     admission_gate_count: 10
     routing_conditions_encoded: ['issue_state', 'head_integrated']
+  - rail: hibernate
+    rule: T2
+    fidelity_class: strict
+    admission_source: ["application/sublane_hibernate_preflight.py"]
+    admission_gate_count: 16
+    routing_conditions_encoded: [disposition, issue_state, park_basis, callback_debt, review_state,
+                                 owner_approval, integration_state, work_in_flight,
+                                 worktree_boundary, unpushed_commits, composer]
+  - rail: quarantine
+    rule: R8
+    fidelity_class: strict
+    admission_source: ["domain/quarantine_approval.py"]
+    admission_gate_count: 10
+    routing_conditions_encoded: [disposition, quarantine_approval, composer]
   - rail: reconcile-recovered-pair-pins
     rule: R15
+    fidelity_class: routing
     admission_source: ["domain/recovered_pair_pin_reconciliation.py"]
     admission_gate_count: 0
     routing_conditions_encoded: [disposition, declared_pins, recovered_pair_pins, live_pair]
   - rail: rehydrate-fleet
     rule: D3
+    fidelity_class: strict
     admission_source: ['domain/fleet_rehydrate.py']
     admission_gate_count: 32
     routing_conditions_encoded: ['dispatch_anchor']
   - rail: resume
     rule: R13
+    fidelity_class: routing
     admission_source: ['application/sublane_resume.py']
     admission_gate_count: 7
     routing_conditions_encoded: ['disposition', 'live_pair', 'issue_state', 'resume_gates']
@@ -361,16 +448,6 @@ rail_admission:
 `admission_gate_count` は base `289343db` 時点の実測値。実装が変われば検算 13 が落ちるので、
 **doc の drift はここで可視化される** (drift の自動追随は本 US scope 外。`## 5` escalation 参照)。
 
-**coverage の明示 (round 6 `finding_admissioncheck` の是正)**: 上表は「各 rail」ではなく
-**決定木が rule を持つ rail** を covering する。`## 1` の 25 本のうち上表に無いのは
-`quarantine` / `quarantine-inspect` / `callback-recovery` / `reboot-audit` /
-`recover-pair-delivery` / `recover-worker-delivery` / `close-residue` 以外の診断系、および
-`retire` の個別 intent である。理由は 2 つ: (i) 診断系 rail (`reboot-audit` /
-`quarantine-inspect` / `callback-recovery` / `list`) は read-only で admission gate による
-破壊拒否を持たない、(ii) `recover-pair-delivery` / `recover-worker-delivery` は
-`rail_admission` ではなく `## 3.1d` の `delivery_rails` 側で `admission` を宣言している。
-**検算 15 が「taxonomy に列挙した rail はすべて rule / `rail_admission` / `delivery_rails` /
-precursor のいずれかに現れる」ことを検算する**ので、この覆いの主張は機械確認される。
 
 ### 2.3 `not_applicable` の規約 (short-circuit された gate)
 
@@ -441,8 +518,10 @@ evaluate(shape) -> Plan | Escalation
   if sel.result == escalation:
       return Escalation(reason=sel.reason, steps=steps, recovery=recovery, terminal=terminal)
   primary = recovery if sel.primary == "recovery" else terminal
-  if primary is null: primary = fallback_from(sel)          # 各行の閉集合から
-  if primary is null: return Escalation(reason="no_applicable_rail", steps=steps)
+  if primary is null:
+      primary = fallback_from(sel)
+  if primary is null:
+      return Escalation(reason="no_applicable_rail", steps=steps)
 
   # 7. terminal の sub-selection (§3.1c T1 の intent_by) も全域でなければ escalation
   if primary is T1:
@@ -450,6 +529,16 @@ evaluate(shape) -> Plan | Escalation
       if intent is catch_all_escalation: return Escalation(reason=intent.reason, steps=steps)
 
   return Plan(steps=steps, selected=primary, also_applicable=dedup(also))
+
+fallback_from(sel):
+  # sel.fallback_if_primary_null は **rule id の閉集合**である (rail 名ではない)。
+  # 宣言順に見て、`matches_rule` を満たす最初の rule を返す。1 つも満たさなければ null を返し、
+  # 呼び出し側が `no_applicable_rail` の escalation を出す。
+  # **match していない rule を fallback として選ぶことはない** — strict rail を
+  # 「該当なしのまま」選ぶ経路を塞ぐため (round 7 `finding_strictfallbacktotality`)。
+  for rid in sel.fallback_if_primary_null or []:
+      if matches_rule(rid, shape): return lookup(rid)
+  return null
 
 matches_rule(rule_id, shape):
   r = lookup(rule_id)                                  # recovery / terminal / delivery のいずれか
@@ -522,7 +611,7 @@ recovery_rules:
       declared_pins: resolvable
       single_slot_mode: requested
       any_slot: {liveness: vanished}                # typed `missing_live_slot` として admit される
-      any_slot_other: {rebind_readiness: repairs_needed}   # 生存 slot に修復対象があること。全部 current なら `terminal_unchanged_noop`
+
       any_slot_other: {liveness: live, membership: this_pair,
                        attestation: [live_joined, restore_stale],
                        rebind_readiness: repairs_needed}
@@ -569,6 +658,7 @@ recovery_rules:
   - id: R8
     when:
       disposition: active
+      quarantine_approval: ready       # 10 値のうち `ready` 以外は approval を mint できず execute へ進めない
       any_slot: {composer: pending}
     rail: quarantine
     precedence_basis: [{over: [R15], basis: precondition_of_later}, {over: [R5, R6, R7], basis: refused_by_later},
@@ -761,16 +851,38 @@ terminal_rules:
       disposition: active            # 初回 preflight は active identity を要求する
       issue_state: open
       park_basis: [dependency_park, early_hibernate]
+      # 実装 `sublane_hibernate_preflight.py` が破壊前に fail-closed にする gate 群。
+      # これらを条件に入れないと strict rail への false positive になる
+      # (round 7 `finding_strictfalsepositive` の反例: callbacks_drained=false で
+      #  `may_hibernate=false` / `callback_debt_outstanding`)。
+      callback_debt: none
+      review_state: settled
+      owner_approval: not_pending    # 注: early hibernate では owner 承認 pending が blocker にならない (下記 note)
+      integration_state: settled
+      work_in_flight: false
+      worktree_boundary: clean_or_recorded
+      unpushed_commits: none
+      all_slots: {composer: settled}
     rail: hibernate
     mode: initial
+    note: >
+      `owner_approval: pending` は **park basis 依存**である — dependency park では blocker だが
+      early hibernate では blocker ではない (source issue の close authority は coordinator の
+      通常経路に残るため)。この条件付き緩和は本 rule では表現せず、`park_basis: early_hibernate`
+      の場合に `owner_approval` を問わない旨をここに記す。決定木は strict rail へ
+      **refusal shape を推奨しない**ことだけを主張し、admit の完全性は主張しない (`## 2.2`)。
 
   - id: T2r
     when:
       disposition: hibernated        # 既存 replay は hibernated 限定 (process release の再駆動)
-      issue_state: open
       park_basis: [dependency_park, early_hibernate]
     rail: hibernate
     mode: release_replay
+    note: >
+      replay は既に hibernated へ遷移済みの lane の process release を再駆動するもの。
+      `issue_state` は実装が replay 経路で読まないため条件に含めない
+      (round 7 deferred `terminal_replay_false_negatives` が指摘した過剰条件のうち、
+      strict rail の false positive を生む側ではないが、ここでは条件を足さないことで整合させた)。
 
   - id: T3a
     when:
@@ -806,6 +918,7 @@ delivery_rails:
   # lifecycle_decision_journal を request にも preflight にも渡さず、出現数 0)。
   - id: D1
     rail: recover-pair-delivery
+    fidelity_class: strict
     admission:
       delivery_authority:
         recovery_anchor_authorization: valid_for_this_anchor
@@ -815,6 +928,7 @@ delivery_rails:
 
   - id: D2
     rail: recover-worker-delivery
+    fidelity_class: strict
     admission:
       delivery_authority:
         recovery_anchor_authorization: valid_for_this_anchor
@@ -824,7 +938,8 @@ delivery_rails:
     reads_lifecycle_decision_journal: true
 
   - id: D3
-    rail: rehydrate-fleet         # --execute の restore_dispatch
+    rail: rehydrate-fleet
+    fidelity_class: strict         # --execute の restore_dispatch
     admission: {dispatch_anchor: present}
     reads_lifecycle_decision_journal: false
     note: >
@@ -847,13 +962,13 @@ selection:
   - id: S1
     when: {issue_state: open}
     primary: recovery
-    fallback_if_primary_null: [hibernate, supersede]
+    fallback_if_primary_null: [T2, T2r, T3a, T3b]     # **rule id** の閉集合。rail 名ではない
     note: "open な issue を勝手に終端化しない。回復が無いときだけ park / 移管を採る。"
 
   - id: S2
     when: {issue_state: closed, head_integrated: true}
     primary: terminal
-    fallback_if_primary_null: []
+    fallback_if_primary_null: []                      # recovery rail は precursor (P1) としてのみ
     note: "recovery rail は precursor (P1) としてのみ plan に載る。"
 
   - id: S3
@@ -908,6 +1023,17 @@ known_intersections:
       first-match は常に T2 を選んで T3 を隠すが、hibernate (process release、所有権は不変) と
       supersede (所有権移管 + 旧 lane release) は **effect が違う authority decision** なので、
       決定木では自動選択せず escalation にする。判断は `## 5` の escalation 対象。
+
+  - id: INT-4
+    phase: terminal
+    rules: [T1, T2r]
+    disposition: escalation
+    reason: retire_hibernate_replay_intersection
+    detail: >
+      T2r から `issue_state` を外した (実装の replay 経路が読まないため) 結果、
+      `closed` + `head_integrated` + `hibernated` + park_basis の shape で T1 (retire) と
+      T2r (hibernate の release replay) が同時に match する。終端化と release 再駆動は
+      effect が違うため自動選択せず escalation にする。
 
   - id: INT-3b
     phase: terminal
@@ -965,7 +1091,7 @@ effect_budget_gaps:
 1. **軸の閉包** — 全 rule / precursor / selection / delivery rail が参照する top-level key は、
    `any_axis` を除きすべて `pair_shape` に宣言された軸である。
 2. **slot fact の閉包** — `all_slots` / `any_slot` / `any_slot_other` / `slot_health.<role>` の中の
-   key は `slot_facts` の 14 軸か派生値 `slot_verdict` である。
+   key は `slot_facts` の 20 軸か派生値 `slot_verdict` である。
 3. **値の閉包** — 各条件の値は対応する軸の宣言値域に含まれる。
 4. **到達可能性** — 同一 first-match 列で、ある rule の `when` が先行 rule の `when` の
    厳密な superset になっていないこと。
@@ -992,6 +1118,9 @@ effect_budget_gaps:
 13. **admission 正本の照合** — `## 2.2` の各 `admission_source` を実装から読み、refusal /
     disposition 語彙の token 数が `admission_gate_count` と一致すること。実装が変われば
     ここが落ち、**doc の drift が可視化される**。
+14. **符号化宣言の実在** — `routing_conditions_encoded` に挙げた軸が、対応する rule の
+    `when` (delivery rail は `admission`) に**実際に条件として存在する**こと。note に書いただけの
+    gate を「符号化した」と称せないようにする (round 5 `finding_railadmissionclosure` の再発防止)。
 15. **taxonomy と決定木の対応** — `## 1` の表に列挙した rail はすべて、rule の `rail` /
     precursor の `step` / rule の `requires` / `rail_admission` / `delivery_rails` /
     `diagnostic_only_rails` のいずれかに現れること。**taxonomy に数えた rail を決定木が
@@ -999,9 +1128,14 @@ effect_budget_gaps:
 16. **件数主張の伝播** — overlap の件数を主張する散文が、`## 3.5` の表から導いた
     true / partial の実数と一致すること。**表だけ直して散文と escalation を放置する伝播漏れを
     検出する** (round 6 `finding_overlapcounts` の再発防止)。
-14. **符号化宣言の実在** — `routing_conditions_encoded` に挙げた軸が、対応する rule の
-    `when` (delivery rail は `admission`) に**実際に条件として存在する**こと。note に書いただけの
-    gate を「符号化した」と称せないようにする (round 5 `finding_railadmissionclosure` の再発防止)。
+17. **fidelity 分類の整合 (j#109802 裁定 2 の受け入れ条件)** — (a) `## 1` の
+    `effect_predicates` が taxonomy の全 (section, rail) 組を過不足なく覆う、
+    (b) `rail_admission` / `delivery_rails` の `fidelity_class` 宣言が
+    「effect 述語を 1 つ以上持つ ⇔ `strict`」と一致する、(c) **strict 集合が全件
+    `rail_admission` ∪ `delivery_rails` に現れる**。
+18. **selection fallback の実在性** — `fallback_if_primary_null` の要素が**実在する rule id**で
+    あること (rail 名を並べると `matches_rule` を通せず、strict rail を match 無しで選ぶ経路が
+    残る。round 7 `finding_strictfallbacktotality` の再発防止)。
 
 ### 3.4 gap (回復方向にどのレールも subject にしていない shape)
 
