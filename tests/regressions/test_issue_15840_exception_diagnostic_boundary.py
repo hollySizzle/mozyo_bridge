@@ -56,7 +56,13 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
     retire_admissibility,
 )
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.diagnostic_sink_fence import (  # noqa: E402,E501
+    FENCE_MISSING_COMPONENT,
+    FENCE_SYMLINK_COMPONENT,
+    open_sink_directory,
+)
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.diagnostic_sink_location import (  # noqa: E402,E501
+    SINK_FORBIDDEN_ROOT_NOT_ABSOLUTE,
     SINK_INSIDE_FORBIDDEN_ROOT,
     SINK_IS_FORBIDDEN_ROOT,
     SINK_NOT_ABSOLUTE,
@@ -410,6 +416,150 @@ class TheSinkRootRefusesEveryForbiddenSurface(unittest.TestCase):
         self.assertTrue(result.admissible, result.detail)
 
 
+class ARelativeForbiddenRootIsRefusedRatherThanMisresolved(unittest.TestCase):
+    """Review j#109685 ``finding_relativeforbiddenroot``.
+
+    The candidate's absoluteness was required from the start; the roots' was not. That
+    asymmetry was fail-OPEN: ``Path("repo").resolve()`` anchors on the process working
+    directory, so a caller passing a relative repo root got a root that was not the one it
+    meant, and candidates under the real repo were admitted.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+        self.actual_repo = self.root / "actual-repo"
+        (self.actual_repo / "sub").mkdir(parents=True)
+        self.elsewhere = self.root / "cwd"
+        self.elsewhere.mkdir()
+
+    def test_a_relative_root_does_not_admit_a_candidate_under_the_intended_root(self):
+        previous = Path.cwd()
+        os.chdir(self.elsewhere)
+        self.addCleanup(os.chdir, previous)
+
+        result = resolve_diagnostic_sink_root(
+            self.actual_repo / "sub" / "diagnostics",
+            forbidden_roots=(Path("actual-repo"),),
+        )
+        self.assertFalse(result.admissible, result.as_payload())
+        self.assertEqual(result.reason, SINK_FORBIDDEN_ROOT_NOT_ABSOLUTE)
+
+    def test_the_same_root_spelled_absolutely_still_refuses_by_descent(self):
+        """The refusal above is about the spelling, not about losing the real rule."""
+        result = resolve_diagnostic_sink_root(
+            self.actual_repo / "sub" / "diagnostics",
+            forbidden_roots=(self.actual_repo,),
+        )
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, SINK_INSIDE_FORBIDDEN_ROOT)
+
+
+class TheAtUseFenceSurvivesSubstitutionAfterAdmission(unittest.TestCase):
+    """Review j#109685 ``finding_staleadmissionrace``.
+
+    ``resolve_diagnostic_sink_root`` is a decision about a path string at one instant.
+    ``Path.resolve()`` is non-strict, so a candidate under an ancestor that does not exist yet
+    is admitted — and replacing that ancestor with a symlink afterwards moves the admitted root
+    inside a forbidden one. The earlier symlink pin only covered links present at decision time.
+
+    The fence is the other half: it walks components with ``dir_fd``-relative opens and
+    ``O_NOFOLLOW``, so a symlink planted at ANY time is a refusal rather than a redirection.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+        self.guarded = self.root / "guarded"
+        self.guarded.mkdir()
+        self.ancestor = self.root / "state"
+        self.sink = self.ancestor / "mozyo-bridge" / "diagnostics"
+
+    def _close(self, result):
+        if result.dir_fd is not None:
+            os.close(result.dir_fd)
+
+    def test_admission_succeeds_before_the_substitution(self):
+        """Precondition: the race is real, i.e. the preflight really does admit this."""
+        admitted = resolve_diagnostic_sink_root(
+            self.sink, forbidden_roots=(self.guarded,)
+        )
+        self.assertTrue(admitted.admissible, admitted.as_payload())
+
+    def test_the_fence_refuses_a_symlink_planted_after_admission(self):
+        resolve_diagnostic_sink_root(self.sink, forbidden_roots=(self.guarded,))
+        self.ancestor.symlink_to(self.guarded, target_is_directory=True)
+
+        result = open_sink_directory(self.sink, create=True)
+        self.addCleanup(self._close, result)
+        self.assertFalse(result.ok, result.as_payload())
+        self.assertEqual(result.reason, FENCE_SYMLINK_COMPONENT)
+
+    def test_nothing_is_written_under_the_forbidden_root(self):
+        """The property that actually matters: zero write, not merely a refusal token."""
+        resolve_diagnostic_sink_root(self.sink, forbidden_roots=(self.guarded,))
+        self.ancestor.symlink_to(self.guarded, target_is_directory=True)
+
+        result = open_sink_directory(self.sink, create=True)
+        self.addCleanup(self._close, result)
+        self.assertEqual(
+            list(self.guarded.rglob("*")), [], "the fence created something inside the guard"
+        )
+
+    def test_the_fence_does_not_leak_a_descriptor_per_refusal(self):
+        """Refusal is the common case on a diagnostic path.
+
+        Leaking one descriptor per refusal would exhaust the process exactly when things are
+        already going wrong. Found while pinning the counter-example, not by it.
+        """
+        self.ancestor.symlink_to(self.guarded, target_is_directory=True)
+        fd_dir = Path("/proc/self/fd")
+        if not fd_dir.is_dir():
+            self.skipTest("descriptor introspection unavailable on this platform")
+
+        before = len(os.listdir(fd_dir))
+        for _ in range(64):
+            result = open_sink_directory(self.sink, create=True)
+            self.assertFalse(result.ok)
+        self.assertLessEqual(len(os.listdir(fd_dir)) - before, 1)
+
+    def test_the_fence_creates_the_sink_when_the_path_is_clean(self):
+        """Control: the fence constrains, it does not forbid. Directories are 0700."""
+        result = open_sink_directory(self.sink, create=True)
+        self.addCleanup(self._close, result)
+        self.assertTrue(result.ok, result.as_payload())
+        self.assertTrue(self.sink.is_dir())
+        self.assertEqual(self.ancestor.stat().st_mode & 0o777, 0o700)
+
+    def test_the_fence_refuses_a_missing_component_when_not_creating(self):
+        result = open_sink_directory(self.sink, create=False)
+        self.addCleanup(self._close, result)
+        self.assertFalse(result.ok)
+        self.assertEqual(result.reason, FENCE_MISSING_COMPONENT)
+
+    def test_the_fence_reports_a_symlink_as_a_symlink(self):
+        """Linux returns ENOTDIR (not ELOOP) for O_NOFOLLOW|O_DIRECTORY on a symlink.
+
+        The refusal is correct either way; reporting it as "not a directory" would send the
+        next reader after the wrong problem, so the reason is disambiguated.
+        """
+        self.ancestor.symlink_to(self.guarded, target_is_directory=True)
+        result = open_sink_directory(self.sink, create=True)
+        self.addCleanup(self._close, result)
+        self.assertEqual(result.reason, FENCE_SYMLINK_COMPONENT)
+
+    def test_the_fence_payload_carries_no_path(self):
+        """The fence's own diagnostic obeys Decision 3 as well."""
+        self.ancestor.symlink_to(self.guarded, target_is_directory=True)
+        result = open_sink_directory(self.sink, create=True)
+        self.addCleanup(self._close, result)
+        serialized = json.dumps(result.as_payload(), ensure_ascii=False)
+        self.assertNotIn(str(self.guarded), serialized)
+        self.assertNotIn(str(self.sink), serialized)
+
+
 class TheBoundaryIsWrittenDown(unittest.TestCase):
     """The decision must be readable, not only encoded in one call site (#15840 順序 1)."""
 
@@ -435,6 +585,12 @@ class TheBoundaryIsWrittenDown(unittest.TestCase):
         # `finding_xdgforbiddenoverlap`: the location must be enforced, not merely listed.
         self.assertIn("resolve_diagnostic_sink_root", text)
         self.assertIn("diagnostic_sink_location.py", text)
+        # `finding_relativeforbiddenroot` / `finding_staleadmissionrace`: the contract must say
+        # that forbidden roots are absolute, that admission is advisory, and that a write goes
+        # through the at-use fence.
+        self.assertIn("forbidden_root_not_absolute", text)
+        self.assertIn("advisory preflight", text)
+        self.assertIn("open_sink_directory", text)
 
     def test_the_normative_field_table_never_re_admits_the_class_name(self):
         """`finding_doccontractdrift`: Decision 3 forbade the class name while Decision 4's

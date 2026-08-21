@@ -88,7 +88,35 @@ sink root を返す resolver は次を満たす。正本実装は
 3. **判定できなければ拒否する。** canonicalize が失敗する、禁止 root 集合が空である、候補が絶対 path でない — いずれも拒否。「たぶん外だろう」で書き始めない。
 4. **拒否時は診断を書かない。** 診断のために持ち出し境界を破らない。診断が取れないことは、秘密が漏れることより軽い。
 
+5. **禁止 root は絶対 path であること。** 相対 root は typed reason (`forbidden_root_not_absolute`) で拒否する。`Path("repo").resolve()` は **cwd 基準**で絶対化されるため、caller が意図した root とは別の directory を指し、実 root 配下の candidate が検出されずに**通ってしまう** (review j#109685 `finding_relativeforbiddenroot` が再現)。candidate 側にだけ絶対性を課して root 側に課さないのは fail-open の非対称である。
+
 resolver は禁止 root を**引数で受け取る** pure 関数とする。`ambient_homes()` を直接 import しない — runtime の診断機構が CI 検証機構へ依存する層の逆転を避けるため。誰が禁止 root を供給するかは sink 実装 slice の配線事項であり、**供給が漏れれば禁止 root 集合が空になり、契約 3 により拒否される** (fail closed)。
+
+#### 訂正 — resolver は advisory preflight であって書込み権限ではない (review j#109685 `finding_staleadmissionrace`)
+
+本節は当初、resolver の admission を「この場所に書いてよい」の判定として扱っていた。**これは誤りである。**
+
+`Path.resolve()` は非 strict なので**未作成 ancestor 配下でも canonicalize が通る**。admit した後にその ancestor を禁止 root への symlink へ差し替えると、返却済み root が禁止先へ移る。review が再現した:
+
+```
+admission        : admissible=True  root=<tmp>/state/mozyo-bridge/diagnostics
+(判定後に ancestor `state` を guarded への symlink へ差し替え)
+再解決           : <tmp>/guarded/mozyo-bridge/diagnostics
+```
+
+**path 文字列を時点 T で検査しても、時点 T+1 の filesystem については何も言っていない。** 既存の symlink 拒否は「判定前から存在する symlink」しか覆っていなかった。
+
+したがって:
+
+- **`resolve_diagnostic_sink_root` の結果は advisory preflight である。** 「admit されたから書いてよい」ではない。
+- **書込み時点に at-use fence を通すことを必須契約とする。** 正本実装は同 feature の
+  `diagnostic_sink_fence.open_sink_directory(root, *, create=False)`。
+- fence は path 文字列を再解決せず、**component ごとに `dir_fd` 相対 open + `O_NOFOLLOW`** で歩く。symlink component が 1 つでもあれば拒否 (`symlink_component`)。判定前に置かれたか判定後に置かれたかを問わない。
+- 成功時は **directory descriptor** を返す。caller はそれを閉じる責任を持ち、以後 **descriptor 相対で開く**。path 文字列を再導出してはならない — 再導出は fence が閉じた窓を開け直す。
+- 拒否時は **zero write**。
+- ADR-0012 の supported platform (macOS / Linux) は `dir_fd` を持つ。`os.supports_dir_fd` が偽の環境では **path ベースの open へ fallback せず拒否する** — fallback こそが脆弱な形だからである。
+
+**明示的残余**: `O_NOFOLLOW` は symlink の**追跡**を拒むが、既に開いた descriptor の下で directory が rename されることは防がない。ただし descriptor は inode を指すため、後続の rename が書込み先を差し替えることはない。閉じていない窓は「caller が descriptor を受け取ってから、それを descriptor 相対 open 以外の用途に使うまで」である。caller は descriptor を使い続けること。
 
 **禁止 surface (明示)**:
 

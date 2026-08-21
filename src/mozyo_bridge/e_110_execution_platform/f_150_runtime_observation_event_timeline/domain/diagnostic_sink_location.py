@@ -42,6 +42,12 @@ SINK_NOT_ABSOLUTE = "candidate_not_absolute"
 SINK_NO_FORBIDDEN_ROOTS = "forbidden_roots_unknown"
 #: A path could not be canonicalized, so the comparison cannot be trusted.
 SINK_UNCANONICALIZABLE = "path_not_canonicalizable"
+#: A forbidden root is relative (Redmine #15840 review j#109685 ``finding_relativeforbiddenroot``).
+#: ``Path("repo").resolve()`` silently anchors on the process working directory, so a caller that
+#: passes a relative repo root gets a root that is NOT the one it meant — and candidates under the
+#: real repo sail through. The candidate's absoluteness was required from the start; the roots'
+#: was not. That asymmetry was fail-OPEN and the review reproduced it.
+SINK_FORBIDDEN_ROOT_NOT_ABSOLUTE = "forbidden_root_not_absolute"
 #: The candidate IS one of the forbidden roots.
 SINK_IS_FORBIDDEN_ROOT = "candidate_is_forbidden_root"
 #: The candidate lives under a forbidden root.
@@ -149,6 +155,13 @@ def resolve_diagnostic_sink_root(
         )
 
     for root in roots:
+        if not Path(root).is_absolute():
+            return _refused(
+                SINK_FORBIDDEN_ROOT_NOT_ABSOLUTE,
+                f"the forbidden root {root!s} is relative. Resolving it would anchor on the "
+                "process working directory and silently name a different directory than the "
+                "caller meant, so candidates under the intended root would be admitted",
+            )
         resolved_root = _canonical(root)
         if resolved_root is None:
             return _refused(
@@ -179,6 +192,7 @@ def resolve_diagnostic_sink_root(
 
 
 __all__ = (
+    "SINK_FORBIDDEN_ROOT_NOT_ABSOLUTE",
     "SINK_INSIDE_FORBIDDEN_ROOT",
     "SINK_IS_FORBIDDEN_ROOT",
     "SINK_NOT_ABSOLUTE",
