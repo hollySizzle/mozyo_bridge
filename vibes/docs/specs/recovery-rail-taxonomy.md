@@ -110,9 +110,13 @@ surface で、retire / kill / route を一切行わない。比較のために�
 
 ## 2. pair shape の軸
 
-**すべての軸は「読めなかった = unknown」を値と区別する** (`unknown` は必ず block へ落ちる。
+**すべての軸は「読めなかった = `unknown`」を値と区別する** (`unknown` は必ず block へ落ちる。
 `reboot_residue_convergence` の "Unknown is not absence"、`fleet_rehydrate` の
 "An axis that could not be read is None and yields a block")。
+
+**`unknown` と `not_applicable` は別物である。** `unknown` は「読もうとしたが読めなかった」、
+`not_applicable` は「実装がその gate を評価する前に short-circuit したので観測が存在しない」。
+前者は block、後者は**その条件を空虚に満たす** (`## 2.2`)。
 
 **この軸集合は `## 3` の全 rule が参照する観測の閉集合である** — rule はここに宣言されていない
 key を参照しない (`## 3.3` の整合チェックを参照)。
@@ -126,243 +130,319 @@ pair_shape:
   declared_pins:      [resolvable, absent, degraded, unknown]   # degraded = unreadable|foreign_pin_role|mixed_pin_role_vocabulary|duplicate_pin_role|incomplete_pin_pair
   process_release:    [not_requested, in_flight, released, unknown]
 
-  # --- B. live inventory 由来 ---
+  # --- B. live inventory 由来。slot_health は role ごとに直交事実の直積を持つ ---
   live_pair:          [both_live, half_live, zero_live_positive, shell_residue, foreign_occupant, unknown]
 
-  # slot_health は role ごとに、互いに直交する事実の **直積** を持つ。単一 enum ではない。
-  # 軸の分け方は decide_slot_recovery (domain/hibernated_pair_recovery.py) が順序評価する
-  # 独立 gate に 1:1 で対応させてある — 同関数が返す単一 disposition token は
-  # 「最初に失敗した gate を名指す」ための順序付けであって、事実が排他だからではない。
   slot_health:
     gateway: &slot_facts
-      liveness:        [live, vanished, shell_residue, unknown]        # slot_absent 系
-      membership:      [this_pair, foreign, ambiguous, unknown]        # identity_resolved / belongs_to_pair
-      attestation:     [generation_bound, stale, absent, unknown]      # 起動自己証明が live locator に generation-bound か
-      generation_rank: [current, newer, older, unknown]                # generation_not_newer
-      productivity:    [productive, turn_ended_unproductive, busy, idle, unknown]  # not_productive
-      composer:        [settled, pending, unknown]                     # no_pending_composer
-      cwd:             [matches, drifted, unreadable, unknown]
-      locator:         [pinned_match, drifted, unresolved, unknown]
-      worktree:        [readable, unreadable, unknown]                 # worktree_readable
+      liveness:              [live, vanished, shell_residue, unknown]
+      membership:            [this_pair, foreign, ambiguous, not_applicable, unknown]
+      attestation:           [live_joined, restore_stale, stale, absent, not_applicable, unknown]
+      launch_generation_row: [attested_bound, pending, superseded, absent, not_applicable, unknown]
+      participant_lineage:   [joined, absent, not_applicable, unknown]
+      generation_rank:       [current, newer, older, unknown]
+      productivity:          [productive, turn_ended_unproductive, busy, idle, not_applicable, unknown]
+      composer:              [settled, pending, not_applicable, unknown]
+      cwd:                   [matches, drifted, unreadable, not_applicable, unknown]
+      locator:               [pinned_match, drifted, unresolved, not_applicable, unknown]
+      worktree:              [readable, unreadable, not_applicable, unknown]
     worker: *slot_facts
 
   # --- C. Redmine / git 由来 ---
   issue_state:        [open, closed, unknown]
   head_integrated:    [true, false, unknown]
 
-  # --- D. durable record 由来の判定軸 (live 観測から導けないので独立軸として持つ) ---
+  # --- D. durable record 由来の判定軸 ---
   stale_signal:       [positive, negative, unknown]   # #13518 shell-residue の positive 判定 (`recover-stale` の is_stale 前提)
   dispatch:           [owed, delivered, uncertain, unreadable, attribution_unknown, not_applicable]
   park_basis:         [dependency_park, early_hibernate, absent, unknown]
   resume_gates:       [green, blocked, unknown]       # `resume` の release-settled / issue-reowned / generation fence の総合
-  successor_attested: [true, false, unknown]          # `supersede` の後継 lane
+  successor_attested: [true, false, unknown]
   successor_same_issue: [true, false, unknown]
   original_idle:      [true, false, unknown]
 
-  # --- E. 配送 authority 軸 (どの配送レールが admit されるかを決める。shape とは独立) ---
-  # 3 つの再配送経路は「同じ lane 状態」でも要求する authority が違うので、
-  # これを軸として持たないと配送レールを区別できない (`## 3.5` OVERLAP-4)。
+  # --- E. 配送 authority。**action-scoped な valid-for 述語**であって present/absent ではない ---
+  # 実装の authorization は (issue, lane, anchor_journal, retry_of_action_sha256) に束縛された
+  # 「この anchor / この action に対して有効か」であり、汎用の有無では rail を区別できない
+  # (round 3 review j#109757 `finding_deliverypartition`)。
   delivery_authority:
-    owner_approval:      [present, absent, unknown]   # RecoveryDeliveryAuthorization (journal/conclusion/authorized_by_role)
-    zero_send_evidence:  [present, absent, unknown]   # RecoveryDeliveryZeroSendEvidence
-    target_generation_pin: [exact, absent, unknown]   # target_assigned_name / locator / revision / action_id
-    lifecycle_decision_journal: [present, absent, unknown]  # recovered_worker_delivery のみ要求
-```
-
-### 2.1 派生値: `slot_verdict`
-
-決定木は上記の直積を直接読む。ただし実装の disposition 語彙と対応づけられるよう、
-`decide_slot_recovery` の順序評価を派生関数として定義しておく (**doc 上の定義であり、
-実装の再宣言ではない。正本は `domain/hibernated_pair_recovery.py`**)。
-
-```text
-slot_verdict(slot):        # 上から最初に成立したもの。実装の順序を写している
-  - if liveness == vanished:               recover_or_preserve_newer   # generation_rank で分岐
-  - if membership in [ambiguous, unknown]: preserve_ambiguous
-  - if membership == foreign:              preserve_foreign
-  - if generation_rank == newer:           preserve_newer_generation
-  - if productivity == productive:         preserve_productive
-  - if composer == pending:                preserve_pending_composer
-  - if worktree == unreadable:             preserve_worktree_unreadable
-  - if attestation == generation_bound and cwd == matches and locator == pinned_match:
-                                           healthy_no_action
-  - else:                                  recover_bad_generation | preserve_ambiguous
+    recovery_anchor_authorization: [valid_for_this_anchor, mismatched, absent, unknown]
+    zero_send_evidence:            [valid_for_this_action, mismatched, absent, unknown]
+    target_generation_pin:         [exact_live_generation, stale, absent, unknown]
+    lifecycle_decision_journal:    [valid_for_this_lane, mismatched, absent, unknown]
 ```
 
 軸の出所:
 
-- `declared_pins` の値語彙は `core/state/lane_pin_role.py` の `PIN_PAIR_*` 正本
-  (`PIN_PAIR_OK` / `PIN_PAIR_ABSENT` / `PIN_PAIR_UNREADABLE` / `PIN_PAIR_FOREIGN` /
-  `PIN_PAIR_MIXED` / `PIN_PAIR_DUPLICATE` / `PIN_PAIR_INCOMPLETE`) をそのまま折り畳んだもの。
-- `productivity` の `turn_ended_unproductive` と `liveness` の `vanished` は**別の事実**であり
-  混同しない (#14661 j#92369 の設計制約: vanished worker と live-but-unproductive worker は
-  別の admission)。直積にしたことで、両者が別軸の値であることが構造的に表現できる。
+- `declared_pins` の値語彙は `core/state/lane_pin_role.py` の `PIN_PAIR_*` 正本。
+- `attestation` の `live_joined` / `restore_stale` の区別は `sublane_restored_pair_adopt_live.py` の
+  `attested` (live-joined) と `attestation_restore_stale` (#15769 の restore-stale signature) に対応する。
+  **`absent` は adopt / rebind いずれでも refusal 側**であり admit 値ではない。
+- `launch_generation_row` / `participant_lineage` は `adopt-restored-pair` の proof chain を表す軸。
+  同 rail は「usable な attested row が無い」を `ADOPT_SLOT_GENERATION_ABSENT` の **hard refusal**
+  にする (実装コメント: "This rail has no declared pin to fall back on, so the missing server-owned
+  row is a hard refusal")。`rebind-restored-pair` は pre-#15769 の attestation-only fall-through を
+  まだ許すので、この 2 軸は rail ごとに要求が違う。
+- `productivity: turn_ended_unproductive` (process は live) と `liveness: vanished` (process が消えた)
+  は**別軸の別事実**。混同しない (#14661 j#92369)。
 - `dispatch` の値語彙は `domain/fleet_rehydrate.py` の `DISPATCH_*` 正本。
 - `park_basis` の 2 値は `sublane hibernate` の affirmative park basis (#13967 item 1)。
-- `delivery_authority` の 4 軸は `domain/recovery_anchor_delivery.py` の
-  `RecoveryDeliveryAuthorization` / `RecoveryDeliveryZeroSendEvidence` /
-  `RecoveryAnchorDeliveryRequest` と `domain/recovered_worker_delivery.py` の
-  `RecoveredWorkerDeliveryRequest` の field から導いた。
+- `delivery_authority` の 4 軸は `RecoveryDeliveryAuthorization` / `RecoveryDeliveryZeroSendEvidence` /
+  `RecoveryAnchorDeliveryRequest` / `RecoveredWorkerDeliveryRequest` の field から導いた。
+
+### 2.1 派生値: `slot_verdict`
+
+決定木の一部の rule は raw な直積ではなく**この派生値**を読む。定義は
+`decide_slot_recovery` (`domain/hibernated_pair_recovery.py`) の順序評価を写したものであり、
+**正本は実装側。本 doc は再宣言ではなく対応表である。**
+
+```text
+slot_verdict(slot):        # 上から最初に成立したもの
+  1. liveness == vanished:
+       generation_rank != newer  -> recover_bad_generation      # short-circuit。以降の gate は評価されない
+       else                      -> preserve_newer_generation
+  2. membership in [ambiguous, unknown]        -> preserve_ambiguous
+  3. membership == foreign                     -> preserve_foreign
+  4. generation_rank == newer                  -> preserve_newer_generation
+  5. productivity == productive                -> preserve_productive
+  6. composer == pending                       -> preserve_pending_composer
+  7. worktree == unreadable                    -> preserve_worktree_unreadable
+  8. attestation == live_joined
+     and cwd == matches and locator == pinned_match  -> healthy_no_action
+  9. else                                      -> recover_bad_generation | preserve_ambiguous
+```
+
+`slot_verdict` は rule の条件 key として使ってよい (`all_slots` / `any_slot` / `slot_health.<role>`
+のいずれでも)。値域は
+`[recover_bad_generation, healthy_no_action, preserve_ambiguous, preserve_foreign,
+preserve_newer_generation, preserve_productive, preserve_pending_composer,
+preserve_worktree_unreadable]`。
+
+### 2.2 `not_applicable` の規約 (short-circuit された gate)
+
+実装は `liveness: vanished` の slot について **membership / attestation / launch_generation_row /
+participant_lineage / productivity / composer / cwd / locator / worktree を評価しない**
+(`decide_slot_recovery` の step 1 が return し、live 側の観測も
+`SlotRecoveryObservation(slot_absent=True, generation_not_newer=...)` **だけ**を設定する)。
+
+- そのとき上記 9 軸の値は `not_applicable` とする。**`unknown` にしてはならない** — `unknown` は
+  P0 の診断 block へ落ちるので、実装が正常に admit する partial-close replay が block と誤符号化される。
+- `all_slots` / `any_slot` / `slot_health.<role>` の条件照合において、**`not_applicable` はその条件を
+  空虚に満たす** (skip)。`any_slot` の存在量化は `not_applicable` を「成立」に数えない。
+- `liveness` と `generation_rank` は vanished slot でも観測されるので `not_applicable` を取らない。
 
 ## 3. 決定木
 
 ### 3.0 評価アルゴリズム (実行意味論)
 
-**単一の first-match ではない。** 2 つの phase を**独立に**評価し、結果を合成する。
+**単一 first-match ではない。** `evaluate` は **ordered plan または escalation** を返す。
 
 ```text
-evaluate(shape):
-  recovery_verdict = first_match(rules where phase == recovery)   # 該当なし → null
-  terminal_verdict = first_match(rules where phase == terminal)   # 該当なし → null
-  return {recovery: recovery_verdict, terminal: terminal_verdict}
+evaluate(shape) -> Plan | Escalation
+
+  # 1. precursor: 宣言順に評価し、match したものを steps へ (閉集合。§3.1a)
+  steps = [p for p in precursors in declared order if match(p.when)]
+  if any(p.blocks_further_evaluation for p in steps):
+      return Escalation(reason=p.id, steps=steps)      # 再観測してからやり直す
+
+  # 2. phase ごとに独立に first-match (§3.1b / §3.1c)
+  recovery = first_match(rules where phase == recovery)     # 無ければ null
+  terminal = first_match(rules where phase == terminal)     # 無ければ null
+
+  # 3. co-applicable rail は first-match の precedence に参加せず、独立に収集 (§3.1d)
+  also = [r for r in co_applicable_rules if match(r.when)]
+
+  # 4. selection table (§3.1e) を上から評価し、最初に match した行で決める
+  sel = first_match(selection)
+  if sel.result == escalation:
+      return Escalation(reason=sel.reason, steps=steps, recovery=recovery, terminal=terminal)
+
+  primary = recovery if sel.primary == "recovery" else terminal
+  if primary is null:
+      primary = fallback(sel)        # 各行が admit する閉集合から。無ければ escalation
+  if primary is null:
+      return Escalation(reason="no_applicable_rail", steps=steps)
+
+  # 5. plan = precursor steps (宣言順) → primary rail → also (参考提示)
+  return Plan(steps=steps, selected=primary, also_applicable=also)
 ```
 
-- **2 つの phase は互いに評価を抑止しない。** recovery 側が `rail: none` (gap) を返しても、
-  terminal 側は独立に評価される。これは実装の事実に対応している: 終端 rail 群は declared pin を
-  **preserve するだけで validate しない** (pin を検証するのは `repair-worktree-binding` の
-  `declared_pins_fail_validation` / `declared_pins_are_not_canonically_encoded` だけ) ので、
-  pin が劣化していても retire は走りうる。
-- **合成規則 (どちらを採るか)**: `issue_state == open` なら recovery を優先し、terminal は
-  `hibernate` / `supersede` の park / 移管判断としてのみ採る。`issue_state == closed` かつ
-  `head_integrated == true` なら terminal を優先し、recovery は「終端前に residue を閉じる」等の
-  前段としてのみ採る。**どちらの phase にも該当しない shape は operator escalation** であり、
-  自動選択しない。
-- `phase: recovery` の rule 列内、および `phase: terminal` の rule 列内では、それぞれ
-  **上から最初に match した rule を採る**。
-- 量化子: `all_slots` は gateway と worker の両方が条件を満たすこと、`any_slot` は少なくとも
-  一方が満たすことを意味する。**`.*` のような曖昧な記法は使わない**。
+**確定していること (前 round の散文を data 化した点)**:
 
-### 3.1 rule 列
+- precursor は `## 3.1a` の**閉集合**であり、他の rail を「前段」に使うことはできない。
+- どちらの phase を primary にするかは `## 3.1e` の selection table が決める。散文ではない。
+- `also_applicable` は「同じ shape に別 authority で適用しうる rail」を**参考として並置**する枠で、
+  primary を置き換えない。これが無いと `## 3.5` OVERLAP-4 の実態 (条件付き共適用) を符号化できない。
+- どの phase にも該当しない shape、および `closed` かつ `head_integrated: false` は
+  **escalation であって自動選択しない**。
+
+**量化子**: `all_slots` は gateway と worker の両方、`any_slot` は少なくとも一方。
+`slot_health.<role>` は role 名指し。`not_applicable` の扱いは `## 2.2`。
+
+**rule 順序の規約 (到達可能性)**: 同一 phase 内では**狭い条件を先に置く**。ある rule の `when` が
+先行 rule の `when` の**厳密な superset** になっていると、その rule は first-match で到達不能になる。
+`## 3.3` でこれを検算する。
+
+### 3.1a precursor (閉集合)
 
 ```yaml
-# 前提: どの軸でも unknown があれば R0 が先に発火する。
-rules:
-
-  # ===================== recovery phase =====================
-  - id: R0
-    phase: recovery
+precursors:
+  - id: P0
+    order: 0
     when: {any_axis: unknown}
-    rail: reboot-audit          # または rehydrate-fleet plan
-    note: "読めない軸がある間は回収レールを選ばない。診断が先。"
+    step: reboot-audit            # または rehydrate-fleet plan
+    blocks_further_evaluation: true
+    rationale: "読めない軸がある間は回収レールを選ばない。診断して再観測してからやり直す。"
 
-  - id: R1
-    phase: recovery
+  - id: P1
+    order: 1
     when: {live_pair: shell_residue}
-    rail: close-residue
-    note: "residue を閉じるまで live-zero 読取は正直にならない。終端化は terminal phase。"
+    step: close-residue
+    blocks_further_evaluation: false
+    rationale: >
+      residue を閉じるまで live-zero 読取が正直にならない。recovery / terminal の
+      どちらの前段にもなるので precursor に置く。close-residue は lifecycle row を
+      書かないので、これ自体は終端でも回復でもない。
+```
+
+### 3.1b recovery phase の rule 列
+
+```yaml
+recovery_rules:
 
   - id: R2
-    phase: recovery
     when:
       disposition: active
       declared_pins: absent
       live_pair: both_live
-      all_slots: {liveness: live, membership: this_pair, attestation: [stale, absent]}
-    rail: adopt-restored-pair   # #15811 が埋めた class
-    note: "create path の正常 shape。pin 不在は record 劣化ではない。片側だけの観測では宣言できない (adopt に single-slot mode は無い)。"
+      all_slots:
+        liveness: live
+        membership: this_pair
+        attestation: [live_joined, restore_stale]   # absent は ADOPT_SLOT_GENERATION_ABSENT / unattested_slot で hard refusal
+        launch_generation_row: attested_bound       # 必須。fall-through 無し
+        participant_lineage: joined                 # 必須
+    rail: adopt-restored-pair
+    effect_budget: metadata_only
+    note: >
+      #15811 が埋めた class。pin 不在は create path の正常 shape であって record 劣化ではない。
+      adopt に single-slot mode は無いので all_slots で要求する。
+      rebind (R3) より **厳しい** proof chain を要求する — 照合先の declared pin が無いため。
 
   - id: R3
-    phase: recovery
     when:
       disposition: active
       declared_pins: resolvable
       all_slots: {liveness: live, membership: this_pair}
       any_slot: {locator: drifted}
     rail: rebind-restored-pair
-    note: "少なくとも 1 slot が実際に drift していること (`locator_not_drifted` / `declared_locator_still_live` で refuse される)。"
+    effect_budget: metadata_only
+    note: >
+      少なくとも 1 slot が実際に drift していること (`locator_not_drifted` /
+      `declared_locator_still_live` で refuse)。R2 と違い `launch_generation_row` は
+      必須でない — pre-#15769 の attestation-only fall-through を許す rail であるため。
 
   - id: R4
-    phase: recovery
     when:
       disposition: active
       declared_pins: resolvable
       all_slots: {liveness: live, membership: this_pair}
       any_slot: {cwd: drifted}
     rail: recover-restored-pair
-    status: diagnose_only        # GAP-1: 実行経路が構造的に存在しない
+    status: diagnose_only         # GAP-1: 実行経路が構造的に存在しない
     effect_budget: none
 
-  - id: R5
-    phase: recovery
-    when:
-      disposition: active
-      slot_health.gateway: {liveness: live, productivity: turn_ended_unproductive, composer: settled}
-    rail: recover-gateway
-    protects: [worker, default_coordinator, foreign]
-    note: "`composer: pending` は `pending_composer_input` で refuse されるので条件に含める。"
-
-  - id: R6
-    phase: recovery
-    when:
-      disposition: active
-      slot_health.worker: {liveness: live, productivity: turn_ended_unproductive}
-    rail: refresh-worker
-    protects: [gateway, default_coordinator, foreign]
-
-  - id: R7
-    phase: recovery
-    when:
-      disposition: active
-      slot_health.worker: {liveness: vanished}
-      stale_signal: positive
-    rail: recover-stale
-    protects: [gateway, default_coordinator, foreign]
-    note: "`liveness: vanished` と R6 の `productivity: turn_ended_unproductive` は別軸の別事実。`recover-stale` は後者を `not_stale` で拒否する (#14661 j#92369)。"
-
   - id: R8
-    phase: recovery
     when:
       disposition: active
       any_slot: {composer: pending}
     rail: quarantine
     requires: quarantine-inspect  # approval token の取得元
+    note: >
+      **pending composer を扱う唯一の recovery rail なので R5 / R6 / R7 より前に置く。**
+      R5 / R6 は実装側で `pending_composer_input` の zero-close refusal になるため、
+      pending を先に quarantine へ吸わないと決定木が拒否 shape を推奨してしまう
+      (round 3 review `finding_pendingcomposerorder`)。
 
-  # --- R9a / R9b: durable row signature は同一、live pair 状態で排他 (`## 3.5` OVERLAP-2) ---
+  - id: R5
+    when:
+      disposition: active
+      slot_health.gateway:
+        {liveness: live, membership: this_pair, generation_rank: current,
+         productivity: turn_ended_unproductive, composer: settled}
+    rail: recover-gateway
+    protects: [worker, default_coordinator, foreign]
+    note: "gate 対応: identity_unknown / non_gateway_protected / wrong_issue_lane / stale_generation / gateway_not_settled / pending_composer_input。"
+
+  - id: R6
+    when:
+      disposition: active
+      slot_health.worker:
+        {liveness: live, membership: this_pair, generation_rank: current,
+         productivity: turn_ended_unproductive, composer: settled, worktree: readable}
+    rail: refresh-worker
+    protects: [gateway, default_coordinator, foreign]
+    note: >
+      gate 対応: identity_unknown / gateway_or_foreign_protected / wrong_issue_lane /
+      stale_generation / worker_not_settled / **pending_composer_input** /
+      dirty_state_unreadable。`worktree: readable` は「dirty を保存するために読めること」で
+      あって clean であることではない。
+
+  - id: R7
+    when:
+      disposition: active
+      slot_health.worker: {liveness: vanished, membership: this_pair, generation_rank: current}
+      stale_signal: positive
+    rail: recover-stale
+    protects: [gateway, default_coordinator, foreign]
+    note: >
+      `liveness: vanished` は R6 の `productivity: turn_ended_unproductive` と別軸の別事実。
+      `recover-stale` は後者を `not_stale` で拒否する (#14661 j#92369)。vanished slot では
+      membership 以外の観測が `not_applicable` になりうる (`## 2.2`)。
+
   - id: R9a
-    phase: recovery
     when:
       disposition: hibernated
       worktree_identity: bound
       declared_pins: absent
       process_release: released
-      live_pair: both_live
-      all_slots:
-        {liveness: live, membership: this_pair, attestation: generation_bound,
-         productivity: [idle, turn_ended_unproductive], composer: settled}
+      all_slots: {slot_verdict: healthy_no_action}
     rail: repair-pins
     effect_budget: metadata_only
     note: "`decide_pair_reconcile` が GREEN を返す pair だけ。close/launch/resume/send を一切しない。"
 
   - id: R9b
-    phase: recovery
     when:
       disposition: hibernated
       worktree_identity: bound
       declared_pins: absent
       process_release: released
-      # 各 role は healthy でも bad でもよい。少なくとも一方が bad であればよい。
-      # 実装 (sublane_hibernated_bound_pair_convergence L233-258) は slot ごとに
-      # SLOT_RECOVER / SLOT_HEALTHY の混在を admit し、pins_exact かつ all SLOT_HEALTHY の
-      # ときだけ ALREADY_CONVERGED を返す = all healthy 以外は action 対象。
-      all_slots: {membership: this_pair, composer: settled, productivity: [idle, turn_ended_unproductive]}
-      any_slot: {attestation: [stale, absent]}
+      all_slots: {slot_verdict: [recover_bad_generation, healthy_no_action]}
+      any_slot:  {slot_verdict: recover_bad_generation}
     rail: converge-bound-pair
     effect_budget: replace_bad_slots_then_repair_pins
-    note: "片側 healthy + 片側 bad は正規の subject。healthy な slot は SLOT_HEALTHY として保存され、bad な slot だけが置換される。"
+    note: >
+      実装 (`sublane_hibernated_bound_pair_convergence` L233-258) の admit 条件と 1:1:
+      全 slot が `SLOT_RECOVER` か `SLOT_HEALTHY`、かつ `pins_exact and all(SLOT_HEALTHY)` の
+      ときだけ `ALREADY_CONVERGED` = **all healthy 以外は action 対象**。
+      片側 healthy + 片側 bad も、**片側 vanished (partial close replay) + 片側 healthy** も
+      正規の subject になる — vanished slot は `slot_verdict` で `recover_bad_generation` に
+      落ちるため (`## 2.1` step 1)。healthy な slot は保存され bad な slot だけが置換される。
 
   - id: R10
-    phase: recovery
     when:
       disposition: hibernated
       worktree_identity: bound
       declared_pins: absent
-      any_slot: {composer: pending}
+      any_slot: {slot_verdict: preserve_pending_composer}
     rail: prepare-bound-pair
     then: converge-bound-pair
-    note: "convergence は pending composer を必ず保存するので、discard は別 gate の前段が要る。"
+    note: >
+      convergence は pending composer を必ず保存する (`pair_contains_preserved_slot`) ので、
+      discard は別 gate の前段が要る。R9b より**前**に置く必要はない — R9b は
+      `slot_verdict` が `preserve_pending_composer` の slot を含む shape に match しないため
+      両者は排他である。
 
   - id: R11
-    phase: recovery
     when:
       disposition: hibernated
       worktree_identity: empty
@@ -372,74 +452,68 @@ rules:
     effect_budget: metadata_only
 
   - id: R12
-    phase: recovery
     when:
       disposition: hibernated
       declared_pins: resolvable
-      any_slot: {attestation: [stale, absent]}
+      any_slot: {slot_verdict: recover_bad_generation}
     rail: recover-pair
+    effect_budget: replace_bad_slots_then_redispatch
 
   - id: R13
-    phase: recovery
     when:
       disposition: hibernated
       live_pair: both_live
       issue_state: open
       resume_gates: green
     rail: resume
+    effect_budget: disposition_cas_only
 
-  # --- R14a / R14b / R14c: lane 状態は同じでも要求 authority が違う (`## 3.5` OVERLAP-4) ---
-  - id: R14a
-    phase: recovery
-    when:
-      disposition: active
-      issue_state: open
-      dispatch: owed
-      delivery_authority:
-        {owner_approval: present, zero_send_evidence: present, target_generation_pin: exact}
-    rail: recover-pair-delivery
-    note: "gateway 経由。owner 承認 + zero-send evidence + exact receiver 世代 pin が必須。"
-
+  # --- 配送: 狭い順に置く (R14b ⊂ R14a なので R14b が先) ---
   - id: R14b
-    phase: recovery
     when:
       disposition: active
       issue_state: open
       dispatch: owed
       delivery_authority:
-        {owner_approval: present, zero_send_evidence: present, target_generation_pin: exact,
-         lifecycle_decision_journal: present}
+        recovery_anchor_authorization: valid_for_this_anchor
+        zero_send_evidence: valid_for_this_action
+        target_generation_pin: exact_live_generation
+        lifecycle_decision_journal: valid_for_this_lane
     rail: recover-worker-delivery
-    note: "worker 直送。R14a の要件に加えて lifecycle decision journal を束縛する (最も狭い)。"
+    note: "worker 直送。3 者で最も狭い。`lifecycle_decision_journal` を追加で束縛する。"
 
-  - id: R14c
-    phase: recovery
+  - id: R14a
     when:
       disposition: active
       issue_state: open
       dispatch: owed
-      delivery_authority: {owner_approval: absent}
-    rail: rehydrate-fleet   # --execute の restore_dispatch
-    note: "lane の causal key が DISPATCH_OWED であることだけを根拠にした additive な再送。owner 承認も zero-send evidence も要求しない。`dispatch: uncertain` は block であって retry ではない。"
+      delivery_authority:
+        recovery_anchor_authorization: valid_for_this_anchor
+        zero_send_evidence: valid_for_this_action
+        target_generation_pin: exact_live_generation
+        lifecycle_decision_journal: [absent, mismatched]   # 明示的な非適用条件 (R14b との排他を順序に依存させない)
+    rail: recover-pair-delivery
+    note: "gateway 経由。R14b の要件から lifecycle decision journal を除いたもの。"
 
   # --- recovery phase の fall-through: 回復方向に subject を持つレールが無い shape ---
   - id: G1
-    phase: recovery
     when: {declared_pins: degraded}
     rail: none
     gap: GAP-2
     note: "劣化 snapshot を subject にする回復レールが 0。terminal phase は独立に評価されるので抑止しない。"
 
   - id: G2
-    phase: recovery
     when: {disposition: hibernated, worktree_identity: empty, declared_pins: absent}
     rail: none
     gap: GAP-3
     note: "repair-worktree-binding は pin を要求し、repair-pins / converge-bound-pair は bound を要求する相互 deadlock。"
+```
 
-  # ===================== terminal phase =====================
+### 3.1c terminal phase の rule 列
+
+```yaml
+terminal_rules:
   - id: T1
-    phase: terminal
     when: {issue_state: closed, head_integrated: true}
     rail: retire
     intent_by:
@@ -455,23 +529,73 @@ rules:
         intent: ["--retire-active-unbound-live-zero"]
       - when: {disposition: active, live_pair: both_live}
         intent: []          # 既定 retire --execute (guarded close)
-    note: "OVERLAP-3。6 intent + 既定が 1 表に折り畳める。declared_pins は preserve され validate されない。"
+    note: "OVERLAP-3。declared_pins は preserve され validate されない。"
 
   - id: T2
-    phase: terminal
     when: {issue_state: open, park_basis: [dependency_park, early_hibernate]}
     rail: hibernate
 
   - id: T3
-    phase: terminal
     when: {successor_attested: true, successor_same_issue: true, original_idle: true}
     rail: supersede
 ```
 
+### 3.1d co-applicable rail (first-match の precedence に参加しない)
+
+```yaml
+co_applicable_rules:
+  - id: R14c
+    when: {disposition: active, issue_state: open, dispatch: owed}
+    rail: rehydrate-fleet         # --execute の restore_dispatch
+    note: >
+      **R14a / R14b と排他ではない。** 実装は `if facts.dispatch.sendable:
+      actions.append(ACTION_RESTORE_DISPATCH)` だけで、他 rail の owner approval を
+      一切参照しないので、action-scoped authority が valid なときも不適用にならない
+      (round 3 review `finding_deliverypartition`)。したがって first-match の
+      precedence には入れず、`also_applicable` として並置する。
+      `dispatch: uncertain` は block であって retry ではない。
+```
+
+### 3.1e selection table
+
+```yaml
+selection:
+  - id: S1
+    when: {issue_state: open}
+    primary: recovery
+    fallback_if_primary_null: [hibernate, supersede]   # terminal 側から admit する閉集合
+    note: "open な issue を勝手に終端化しない。回復が無いときだけ park / 移管を採る。"
+
+  - id: S2
+    when: {issue_state: closed, head_integrated: true}
+    primary: terminal
+    fallback_if_primary_null: []
+    note: "recovery rail は precursor (P1) としてのみ plan に載る。R2-R14a は選ばない。"
+
+  - id: S3
+    when: {issue_state: closed, head_integrated: false}
+    result: escalation
+    reason: head_not_integrated_on_closed_issue
+    note: "closed だが未統合。終端も回復も自動選択しない (#13841 / #14242 が要求する head 到達性を満たさない)。"
+
+  - id: S4
+    when: {}                    # 上記いずれにも該当しない (issue_state: unknown 等)
+    result: escalation
+    reason: no_phase_applies
+```
+
+**指摘された 2 例の機械的な帰結** (round 3 review `finding_phasecomposition`):
+
+- `open` + worker turn failure + `dependency_park` → S1 (primary=recovery)。recovery は R6
+  (`refresh-worker`) を返すので **primary は R6**。T2 (`hibernate`) は `fallback_if_primary_null`
+  であり recovery が非 null なので**採らない**。plan = `[refresh-worker]`。
+- `closed` + `head_integrated: true` + `shell_residue` → P1 が step に入る。S2 (primary=terminal)
+  で T1 (`retire`)。plan = `[close-residue, retire]` (この順)。
+
 ### 3.2 effect-budget gap (rail は在るが effect budget の選択肢が無い)
 
 `rail: none` の fall-through とは**別種の欠落**がある: subject を持つレールは存在するが、
-その effect budget が 1 種類しかなく、保存側の選択肢が無い場合。決定木では rule の
+その effect budget が 1 種類しかなく保存側の選択肢が無い場合。決定木では rule の
 `effect_budget` に対する注記として表現し、`rail: none` の fall-through には置かない
 (置くと先行 rule が match するため到達不能になる)。
 
@@ -486,24 +610,30 @@ effect_budget_gaps:
     note: >
       R9b (converge-bound-pair) はこの shape の subject を持つので「レールが無い」のではない。
       無いのは「復元された provider session を close せずに pin だけ宣言する」effect budget。
-      metadata-only の `repair-pins` (R9a) は attestation が generation_bound の pair しか
-      扱えないため、server 復元で attestation を失った pair には適用できない。
+      metadata-only の `repair-pins` (R9a) は `slot_verdict: healthy_no_action` の pair しか
+      扱えず、server 復元で attestation を失った pair には適用できない。
       #15811 が ACTIVE 側に作った adopt-restored-pair の hibernated 版に相当する。
 ```
 
 ### 3.3 整合チェック (この doc 内で検算できる形にしてある)
 
-- rule が `when` / `intent_by[].when` で参照する key は、`any_axis` を除きすべて `## 2` の
-  `pair_shape` に宣言された軸である。`all_slots` / `any_slot` / `slot_health.gateway` /
-  `slot_health.worker` は `slot_health` の role 別直積を指す量化子付き参照であり、
-  その中の key はすべて `slot_facts` に宣言されている。
-- `any_axis` は R0 専用の meta 述語であり、観測軸ではない。
-- **`yaml` と記した block はすべて `yaml.safe_load` で parse できる data である**
-  (`pair_shape` / `rules` / `effect_budget_gaps`)。`evaluate(shape)` と `slot_verdict(slot)` は
-  アルゴリズムの擬似コードなので `text` block とし、data と混同できないようにしてある。
-- 各 gap は到達可能でなければならない: `rail: none` の fall-through (G1 / G2) は、先行する
-  同 phase の rule のいずれにも match しない shape に対してのみ発火する。effect-budget gap
-  (EBG-1) は先行 rule が match する shape を対象とするため fall-through には置かない。
+以下は本 doc 自身を `yaml.safe_load` して機械的に検算できる。
+
+1. **軸の閉包**: 全 rule / precursor / selection / co-applicable rule が `when` /
+   `intent_by[].when` で参照する top-level key は、`any_axis` を除きすべて `## 2` の
+   `pair_shape` に宣言された軸である。
+2. **slot fact の閉包**: `all_slots` / `any_slot` / `slot_health.<role>` の中の key は、
+   `slot_facts` の 11 軸か、派生値 `slot_verdict` のいずれかである。
+3. **値の閉包**: 各条件の値は、対応する軸の宣言値域に含まれる (`slot_verdict` は `## 2.1` の値域)。
+4. **到達可能性**: 同一 phase 内で、ある rule の `when` が先行 rule の `when` の**厳密な superset**
+   になっていないこと (superset は first-match で到達不能)。`co_applicable_rules` は
+   precedence に参加しないので本チェックの対象外。
+5. **`yaml` block の parse 可能性**: `yaml` と記した block はすべて `yaml.safe_load` で parse できる
+   data である。`evaluate(shape)` と `slot_verdict(slot)` はアルゴリズムの擬似コードなので
+   `text` block とし、data と混同できないようにしてある。
+6. **gap の到達可能性**: `rail: none` の fall-through (G1 / G2) は、先行する同 phase の rule の
+   いずれにも match しない shape に対してのみ発火する。effect-budget gap (EBG-1) は先行 rule が
+   match する shape を対象とするため fall-through には置かない。
 
 ### 3.4 gap (回復方向にどのレールも subject にしていない shape)
 
@@ -515,7 +645,7 @@ effect_budget_gaps:
   なく保存側が選べない (`## 3.2` の EBG-1 に対応)。本表では **GAP-4**。決定木の fall-through
   には置けない (先行 rule が match するため到達不能になる)。
 
-**主張の範囲**: 「回復方向にレールが無い」は **recovery phase についての主張**である。
+**主張の範囲**: 「回復方向にレールが無い」は **recovery phase (`## 3.1b`) についての主張**である。
 terminal phase は `## 3.0` の評価アルゴリズムどおり**独立に評価される**ので、gap があっても
 終端方向は到達しうる — 終端 rail 群は declared pin を **preserve するだけで validate しない**
 (pin を検証するのは `repair-worktree-binding` のみ)。「回復できないが終端はできる」という
@@ -523,10 +653,10 @@ terminal phase は `## 3.0` の評価アルゴリズムどおり**独立に評�
 
 | id | shape | 現状 (回復方向) | 根拠 |
 | --- | --- | --- | --- |
-| **GAP-1** | `active` + pin 解決可 + `cwd_drifted` / attestation non-green | `recover-restored-pair` が唯一の subject だが、`RestoredPairPlan.generation_conditional_close_available` が**常に `False` を返す固定 property** であり、`blocked_reasons` に `generation_conditional_close_unavailable` が必ず入る。したがって `may_recover` は**構造的に常に False**。診断は在るが**回収経路は存在しない** | `domain/restored_pair_recovery.py` L163-234。CLI help も "Read-only until Herdr exposes an atomic generation-conditional close primitive" と明記。Herdr 0.8 / protocol 19 が close 変異に `pane_id` しか受けないことが根本原因。**実測 (2026-08-21, base `289343db`)**: 全 identity 充足 / `lifecycle_current=True` / `worktree_authority_current=True` / `allow_pending_composer_loss=True` / 片 slot だけ `cwd_matches=False` という最良 shape を構成しても `blocked_reasons == ('generation_conditional_close_unavailable',)` / `may_recover=False` |
+| **GAP-1** (決定木 R4、`status: diagnose_only`) | `active` + `declared_pins: resolvable` + `any_slot: {cwd: drifted}` (または attestation が non-green) | `recover-restored-pair` が唯一の subject だが、`RestoredPairPlan.generation_conditional_close_available` が**常に `False` を返す固定 property** であり、`blocked_reasons` に `generation_conditional_close_unavailable` が必ず入る。したがって `may_recover` は**構造的に常に False**。診断は在るが**回収経路は存在しない** | `domain/restored_pair_recovery.py` L163-234。CLI help も "Read-only until Herdr exposes an atomic generation-conditional close primitive" と明記。Herdr 0.8 / protocol 19 が close 変異に `pane_id` しか受けないことが根本原因。**実測 (2026-08-21, base `289343db`)**: 全 identity 充足 / `lifecycle_current=True` / `worktree_authority_current=True` / `allow_pending_composer_loss=True` / 片 slot だけ `cwd_matches=False` という最良 shape を構成しても `blocked_reasons == ('generation_conditional_close_unavailable',)` / `may_recover=False` |
 | **GAP-2** (決定木 G1) | 任意 disposition + `declared_pins: degraded` (`unreadable` / `foreign_pin_role` / `mixed_pin_role_vocabulary` / `duplicate_pin_role` / `incomplete_pin_pair`) | **回復方向にどのレールも subject にしていない** (終端は T1 で到達しうる)。`adopt-restored-pair` は `declared_pins_present:<reason>` で明示拒否 (劣化 snapshot を上書きすると証拠が消えるため、これは意図的な正しい拒否)。`rebind-restored-pair` は exact 旧 pair 2 件を要求し `declared_slots_unresolved`。`repair-pins` は **empty** 限定。`repair-worktree-binding` は `declared_pins_fail_validation` / `declared_pins_are_not_canonically_encoded` で拒否。`read_declared_pin_pair` の全 consumer が非 OK を refusal として扱い、subject として消費する箇所は 0 | `src/` 全体で `PIN_PAIR_FOREIGN` / `_MIXED` / `_DUPLICATE` / `_INCOMPLETE` / `_UNREADABLE` を参照するのは定義元 `lane_pin_role.py` のみ (grep で確認) |
 | **GAP-3** (決定木 G2) | `hibernated` + `released` + `worktree_identity: empty` + `declared_pins: absent` | **相互 precondition の deadlock。** `repair-worktree-binding` は pin を要求し `hibernated_record_missing_pins` で拒否。`repair-pins` と `converge-bound-pair` は **bound** row を要求 (`not_hibernated_released_bound_pins_empty`) するので、binding が空な限り走れない。**回復方向の出口が無く**、残る経路は `--migrate-hibernated-legacy` / `--retire-hibernated-unbound-live-zero` / `--reconcile-hibernated-live` の terminal 化のみ = この shape の lane は**終端しかできない** | `sublane_worktree_binding_repair.py` の `BLOCK_MISSING_PINS`、`sublane_hibernated_pin_repair.py` docstring ("hibernated / released **BOUND** ... `worktree_identity` present")、`hibernated_bound_pair_convergence.py` の `BLOCK_NOT_BOUND_SIGNATURE` |
-| **GAP-4** (`## 3.2` EBG-1。**effect-budget gap**) | `hibernated` + `released` + `bound` + `declared_pins: absent` + server 復元により **attestation が `stale` / `absent`** な pair | **レールは在る。無いのは effect budget の選択肢。** 決定木 R9b (`converge-bound-pair`) がこの shape の subject を持つので「どのレールも扱えない」ではない。無いのは「復元された provider session を close せずに pin だけ宣言する」= session-preserving な metadata-only 予算である。metadata-only の `repair-pins` (R9a) は `attestation: generation_bound` の pair しか扱えず、server 復元で attestation を失った pair には適用できない。結果としてこの shape の唯一の前進手段が `converge-bound-pair` の破壊的置換になる。#15811 が ACTIVE 側に作った `adopt-restored-pair` の hibernated 版に相当する | `sublane_hibernated_pin_repair.py` docstring (metadata-only 宣言 + GREEN 条件) / `domain/sublane_hibernated_live_reconcile.py` の `STATE_GREEN` / `hibernated_bound_pair_convergence.py` の `APPROVAL_EFFECT = "replace_bad_pair_then_repair_pins"` と help ("replace the exact **stale/unattested** pair") |
+| **GAP-4** (`## 3.2` EBG-1。**effect-budget gap**) | `hibernated` + `released` + `bound` + `declared_pins: absent` + server 復元により **`slot_verdict` が `recover_bad_generation`** になる pair (attestation が `restore_stale` / `stale` / `absent`) | **レールは在る。無いのは effect budget の選択肢。** 決定木 R9b (`converge-bound-pair`) がこの shape の subject を持つので「どのレールも扱えない」ではない。無いのは「復元された provider session を close せずに pin だけ宣言する」= session-preserving な metadata-only 予算である。metadata-only の `repair-pins` (R9a) は `slot_verdict: healthy_no_action` (= `attestation: live_joined` かつ cwd/locator 一致) の pair しか扱えず、server 復元で attestation を失った pair には適用できない。結果としてこの shape の唯一の前進手段が `converge-bound-pair` の破壊的置換になる。#15811 が ACTIVE 側に作った `adopt-restored-pair` の hibernated 版に相当する | `sublane_hibernated_pin_repair.py` docstring (metadata-only 宣言 + GREEN 条件) / `domain/sublane_hibernated_live_reconcile.py` の `STATE_GREEN` / `hibernated_bound_pair_convergence.py` の `APPROVAL_EFFECT = "replace_bad_pair_then_repair_pins"` と help ("replace the exact **stale/unattested** pair") |
 | **GAP-5** (決定木外) | `audit-failure-terminal` が記録した監査失敗 lane の terminal retire | 記録は書けるが**何も authorize しない**。`coordinator_receipt_authority_unresolvable` で #15195 待ち。監査失敗 lane の終端は現在 owner 手動 | `cli_audit_failure_terminal_decision.py` help |
 
 GAP-1 と GAP-5 は「レール乱立の副作用」ではなく **外部依存 (Herdr API / #15195) による既知残余**であり、
@@ -553,20 +683,31 @@ live 側の `slot_health` で排他になっているものは overlap ではな
 妥当性が変わる (真の overlap は 1 本に畳める可能性があるが、split を畳むと排他条件を
 parameter 化することになり、別種の取引になる)。
 
+種別は 3 値とする。
+
+- **true** — pair shape ベクトルが同一値のとき、常に複数レールが適用可能。
+- **conditional true** — ある軸の値によって「共適用」と「排他」が切り替わる。条件を明記する。
+- **partial** — 共通しているのは shape ではなく machinery / 契約 / durable half だけで、
+  pair shape 上は常に排他。
+
 | id | 重複するレール | 種別 | 重複の実体 | 現時点で分かれている理由 (docstring 由来) |
 | --- | --- | --- | --- | --- |
 | **OVERLAP-1** | `recover-stale` / `recover-gateway` / `refresh-worker` | **partial** (actuation machinery のみ。shape は排他) | 3 本とも #13806 tranche A/B の同一 actuation (guarded exact-generation close → same-slot launch → action-bound attestation → continuation 1 回)。`worker_turn_recovery` は `gateway_turn_recovery.classify_gateway_turn` を**逐語再利用**し `TURN_CLASS_*` 語彙を共有。ただし決定木では R5 / R6 / R7 が `slot_health.gateway` / `slot_health.worker` / `vanished` で**排他**であり、pair shape が一致することはない | 保護対象の集合が互いに反転している (gateway 保護 / worker 保護 / 両方保護)。staleness 述語が異なる。#14661 j#92369 が「vanished worker と live-but-unproductive worker は別の事実で別の admission」と設計制約として固定 |
 | **OVERLAP-2** | `repair-pins` / `converge-bound-pair` | **partial** (durable half のみ。live 側で排他) | 一致するのは **durable row signature** だけ (`hibernated` + `released` + `bound` + pins empty = `not_hibernated_released_bound_pins_empty`)。**live pair 状態では排他**である: `repair-pins` が pin を書けるのは `decide_pair_reconcile` が **GREEN** を返す pair (present / unique / live / idle-or-turn-ended / composer-settled / generation-bound attested) のときだけで、`converge-bound-pair` の subject は逆に「その GREEN を満たさない **stale / unattested** な pair」(`APPROVAL_EFFECT = "replace_bad_pair_then_repair_pins"`)。決定木では R9a / R9b として分離した | actuation 予算が違う (metadata-only vs process 置換)。#13879 は #13847 の precondition を弱めないことを明示目的にしている |
 | **OVERLAP-3** | `retire` の 6 intent + 既定 | **partial** (terminal CAS 契約のみ。shape は分割) | 7 経路すべてが「terminal disposition への CAS」を共有するが、`intent_by` 表のとおり `(disposition × worktree_identity × live_pair)` で**互いに排他な分割**になっている。畳めるのは契約であって shape ではない | 各 intent が異なる liveness authority を持つ。#14242 は「ACTIVE row は `process_release == not_requested` なので live-inventory 読取が唯一の liveness authority」であり #13845 より要求が高い、と明記。#14499 は「operator が 5 intent を 1 語彙で読めるよう #14242 を意図的に mirror した」と記録 |
-| **OVERLAP-4** | `recover-pair-delivery` / `recover-worker-delivery` / `rehydrate-fleet --execute` の `restore_dispatch` | **partial** (lane 状態のみ一致。`delivery_authority` で排他) | lane 側の shape (`active` + `issue_state: open` + `dispatch: owed`) は一致するが、**要求する authority が違う**ので同時適用可能ではない。`recover-pair-delivery` は `RecoveryDeliveryAuthorization` (`journal` / `conclusion` / `authorized_by_role` / `anchor_journal` / `retry_of_action_sha256` / `prior_zero_send_journal`) と `RecoveryDeliveryZeroSendEvidence` (`typed_count` / `send_count` / `turn_start_count` / `target_count`) を要求し、request が `target_assigned_name` / `target_locator` / `target_revision` / `target_action_id` で exact な receiver 世代に pin される。`recover-worker-delivery` はさらに `implementation_request_journal` / `lifecycle_decision_journal` を束縛する (3 者で最も狭い)。`rehydrate-fleet` の `ACTION_RESTORE_DISPATCH` は "Only ever planned on `DISPATCH_OWED`" で、**owner 承認も zero-send evidence も要求しない** additive な再送。決定木では R14a / R14b / R14c として分離した。前 2 者は `recovery_effect_contract` の applied-effect / unresolved-fate 契約を共有する | gateway 経由 / worker 直送 / fleet 単位、で経路・承認・effect 契約が異なる |
-| **OVERLAP-5** | `reboot-audit` / `rehydrate-fleet` (plan) | **true** (同一 shape) | 決定木 R0 が両方を返す。同一の per-lane joined facts に対する 2 つ目の per-lane 決定 | `fleet_rehydrate` docstring が明示: #14499 は「この lane はどの disposition へ収束すべきか」、#15745 は「この lane はどの未配送 action を負っているか」で**問いが違う**。#14499 の「lane ごとに違う答え」性質を潰さないため別 planner にした |
+| **OVERLAP-4** | `recover-pair-delivery` / `recover-worker-delivery` / `rehydrate-fleet --execute` の `restore_dispatch` | **conditional true** (下記条件で共適用) | `recover-pair-delivery` (R14a) と `recover-worker-delivery` (R14b) は `delivery_authority.lifecycle_decision_journal` の値で**排他** (`valid_for_this_lane` vs `[absent, mismatched]`)。しかし `rehydrate-fleet` の `restore_dispatch` (R14c) は実装が `if facts.dispatch.sendable: actions.append(ACTION_RESTORE_DISPATCH)` だけを見ており、**他 rail の action-scoped authority が valid でも不適用にならない**。したがって `dispatch: owed` かつ action-scoped authority が valid な shape では **R14c が R14a / R14b と同時に適用可能**になる = その条件下では true overlap。authority が invalid / absent なら R14c だけが残り排他になる。決定木では R14c を `co_applicable_rules` に置き、first-match の precedence に参加させずに `also_applicable` として並置することでこの実態を符号化した | gateway 経由 / worker 直送 / fleet 単位、で経路・要求 authority・effect 契約が異なる。前 2 者は `recovery_effect_contract` の applied-effect / unresolved-fate 契約を共有する |
+| **OVERLAP-5** | `reboot-audit` / `rehydrate-fleet` (plan) | **true** (同一 shape) | 決定木 P0 (precursor) が両方を挙げる。同一の per-lane joined facts に対する 2 つ目の per-lane 決定 | `fleet_rehydrate` docstring が明示: #14499 は「この lane はどの disposition へ収束すべきか」、#15745 は「この lane はどの未配送 action を負っているか」で**問いが違う**。#14499 の「lane ごとに違う答え」性質を潰さないため別 planner にした |
 | **OVERLAP-6** | `quarantine` / `prepare-bound-pair` / `refresh-worker` | **partial** (`pending_composer` 軸のみ。disposition で排他) | 3 本が「pending composer が前進を塞ぐ」状態を扱うが、決定木では R8 (`active`) / R10 (`hibernated` + bound + pins absent) / R6 (worker が live-unproductive) と前提が分かれる | 承認 gate が別 (`quarantine` の 5 token / `bound_pair_composer_discard_approval` / `worker_refresh_owner_approval`) |
 | **OVERLAP-7** | `adopt-restored-pair` / `rebind-restored-pair` | **partial** (`declared_pins` で排他) | 共有するのは「ACTIVE lane の server-restored pair で pin snapshot が現実と合わない」という**問題設定**であり、`declared_pins` の値 (`absent` vs `resolvable`) で排他 (R2 / R3)。両者は既に status 語彙と `slot_reason` を共有している | pin snapshot が absent か stale かで CAS が別物 (empty-only backfill vs exact-2 件 replace)。adopt は rebind より**厳しい** proof chain を要求する (declared pin という照合先が無いため) |
 
-**この分類から出る所見**: 7 件のうち **true overlap は 1 件 (OVERLAP-5) だけ**で、
-残り 6 件は「近傍だが排他」な split である (OVERLAP-4 は round 2 review j#109751
-`finding_deliveryauthority` を受けて true → partial へ訂正した — 3 経路は lane 状態が同じでも
-`delivery_authority` で排他する)。したがって「レールが乱立している」という問題の実体は
+**この分類から出る所見**: 7 件のうち **無条件の true overlap は 1 件 (OVERLAP-5) のみ**、
+**条件付き true が 1 件 (OVERLAP-4)**、残り 5 件は「近傍だが排他」な split である。
+
+OVERLAP-4 の判定は 2 度訂正している (round 2 j#109751 `finding_deliveryauthority` で
+true → partial、round 3 j#109757 `finding_deliverypartition` で partial → conditional true)。
+1 度目は「3 経路の要求 authority が違う」ことだけを見て排他と結論したが、**要求 authority が
+違うことと適用可能性が排他であることは別**であり、`restore_dispatch` は他 rail の authority を
+参照しないので共適用しうる、というのが実装上の事実だった。したがって「レールが乱立している」という問題の実体は
 **同じことを 2 回やっている冗長**ではなく、**近傍の shape ごとに 1 本ずつレールが生えた結果、
 集合としての被覆に穴が空いている** (= `## 3.4` の gap) ことにある。統合の主目的を「重複削除」に
 置くと GAP-2 / GAP-3 / GAP-4 は閉じない。
@@ -652,14 +793,20 @@ durable row signature だけで、live pair 状態 (`decide_pair_reconcile` が 
 
 ### C5. 再配送 3 経路の統合 (OVERLAP-4)
 
-**前提の訂正 (round 2 review `finding_deliveryauthority`)**: OVERLAP-4 は true overlap では
-**ない**。3 経路は lane 状態が同じでも `delivery_authority` で排他する — `recover-pair-delivery`
-は owner 承認 + zero-send evidence + exact receiver 世代 pin、`recover-worker-delivery` はさらに
-lifecycle decision journal、`rehydrate-fleet` の `restore_dispatch` は causal key の
-`DISPATCH_OWED` のみ。したがって本候補は「重複を削る統合」ではなく、**authority の強さで
-段階化された 3 経路を 1 rail の権限階梯として表現できるか**という問いである。畳む場合、
-最も弱い authority (fleet の additive 再送) が最も強い経路の effect を得ないことが
-load-bearing な条件になる。
+**前提の訂正 (2 度目。round 3 review `finding_deliverypartition`)**: OVERLAP-4 は
+**conditional true** である。`recover-pair-delivery` (R14a) と `recover-worker-delivery` (R14b) は
+`lifecycle_decision_journal` の値で排他だが、`rehydrate-fleet` の `restore_dispatch` (R14c) は
+実装が `dispatch.sendable` **だけ**を見るため他 rail の authority が valid でも不適用にならず、
+**その条件下では 3 経路が同時に適用可能**になる。
+
+したがって本候補は 2 つの別の問いを含む。
+
+1. R14a / R14b は「authority の強さで段階化された 2 経路を 1 rail の権限階梯として表現できるか」。
+   畳む場合、`lifecycle_decision_journal` の有無で effect が変わることを型で保てるかが焦点。
+2. R14c は 1 と**同じ shape に共適用しうる別 authority の経路**である。畳むなら
+   「最も弱い authority (fleet の additive 再送) が、最も強い経路の effect を得ない」ことが
+   load-bearing な不変条件になる。ここを緩めると owner 承認なしの再送が承認付き経路の
+   effect を得る。
 
 | 不変条件 | 封じている事故 | test |
 | --- | --- | --- |
@@ -705,11 +852,15 @@ Phase 2 で採るなら ADR-0001 の「記録済み設計判断の反転には o
 7. **C3 の統合可否**: intent flag の operator 可読性 (#14499 が意図的に mirror した性質) を
    宣言表に畳んだあとも維持できるか。
 8. **C6 が ADR-0001 の反転に当たるか**の判定。
-9. **統合の主目的の確認**: `## 3.5` の分類では true overlap は **1 件 (OVERLAP-5) だけ**で、
-   残り 6 件は近傍だが排他な split だった。統合の目的を「重複削除」に置くと GAP-2 / GAP-3 /
-   GAP-4 は 1 つも閉じない。Phase 2 の主目的を「被覆の穴 (subject gap + effect-budget gap) を
-   閉じる」側に置き直してよいか。
-10. Phase 2 の受け入れ条件を「本 doc の C1-C5 に列挙した test が 1 本も緑を失わない」で
+9. **統合の主目的の確認**: `## 3.5` の分類では**無条件 true overlap は 1 件 (OVERLAP-5) のみ、
+   条件付き true が 1 件 (OVERLAP-4)**、残り 5 件は近傍だが排他な split だった。統合の目的を
+   「重複削除」に置くと GAP-2 / GAP-3 / GAP-4 は 1 つも閉じない。Phase 2 の主目的を
+   「被覆の穴 (subject gap + effect-budget gap) を閉じる」側に置き直してよいか。
+10. **OVERLAP-4 の共適用を仕様として認めるか**: `restore_dispatch` が他 rail の action-scoped
+   authority を参照せず共適用しうるのは、実装の意図なのか未整理なのか。owner 承認付き経路と
+   承認なし経路が同じ shape に同時適用できる状態を許容するかは authority policy の判断であり、
+   本 doc は判定しない。
+11. Phase 2 の受け入れ条件を「本 doc の C1-C5 に列挙した test が 1 本も緑を失わない」で
     固定してよいか。
 
 ## 参照
