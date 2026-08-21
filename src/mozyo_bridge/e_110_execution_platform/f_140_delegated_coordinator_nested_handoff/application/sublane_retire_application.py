@@ -12,6 +12,7 @@ Git has no non-force primitive that atomically checks the lane identity while re
 
 from __future__ import annotations
 
+import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -52,10 +53,11 @@ REASON_INTENT_NOT_APPLICABLE = "retire_intent_not_applicable"
 REASON_IDENTITY_UNRESOLVED = "retire_identity_unresolved"
 REASON_IDENTITY_CHANGED = "retire_identity_changed"
 REASON_APPLICATION_ERROR = "retire_application_error"
-#: Separator between :data:`REASON_APPLICATION_ERROR` and the exception's class name (Redmine
-#: #15840). The reason stays a prefix match for every pre-#15840 caller: ``retire_application_error``
-#: becomes ``retire_application_error:OSError``, never a different token.
+#: Separator between :data:`REASON_APPLICATION_ERROR` and the failure-kind token (Redmine #15840).
+#: The reason stays a prefix match for every pre-#15840 caller: ``retire_application_error``
+#: becomes ``retire_application_error:os_error``, never a different token.
 REASON_APPLICATION_ERROR_SEPARATOR = ":"
+
 REASON_CLEANUP_ATOMIC_GUARD_UNAVAILABLE = "cleanup_atomic_guard_unavailable"
 #: ``--worktree-absent`` (Redmine #15789) was combined with an intent it does not apply to. It
 #: modifies exactly the two BOUND terminal retires; the unbound rails never had a checkout in
@@ -71,6 +73,76 @@ REASON_ABSENT_WORKTREE_UNPROVEN = "absent_worktree_unproven"
 #: The intents ``--worktree-absent`` modifies: the BOUND metadata-only terminal retires, whose
 #: whole effect is a lifecycle CAS and whose only use for the checkout was the two facts
 #: :mod:`...sublane_absent_worktree_evidence` re-derives from git's surviving entry.
+#: The failure kind when the raised exception matches nothing in the closed table below.
+#:
+#: Redmine #15840 review j#109671 ``finding_unsafeexceptiontype``: the first attempt appended
+#: ``type(exc).__name__``, described as safe because "a class name is an identifier". That was
+#: WRONG and the review reproduced it — ``type()`` accepts an ARBITRARY string as the class name,
+#: so ``type("SECRET_TOKEN_VALUE_123", (RuntimeError,), {})`` produced
+#: ``retire_application_error:SECRET_TOKEN_VALUE_123`` and passed an ``isidentifier()`` pin that
+#: claimed to prevent exactly that. A class name is identifier-SHAPED caller data, never a
+#: trusted literal. Anything that reaches a durable record must come out of the closed table in
+#: this module and nowhere else.
+REASON_EXCEPTION_UNCLASSIFIED = "unclassified"
+
+#: ``(trusted exception class, literal token)``, most specific first. The token is the ONLY thing
+#: that can reach a durable record, and every one of them is written here — no value derived from
+#: the raised object is ever emitted.
+#:
+#: Kept deliberately small and centred on the distinction the diagnostic exists to make (Redmine
+#: #15789 j#109134): did an external command fail, or did our own logic break? Extending it is a
+#: deliberate edit of this table, which is the point.
+_DURABLE_FAILURE_KINDS: tuple[tuple[type, str], ...] = (
+    # Subprocess failures — the class that cost the round trip this issue was opened for.
+    (subprocess.TimeoutExpired, "subprocess_timeout"),
+    (subprocess.CalledProcessError, "called_process_error"),
+    (subprocess.SubprocessError, "subprocess_error"),
+    # Filesystem / OS. FileNotFoundError & friends are OSError subclasses and land here.
+    (FileNotFoundError, "file_not_found"),
+    (PermissionError, "permission_denied"),
+    (OSError, "os_error"),
+    # Our own logic breaking.
+    (KeyError, "key_error"),
+    (AttributeError, "attribute_error"),
+    (TypeError, "type_error"),
+    (ValueError, "value_error"),
+)
+
+
+def _durable_failure_kind(exc: BaseException) -> str:
+    """The closed-vocabulary token for ``exc`` — total, and never caller-derived (#15840).
+
+    Two properties are load-bearing, both from review j#109671:
+
+    - **Closed vocabulary** (``finding_unsafeexceptiontype``). Every possible return value is a
+      literal from :data:`_DURABLE_FAILURE_KINDS` or :data:`REASON_EXCEPTION_UNCLASSIFIED`. No
+      string carried by the exception — name, message, args — can reach the caller. That is what
+      makes "this cannot leak a secret" a property of the code rather than an assumption about
+      how exception classes happen to be named.
+
+    - **Totality** (``finding_terminalhandlerescape``). This runs inside the retire application's
+      broad terminal handler, which is the last line before the caller. The first attempt read
+      ``type(exc).__name__`` there; a metaclass can define ``__name__`` as a property that raises,
+      and the review reproduced a ``RuntimeError`` escaping the handler instead of an
+      ``uncertain`` result — breaking the #15066 contract that unexpected failures reach callers
+      as a typed result. So: identity comparison only (``is`` never invokes user code), no
+      ``__name__``, no ``isinstance`` (a metaclass can hook ``__instancecheck__``), no dict
+      lookup (a metaclass can hook ``__hash__``), and the whole walk wrapped so that even a
+      hostile ``__mro__`` degrades to the fixed literal rather than raising.
+    """
+    try:
+        mro = type(exc).__mro__
+    except BaseException:  # noqa: BLE001 - a hostile metaclass must not escape the handler
+        return REASON_EXCEPTION_UNCLASSIFIED
+    try:
+        for base in mro:
+            for known, token in _DURABLE_FAILURE_KINDS:
+                if base is known:
+                    return token
+    except BaseException:  # noqa: BLE001 - likewise for a hostile __mro__ sequence
+        return REASON_EXCEPTION_UNCLASSIFIED
+    return REASON_EXCEPTION_UNCLASSIFIED
+
 _WORKTREE_ABSENT_INTENTS = frozenset(
     {RETIRE_INTENT_ACTIVE_LIVE_ZERO, RETIRE_INTENT_HIBERNATED_BOUND}
 )
@@ -395,12 +467,14 @@ def run_retire_application(request: RetireApplicationRequest) -> RetireApplicati
         # throwaway harness and re-running; it turned out to be a `git worktree add` refusal
         # whose message was the load-bearing evidence for that issue's whole fix.
         #
-        # Only the exception's CLASS NAME is carried. That is a type-level guarantee, not a
-        # case-by-case judgement: a Python class name is an identifier and cannot contain a
-        # path, a token, or personal data. `str(exc)` / `repr(exc)` / the traceback can and do
-        # — the very `git worktree add` refusal above embeds the recorded worktree's ABSOLUTE
-        # PATH, which `lane_metadata` declares host-local private state that must never reach a
-        # durable Redmine record. Those belong in the host-local sink, not in a value that
+        # What crosses is a CLOSED-VOCABULARY token, never anything the exception carries. See
+        # `_durable_failure_kind`: an earlier attempt appended `type(exc).__name__` and called it
+        # safe, and review j#109671 reproduced both ways that was wrong — a class name is
+        # arbitrary caller data (`type("SECRET...", ...)`), and reading it can itself raise out
+        # of this handler. `str(exc)` / `repr(exc)` / the traceback stay out for the original
+        # reason too: the `git worktree add` refusal above embeds the recorded worktree's
+        # ABSOLUTE PATH, which `lane_metadata` declares host-local private state that must never
+        # reach a durable Redmine record. Raw belongs in the host-local sink, not in a value that
         # flows into CLI JSON and gets pasted into a journal. Boundary:
         # `vibes/docs/logics/exception-diagnostic-sink-boundary.md`.
         return RetireApplicationResult(
@@ -408,7 +482,7 @@ def run_retire_application(request: RetireApplicationRequest) -> RetireApplicati
             reason=(
                 REASON_APPLICATION_ERROR
                 + REASON_APPLICATION_ERROR_SEPARATOR
-                + type(exc).__name__
+                + _durable_failure_kind(exc)
             ),
             uncertain=True,
         )
@@ -437,6 +511,7 @@ __all__ = (
     "REASON_ABSENT_WORKTREE_UNPROVEN",
     "REASON_APPLICATION_ERROR",
     "REASON_APPLICATION_ERROR_SEPARATOR",
+    "REASON_EXCEPTION_UNCLASSIFIED",
     "REASON_WORKTREE_ABSENT_NOT_APPLICABLE",
     "run_retire_application",
 )

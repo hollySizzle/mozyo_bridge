@@ -14,14 +14,18 @@ entire fix.
 
 What is pinned here, in one file per the R3-c same-issue grouping rule:
 
-1. the class name of the raised exception now reaches the caller;
+1. a CLOSED-VOCABULARY failure kind reaches the caller -- never a string the exception
+   carries. Review j#109671 reproduced both ways the first attempt (``type(exc).__name__``)
+   was wrong, and those two counter-examples are pinned directly below;
 2. **the message, the traceback and any path do NOT** — the boundary in
    ``vibes/docs/logics/exception-diagnostic-sink-boundary.md`` allows raw only in a host-local
    sink and forbids copying it into a durable record, and this value flows into CLI JSON that
    gets pasted into Redmine journals;
 3. the reason stays a prefix of the pre-#15840 token, so no consumer is renamed out from under;
 4. the typed refusal vocabulary is untouched — a deterministic refusal is still a deterministic
-   refusal, and only the genuinely-unexpected path gained a class name.
+   refusal, and only the genuinely-unexpected path gained a failure kind;
+5. the terminal handler stays TOTAL: it must return an ``uncertain`` result even when reading
+   anything off the raised object would itself raise.
 
 Point 2 is the load-bearing pin. It fails loudly if a later slice wires the host-local sink and
 lets the raw text leak into the returned value on the way.
@@ -33,6 +37,7 @@ injected by patching one collaborator to raise.
 from __future__ import annotations
 
 import json
+import subprocess
 import sys
 import traceback
 import unittest
@@ -50,8 +55,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     retire_admissibility,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_application import (  # noqa: E402,E501
+    _DURABLE_FAILURE_KINDS,
     REASON_APPLICATION_ERROR,
     REASON_APPLICATION_ERROR_SEPARATOR,
+    REASON_EXCEPTION_UNCLASSIFIED,
     RETIRE_RESULT_UNCERTAIN,
     RetireApplicationRequest,
     RetireAssertions,
@@ -97,19 +104,31 @@ class TheUnexpectedExceptionNowNamesItsType(unittest.TestCase):
         self.assertTrue(result.uncertain)
         self.assertFalse(result.mutated)
 
-    def test_the_exception_class_name_reaches_the_caller(self):
+    def test_a_recognised_failure_kind_reaches_the_caller(self):
+        """A subprocess failure is named -- the distinction this diagnostic exists for."""
+        result = _run_with_raised(subprocess.CalledProcessError(1, "git"))
+        self.assertEqual(
+            result.reason,
+            REASON_APPLICATION_ERROR
+            + REASON_APPLICATION_ERROR_SEPARATOR
+            + "called_process_error",
+        )
+
+    def test_a_different_failure_kind_is_distinguishable(self):
+        """The whole point: subprocess failure vs logic bug must be told apart."""
+        first = _run_with_raised(subprocess.CalledProcessError(1, "git"))
+        second = _run_with_raised(TypeError("unrelated logic bug"))
+        self.assertNotEqual(first.reason, second.reason)
+        self.assertTrue(second.reason.endswith("type_error"), second.reason)
+
+    def test_an_unrecognised_type_degrades_to_the_fixed_literal(self):
         result = _run_with_raised(_LeakyFailure(_RAISED_MESSAGE))
         self.assertEqual(
             result.reason,
-            REASON_APPLICATION_ERROR + REASON_APPLICATION_ERROR_SEPARATOR + "_LeakyFailure",
+            REASON_APPLICATION_ERROR
+            + REASON_APPLICATION_ERROR_SEPARATOR
+            + REASON_EXCEPTION_UNCLASSIFIED,
         )
-
-    def test_a_different_exception_type_is_distinguishable(self):
-        """The whole point: subprocess failure vs logic bug must be told apart."""
-        first = _run_with_raised(_LeakyFailure(_RAISED_MESSAGE))
-        second = _run_with_raised(TypeError("unrelated logic bug"))
-        self.assertNotEqual(first.reason, second.reason)
-        self.assertTrue(second.reason.endswith("TypeError"))
 
     def test_the_reason_stays_a_prefix_of_the_pre_change_token(self):
         """No consumer is renamed out from under: the old token is still the prefix."""
@@ -160,17 +179,112 @@ class TheRawTextNeverCrossesTheBoundary(unittest.TestCase):
         self.assertNotIn(__file__, serialized)
         self.assertTrue(frames, "precondition: a traceback was actually formatted")
 
-    def test_only_an_identifier_is_appended(self):
-        """A class name is an identifier by construction — that is the type-level guarantee.
+    def test_only_a_token_from_the_closed_table_is_appended(self):
+        """The replacement for a pin that did not hold (review j#109671).
 
-        Pinned as a property rather than a literal so a future exception type cannot quietly
-        introduce a value that is not identifier-shaped.
+        The first version asserted ``isidentifier()`` and called a class name a type-level
+        guarantee. It is not: ``type()`` takes an arbitrary string, so an identifier-shaped
+        secret passed that pin. The property that actually holds is membership of a closed
+        table written in this repository's own source.
         """
-        result = _run_with_raised(_LeakyFailure(_RAISED_MESSAGE))
-        appended = result.reason[
-            len(REASON_APPLICATION_ERROR + REASON_APPLICATION_ERROR_SEPARATOR) :
-        ]
-        self.assertTrue(appended.isidentifier(), appended)
+        allowed = {token for _cls, token in _DURABLE_FAILURE_KINDS}
+        allowed.add(REASON_EXCEPTION_UNCLASSIFIED)
+        for raised in (
+            subprocess.CalledProcessError(1, "git"),
+            FileNotFoundError(_SECRET_PATH),
+            TypeError("x"),
+            _LeakyFailure(_RAISED_MESSAGE),
+        ):
+            appended = _run_with_raised(raised).reason[
+                len(REASON_APPLICATION_ERROR + REASON_APPLICATION_ERROR_SEPARATOR) :
+            ]
+            self.assertIn(appended, allowed, appended)
+
+
+class TheReviewCounterExamplesStayClosed(unittest.TestCase):
+    """The two counter-examples from review j#109671, pinned as tests rather than prose.
+
+    The first implementation appended ``type(exc).__name__`` and justified it as a type-level
+    guarantee. Both halves of that were false, and both are reproduced here so the claim can
+    never be re-adopted silently.
+    """
+
+    def test_an_identifier_shaped_secret_in_a_class_name_does_not_leak(self):
+        """`finding_unsafeexceptiontype`: `type()` takes an ARBITRARY string as the name.
+
+        The superseded pin asserted `isidentifier()`, which this class name satisfies — so the
+        old regression accepted exactly the leak it claimed to prevent.
+        """
+        secret = "SECRET_TOKEN_VALUE_123"
+        leaking = type(secret, (RuntimeError,), {})
+        self.assertTrue(secret.isidentifier(), "precondition: the secret is identifier-shaped")
+
+        result = _run_with_raised(leaking("boom"))
+        self.assertNotIn(secret, result.reason)
+        self.assertNotIn(
+            secret, json.dumps(result.as_payload(), ensure_ascii=False)
+        )
+        self.assertTrue(result.reason.endswith(REASON_EXCEPTION_UNCLASSIFIED), result.reason)
+
+    def test_a_metaclass_whose_name_raises_still_yields_an_uncertain_result(self):
+        """`finding_terminalhandlerescape`: the handler is the last line and must be total.
+
+        Reading `__name__` inside it let a hostile metaclass throw straight past the caller,
+        breaking the #15066 contract that unexpected failures arrive as a typed result.
+        """
+
+        class _RaisingName(type):
+            @property
+            def __name__(cls):  # noqa: D105 - the whole point is that it raises
+                raise RuntimeError("metaclass __name__ raised")
+
+        hostile = _RaisingName("Hostile", (RuntimeError,), {})
+        with self.assertRaises(RuntimeError):
+            _ = hostile.__name__  # precondition: reading the name really does raise
+
+        result = _run_with_raised(hostile("boom"))
+        self.assertEqual(result.state, RETIRE_RESULT_UNCERTAIN)
+        self.assertTrue(result.uncertain)
+        self.assertTrue(result.reason.endswith(REASON_EXCEPTION_UNCLASSIFIED), result.reason)
+
+
+    def test_a_metaclass_whose_mro_raises_still_yields_an_uncertain_result(self):
+        """The classifier's own guard, exercised rather than assumed.
+
+        A first mutation attempt failed to reach this guard — the hostile-``__name__`` class
+        above never touches ``__mro__`` — so it was pinned separately instead of being left
+        as untested defensive code.
+        """
+
+        class _RaisingMro(type):
+            @property
+            def __mro__(cls):  # noqa: D105 - the whole point is that it raises
+                raise RuntimeError("mro raised")
+
+        hostile = _RaisingMro("HostileMro", (RuntimeError,), {})
+        with self.assertRaises(RuntimeError):
+            _ = hostile.__mro__  # precondition: reading the mro really does raise
+
+        result = _run_with_raised(hostile("boom"))
+        self.assertEqual(result.state, RETIRE_RESULT_UNCERTAIN)
+        self.assertTrue(result.reason.endswith(REASON_EXCEPTION_UNCLASSIFIED), result.reason)
+
+    def test_an_mro_that_raises_while_iterating_still_yields_an_uncertain_result(self):
+        """The second guard: the walk itself, not only obtaining the sequence."""
+
+        class _BadSequence:
+            def __iter__(self):
+                raise RuntimeError("mro iteration raised")
+
+        class _BadIterMro(type):
+            @property
+            def __mro__(cls):  # noqa: D105
+                return _BadSequence()
+
+        hostile = _BadIterMro("HostileIter", (RuntimeError,), {})
+        result = _run_with_raised(hostile("boom"))
+        self.assertEqual(result.state, RETIRE_RESULT_UNCERTAIN)
+        self.assertTrue(result.reason.endswith(REASON_EXCEPTION_UNCLASSIFIED), result.reason)
 
 
 class TheDeterministicRefusalsAreUntouched(unittest.TestCase):
@@ -211,6 +325,14 @@ class TheBoundaryIsWrittenDown(unittest.TestCase):
         self.assertIn("shared-home guard", text)
         # Constraint B: raw is host-local only; never copied into a durable record.
         self.assertIn("never copy it into a durable Redmine record", text)
+        # `finding_sinklocationundefined`: an exclusion is not a selection. A concrete sink
+        # location, its permissions, its retention and the forbidden surfaces must be named.
+        self.assertIn("XDG_STATE_HOME", text)
+        self.assertIn("0700", text)
+        self.assertIn("0600", text)
+        self.assertIn("retention", text.lower())
+        for forbidden_surface in ("repo / worktree", "stderr"):
+            self.assertIn(forbidden_surface, text, forbidden_surface)
 
     def test_the_doc_is_registered_in_the_catalog(self):
         catalog = (

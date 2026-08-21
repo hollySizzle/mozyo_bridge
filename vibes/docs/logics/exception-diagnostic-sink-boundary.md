@@ -53,7 +53,28 @@ typed refusal / blocked reason の体系は**この doc の対象外であり、
 
 したがって診断 sink を **home 配下の SQLite table にしてはならない**。test 実行のたびに row が増え、guard が毎回 `operator shared home changed` で FAIL する。これは #15789 の作業中に 2 回踏んだ偽 FAIL と同じ現象になる。
 
-**採る形**: guard の fingerprint 対象外の位置に置く。
+### 選定 (Redmine #15840 review j#109671 `finding_sinklocationundefined`)
+
+初版は「guard の fingerprint 対象外の位置に置く」とだけ書いていた。これは**除外であって選定ではない**。`MOZYO_BRIDGE_HOME` の外であることは何も保証しない — repo / worktree 内に落ちれば commit されて共有され、stderr のみにすれば親 process に capture されて CI log や journal という durable surface に載り、permission を決めなければ host-local でも他 user から読める。以下を選定として固定する。
+
+**sink**: `${XDG_STATE_HOME:-~/.local/state}/mozyo-bridge/diagnostics/` 配下の **file**。
+
+- **XDG state を選ぶ理由**: 診断は config でも cache でもなく、再生成できないが設定でもない state である。repo には既に XDG 慣行がある (`shared/paths.py` の `CONFIG_HOME = XDG_CONFIG_HOME or ~/.config`) ので、新しい慣行を発明しない。
+- **guard 対象外であることの根拠**: shared-home guard の対象は `ambient_homes()` が返す `~/.mozyo_bridge` と `$MOZYO_BRIDGE_HOME` の 2 つだけであり (`test_home_fence.py`)、XDG state 配下はそこに含まれない。したがって sink への追記が `tests run` を鳴らすことはない。
+- **permission**: directory は `0700`、file は `0600`。作成時に明示的に設定する (umask 依存にしない)。
+- **retention**: 無限成長させない。上限 (件数または総 byte 数) を実装時に固定し、超過分は古い順に破棄する。
+- **file 形式**: 1 record 1 行の追記のみ。読む側が壊れた行を読み飛ばせること (診断が診断の障害で失われないため)。
+
+**禁止 surface (明示)**:
+
+| 置いてはならない場所 | 理由 |
+| --- | --- |
+| repo / worktree 内 | commit されて共有される。持ち出し境界を破る |
+| guard された home (`~/.mozyo_bridge` / `$MOZYO_BRIDGE_HOME`) | 上記制約。`tests run` が毎回鳴る |
+| stderr のみ | 親 process / CI / pane scrollback に capture され、durable surface へ載りうる |
+| 環境変数 / process 引数 | 他 process から読める |
+
+stderr への出力を**併用**すること自体は禁じないが、その場合 stderr へ出してよいのは決定 3 の「durable record へ出してよい field」に限る。raw は sink file にのみ書く。
 
 **却下した形と理由**:
 
@@ -77,12 +98,36 @@ herdr の locator / assigned name、Redmine token、operator の絶対 path も�
 
 ### 系: durable record へ出る field は構造的に安全なものに限る
 
-typed outcome (`reason` / `detail` など) は CLI の JSON 出力に乗り、journal へ貼られうる。したがってそこに載せてよいのは、**型として秘密を含み得ないもの**に限る。
+typed outcome (`reason` / `detail` など) は CLI の JSON 出力に乗り、journal へ貼られうる。したがってそこに載せてよいのは、**閉じた語彙から出た値**に限る。
 
-- **載せてよい**: 例外の **class 名** (`type(exc).__name__`)。Python の class 名は識別子であり、path / token / 個人情報を構造上含まない。
-- **載せてはならない**: `str(exc)` / `repr(exc)` / traceback / `args`。これらは path や外部コマンドの出力を含みうる。実例: `git worktree add` の失敗 message は recorded worktree の**絶対 path を含む**。
+- **載せてよい**: **この repo が書いたリテラルの閉集合**から選ばれた token のみ。例外オブジェクトから導出した文字列は一切含まない。
+- **載せてはならない**: `str(exc)` / `repr(exc)` / traceback / `args`、**および `type(exc).__name__`**。
 
-この区別は「今は安全そうだから」ではなく**型による保証**である。判断を都度させない。
+#### 訂正 (Redmine #15840 review j#109671 `finding_unsafeexceptiontype`)
+
+本 doc の初版は「class 名は識別子なので path / token を構造上含まない、これは**型による保証**である」と書いていた。**これは誤りであり、review が反例で示した。**
+
+```python
+type("SECRET_TOKEN_VALUE_123", (RuntimeError,), {})
+```
+
+`type()` の第 1 引数は**任意の文字列**を取る。したがって class 名は「識別子の形をした呼び出し側データ」でしかなく、信頼できるリテラルではない。`isidentifier()` は形しか見ないので、秘密が識別子の形をしていれば素通りする。初版の実装と regression は、**防ぐと称した漏洩をそのまま受理していた**。
+
+**型による保証を主張できる条件は 1 つだけ**である: 出力される値が、**この repo のソースに書かれたリテラルの閉集合**から出ること。データ由来の文字列を 1 つでも通すなら、それは保証ではなく「そういう名前は付けられないだろう」という仮定にすぎない。
+
+実装は `sublane_retire_application._durable_failure_kind` を正本とし、`(信頼する例外 class, リテラル token)` の固定表を identity 比較で走査して token を返す。未知は固定リテラル (`unclassified`) へ落とす。
+
+#### 終端 handler では raise しうる操作を行わない (`finding_terminalhandlerescape`)
+
+同 review は、初版が broad terminal handler の中で `type(exc).__name__` を読んでいたことも指摘した。metaclass は `__name__` を raise する property として定義でき、その場合 **handler 自身が例外を投げて、呼び出し側は `uncertain` を受け取れない**。`RetireApplicationResult` の契約 (`exceptions never masquerade as a deterministic refusal`) は「例外が typed result として**呼び出し側へ届く**」ことを含むので、これは契約違反である。
+
+したがって分類処理は次を守る:
+
+- **identity 比較 (`is`) のみ**を使う。user code を呼ばない。
+- `__name__` / `isinstance` (`__instancecheck__`) / dict lookup (`__hash__`) を使わない。いずれも metaclass が乗っ取れる。
+- 走査全体を `except BaseException` で包み、失敗しても固定リテラルへ落とす。**分類は総体 (total) でなければならない。**
+
+metaclass が異様であることは免罪にならない。終端 handler は最後の砦であり、そこで raise しうる操作を実行してはならない。
 
 ## 決定 4: 自由 interpolation を許さない
 
