@@ -1,0 +1,167 @@
+# Provider stall signatures — post-turn runtime screens (Redmine #15843).
+#
+# The screens a provider renders when a turn that ALREADY STARTED stops making
+# progress. Read by the stall watcher's classifier
+# (`e_110_execution_platform/f_150_runtime_observation_event_timeline`) after the
+# screen-diff sensor reports that the rendered screen did not advance.
+#
+# WHY THIS IS NOT A FIELD ON `agent_provider_profiles.yaml`
+# --------------------------------------------------------
+# `startup_blockers` over there is consumed by the **pre-send admission gate**
+# (#13760), where a match means a hard zero-send refusal. That is a safety surface,
+# and every string in it is held to "read from the shipped binary AND confirmed by
+# rendering the real screen" (#14741). The signatures HERE are a different moment
+# (mid-turn, not pre-composer), a different consumer (a present-only watcher, which
+# sends nothing), and — for the outage family — a weaker evidence tier, because the
+# screen cannot be rendered on demand without inducing an upstream outage.
+#
+# Keeping the two registries apart is the mechanical guarantee that the weaker tier
+# can never widen the send-boundary refusal gate: nothing in this file is read by the
+# admission classifier, and adding an entry here cannot refuse a send.
+#
+# EVIDENCE TIERS (validated, not conventional — see `agent_provider_stall_signature.py`)
+#   rendered_confirmed      the literal has been SEEN ON A REAL RENDERED SCREEN and that
+#                           observation is recorded against a durable anchor. Two routes
+#                           reach it: read the binary then render the screen (#14741), or
+#                           capture the screen live. May assert any declared class. Each
+#                           entry below states which route it took.
+#   binary_read_unrendered  literals read from the shipped binary; the screen was never
+#                           rendered because reproducing it needs a real upstream
+#                           outage. May ONLY assert `provider_unresponsive_suspected`,
+#                           whose prescription is identical to the one the
+#                           no-signature-matched case already gets (patient wait, never
+#                           relaunch). So a wrong signature at this tier changes the
+#                           REPORTED reason and never the RECOMMENDED action.
+#
+# WHAT A SIGNATURE MAY NEVER DO
+#   - authorise answering the screen. Same 境界 as `startup_blockers` (#13760): the
+#     watcher presents a prescription; it never types, never presses Enter, never
+#     resets a session, never relaunches.
+#   - assert `unsent_composer`. That class needs the dispatched body, which is a
+#     durable delivery fact, not a screen substring — declaring it as data would
+#     invite a substring guess where #15842 requires composer evidence.
+#
+# Each entry is an AND of substrings CO-LOCATED ON ONE SCREEN, exactly like
+# `startup_blockers`. The property that matters is that a signature cannot fire on prose
+# a working agent might plausibly print. An AND is how a signature made of GENERIC
+# fragments reaches that property (`attempt` alone is everywhere; `· attempt ` beside
+# `· Retrying in ` is status-line chrome). A single substring is admissible when the
+# substring is itself a full, provider-authored sentence that nothing else renders — and
+# where that is claimed below, it is claimed explicitly rather than left to the reader.
+
+version: "1"
+source: >-
+  Redmine #15843 (owner intent: screen diff as the primary sensor for the
+  server-down class; classification before any prescription; server-down is a
+  patient disposition). Claude literals read from claude-code 2.1.220's shipped
+  binary; Codex literals read from codex-cli 0.149.0's shipped native binary
+  (x86_64-unknown-linux-musl).
+
+providers:
+  claude:
+    # Claude Code renders its request-retry backoff as a status line appended to the
+    # working indicator. Two distinct render sites exist in 2.1.220 and they differ in
+    # the capitalisation of the verb, so both are declared rather than one being
+    # case-folded — case folding would also make the pair match ordinary transcript
+    # prose, which is exactly the false positive the AND is there to prevent.
+    #
+    #   ` · Retrying in ${delay}${unit} · attempt ${attempt}/${maxRetries}`
+    #   [" · retrying in ", secs, "s · attempt ", retryAttempt, "/", maxRetries]
+    #
+    # The middle dot separators are carried INTO the signature. `attempt` alone appears
+    # in ordinary agent output constantly; ` · attempt ` is chrome from the status line.
+    #
+    # Evidence: read from the shipped binary. NOT rendered — producing this screen
+    # requires the upstream API to actually fail, which cannot be induced from here.
+    # Hence the `_suspected` class and the unchanged patient prescription.
+    stall_signatures:
+      - id: api_retry_backoff_capitalised
+        asserts: provider_unresponsive_suspected
+        evidence: binary_read_unrendered
+        all_of:
+          - "· Retrying in "
+          - "· attempt "
+      - id: api_retry_backoff_lowercase
+        asserts: provider_unresponsive_suspected
+        evidence: binary_read_unrendered
+        all_of:
+          - "· retrying in "
+          - "· attempt "
+
+  codex:
+    # Codex's transport status vocabulary for a lost upstream connection, read from the
+    # 0.149.0 native binary's rodata. Same tier and same reasoning as the Claude entries.
+    #
+    # Single-substring by design, per the note above: each is a complete, punctuated
+    # sentence Codex authors for its own status surface. `stream connection failed;
+    # waiting to retry` and `Reconnecting... waiting for network` are not fragments a
+    # working agent's prose reconstructs verbatim, so an AND partner would add no
+    # discrimination and would only pin more of a screen whose layout was never observed.
+    stall_signatures:
+      - id: stream_connection_retry_wait
+        asserts: provider_unresponsive_suspected
+        evidence: binary_read_unrendered
+        all_of:
+          - "stream connection failed; waiting to retry"
+      - id: network_reconnect_wait
+        asserts: provider_unresponsive_suspected
+        evidence: binary_read_unrendered
+        all_of:
+          - "Reconnecting... waiting for network"
+      # The content-policy refusal (#15789 j#109183, gpt-5.6-sol, 2026-08-20). Route:
+      # CAPTURED LIVE — a read-only pane debug read recorded the rendered screen verbatim
+      # into the durable record, so this is a rendered observation, not a binary read.
+      # The captured screen:
+      #
+      #     ⓘ This content can't be shown
+      #       We take extra caution with cybersecurity requests. If you're a security
+      #       professional, you may be able to apply for Trusted Access.
+      #
+      # #15789 j#109186 then established the disposition: the same request went through
+      # after one context reset, so the cause is accumulated session context crossing a
+      # classifier threshold, not the request's content — which is why this class
+      # prescribes `context_reset_reinjection` (#15816) rather than escalation.
+      #
+      # Substring choice, from that capture:
+      #   - the render HARD-WRAPS at the pane width ("If you're a security" / "professional,
+      #     ..."), so a substring spanning the wrap would be width-dependent. Both fragments
+      #     below sit inside one line and are short enough to survive a narrower pane.
+      #   - `This content can` deliberately STOPS BEFORE THE APOSTROPHE. The capture shows
+      #     `can't`, but whether the provider renders an ASCII `'` or a typographic `’`
+      #     cannot be settled from a journal transcription — so the signature takes only
+      #     what is certain rather than guessing one character.
+      # Their conjunction on one screen has no realistic false positive: ordinary agent
+      # output does not render both.
+      - id: content_policy_refusal
+        asserts: content_refusal
+        evidence: rendered_confirmed
+        all_of:
+          - "This content can"
+          - "cybersecurity requests"
+
+# NO `content_refusal` SIGNATURE IS DECLARED FOR **CLAUDE**, DELIBERATELY.
+#
+# Codex's is declared above from the #15789 j#109183 live capture. Claude has no
+# equivalent: no record in this repo carries a rendered content-policy refusal from a
+# Claude pane, and searching the shipped 2.1.220 binary surfaced only internal wire
+# tokens and model-card prose, never a user-facing refusal banner.
+#
+# Writing one from memory is exactly what this schema family forbids
+# (`agent_provider_profiles.yaml`: "read from the shipped binary, not from memory"), and a
+# wrong `content_refusal` signature is the one mistake here with a real cost — its
+# prescription discards a live session's context. So for Claude the class stays declarable
+# and undeclared, and an unmatched refusal screen falls through to
+# `unresponsive_indeterminate` → patient wait: wrong-but-harmless rather than
+# right-but-destructive.
+#
+# The bar for adding one is the tier above: see the screen and record the observation
+# against a durable anchor. Until then this absence is a recorded residual, not an
+# oversight — and it is the shape #15816 j#109281 / j#109286 already settled, where an
+# observation that did not exist was left absent rather than invented.
+#
+# The failure that produced this note is worth keeping visible: the Codex signature was
+# initially left undeclared too, on the belief that the wording had never been captured.
+# It had been — verbatim, in the durable record the implementation request pointed at
+# (#15843 j#109937 found it, j#109938 records the verdict). SEARCH THE DURABLE RECORD
+# BEFORE CONCLUDING A LITERAL WAS NEVER OBSERVED; the binaries are the second place to
+# look, not the first.

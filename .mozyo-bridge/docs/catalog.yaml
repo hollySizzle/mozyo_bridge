@@ -278,6 +278,20 @@ documents:
       - skill-workflow-reference
       - spec-project-map
 
+  - id: spec-stall-watcher-screen-diff
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/stall-watcher-screen-diff.md
+    purpose: 停滞検知 watcher の設計正本 (Redmine #15843)。pane の描画画面差分を一次センサーにし (`changed` / `chrome_only` / `identical` / `incomparable` の 3+1 値。animate する chrome 自体を liveness signal に使うので持続時間閾値に依存しない)、非進行の画面だけを分類する: 順序付き first-match 8 rule と、名指しした 3 交差 (startup screen > body 残存 > signature) の precedence_basis。処方 map は全件 `present_only` で、server-down と wedge は外から区別できないため `unresponsive_indeterminate` へ意図的に統合し patience を共有処方とする (relaunch は caller が durable record から patient window 消尽を表明した場合の owner escalation 候補としてのみ提示)。provider 固有文字列は `agent_provider_stall_signatures.yaml` のみに置き、`rendered_confirmed` / `binary_read_unrendered` の evidence tier を schema で強制する (弱い tier は「signature 未一致の場合と同一の処方」に至る class しか主張できない)。`content_refusal` signature の未宣言は記録済み残余。
+    audit_role: stall_watcher_screen_diff_spec
+    related_document_refs:
+      - logic-ack-completion-receiver-state
+      - logic-tmux-send-safety-contract
+      - rule-adr-index
+      - skill-workflow-reference
+      - spec-recovery-rail-taxonomy
+      - spec-herdr-native-identity
+
   - id: spec-delegated-coordinator-role-profile
     type: spec
     status: active
@@ -1936,6 +1950,17 @@ file_conventions:
     document_refs:
       - logic-plugin-ready-adapter-boundary
       - spec-project-map
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+
+  - id: fc-agent-provider-stall-signatures
+    name: packaged provider stall-signature data source of truth
+    patterns:
+      - src/mozyo_bridge/e_140_adapter_provider/f_160_provider_registry/domain/agent_provider_stall_signatures.yaml
+    severity: block
+    document_refs:
+      - spec-stall-watcher-screen-diff
+      - logic-ack-completion-receiver-state
       - rule-project-agent-workflow
       - skill-workflow-reference
 
