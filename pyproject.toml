@@ -111,6 +111,14 @@ mozyo_bridge = [
     # it an installed wheel cannot resolve ANY agent provider and every launch
     # fails closed, so it must travel with the package, not just the repo.
     "e_140_adapter_provider/f_160_provider_registry/domain/agent_provider_profiles.yaml",
+    # Provider stall signatures (Redmine #15843). The post-turn runtime screens the
+    # stall watcher classifies against, loaded via importlib.resources at first use.
+    # A separate artifact from agent_provider_profiles.yaml on purpose: those feed the
+    # pre-send zero-send admission gate, these feed a present-only watcher at a weaker
+    # evidence tier, and keeping the files apart is what stops the weaker tier from ever
+    # widening the send-boundary refusal. Without it an installed wheel loads no
+    # signatures and every frozen screen degrades to the patient indeterminate class.
+    "e_140_adapter_provider/f_160_provider_registry/domain/agent_provider_stall_signatures.yaml",
 ]
 
 [tool.pytest.ini_options]

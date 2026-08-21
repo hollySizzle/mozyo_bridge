@@ -91,6 +91,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     cmd_workflow_watch,
     register_watch,
 )
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.cli_workflow_stall_watch import (  # noqa: E501
+    register_stall_watch,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_callbacks import (
     register_callbacks,
 )
@@ -845,6 +848,7 @@ def register(sub) -> None:
     register_runtime(workflow_sub)
     register_resume(workflow_sub)
     register_watch(workflow_sub)
+    register_stall_watch(workflow_sub)
     register_glance(workflow_sub)
     register_drain_queue(workflow_sub)
     register_review_escalation(workflow_sub)
