@@ -56,12 +56,21 @@ surface で、retire / kill / route を一切行わない。比較のために�
 | `recover-restored-pair` | reboot 復元で cwd / startup identity proof が不整合になった ACTIVE lane の exact idle 世代を検査 | ACTIVE + pin あり + 両 slot live + cwd drift または attestation non-green | reboot restoration (#15227) | **preflight のみ** (下記 GAP-1 参照) | `managed_slot_busy` / `managed_pair_already_healthy` / `pending_composer_loss_not_approved` / `generation_conditional_close_unavailable` |
 | `list` (**回収レールではない / 本数外**) | pane inventory から live sublane を列挙し stale/retire hint を出す | 任意 | 日常運用 | advisory hint のみ。retire / kill / route は一切しない | — |
 
+**診断専用 rail (rule を持たない理由の明示)**: 次の 4 本は read-only の診断 surface で、
+決定木の `rail` にはならない。`reboot-audit` は precursor `P0` の `step`、`quarantine-inspect` は
+`R8` の `requires`、`callback-recovery` は stall 分類の入口、`audit-failure-terminal` は
+`## 3.4` GAP-5 のとおり**何も authorize しない**記録である。検算 15 はこの宣言を読んで覆いを検算する。
+
+```yaml
+diagnostic_only_rails: [reboot-audit, quarantine-inspect, callback-recovery, audit-failure-terminal]
+```
+
 ### 1.B metadata レール (lifecycle row のみ書く。process を触らない)
 
 | レール | 何をするか | 前提 pair shape | 発生源 | 出力 disposition | 主な typed refusal |
 | --- | --- | --- | --- | --- | --- |
 | `adopt-restored-pair` | pin snapshot が **exactly absent** な ACTIVE row に、live 復元 pair から **初回** pin を宣言 (empty-only CAS `backfill_active_binding`) + generation / participant / attestation を re-attest | ACTIVE + `declared_pins_absent` + 両 slot が server-restored | herdr server generation 変更 (#15795) 後、create path が空 pin で宣言した row のまま復元された (#15811) | pin 宣言 + re-attest lineage。`lane_generation` 不変 | `declared_pins_present:<pin_pair_reason>` / `generation_absent:<slot>` / `ambiguous_live_locators` / `lane_not_active` |
-| `rebind-restored-pair` | pin snapshot が **stale な exact old pair** の ACTIVE row を、新 locator へ replace-CAS。#15769 で generation row / participant locator の re-attest も追加 | ACTIVE + pin 解決可 + locator drift あり | herdr server restart が同一 session を新 pane へ復元 (#15656 / #15769) | pin 置換 + old→new lineage | `declared_slots_unresolved` / `locator_not_drifted` / `declared_locator_still_live` / `unattested_slot:<slot>` / `terminal_unchanged_noop:<slot>` |
+| `rebind-restored-pair` | pin snapshot が **stale な exact old pair** の ACTIVE row を、新 locator へ replace-CAS。#15769 で generation row / participant locator の re-attest も追加 | ACTIVE + pin 解決可 + **いずれかの slot に修復対象がある** (`rebind_readiness: repairs_needed`。locator drift は必須ではない — 同一 locator でも terminal / participant / receipt / attestation の restore-stale repair があれば admit される) | herdr server restart が同一 session を新 pane へ復元 (#15656 / #15769) | pin 置換 + old→new lineage | `declared_slots_unresolved` / `locator_not_drifted` / `declared_locator_still_live` / `unattested_slot:<slot>` / `terminal_unchanged_noop:<slot>` |
 | `repair-pins` | hibernated / released / **bound** row の **空** pin snapshot を、live idle attested pair から repair。`recover-pair` の preflight を通す準備 | hibernated + released + `worktree_identity` あり + pins **empty** + pair live | #13846 j#79915 で `recover-pair` が `hibernated_record_missing_pins` で永久 fail | `repaired` / `already_repaired` (byte-equal のみ) | `declared_pins_divergent` / `live_pair_absent` / `not_repairable_state` / `revision_race` / `generation_race` |
 | `repair-worktree-binding` | hibernated / released row の **空** `worktree_identity` を、実在 checkout の positive evidence から 1 field だけ書く | hibernated + released + pin あり + `worktree_identity` **empty** | #13809 の backfill が active-row 限定で、hibernated row では `unexpected_state` zero-write (#14475) | `repaired` | `worktree_not_a_live_checkout` / `worktree_path_is_not_the_worktree_root` / `worktree_belongs_to_a_foreign_workspace` / `worktree_branch_is_not_the_lane_branch` / `hibernated_record_missing_pins` |
 | `reconcile-recovered-pair-pins` | `recover-pair` で回収済みの exact active pair について、**stale な宣言 pair snapshot だけ**を置換 (旧 2 件 exact 必須の置換専用 CAS) | ACTIVE + 回収済 pair + 旧 pin 2 件 exact | #14203 R19 | pin 置換 | authority field 不一致による zero-write |
@@ -156,6 +165,16 @@ pair_shape:
       # 1 delivered callback の provider turn 分類 (gateway_turn_recovery の TURN_CLASS_*)
       turn_class:            [turn_productive, turn_failed_no_durable_gate, turn_unconfirmed,
                               turn_not_settled, turn_unobservable, not_applicable, unknown]
+      # 以下 5 軸は Gateway/WorkerRefreshObservation が **role ごとに独立して**持つ fact。
+      # lane-level scalar にすると gateway=conflict / worker=actionable の混合 shape を潰す
+      # (round 6 `finding_roleauthorityscope`)。
+      issue_lane_match:      [true, false, not_applicable, unknown]
+      launch_authority:      [current, unavailable, not_applicable, unknown]
+      counterpart_distinguished: [true, false, not_applicable, unknown]
+      authority_conflict:    [none, present, not_applicable, unknown]
+      resume_anchor:         [present, absent, not_applicable, unknown]
+      # rebind の per-slot readiness。片 slot が hard_blocked なら pair 全体が zero-write になる
+      rebind_readiness:      [repairs_needed, already_current, hard_blocked, not_applicable, unknown]
     worker: *slot_facts
 
   # --- C. Redmine / git 由来 ---
@@ -172,12 +191,9 @@ pair_shape:
   successor_same_issue: [true, false, unknown]
   original_idle:      [true, false, unknown]
   single_slot_mode:   [requested, not_requested]      # rebind の `--allow-single-slot`
-  rebind_actionability: [repairs_needed, already_current, unknown]  # locator drift とは独立。terminal/participant/receipt/attestation の要修復有無
-  issue_lane_match:   [true, false, unknown]          # `wrong_issue_lane` gate
-  launch_authority:   [current, unavailable, unknown] # `launch_authority_unavailable` gate
-  counterpart_distinguished: [true, false, unknown]   # `worker_not_distinguished` / `gateway_not_distinguished` gate
-  authority_conflict: [none, present, unknown]        # `authority_conflict` gate
   dispatch_anchor:    [present, absent, unknown]      # LaneDispatchFact.sendable は anchor_journal の非空も要求する
+  ownership_handed_to_recovery: [true, false, unknown]  # supersede の `already_handed_over` (原 row が superseded かつ owner が recovery lane)
+  recovered_pair_pins: [stale_exact_pair, current, unresolved, unknown]  # `reconcile-recovered-pair-pins` の subject (旧 2 件 exact 必須の置換専用 CAS)
 
   # --- E. 配送 authority。action-scoped な valid-for 述語 ---
   delivery_authority:
@@ -264,7 +280,7 @@ rail_admission:
     rule: R3a
     admission_source: ['domain/restored_pair_rebind.py']
     admission_gate_count: 34
-    routing_conditions_encoded: ['disposition', 'declared_pins', 'single_slot_mode', 'rebind_actionability', 'liveness', 'membership', 'attestation']
+    routing_conditions_encoded: ['disposition', 'declared_pins', 'single_slot_mode', 'rebind_readiness', 'liveness', 'membership', 'attestation']
   - rail: recover-restored-pair
     rule: R4
     admission_source: ['domain/restored_pair_recovery.py']
@@ -316,7 +332,7 @@ rail_admission:
     admission_gate_count: 16
     routing_conditions_encoded: ['live_pair', 'liveness']
   - rail: supersede
-    rule: T3
+    rule: T3a
     admission_source: ['application/sublane_supersede.py']
     admission_gate_count: 4
     routing_conditions_encoded: ['disposition', 'successor_attested', 'successor_same_issue', 'original_idle']
@@ -325,6 +341,11 @@ rail_admission:
     admission_source: ['application/sublane_retire_application.py']
     admission_gate_count: 10
     routing_conditions_encoded: ['issue_state', 'head_integrated']
+  - rail: reconcile-recovered-pair-pins
+    rule: R15
+    admission_source: ["domain/recovered_pair_pin_reconciliation.py"]
+    admission_gate_count: 0
+    routing_conditions_encoded: [disposition, declared_pins, recovered_pair_pins, live_pair]
   - rail: rehydrate-fleet
     rule: D3
     admission_source: ['domain/fleet_rehydrate.py']
@@ -339,6 +360,17 @@ rail_admission:
 
 `admission_gate_count` は base `289343db` 時点の実測値。実装が変われば検算 13 が落ちるので、
 **doc の drift はここで可視化される** (drift の自動追随は本 US scope 外。`## 5` escalation 参照)。
+
+**coverage の明示 (round 6 `finding_admissioncheck` の是正)**: 上表は「各 rail」ではなく
+**決定木が rule を持つ rail** を covering する。`## 1` の 25 本のうち上表に無いのは
+`quarantine` / `quarantine-inspect` / `callback-recovery` / `reboot-audit` /
+`recover-pair-delivery` / `recover-worker-delivery` / `close-residue` 以外の診断系、および
+`retire` の個別 intent である。理由は 2 つ: (i) 診断系 rail (`reboot-audit` /
+`quarantine-inspect` / `callback-recovery` / `list`) は read-only で admission gate による
+破壊拒否を持たない、(ii) `recover-pair-delivery` / `recover-worker-delivery` は
+`rail_admission` ではなく `## 3.1d` の `delivery_rails` 側で `admission` を宣言している。
+**検算 15 が「taxonomy に列挙した rail はすべて rule / `rail_admission` / `delivery_rails` /
+precursor のいずれかに現れる」ことを検算する**ので、この覆いの主張は機械確認される。
 
 ### 2.3 `not_applicable` の規約 (short-circuit された gate)
 
@@ -376,7 +408,10 @@ evaluate(shape) -> Plan | Escalation
   # 3. known_intersections (§3.1f)。要素は rule id なので、id を該当 phase の rule へ解決してから
   #    その rule の `when` で判定する。D1-D3 は `when` を持たず `admission` を持つので、
   #    delivery rail は `admission` で判定する (下記 step 4 と同じ述語)。
+  #    **delivery rail (D1-D3) の判定は routing rule R14 の match を前提とする** — R14 に
+  #    該当しない lane で delivery を also へ載せてはならない (round 6 `finding_deliveryclosure`)。
   for x in known_intersections:
+      if x.rules are delivery rails and not match(R14.when): continue
       hit = all(matches_rule(rid, shape) for rid in x.rules)   # matches_rule は when または admission を読む
       if not hit: continue
       if x.disposition == "escalation":
@@ -386,6 +421,10 @@ evaluate(shape) -> Plan | Escalation
   # 4. rail_set をもつ rule (§3.1d の R14) は、実装 admission 述語で適用可能な rail を全列挙
   if recovery has rail_set:
       recovery.applicable  = [r for r in rail_set if match(r.admission)]
+      if recovery.applicable == []:
+          # routing rule は match したが、どの rail の admission も成立しない。
+          # primary を non-null のまま返すと「送れる」と誤読される (round 6 `finding_deliveryclosure`)。
+          return Escalation(reason="delivery_rail_set_empty", steps=steps, rule=id_of(recovery))
       recovery.policy_order = rail_set.policy_preference   # policy であって排他ではない
       also += recovery.applicable[1:] in policy order      # 先頭以外は共適用として並置
 
@@ -482,12 +521,13 @@ recovery_rules:
       disposition: active
       declared_pins: resolvable
       single_slot_mode: requested
-      rebind_actionability: repairs_needed          # 全部 current なら pair-level `terminal_unchanged_noop` で拒否される
       any_slot: {liveness: vanished}                # typed `missing_live_slot` として admit される
+      any_slot_other: {rebind_readiness: repairs_needed}   # 生存 slot に修復対象があること。全部 current なら `terminal_unchanged_noop`
       any_slot_other: {liveness: live, membership: this_pair,
-                       attestation: [live_joined, restore_stale]}
+                       attestation: [live_joined, restore_stale],
+                       rebind_readiness: repairs_needed}
     rail: rebind-restored-pair
-    precedence_basis: [{over: [R8, R5, R6, R7, R14], basis: least_effect_first}]
+    precedence_basis: [{over: [R15], basis: precondition_of_later}, {over: [R8, R5, R6, R7, R14], basis: least_effect_first}]
     mode: single_slot
     effect_budget: metadata_only
     note: "`--allow-single-slot`。片 slot 完全不在を許し、生存 slot だけを re-pin / re-attest する。"
@@ -497,18 +537,21 @@ recovery_rules:
       disposition: active
       declared_pins: resolvable
       single_slot_mode: not_requested
-      rebind_actionability: repairs_needed
       all_slots: {liveness: live, membership: this_pair,
-                  attestation: [live_joined, restore_stale]}
+                  attestation: [live_joined, restore_stale],
+                  rebind_readiness: [repairs_needed, already_current]}   # hard_blocked が 1 つでもあれば pair 全体が zero-write
+      any_slot: {rebind_readiness: repairs_needed}
     rail: rebind-restored-pair
-    precedence_basis: [{over: [R4, R8, R5, R6, R7, R14], basis: least_effect_first}]
+    precedence_basis: [{over: [R15], basis: precondition_of_later}, {over: [R4, R8, R5, R6, R7, R14], basis: least_effect_first}]
     mode: pair
     effect_budget: metadata_only
     note: >
       既定の pair mode。`attestation: absent` は `unattested_slot` で拒否されるので条件から除外する。
       **`locator: drifted` は要求しない** — 実装は locator が同一でも terminal / participant /
       receipt / attestation の restore-stale repair があれば admit する (#15769 回帰 test の
-      `old_locator == new_locator` ケース)。actionability は `rebind_actionability` 軸で表す。
+      `old_locator == new_locator` ケース)。actionability は **per-slot** の `rebind_readiness` で表す。
+      片 slot が `hard_blocked` (`locator_not_drifted` 等) なら pair 全体が zero-write になる
+      (`test_single_passing_slot_never_partially_updates`) ので `all_slots` で除外する。
       R2 と違い `launch_generation_row: attested_bound` は必須でない — pre-#15769 の
       attestation-only fall-through を許す rail であるため。
 
@@ -519,7 +562,7 @@ recovery_rules:
       all_slots: {liveness: live, membership: this_pair}
       any_slot: {cwd: drifted}
     rail: recover-restored-pair
-    precedence_basis: [{over: [R8, R5, R6, R7, R14], basis: diagnose_only_first}]
+    precedence_basis: [{over: [R15], basis: precondition_of_later}, {over: [R8, R5, R6, R7, R14], basis: diagnose_only_first}]
     status: diagnose_only         # GAP-1: 実行経路が構造的に存在しない
     effect_budget: none
 
@@ -528,7 +571,7 @@ recovery_rules:
       disposition: active
       any_slot: {composer: pending}
     rail: quarantine
-    precedence_basis: [{over: [R5, R6, R7], basis: refused_by_later},
+    precedence_basis: [{over: [R15], basis: precondition_of_later}, {over: [R5, R6, R7], basis: refused_by_later},
                        {over: [R14], basis: precondition_of_later}]
     requires: quarantine-inspect
     note: "pending composer を扱う唯一の recovery rail。R5 / R6 / R7 は実装側で `pending_composer_input` の zero-close refusal になるので先に置く。"
@@ -536,48 +579,43 @@ recovery_rules:
   - id: R5
     when:
       disposition: active
-      resume_anchor: present
-      issue_lane_match: true
-      launch_authority: current
-      counterpart_distinguished: true
-      authority_conflict: none
       slot_health.gateway:
         {liveness: live, membership: this_pair, generation_rank: current,
          productivity: turn_ended_unproductive, composer: settled,
-         turn_class: turn_failed_no_durable_gate}
+         turn_class: turn_failed_no_durable_gate,
+         issue_lane_match: true, launch_authority: current,
+         counterpart_distinguished: true, authority_conflict: none,
+         resume_anchor: present}
     rail: recover-gateway
-    precedence_basis: [{over: [R6, R7], basis: role_precedence},
+    precedence_basis: [{over: [R15], basis: precondition_of_later}, {over: [R6, R7], basis: role_precedence},
                        {over: [R14], basis: precondition_of_later}]
     protects: [worker, default_coordinator, foreign]
 
   - id: R6
     when:
       disposition: active
-      resume_anchor: present
-      issue_lane_match: true
-      launch_authority: current
-      counterpart_distinguished: true
-      authority_conflict: none
       slot_health.worker:
         {liveness: live, membership: this_pair, generation_rank: current,
          productivity: turn_ended_unproductive, composer: settled,
-         turn_class: turn_failed_no_durable_gate, worktree: readable}
+         turn_class: turn_failed_no_durable_gate, worktree: readable,
+         issue_lane_match: true, launch_authority: current,
+         counterpart_distinguished: true, authority_conflict: none,
+         resume_anchor: present}
     rail: refresh-worker
-    precedence_basis: [{over: [R14], basis: precondition_of_later}]
+    precedence_basis: [{over: [R15], basis: precondition_of_later}, {over: [R14], basis: precondition_of_later}]
     protects: [gateway, default_coordinator, foreign]
 
   - id: R7
     when:
       disposition: active
       stale_signal: positive
-      issue_lane_match: true
-      counterpart_distinguished: true
-      authority_conflict: none
       slot_health.worker:
         {liveness: shell_residue, membership: this_pair, generation_rank: current,
-         productivity: [idle, not_applicable], worktree: readable}
+         productivity: [idle, not_applicable], worktree: readable,
+         issue_lane_match: true, counterpart_distinguished: true,
+         authority_conflict: none}
     rail: recover-stale
-    precedence_basis: [{over: [R14], basis: precondition_of_later}]
+    precedence_basis: [{over: [R15], basis: precondition_of_later}, {over: [R14], basis: precondition_of_later}]
     protects: [gateway, default_coordinator, foreign]
     note: >
       subject は **存在する** assigned-name row が `classify_named_slot(row) == SLOT_STALE` に
@@ -615,6 +653,7 @@ recovery_rules:
       disposition: hibernated
       worktree_identity: bound
       declared_pins: absent
+      process_release: released      # 実装 `lifecycle_exact` は hibernated+released+bound+pins-empty の signature を要求する
       any_slot: {slot_verdict: preserve_pending_composer}
     rail: prepare-bound-pair
     precedence_basis: [{over: [R13], basis: precondition_of_later}]
@@ -647,6 +686,22 @@ recovery_rules:
       resume_gates: green
     rail: resume
     effect_budget: disposition_cas_only
+
+  - id: R15
+    when:
+      disposition: active
+      declared_pins: resolvable
+      recovered_pair_pins: stale_exact_pair
+      live_pair: both_live
+    rail: reconcile-recovered-pair-pins
+    effect_budget: metadata_only
+    precedence_basis: [{over: [R14], basis: precondition_of_later}]
+    note: >
+      `recover-pair` で回収済みの active pair について、**stale な宣言 pair snapshot だけ**を
+      置換する (`LaneRecoveredPairPinReconcileStore.reconcile` は **旧 pair 2 件 exact 必須**の
+      置換専用 CAS。`len(old_slots) != 2` は ValueError)。再配送 (R14) の前に pin を正すので
+      `precondition_of_later`。round 6 `finding_railcoverage` で taxonomy にしか現れていない
+      ことが判明したため追加した。
 
   - id: R14
     when: {disposition: active, issue_state: open, dispatch: owed}
@@ -702,22 +757,44 @@ terminal_rules:
     note: "OVERLAP-3。declared_pins は preserve され validate されない。intent_by は catch-all で全域。"
 
   - id: T2
-    when: {issue_state: open, park_basis: [dependency_park, early_hibernate]}
-    rail: hibernate
-    note: "T3 と交差しうる (§3.1f INT-1)。実装 supersede は issue の open/closed も park basis も見ない。"
-
-  - id: T3
     when:
-      disposition: active            # original lane。実装 original_identity_known は record 存在 + disposition==active + issue 一致の積
+      disposition: active            # 初回 preflight は active identity を要求する
+      issue_state: open
+      park_basis: [dependency_park, early_hibernate]
+    rail: hibernate
+    mode: initial
+
+  - id: T2r
+    when:
+      disposition: hibernated        # 既存 replay は hibernated 限定 (process release の再駆動)
+      issue_state: open
+      park_basis: [dependency_park, early_hibernate]
+    rail: hibernate
+    mode: release_replay
+
+  - id: T3a
+    when:
+      disposition: active            # 初回 handover。実装 original_identity_known は record 存在 ∧ active ∧ issue 一致の積
       successor_attested: true
       successor_same_issue: true
       original_idle: true
     rail: supersede
+    mode: initial_handover
+
+  - id: T3b
+    when:
+      disposition: superseded        # idempotent replay。既に所有権を渡した後の release 再駆動
+      ownership_handed_to_recovery: true
+      original_idle: true
+    rail: supersede
+    mode: release_replay
     note: >
-      実装の gate は `original_identity_unknown` / `recovery_not_both_slots_live` /
-      `recovery_not_attested` / `original_not_idle` の 4 件。`original_identity_unknown` は
-      **original record 存在 ∧ lane_disposition == active ∧ issue 一致**の積なので、
-      `disposition: active` を条件に含める (round 5 `finding_supersedeidentityadmission`)。"
+      実装は `already_handed_over = original_rec.lane_disposition == DISPOSITION_SUPERSEDED
+      and owner.lane_id == recovery_lane` を明示的に admit し、commit を飛ばして release を
+      再駆動する (pane close は send と違い idempotent)。`test_partial_release_resumes_idempotently`
+      が partial → released の成功を固定している。round 5 で T3 に `disposition: active` を
+      足した修正がこの shape を落としたので、初回と replay を分けた
+      (round 6 `finding_supersedereplay`)。
 ```
 
 ### 3.1d 配送 rail (rail_set。実装 admission と policy 選択を分離する)
@@ -820,7 +897,7 @@ reporting_rule: >
 known_intersections:
   - id: INT-1
     phase: terminal
-    rules: [T2, T3]
+    rules: [T2, T3a]
     disposition: escalation
     reason: hibernate_supersede_intersection
     detail: >
@@ -832,9 +909,20 @@ known_intersections:
       supersede (所有権移管 + 旧 lane release) は **effect が違う authority decision** なので、
       決定木では自動選択せず escalation にする。判断は `## 5` の escalation 対象。
 
+  - id: INT-3b
+    phase: terminal
+    rules: [T1, T3b]
+    disposition: escalation
+    reason: retire_supersede_replay_intersection
+    detail: >
+      `closed` + `head_integrated` の lane が `disposition: superseded` かつ ownership を
+      recovery lane へ渡し済みの場合、T1 (retire) と T3b (supersede の release replay) が
+      同時に match する。実装 supersede は issue state を見ないので replay 側も admit される。
+      retire は終端化、T3b は release の再駆動で effect が違うため自動選択しない。
+
   - id: INT-3
     phase: terminal
-    rules: [T1, T3]
+    rules: [T1, T3a]
     disposition: escalation
     reason: retire_supersede_intersection
     detail: >
@@ -888,8 +976,13 @@ effect_budget_gaps:
 7. **selection の網羅** — catch-all (`when: {}`) の行が存在する。
 8. **`slot_verdict` の全域性** — 各 step が単一結果を返し、最後に無条件の既定がある。
 9. **id の一意性**。
-10. **admission gate の対応** — `## 2.2` の表に挙げた各 rail の実装 gate が、対応する rule の
-    `when` に条件として現れていること (note ではなく条件であること)。
+10. **`rail_admission` の参照整合** — `rail_admission` の各 entry が指す `rule` が実在し、
+    `when` (delivery rail は `admission`) を持つこと。**これは「実装の全 gate が `when` に
+    現れる」ことは要求しない** — `## 2.2` の routing-only 契約と一致させるため、実際に
+    実行している述語をそのまま書いている (round 6 `finding_admissioncheck` の是正。
+    以前はここに「各 implementation gate が `when` に現れること」と書きながら、
+    実行していたのは弱い述語だった)。gate の完全性ではなく**符号化を宣言した軸の実在**を
+    見るのは検算 14。
 11. **交差の明示** — 同一 first-match 列で同時 match しうる rule の組 (共有 key のすべてで
     値域が交差し、かつ `all_slots` / `any_slot` の値域が disjoint でない組) は、次のいずれかで
     閉じられていること: (a) `known_intersections` に列挙、(b) 先行 rule の `precedence_basis` が
@@ -899,6 +992,13 @@ effect_budget_gaps:
 13. **admission 正本の照合** — `## 2.2` の各 `admission_source` を実装から読み、refusal /
     disposition 語彙の token 数が `admission_gate_count` と一致すること。実装が変われば
     ここが落ち、**doc の drift が可視化される**。
+15. **taxonomy と決定木の対応** — `## 1` の表に列挙した rail はすべて、rule の `rail` /
+    precursor の `step` / rule の `requires` / `rail_admission` / `delivery_rails` /
+    `diagnostic_only_rails` のいずれかに現れること。**taxonomy に数えた rail を決定木が
+    routing できない状態を検出する** (round 6 `finding_railcoverage` の再発防止)。
+16. **件数主張の伝播** — overlap の件数を主張する散文が、`## 3.5` の表から導いた
+    true / partial の実数と一致すること。**表だけ直して散文と escalation を放置する伝播漏れを
+    検出する** (round 6 `finding_overlapcounts` の再発防止)。
 14. **符号化宣言の実在** — `routing_conditions_encoded` に挙げた軸が、対応する rule の
     `when` (delivery rail は `admission`) に**実際に条件として存在する**こと。note に書いただけの
     gate を「符号化した」と称せないようにする (round 5 `finding_railadmissionclosure` の再発防止)。
@@ -971,7 +1071,7 @@ parameter 化することになり、別種の取引になる)。
 | **OVERLAP-9** | `retire` (T1) / `supersede` (T3) | **true** (`## 3.1f` INT-3、disposition=escalation) | `closed` + `head_integrated` の lane で successor attested + same issue + original idle が成立する shape も同様に両方 admit される。「閉じた issue に後継へ渡す意味は無いはず」は**意図であって実装の制約ではない**ので、doc 側で排他を創作せず escalation にした | 同上 |
 
 **この分類から出る所見**: 9 件のうち **true overlap は 5 件 (OVERLAP-1 / 4 / 5 / 8 / 9)**、
-partial が 4 件 (OVERLAP-2 / 3 / 6 / 7)。**true の 5 件はいずれも「実装が排他にしていない」
+partial が 4 件 (OVERLAP-2 / 3 / 6 / 7)。**true の 5 件 (OVERLAP-1 / 4 / 5 / 8 / 9) はいずれも「実装が排他にしていない」
 class** であり、うち 4 件 (1 / 4 / 8 / 9) は round 3-5 の review で発見された。
 OVERLAP-1 は round 4 で `precedence_basis` を導入した際に**overlap 表を追随させ忘れた**もので、
 `role_precedence` を宣言しておきながら同じ表で「shape 上は常に排他」と書く自己矛盾だった
@@ -985,7 +1085,7 @@ OVERLAP-1 は round 4 で `precedence_basis` を導入した際に**overlap 表�
 したがって「レールが乱立している」という問題の実体は 2 つある。**(a) 近傍の shape ごとに
 1 本ずつレールが生えた結果、集合としての被覆に穴が空いている** (= `## 3.4` の gap)、
 **(b) 実装が排他にしていない rail の組が複数あり、どれを採るかの決定規則が
-どこにも書かれていなかった** (= 本節の true overlap 4 件)。統合の主目的を「重複削除」に
+どこにも書かれていなかった** (= 本節の true overlap **5 件**)。統合の主目的を「重複削除」に
 置くと GAP-2 / GAP-3 / GAP-4 は閉じない。
 
 ## 4. 統合提案
@@ -1064,7 +1164,7 @@ durable row signature だけで、live pair 状態 (`decide_pair_reconcile` が 
 | adopt は attested launch-generation row を**必須**とする (rebind の pre-#15769 attestation-only fall-through を持たない)。照合先の declared pin が無いため | server 名以外に live process と lane を結ぶものが無い状態での誤 adopt | 同上 |
 | slot は caller 供給名ではなく **server-owned `mzb1` 名の decode** で選ぶ | caller による slot 詐称 | 同上 |
 | write は action 時に**自分の証拠を再導出**し、outcome は preflight ではなく **action-time の plan** を返す (review j#109452 `finding_actiontimeoutcome`: `w1:%1` を報告しながら書いた pin は `w9:%11` だった) | 監査証拠と実書込の乖離 | 同上 |
-| rebind: locator drift が**実在する**ことを要求 (`locator_not_drifted` / `declared_locator_still_live`) | drift していない pair の無用な置換 | `test_issue_15656_rebind_restored_pair.py` |
+| rebind: **修復対象が実在する**ことを要求。`locator_not_drifted` / `declared_locator_still_live` は個々の slot の hard block であり、**1 slot でも hard block なら pair 全体が zero-write** になる (partial 更新を作らない) | drift していない pair の無用な置換 / 片側だけ更新された不整合な pin | `test_issue_15656_rebind_restored_pair.py` (`test_single_passing_slot_never_partially_updates`) |
 | rebind: terminal id / locator の old→new lineage を outcome に記録 | 追跡不能な再 attest | `test_issue_15769_restored_pair_reattest.py` |
 
 ### C5. 再配送 3 経路の統合 (OVERLAP-4)
@@ -1129,7 +1229,7 @@ Phase 2 で採るなら ADR-0001 の「記録済み設計判断の反転には o
 7. **C3 の統合可否**: intent flag の operator 可読性 (#14499 が意図的に mirror した性質) を
    宣言表に畳んだあとも維持できるか。
 8. **C6 が ADR-0001 の反転に当たるか**の判定。
-9. **統合の主目的の確認**: `## 3.5` の分類では **true overlap 4 件 / partial 5 件**で、
+9. **統合の主目的の確認**: `## 3.5` の分類では **true overlap 5 件 / partial 4 件**で、
    true の 4 件はいずれも「実装が排他にしていない」class だった。統合の目的を「重複削除」に
    置くと GAP-2 / GAP-3 / GAP-4 は 1 つも閉じない。Phase 2 の主目的を「被覆の穴 (subject gap +
    effect-budget gap) を閉じる」と「排他でない rail の決定規則を置く」の 2 本に置き直してよいか。
