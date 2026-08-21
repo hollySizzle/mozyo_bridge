@@ -23,9 +23,16 @@ Reuse (issue #15843 IR step 2). Nothing here re-derives an existing authority:
 - startup screens are classified by :func:`evaluate_startup_admission` — the #13760
   authority that already knows each provider's declared blockers, already refuses to guess
   for an unprofiled provider, and already never returns pane text;
-- a retained dispatched body is the #15842 submit-proof idea, evaluated against the marker
-  the caller supplies from the durable delivery record rather than guessed from a
-  substring the data file was allowed to invent;
+- a retained dispatched body is evaluated by :func:`current_composer_retains_body` — the
+  same predicate the queue-enter retry gate uses — against the marker the caller supplies
+  from the durable delivery record. Reusing it is not a convenience: the first cut of this
+  module substring-matched the marker against the whole visible pane, which
+  ``ack-completion-receiver-state.md`` forbids ("scrollback 全体の substring は使わない")
+  for a reason that bites hardest here — a *successfully submitted* body stays in the
+  transcript as a user message, so a whole-pane match reports ``unsent_composer`` most
+  eagerly on exactly the panes that did submit. That predicate instead finds the last
+  rendered composer prompt, fails closed when unindented output below it proves the prompt
+  is historical, and removes whitespace so a hard-wrapped marker still matches;
 - everything provider-specific is data (``agent_provider_stall_signatures.yaml``).
 
 Classification order, and why (first-match with the intersections named)
@@ -46,11 +53,14 @@ co-applicable case, so each is named with its precedence basis:
    never be reachable while a startup screen is up. *Intersects rule 6* (an update prompt
    can coexist with a retry line) and wins on ``role_precedence``: rendered-confirmed
    evidence with an operator-owned remedy outranks a lower-tier suspicion.
-5. **dispatched body retained** → ``unsent_composer``. *Intersects rule 6*: a retained
-   body under a retry banner is possible. Rule 5 wins on ``direct_evidence_over_suspicion``
-   — the body's presence is an observation about *this* dispatch, the banner is an
-   inference about the provider, and the remedy (one Enter, body never re-typed) is the
-   bounded budget ADR-0002 authorises regardless.
+5. **dispatched body retained in the CURRENT composer** → ``unsent_composer``. *Intersects
+   rule 6*: a retained body under a retry banner is possible. Rule 5 wins on
+   ``direct_evidence_over_suspicion`` — a body still sitting in the live composer is an
+   observation about *this* dispatch's submit, the banner is an inference about the
+   provider, and the remedy (one Enter, body never re-typed) is the bounded budget
+   ADR-0002 authorises regardless. The precedence rests on the evidence being
+   current-composer; it would not survive a whole-pane match, which observes only that the
+   dispatch left a trace somewhere.
 6. **declared stall signature matched** → the class it asserts.
 7. **chrome moved** → ``busy_likely``. The render loop is alive and nothing positive
    matched; reasoning, a tool call and a long test run all land here, and the prescription
@@ -93,6 +103,9 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_admission import (  # noqa: E501
     ADMISSION_BLOCKED,
     evaluate_startup_admission,
+)
+from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.turn_start_resend_gate import (  # noqa: E501
+    current_composer_retains_body,
 )
 from mozyo_bridge.e_140_adapter_provider.f_160_provider_registry.domain.agent_provider_stall_signature import (  # noqa: E501
     StallSignatureRegistry,
@@ -186,7 +199,7 @@ def classify_static_screen(
     if admission.outcome == ADMISSION_BLOCKED:
         return CLASS_STARTUP_INTERACTION, admission.blocker_id, ""
 
-    if pending_body_marker and pending_body_marker in screen:
+    if current_composer_retains_body(screen, pending_body_marker):
         return CLASS_UNSENT_COMPOSER, "", ""
 
     signature = first_match(signatures.for_provider(provider_id), screen)

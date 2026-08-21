@@ -177,22 +177,33 @@ class PackagedArtifactTest(unittest.TestCase):
                         prescribe(signature.asserts).relaunch_is_a_candidate
                     )
 
-    def test_no_content_refusal_signature_is_shipped_undeclared(self):
-        # A recorded residual, asserted rather than left to a comment: the CLASS is
-        # supported and the DATA is deliberately absent until a rendered observation
-        # exists (the #14741 standard). If someone adds one, this test is the prompt to
-        # confirm they rendered it rather than recalled it.
+    def test_the_codex_content_refusal_signature_is_shipped_at_the_rendered_tier(self):
+        # #15789 j#109183 captured this screen verbatim from a live pane, so it meets the
+        # rendered bar and may assert the class whose remedy is destructive.
+        shipped = {
+            signature.signature_id: signature
+            for signature in self.registry.for_provider("codex")
+            if signature.asserts == CLASS_CONTENT_REFUSAL
+        }
+        self.assertEqual(set(shipped), {"content_policy_refusal"})
+        self.assertEqual(
+            shipped["content_policy_refusal"].evidence, EVIDENCE_RENDERED_CONFIRMED
+        )
+
+    def test_claude_ships_no_content_refusal_signature(self):
+        # The remaining residual, asserted rather than left to a comment: no record in
+        # this repo carries a rendered Claude content-policy refusal. If someone adds one,
+        # this test is the prompt to confirm they observed it rather than recalled it.
         shipped = [
             signature.signature_id
-            for signatures in self.registry.signatures.values()
-            for signature in signatures
+            for signature in self.registry.for_provider("claude")
             if signature.asserts == CLASS_CONTENT_REFUSAL
         ]
         self.assertEqual(
             shipped,
             [],
-            "a content_refusal signature was added: confirm it was read from the shipped "
-            "binary AND rendered, then update this residual",
+            "a Claude content_refusal signature was added: confirm the screen was "
+            "observed and anchored, then update this residual",
         )
 
 

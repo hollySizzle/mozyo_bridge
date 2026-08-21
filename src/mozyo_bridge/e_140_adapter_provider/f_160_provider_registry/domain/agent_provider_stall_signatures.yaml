@@ -20,8 +20,11 @@
 # admission classifier, and adding an entry here cannot refuse a send.
 #
 # EVIDENCE TIERS (validated, not conventional — see `agent_provider_stall_signature.py`)
-#   rendered_confirmed      literals read from the shipped binary AND observed on a
-#                           rendered screen. May assert any declared class.
+#   rendered_confirmed      the literal has been SEEN ON A REAL RENDERED SCREEN and that
+#                           observation is recorded against a durable anchor. Two routes
+#                           reach it: read the binary then render the screen (#14741), or
+#                           capture the screen live. May assert any declared class. Each
+#                           entry below states which route it took.
 #   binary_read_unrendered  literals read from the shipped binary; the screen was never
 #                           rendered because reproducing it needs a real upstream
 #                           outage. May ONLY assert `provider_unresponsive_suspected`,
@@ -105,24 +108,60 @@ providers:
         evidence: binary_read_unrendered
         all_of:
           - "Reconnecting... waiting for network"
+      # The content-policy refusal (#15789 j#109183, gpt-5.6-sol, 2026-08-20). Route:
+      # CAPTURED LIVE — a read-only pane debug read recorded the rendered screen verbatim
+      # into the durable record, so this is a rendered observation, not a binary read.
+      # The captured screen:
+      #
+      #     ⓘ This content can't be shown
+      #       We take extra caution with cybersecurity requests. If you're a security
+      #       professional, you may be able to apply for Trusted Access.
+      #
+      # #15789 j#109186 then established the disposition: the same request went through
+      # after one context reset, so the cause is accumulated session context crossing a
+      # classifier threshold, not the request's content — which is why this class
+      # prescribes `context_reset_reinjection` (#15816) rather than escalation.
+      #
+      # Substring choice, from that capture:
+      #   - the render HARD-WRAPS at the pane width ("If you're a security" / "professional,
+      #     ..."), so a substring spanning the wrap would be width-dependent. Both fragments
+      #     below sit inside one line and are short enough to survive a narrower pane.
+      #   - `This content can` deliberately STOPS BEFORE THE APOSTROPHE. The capture shows
+      #     `can't`, but whether the provider renders an ASCII `'` or a typographic `’`
+      #     cannot be settled from a journal transcription — so the signature takes only
+      #     what is certain rather than guessing one character.
+      # Their conjunction on one screen has no realistic false positive: ordinary agent
+      # output does not render both.
+      - id: content_policy_refusal
+        asserts: content_refusal
+        evidence: rendered_confirmed
+        all_of:
+          - "This content can"
+          - "cybersecurity requests"
 
-# NO `content_refusal` SIGNATURE IS DECLARED FOR EITHER PROVIDER, DELIBERATELY.
+# NO `content_refusal` SIGNATURE IS DECLARED FOR **CLAUDE**, DELIBERATELY.
 #
-# #15789 j#109183 observed a Codex session decline a request as cybersecurity-adjacent
-# and stop working, and #15816 turned the recovery into doctrine — so the CLASS is real
-# and the classifier supports it. But the rendered wording of that screen was never
-# captured: the #15789 record carries the behaviour, not the literal, and a search of
-# both shipped binaries did not yield a user-facing refusal banner to pin.
+# Codex's is declared above from the #15789 j#109183 live capture. Claude has no
+# equivalent: no record in this repo carries a rendered content-policy refusal from a
+# Claude pane, and searching the shipped 2.1.220 binary surfaced only internal wire
+# tokens and model-card prose, never a user-facing refusal banner.
 #
-# Writing the strings from memory is precisely what this schema family forbids
-# (`agent_provider_profiles.yaml`: "read from the shipped binary, not from memory"), and
-# a wrong `content_refusal` signature is the one mistake with a real cost here — its
-# prescription discards a live session's context. So the class stays declarable and
-# undeclared, and an unmatched refusal screen falls through to
-# `unresponsive_indeterminate` → patient wait, which is wrong-but-harmless rather than
+# Writing one from memory is exactly what this schema family forbids
+# (`agent_provider_profiles.yaml`: "read from the shipped binary, not from memory"), and a
+# wrong `content_refusal` signature is the one mistake here with a real cost — its
+# prescription discards a live session's context. So for Claude the class stays declarable
+# and undeclared, and an unmatched refusal screen falls through to
+# `unresponsive_indeterminate` → patient wait: wrong-but-harmless rather than
 # right-but-destructive.
 #
-# The condition for adding one is the same one #14741 met before declaring Codex's
-# update prompt: observe the screen, read its literals off the shipped binary, and
-# confirm them by rendering. Until then this absence is a recorded residual, not an
-# oversight.
+# The bar for adding one is the tier above: see the screen and record the observation
+# against a durable anchor. Until then this absence is a recorded residual, not an
+# oversight — and it is the shape #15816 j#109281 / j#109286 already settled, where an
+# observation that did not exist was left absent rather than invented.
+#
+# The failure that produced this note is worth keeping visible: the Codex signature was
+# initially left undeclared too, on the belief that the wording had never been captured.
+# It had been — verbatim, in the durable record the implementation request pointed at
+# (#15843 j#109937 found it, j#109938 records the verdict). SEARCH THE DURABLE RECORD
+# BEFORE CONCLUDING A LITERAL WAS NEVER OBSERVED; the binaries are the second place to
+# look, not the first.

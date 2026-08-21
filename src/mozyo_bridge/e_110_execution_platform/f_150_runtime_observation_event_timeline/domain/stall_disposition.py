@@ -124,9 +124,16 @@ APPLY_PRESENT_ONLY = "present_only"
 # Evidence tiers for provider signature data
 # --------------------------------------------------------------------------------------
 
-#: The signature's literal strings were read from the shipped binary AND the screen was
-#: rendered and observed carrying them (the standard `startup_blockers` holds itself to:
-#: #13760, and #14741's "read then CONFIRMED BY RENDERING").
+#: The literal has been **seen on a real rendered screen**, and that observation is
+#: recorded against a durable anchor. That single property is what the tier gates on.
+#:
+#: #14741 phrased its bar as "read from the shipped binary AND confirmed by rendering",
+#: and both halves were needed *there* because the strings were being proposed out of a
+#: binary and had to be shown to actually render. Reading the binary is a way to arrive at
+#: a candidate, not the thing that makes the candidate trustworthy — a verbatim capture of
+#: the live screen satisfies the same requirement directly, and more strongly. #15843
+#: j#109938 records the correction; the per-entry comment in the data file states which
+#: route each signature took.
 EVIDENCE_RENDERED_CONFIRMED = "rendered_confirmed"
 #: The literals were read from the shipped binary but the screen was never rendered,
 #: because reproducing it requires an upstream outage that cannot be induced. A signature

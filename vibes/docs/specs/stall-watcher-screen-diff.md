@@ -84,7 +84,7 @@ threshold を定数ではなく引数にしているのはこのためである�
 | 2 | `changed` | `screen_progressing` |
 | 3 | 読めたが空白のみ | `unknown` |
 | 4 | 宣言済み startup screen に一致 | `startup_interaction` |
-| 5 | 投入済み body が画面に残存 | `unsent_composer` |
+| 5 | 投入済み body が**現在の composer** に残存 | `unsent_composer` |
 | 6 | 宣言済み stall signature に一致 | signature が宣言する class |
 | 7 | `chrome_only` | `busy_likely` |
 | 8 | `identical` | `unresponsive_indeterminate` |
@@ -97,7 +97,9 @@ rule 7 と 8 が非進行の 2 状態を尽くすので、到達不能な末尾�
 | --- | --- | --- |
 | 4 × 5 | 4 | `least_effect_first` — startup screen 上の Enter は dialog の既定を選ぶ。それが #13760 / #14741 の defect 本体なので、Enter 処方は startup screen が出ている間 到達可能であってはならない |
 | 4 × 6 | 4 | `role_precedence` — rendered-confirmed 証拠 + operator 所有の処方が、低 tier の suspicion に優先する |
-| 5 × 6 | 5 | `direct_evidence_over_suspicion` — body 残存は**この dispatch** についての観測、banner は provider についての推論。処方 (Enter 1 回、本文再入力なし) は ADR-0002 の bounded budget でいずれにせよ許される |
+| 5 × 6 | 5 | `direct_evidence_over_suspicion` — current composer に残る body は**この dispatch の submit** についての観測、banner は provider についての推論。処方 (Enter 1 回、本文再入力なし) は ADR-0002 の bounded budget でいずれにせよ許される |
+
+rule 5 の証拠は **current composer に限る** (`current_composer_retains_body`、queue-enter retry gate と同一 predicate)。可視画面全体の substring にしてはならない — `ack-completion-receiver-state.md` が「scrollback 全体の substring は使わない」と禁じており、その理由が最も強く効くのがここである: **submit に成功した body ほど transcript に user message として残る**ので、全画面照合は「実際に submit できた pane」を最も熱心に `unsent_composer` と誤分類する。誤分類の帰結は Enter の提示であり、operator を実際の停滞原因から遠ざける。初版はこの誤りを持っており、review (#15843 j#109937) が再現付きで指摘した。上の precedence は証拠が current-composer であることに依存しており、全画面照合の下では成立しない。
 
 `unknown` は fail-safe として実在し、rule 3 で到達する。「読めたが空の画面」を frozen と
 呼ぶことは、read についての所見を lane についての所見に見せかけることになる。
@@ -146,8 +148,10 @@ watcher** が読む面であり、後者は evidence tier が弱い。2 つの r
 
 | tier | 意味 | 主張できる class |
 | --- | --- | --- |
-| `rendered_confirmed` | shipped binary から読み、**実際に描画して確認**した (#14741 の基準) | 宣言済みの任意 class |
+| `rendered_confirmed` | その文字列が**実画面に出たことが確認され**、その観測が durable anchor に記録されている | 宣言済みの任意 class |
 | `binary_read_unrendered` | shipped binary から読んだが、再現に上流障害が要るため描画未確認 | `provider_unresponsive_suspected` のみ |
+
+`rendered_confirmed` の要件は「実画面に出たことの確認」の一点である。#14741 は「binary から読み **かつ** 描画確認」と表現したが、そこで両方が要ったのは *binary から文字列を提案していた*からであり、binary read は候補を得る手段であって信頼性の源ではない。live capture は同じ要件を直接、より強く満たす。到達経路 (binary → 描画確認 / live capture) は entry ごとに data file の comment へ記録する。
 
 後者の安全性の全体は次の 1 点に帰着する: **その class の処方は、signature が 1 つも一致
 しなかった場合に既に得られる処方と同一である**。したがってこの tier の literal が誤って
@@ -158,23 +162,37 @@ load 時に強制し、packaged artifact 自体も同じ不変条件で検査さ
 証拠 (#15842) で成立する class であり、data file が部分文字列で主張できてしまえば #15842 が
 除去した推測がそのまま戻る。
 
-### 記録済み残余: `content_refusal` の signature は未宣言
+### `content_refusal`: Codex は宣言済み、Claude は記録済み残余
 
-#15789 j#109183 は Codex session が依頼を cybersecurity 隣接として拒否し作業に入らなかった
-ことを記録し、#15816 が回復をドクトリン化した。したがって **class は実在する**。しかし
-その画面の**描画文言は捕捉されていない** (#15789 の記録は挙動であって literal ではない) し、
-両 provider の shipped binary を探しても user 向けの refusal banner を pin できなかった。
+Codex の signature は **#15789 j#109183 の live capture** から宣言されている。同 journal は
+read-only pane debug read で描画画面を逐語記録しており (`This content can't be shown` /
+`We take extra caution with cybersecurity requests.` /
+`apply for Trusted Access`)、#15789 j#109186 が「同一依頼が 1 回の context reset 後に通った」
+= 原因は内容ではなく累積 session 文脈、という disposition を確定している。この class が
+escalation ではなく `context_reset_reinjection` (#15816) を処方するのはそのためである。
 
-記憶から文字列を書くことは、この schema 系列が明示的に禁じている
-(`agent_provider_profiles.yaml`:「read from the shipped binary, not from memory」)。しかも
+substring は捕捉された render から、**1 行に収まり幅変化に耐える**断片を選ぶ。実測 render は
+pane 幅で hard wrap しており (`If you're a security` / `professional, ...`)、wrap を跨ぐ
+substring は幅依存で壊れる。また `This content can` は **apostrophe の手前で止めている**:
+capture は `can't` だが、ASCII `'` と typographic `’` のどちらが描画されたかは journal 転記
+から確定できないため、確定できる範囲だけを採る (1 文字を推測で足すより狭く採る)。
+
+**Claude 側は未宣言のまま**である。この repo のどの記録も Claude pane の content-policy
+refusal の描画を持たず、shipped 2.1.220 binary を探しても内部 wire token と model-card 散文
+しか出ず、user 向け banner は pin できなかった。記憶から書くことは schema 系列が禁じており
+(`agent_provider_profiles.yaml`:「read from the shipped binary, not from memory」)、しかも
 `content_refusal` の誤判定は、この spec で唯一実害のある誤りである — その処方は生きた
-session の context を捨てる。したがって class は宣言可能なまま **data は空**とし、未一致の
-refusal 画面は `unresponsive_indeterminate` → patience に落ちる。**間違っているが無害**で
-あって、**正しいが破壊的**ではない側を選んでいる。
+session の context を捨てる。したがって Claude については class は宣言可能なまま **data は
+空**とし、未一致の refusal 画面は `unresponsive_indeterminate` → patience に落ちる。
+**間違っているが無害**であって、**正しいが破壊的**ではない側を選んでいる。これは
+#15816 j#109281 / j#109286 が「存在しない観測を補完で書き足さない」を実行し review が受理した
+のと同じ形である。追加の条件は上の tier どおり、画面を観測し durable anchor に記録すること。
 
-追加の条件は #14741 が Codex の update prompt を宣言する前に満たしたものと同じである:
-画面を観測し、literal を shipped binary から読み、描画して確認する。それまでは、この不在は
-見落としではなく記録された残余である (unit test が assertion として保持している)。
+この残余の由来は残しておく価値がある: Codex 側も初版では同じ理由 (「文言は捕捉されていない」)
+で未宣言にしていた。実際には捕捉されており、それは implementation request が指していた
+durable record の中にあった。**literal が観測されていないと結論する前に durable record を
+探すこと。binary は 2 番目に見る場所であって最初ではない** (#15843 j#109937 の指摘、
+j#109938 の verdict)。
 
 ## 置き場: watcher 層であって LLM turn ではない
 
@@ -196,8 +214,10 @@ target ごとに待つと cockpit の成長に対して cadence が線形に劣�
 - **startup screen の分類**: `evaluate_startup_admission` (#13760)。provider ごとの宣言済み
   blocker を既に知っており、未 profile provider については既に推測を拒否し、pane text を
   既に返さない。
-- **body 残存**: #15842 の submit-proof の考え方。ただし screen の部分文字列を data に
-  発明させるのではなく、caller が durable delivery record から渡した marker と照合する。
+- **body 残存**: queue-enter retry gate と**同一の** `current_composer_retains_body`
+  (`turn_start_resend_gate`)。自前の composer 検出を書かない — それは #15842 が除去した
+  推測を別の形で戻すことになる。照合対象の marker は、screen の部分文字列を data に
+  発明させるのではなく caller が durable delivery record から渡す。
 - **回復ドクトリン**: #15816 (context reset) / ADR-0002 + #15842 (Enter-only) / #13760 /
   #14741 (screen は operator が解く)。本 spec はこれらを分類の**帰結**として参照するだけで、
   いずれの挙動も再定義しない。
