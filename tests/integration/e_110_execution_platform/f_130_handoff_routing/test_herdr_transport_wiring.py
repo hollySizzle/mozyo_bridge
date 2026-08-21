@@ -128,6 +128,7 @@ class _FakeHerdr:
         wait_results=None,
         read_returns_body=False,
         enter_clears_composer=False,
+        enters_absorbed=0,
         fail_send_text=False,
         fail_send_keys=False,
         pane_content=None,
@@ -148,6 +149,10 @@ class _FakeHerdr:
         # Enter, so the retained body disappears. Opt-in so the stuck-Enter tests
         # (body retained across Enters) keep their scenario.
         self._enter_clears_composer = enter_clears_composer
+        # #15842: a swallowed Enter leaves the body parked. This many LEADING
+        # Enters are absorbed by the TUI (startup UI / redraw) and do not submit;
+        # the composer only releases the body from the next Enter onward.
+        self._enters_absorbed = int(enters_absorbed)
         self._fail_send_text = fail_send_text
         self._fail_send_keys = fail_send_keys
         # Redmine #13760: what the receiver's pane is rendering. Defaults to a live,
@@ -199,7 +204,10 @@ class _FakeHerdr:
             keys = rest[3] if len(rest) > 3 else ""
             self.sends.append(("send_keys", rest[2], keys))
             if self._enter_clears_composer and not self._fail_send_keys:
-                self._last_body_by_target.pop(rest[2], None)
+                if self._enters_absorbed > 0:
+                    self._enters_absorbed -= 1
+                else:
+                    self._last_body_by_target.pop(rest[2], None)
             rc = 1 if self._fail_send_keys else 0
             return subprocess.CompletedProcess(
                 argv, rc, stdout="", stderr="send-keys failed" if rc else ""
@@ -1319,9 +1327,14 @@ class PureHerdrEndToEndTest(unittest.TestCase):
 
         herdr = _FakeHerdr(
             [],
-            get_states=["idle", "idle", "idle"],
+            get_states=["idle", "idle", "idle", "idle"],
             wait_results=[(1, "timed out"), (0, ""), (0, "")],
             read_returns_body=True,
+            # #15842: the first Enter is absorbed, so the body stays in the composer
+            # across the timeout. The second Enter submits and the composer releases
+            # it, which is what makes the second changed event a confirmed turn start.
+            enter_clears_composer=True,
+            enters_absorbed=1,
         )
         original_gate = LiveTmuxTransportRailOps.evaluate_queue_enter_resend
         with patch.object(
@@ -1347,8 +1360,9 @@ class PureHerdrEndToEndTest(unittest.TestCase):
         outcome = _outcome_from(out)
         self.assertEqual(outcome.get("status"), "sent", msg=out)
         self.assertEqual(outcome.get("reason"), "ok", msg=out)
-        # Once after re-arming and once again at the raw Enter effect boundary.
-        self.assertEqual(gate_spy.call_count, 2)
+        # Once after re-arming, once at the raw Enter effect boundary, and once more
+        # for #15842's submit proof on the confirming changed event.
+        self.assertEqual(gate_spy.call_count, 3)
 
         send_texts = [op for op in herdr.sends if op[0] == "send_text"]
         waits = [op for op in herdr.sends if op[0] == "wait"]

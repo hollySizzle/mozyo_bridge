@@ -29,6 +29,7 @@
   **`timeout` 側の gate・再待機 window・reader 呼び出し列は不変**。telemetry は additive に 2 key 追加 (`first_wait_kind` / `resend_skipped_reason`): 再送で回復しても最初の wait 失敗を最終結果で上書きせず、`enter_resends=0` が「不要」か「拒否」かを区別する。standard-rail の失敗文言は本文再入力の有無と Enter-only resend 回数を分離し、`enter_resends>0` を `no re-send` と表現しない。wire `Status` / `Reason` 集合・pane selection・tmux backend・`--mode pending` / queue-enter rail は不変。screen を検出しても mozyo がそれに **応答することはない** (#13760 境界は不変)。
 - v0.21 で更新 (Redmine #15242 既定 queue-enter の turn-start 補完): **herdr backend の既定 `queue-enter` を causal な turn-start 観測と、厳格な Enter-only fallback に接続する**。public default は window 30 秒 / interval 2 秒で、本文は一度だけ type する。first Enter は zero-or-one であり、body 注入後の pinned generation 再確認、working-transition wait の arm、absolute deadline check が成功した場合だけ発行する。失敗時は `enter_attempts=0` のまま `blocked` / `turn_start_unconfirmed` に閉じる。ただし **busy baseline は例外** (ADR-0002 / Redmine #15537): 受信 agent が既に working の場合、working-transition wait は attribution に使えない (即時 satisfy して pending でなくなる) ため、pending-observer 要求を waive して first Enter を発行する。deadline と pinned generation の再確認は维持し、causal claim は一切しない。idle / turn-ended 系列で実際に発行する first / extra Enter は先に wait を arm する (busy 系列は下記の queued-submission 例外)。`timeout` の系列では、target identity、衝突しない launch generation、現在の composer tail にある exact marker+body、startup / modal / trust / login / selection screen の非該当、runtime state の read 成功を **各回の送信直前に fresh に再確認**し、policy の回数上限と単一 absolute deadline の範囲で Enter-only retry を繰り返せる。wait `error` は次の Enter を許可せず即時停止し、それ以前に timeout の fresh gate で許可・発行済みの retry は telemetry に残す。本文は再入力しない。`busy` は queue semantics を維持するため追加 Enter の候補から除外しないが、busy snapshot や busy baseline に重なった event だけで submission を confirmed にしない。`awaiting_input` / `turn_ended` から先に arm した working-transition event と、前後で一致する collision-free generation を揃えた場合だけ causal confirmation とし、`sent` / `ok` / exit 0 を返す。busy baseline の送信は causal confirmation の代わりに **queued submission** を証明できる (ADR-0002 / #15537): Enter 後に injected body が current composer から消えたこと (resend gate の body 照合) を確認した場合、受信 CLI の入力 queue に入った practical queued submission として `sent` / `queue_enter` / exit 0 を返す (tmux queue-enter と同じ promise 水準の既存語彙。causal claim ではない)。body が deadline まで composer に残った場合は従来どおり `blocked` / `turn_start_unconfirmed`。それ以外は fail-closed の非 0: wait `absent` は `blocked` / `turn_start_absent`、fresh gate が runtime `blocked` を確認した場合は `blocked` / `receiver_blocked`、timeout / error / wait unarmed / identity-generation drift / body-screen-state の再確認不成立は `blocked` / `turn_start_unconfirmed`、送信 primitive の `TerminalTransportError` は `blocked` / `transport_error` へ写す。queue 専用 telemetry と delivery-ledger 分類を維持し、standard rail の `turn_start_outcome` と混ぜない。public window は初回待機・必要な interval 待ち・全追加 Enter 後の再待機を含む **単一の absolute budget** で、各 wait は remaining budget を超えず、再 arm で延長しない。window / interval のどちらか `0`、または正値でも `0.001` 秒未満なら追加 Enter 無効だが、first Enter と observation は generation 再確認・wait arm・deadline check が成功した場合に限る。非有限値は pre-injection `invalid_args` とする。tmux queue-enter の既存 marker retry、herdr `standard`、`pending` は変更しない。
 - v0.22 で訂正 (Redmine #15198): **Herdr 0.8 の実 CLI と causal queue-enter の順序を同期する**。working-transition wait の現行 argv は `agent wait TARGET --until STATUS --timeout MS` であり、旧 `wait agent-status ... --status ...` を production / fake の current grammar として使わない。Herdr queue-enter は body exactly once の後に tmux 由来の landing-marker wait を行わず、stable generation 再確認 → wait arm → deadline 再確認 → Enter の順で進む。post-injection transport failure は `uncertain_partial` の delivery-ledger row を exactly one 残し、`backend=herdr` / `rail=queue_enter_rail` / `disposition=<TRANSPORT_STEPS の固定 primitive>` とする。structured outcome は `transport_failure.primitive` の同じ固定 token だけを持ち、adapter exception、raw stderr、binary / repository path、任意 detail を持たない。Unit Board への public-safe 射影は `gateway_status=blocked` / `gateway_reason=transport_error` / `transport_primitive=<同 token>` に限る。
+- v0.23 で更新 (Redmine #15842 queue-enter の submitted_confirmed 偽陽性): **causal 系列の confirmation にも submit 証拠 (composer clear) を必須にする**。v0.21 は idle / turn-ended baseline + 先に arm した working-transition event + coherent generation の 3 点で causal confirmation としていたが、この 3 点は provider の **起動 busy** と **prompt 処理 busy** を区別できない。実測 (#15842 j#109739 / #15841 の停止): `sublane create` が fresh な Codex gateway を起動し同一操作で dispatch したところ、TUI が submit-ready になる前の Enter が起動 UI に吸われて marker+body が composer に残ったまま (`Context 0% used` = 処理 0 バイト) になり、それでも起動アクティビティが armed wait を changed にしたため rail は `submitted_confirmed` を返した。dispatcher はその ACK で yield し、lane は 1 時間以上 silent stall した (operator の手動 Enter 1 回で回復 = 本文は composer に正しく入っており submit だけが欠けていた)。v0.23 は busy 系列が #15537 以来使ってきた **composer clear** を causal 系列にも適用する: armed event が changed でも、**injected body が current composer から消えたことを確認できるまで confirmation にしない**。判定は既存 resend gate の 1 回読みで行い (identity → startup screen → current composer tail → runtime state)、新しい port も transport primitive も provider literal も追加しない。gate の closed token を 3 分割する: `body_absent` = submit 証明済み (causal confirmation 成立)、`(none)` = identity / screen / state すべて健全で **body が composer に残る** = swallowed Enter の署名 → ADR-0002 に従い bounded Enter-only budget をここで使う (本文は再入力しない)、それ以外の token (`startup_screen` / `pane_unreadable` / `identity_drift` / `state_not_injectable` 等) = どちらも証明できず confirmation も追加 Enter も拒否する fail-closed。非 `str` の token も後者に倒す (`(none)` は空文字なので、正規化すると唯一の「Enter を許可する」値へ落ちるため)。telemetry は additive に 2 key (`submit_proof` / `submit_proof_refusal`)。**通常 dispatch の挙動は不変**: 実際に land した Enter は working transition より先に composer を clear するので、armed wait が発火する時点で証明は既に成立している。busy 系列 (#15537)、tmux queue-enter、herdr `standard` / `pending`、wire `Status` / `Reason` 集合はいずれも不変。tmux queue-enter には同型の穴が無い (causal 観測を一切行わないため `submitted_confirmed` に到達しない)。
 - v0.5.1 で追加 (Redmine #12612): delivery rail dogfood / smoke / pre-smoke gate では **runtime fingerprint** を必須 evidence とする。`mozyo-bridge --version` だけでは、同じ version 文字列を名乗る installed package と `origin/main` source CLI の挙動差を検出できない。実行した executable path、imported package path、source / installed の区別、feature probe (例: `standard_target_admission` present) を durable record に残し、fingerprint が期待 behavior と一致しない場合は dogfood を green にしない。
 - v0.4 で pivot (Asana `1214824751741628` / parent `1214825156046950`): default delivery rail を strict `standard` から `queue-enter` に再配置し、product promise を `confirmed landing` 中心から `strong preflight 付き practical queued submission` 中心に切り替える (`## Default Delivery Promise (v0.4)` 参照)。strict `standard` rail は contract から削除せず、明示的 fallback として残す。strict rail の挙動・wire enums (`Status` / `Reason` / `AckStatus` / `next_action_owner`)・queue-enter rail の Layer B admission gate (Step 1–14) はいずれも変更しない (新規 `Reason` 値も追加しない)。本 task の射程は contract wording の pivot のみであり、CLI / handoff 実装 (Asana `1214825307842391`)、distributed docs / rules / skill refs / preset surfaces (Asana `1214825156844993`)、tests / smoke / workflow verification (Asana `1214825156769677`) は別 child task が所有する。
 - Upstream contract (前提): `mozyo_bridge_pty/vibes/docs/specs/transport-agnostic-ack-state-contract.md`
@@ -186,7 +187,7 @@ dogfood は safety bypass ではない。high-level primitive が fail-closed �
 | `acknowledged` (PTY-only) | tmux 経路では取得不可能 (rendered text 観測しかできないため)。 | — |
 | `submitted` (tmux queue-enter, marker 観測あり) | tmux `queue-enter` rail で typing 後 `wait_for_text(marker)` が true を返し、Enter を発行した。strict rail と同じ outcome に倒す。 | `sent` / `ok` |
 | `submitted` (tmux queue-enter, marker 未観測) | tmux `queue-enter` rail で marker が landing_timeout 内に observe できなかったが、target が agent pane であることを根拠に Enter を発行した。ACK 到達は strict と同じ `submitted`。`reason="queue_enter"` (v0.2 新規) は sender が pre-Enter で landing を確認していない事実を wording-layer で残すための差分情報。strict rail はこの分岐を持たない。 | `sent` / `queue_enter` (新規 reason; v0.2 で追加) |
-| `submitted` (Herdr queue-enter, causal turn start) | `awaiting_input` / `turn_ended` baseline より先に arm した working transition と、前後で coherent な同一 launch generation が揃った。marker 観測や post-hoc busy だけでは本 state にしない。 | `sent` / `ok` |
+| `submitted` (Herdr queue-enter, causal turn start) | `awaiting_input` / `turn_ended` baseline より先に arm した working transition と、前後で coherent な同一 launch generation が揃い、**かつ injected body が current composer から消えたこと (submit 証拠) を確認した** (v0.23 / #15842)。marker 観測、post-hoc busy、armed event だけでは本 state にしない — 起動中の provider は body を composer に残したまま working transition を発生させる。 | `sent` / `ok` |
 | `submitted` (Herdr queue-enter, busy queued submission) | busy baseline (ADR-0002 / #15537) で wait 非依存の full effect fence を通した Enter の後、injected body が current composer から消えたことを sender が確認した。非 causal な queued submission であり turn start は主張しない。injection stage は `uncertain_partial` のままで blind retry 禁止。 | `sent` / `queue_enter` |
 | `blocked` (Herdr queue-enter, causal / composer-clear どちらも未確認) | wait absent は `turn_start_absent`、fresh gate の runtime blocked は `receiver_blocked`、timeout/error/unarmed/drift/body-screen-state の再確認不成立は `turn_start_unconfirmed`、raised transport primitive failure は `transport_error`。本文/Enter は既に送られ得るため injection stage は `uncertain_partial` で blind retry 禁止。 | `blocked` / `turn_start_absent` \| `receiver_blocked` \| `turn_start_unconfirmed` \| `transport_error` (non-zero) |
 
@@ -199,7 +200,7 @@ tmux 経路の最終到達は `submitted` を超えない。これは contract �
 ### `mozyo-bridge handoff send` / `handoff reply` (`orchestrate_handoff`)
 
 - 本 contract の **標準経路**。Asana / Redmine anchor を引数として要求し、marker shape は `[mozyo:handoff:source=<src>:task=<id>:comment=<id>:kind=<label>:to=<receiver>]` を採る。
-- `--mode queue-enter` (**v0.4 normative default**; CLI binary 上も `default=MODE_QUEUE_ENTER`、commit `93dc953` で land 済み): Claude / Codex agent pane に対する queue-oriented delivery 経路。body は backend にかかわらず一度だけ type する。tmux は従来どおり marker 未観測でも `C-u` rollback せず legacy marker retry を行い、観測あり → `sent` / `ok`、未観測 → `sent` / `queue_enter`。Herdr は idle/turn-ended baseline では発行する first / each extra Enter より先に causal wait を arm し、同一 generation の causal start が `sent` / `ok` になる。busy baseline (#15537) は wait 非依存の full effect fence を通した Enter と composer clear を証拠に非 causal な `sent` / `queue_enter` になる。timeout-only なら absolute policy/deadline まで fresh strict gate を反復する。wait error は次の Enter を許可せず即時停止する。上記いずれの証拠も無い未確認は上表の precise `blocked` reason + non-zero になる。Layer B preflight 違反は typing 前に `stage_failed` で die する。詳細・適用条件・許容ターゲット・durable wording は `## Queue-Enter Default Rail` と `### Enter-Only Retry` を正本として参照する。
+- `--mode queue-enter` (**v0.4 normative default**; CLI binary 上も `default=MODE_QUEUE_ENTER`、commit `93dc953` で land 済み): Claude / Codex agent pane に対する queue-oriented delivery 経路。body は backend にかかわらず一度だけ type する。tmux は従来どおり marker 未観測でも `C-u` rollback せず legacy marker retry を行い、観測あり → `sent` / `ok`、未観測 → `sent` / `queue_enter`。Herdr は idle/turn-ended baseline では発行する first / each extra Enter より先に causal wait を arm し、同一 generation の causal start が **composer clear の submit 証拠と揃った場合だけ** `sent` / `ok` になる (v0.23 / #15842)。busy baseline (#15537) は wait 非依存の full effect fence を通した Enter と composer clear を証拠に非 causal な `sent` / `queue_enter` になる。timeout-only なら absolute policy/deadline まで fresh strict gate を反復する。wait error は次の Enter を許可せず即時停止する。上記いずれの証拠も無い未確認は上表の precise `blocked` reason + non-zero になる。Layer B preflight 違反は typing 前に `stage_failed` で die する。詳細・適用条件・許容ターゲット・durable wording は `## Queue-Enter Default Rail` と `### Enter-Only Retry` を正本として参照する。
 - `--mode standard` (**strict explicit fallback**): typing → `wait_for_text(marker)` → Enter。成功で `sent` / `ok` (`submitted`)。marker_timeout で `C-u` rollback + `blocked` / `marker_timeout` (`rolled_back`)。marker observation を Enter の必要条件とする strict rail を明示的に選ぶ送信用 (例: regression check、brand-new pane で queue-pickup 確率が未確認、observability test、strict landing evidence が監査要件)。v0.4 contract で default ではなくなったが contract からは削除しない。**Enter 後の turn-start 検証を追加**: marker 観測 + Enter 発行後に受信 pane の新規出力活動を read-only 観測し、観測ありで `sent` / `ok` (`submitted`)、観測なしで `blocked` / `turn_start_unconfirmed` (fail-closed、C-u rollback も再送もしない)。この検証は codex receiver で v0.6 (#13166)、claude receiver で v0.7 (#13262) に追加された (codex の出力は byte-identical に保たれ、turn-start 記録行 / narrative は receiver 名で rail を表記する)。上の Status / Reason mapping table と Status 節 v0.6 / v0.7 bullet を正本とする。
 - `--mode pending`: typing 後、`wait_for_text` も Enter も発行しない。`pending_input` / `ok` (`pending_submit`)。入力は prompt に残る。operator 判断で submit する経路。`## Default Delivery Promise (v0.4)` の Scope 射程外。
 - pre-flight (target_unavailable / target_not_agent / invalid_anchor / invalid_args) は typing 開始前に死ぬ。いずれも `stage_failed` 経路で `blocked` / `<reason>` を emit する。
@@ -308,9 +309,9 @@ operator が pane を見たとき、receiver agent が durable record を読む�
 4. `--mode pending` / `message --no-submit` は意図的に Enter を発行しないが、ここでも typing 後の prompt 状態は durable record に "operator pending" として残す。pane の最終 Enter 押下は operator のみが行う。
 5. tmux 経路は `capture-pane` の rendered text を ACK の **正本** にしない。あくまで `submitted` / `pending_submit` の補助観測。wrap / indent / TUI redraw 差で揺れるのは正常な現象として contract が許容する (揺れたら `rolled_back` に倒す)。
 
-`queue-enter` rail (v0.4 以降の default) だけは条件 2 の「`wait_for_text` の `True` を Enter の必要条件とする」を緩める。ただし条件 1 (typing 前 capture-pane / read marker)、条件 3 のうち rollback 方針 (queue-enter rail では `C-u` rollback はせず Enter を発行)、条件 4 (operator pending の durable 記録)、条件 5 (rendered text を ACK 正本にしない) はすべて維持する。tmux queue-enter の Enter 発行は「target が agent paneであり Layer B deterministic admission gate をすべて通過した」という別根拠を precondition とし、`reason="queue_enter"` で「pre-Enter landing 観測なし」を durable に明示する。Herdr queue-enter はさらに idle / turn-ended 系列では first / each extra Enter より先の causal wait と、extra Enter ごとの fresh strict gate を要求する。busy 系列 (ADR-0002 / #15537) は wait 非依存の full effect fence を通した Enter と composer clear を証拠に非 causal な `sent` / `queue_enter` を返す。どちらの証拠も無ければ precise `blocked` reason + non-zero へ fail-closed する。strong preflight は default rail の必須前提であり、default 化を根拠に緩めない。
+`queue-enter` rail (v0.4 以降の default) だけは条件 2 の「`wait_for_text` の `True` を Enter の必要条件とする」を緩める。ただし条件 1 (typing 前 capture-pane / read marker)、条件 3 のうち rollback 方針 (queue-enter rail では `C-u` rollback はせず Enter を発行)、条件 4 (operator pending の durable 記録)、条件 5 (rendered text を ACK 正本にしない) はすべて維持する。tmux queue-enter の Enter 発行は「target が agent paneであり Layer B deterministic admission gate をすべて通過した」という別根拠を precondition とし、`reason="queue_enter"` で「pre-Enter landing 観測なし」を durable に明示する。Herdr queue-enter はさらに idle / turn-ended 系列では first / each extra Enter より先の causal wait と、extra Enter ごとの fresh strict gate、そして confirmation 時の composer clear (v0.23 / #15842) を要求する。busy 系列 (ADR-0002 / #15537) は wait 非依存の full effect fence を通した Enter と composer clear を証拠に非 causal な `sent` / `queue_enter` を返す。どちらの証拠も無ければ precise `blocked` reason + non-zero へ fail-closed する。strong preflight は default rail の必須前提であり、default 化を根拠に緩めない。
 
-これにより、`wait_for_text` の精度が揺れても、strict rail では `submitted` 判定が揺れるだけで contract 自体は揺れない。tmux queue-enter では marker 観測あり / 未観測の wording 区別が揺れるだけである。Herdr queue-enter の成功判定は marker ではなく、idle / turn-ended 系列では causal event + coherent generation、busy 系列では full effect fence 後の composer clear (#15537) なので、marker の揺れを `sent` / `ok` / `queue_enter` の根拠にしない。
+これにより、`wait_for_text` の精度が揺れても、strict rail では `submitted` 判定が揺れるだけで contract 自体は揺れない。tmux queue-enter では marker 観測あり / 未観測の wording 区別が揺れるだけである。Herdr queue-enter の成功判定は marker ではなく、idle / turn-ended 系列では causal event + coherent generation + composer clear (v0.23 / #15842)、busy 系列では full effect fence 後の composer clear (#15537) なので、marker の揺れを `sent` / `ok` / `queue_enter` の根拠にしない。
 
 ## Fail-Closed Conditions
 
@@ -325,7 +326,7 @@ operator が pane を見たとき、receiver agent が durable record を読む�
 
 これらは fail-open に倒さない (= 観測なしで Enter を押さない、anchor 不明のままで durable record だけ書かない)。
 
-`queue-enter` rail だけは「marker 未観測でも Enter を発行できる」例外を contract として明示する。tmux は別 outcome (`reason="queue_enter"`) を emit する既存設計、Herdr は idle / turn-ended 系列では各 Enter より先の causal wait と fresh gate、busy 系列 (ADR-0002 / #15537) では wait 非依存の full effect fence と composer clear を根拠にする設計である。Herdr は causal confirmation か busy 系列の composer-clear 証拠のどちらかが無ければ成功にせず、precise `blocked` reason + non-zero を返す。strict marker observation を Enter の必要条件として要求する経路は `--mode standard` で明示的 fallback として選択できる。
+`queue-enter` rail だけは「marker 未観測でも Enter を発行できる」例外を contract として明示する。tmux は別 outcome (`reason="queue_enter"`) を emit する既存設計、Herdr は idle / turn-ended 系列では各 Enter より先の causal wait と fresh gate と confirmation 時の composer clear (v0.23 / #15842)、busy 系列 (ADR-0002 / #15537) では wait 非依存の full effect fence と composer clear を根拠にする設計である。したがって **どちらの系列も composer clear を submit 証拠として要求する**。Herdr は causal confirmation か busy 系列の composer-clear 証拠のどちらかが無ければ成功にせず、precise `blocked` reason + non-zero を返す。strict marker observation を Enter の必要条件として要求する経路は `--mode standard` で明示的 fallback として選択できる。
 
 ## Known Issue: False-Blocked (strict `marker_timeout` は非配達の証明ではない) (Redmine #13262 / #13261)
 
@@ -353,7 +354,7 @@ turn-start 検証 (v0.6 / v0.7、`turn_start_unconfirmed`) も同じ doctrine �
 
 ### tmux Queue-Enter Marker 未観測を block しない (option (c) 保留)
 
-上記は **tmux compatibility rail** の規定である。marker 未観測は非配達の証明ではないため、tmux queue-enter は marker 未観測でも `sent` / `queue_enter` を維持する。Herdr queue-enter は v0.21 で causal turn-start rail に更新され、marker miss 自体では block しない一方、same-generation causal confirmation が無ければ precise `blocked` reason + non-zero にする。したがって旧 option (c) の「marker miss をそのまま block」は採らず、より強い runtime signal で fail-closed を決める。
+上記は **tmux compatibility rail** の規定である。marker 未観測は非配達の証明ではないため、tmux queue-enter は marker 未観測でも `sent` / `queue_enter` を維持する。Herdr queue-enter は v0.21 で causal turn-start rail に更新され (v0.23 / #15842 で submit 証拠を追加)、marker miss 自体では block しない一方、same-generation causal confirmation と composer clear が無ければ precise `blocked` reason + non-zero にする。したがって旧 option (c) の「marker miss をそのまま block」は採らず、より強い runtime signal で fail-closed を決める。
 
 ## Duplicate Same-Lane Receiver Pane And Receiver/Actor Divergence (Redmine #12229)
 
@@ -427,7 +428,7 @@ tmux queue-enter rail でも `wait_for_text(marker)` は引き続き呼ぶ。こ
 
 `wait_for_text` 実装は tmux queue-enter rail のために挙動を変える必要はない。Herdr queue-enter は marker
 observation を success authority にせず、`### Enter-Only Retry` の pre-armed event / coherent generation で
-判定する。marker 観測の有無にかかわらず causal start が未確認なら `sent` に倒さない。
+判定する。marker 観測の有無にかかわらず causal start が未確認なら `sent` に倒さない。causal start は armed event だけでは確定せず、composer clear の submit 証拠を伴う (v0.23 / #15842)。
 
 ### State / Outcome Mapping
 
@@ -506,8 +507,11 @@ herdr_queue_enter_retry:
       提出証拠は composer clear であり、causal confirmation ではない (`sent` / `queue_enter`)
     - target identity と collision-free launch generation を前後で exact 照合する
     - pre-Enter runtime state が awaiting_input / turn_ended で、armed event が changed、
-      generation が coherent な場合だけ submission confirmation に使える
+      generation が coherent で、**かつ injected body が current composer から消えている**
+      場合だけ submission confirmation に使える (v0.23 / #15842)
     - busy baseline / busy snapshot / busy に重なった event だけでは confirmation にしない
+    - provider の起動 busy と prompt 処理 busy は event だけでは区別できないため、
+      fresh pane への dispatch でも composer clear だけが決定的な submit 証拠である
   extra_enter_gate:
     - causal start が未確認である
     - target identity が注入前と **今回の送信直前**で exact 一致する
@@ -521,8 +525,11 @@ herdr_queue_enter_retry:
     - idle / turn-ended 系列では、今回の追加 Enter より先に次の working-transition wait を arm できる (busy 系列 (#15537) は arm を要求せず retry effect boundary 内で同じ gate を再証明する)
     - 上記の全条件を追加 Enter ごとに fresh に取り直す
   result:
-    - idle / turn-ended 系列は causal event + coherent generation が揃えば `sent` / `ok` / exit 0
+    - idle / turn-ended 系列は causal event + coherent generation + composer clear が揃えば
+      `sent` / `ok` / exit 0 (v0.23 / #15842)
     - busy 系列は full effect fence 後の composer clear を証拠に `sent` / `queue_enter` / exit 0 (#15537)
+    - causal event が出ても body が composer に残る場合は confirmation にせず、ADR-0002 の
+      bounded Enter-only budget を使い切ってから `blocked` / `turn_start_unconfirmed` (v0.23)
     - wait absent は `blocked` / `turn_start_absent` / non-zero
     - fresh gate が runtime blocked を確認した場合は `blocked` / `receiver_blocked` / non-zero
     - timeout / error / wait unarmed (idle / turn-ended 系列) / identity-generation drift / body-screen-state の
@@ -532,7 +539,10 @@ herdr_queue_enter_retry:
 
 `busy` を追加 Enter gate で許容することと、`busy` を delivery confirmation に使うことは別である。前者は
 現在の composer に exact request が残り、同一 target / generation であることを確認した上で queue 受理を
-補完するための限定的な許可である。後者は既存 turn が動いているだけでも成立するため禁止する。
+補完するための限定的な許可である。後者は既存 turn が動いているだけでも成立するため禁止する。v0.23
+(#15842) はこの禁止を **armed event にも**広げた: 事前に arm していても、observe した busy 化が
+この送信の turn 開始によるものか provider の起動によるものかは event からは決まらない。busy 性は推論で
+あり composer clear は観測なので、confirmation の必要条件は後者である。
 
 public policy の `--queue-enter-retry-window`（既定 30 秒）は、初回 event wait、必要な interval 待ち、全追加
 Enter 後の再待機を合わせた **単一の absolute wall-clock budget** である。各 wait timeout はその時点の
@@ -862,7 +872,8 @@ Redmine #15242 (既定 queue-enter の turn-start 補完) は、上記の「post
 初期境界を **herdr queue-enter に限って**更新する。idle / turn-ended baseline では first Enter より先に armed working-transition wait を
 置く (busy baseline は ADR-0002 / #15537 の queued-submission 例外で、wait 非依存の full effect fence を通す)。本文入力前は解決時の保守的な`process_generation`（mutableな`terminal.revision`を含む）をexact照合する。
 本文入力後はprovider / assigned name / locator / terminal id / verified `pane_bound_v2` launch tokenをstable
-generationとして照合し、同じterminalのrevision-only driftは許容する。causal start が
+generationとして照合し、同じterminalのrevision-only driftは許容する。armed event が changed でも injected body が
+current composer に残る限り causal start は確定しない (v0.23 / #15842)。causal start が
 確認できなければ、`### Enter-Only Retry` の厳格 gate を **各回 fresh に**満たした場合だけ (idle / turn-ended 系列では加えて各 Enter より先に wait を arm)、単一の absolute deadline と policy 回数上限まで Enter-only retry を行う。timeout はこの
 範囲で反復可能だが、wait error は次の Enter を許可せず即時停止する。late error より前に timeout の fresh
 gate で発行済みの retry は telemetry に残す。本文は
@@ -875,8 +886,8 @@ eventをその送信のcausal proofへ昇格させない。
 
 この更新でも telemetry の所有先は `queue_enter_turn_start_observation` のままである。busy baseline / post-hoc
 busy snapshot は submission proof ではなく、standard rail 用 `turn_start_outcome` も生成しない。従って
-delivery-ledger は queue rail のまま保たれる。causal event + coherent generation が揃えば `sent` / `ok`、
-揃わなければ precise reason (`turn_start_absent` / `receiver_blocked` / `turn_start_unconfirmed` /
+delivery-ledger は queue rail のまま保たれる。causal event + coherent generation + composer clear (v0.23 / #15842) が
+揃えば `sent` / `ok`、揃わなければ precise reason (`turn_start_absent` / `receiver_blocked` / `turn_start_unconfirmed` /
 `transport_error`) を伴う `blocked` / non-zero である。後者は本文が届いた可能性を持つので injection stage は
 `uncertain_partial`、blind retry 禁止のままになる。ここで確認するのは turn start までであり、task completion や
 ticket gate を確認するものではない。

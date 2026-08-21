@@ -148,6 +148,12 @@ files = [
     # Enter-only retry application seam and its structurally-conforming fake port.
     "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_herdr_queue_enter_rail.py",
     "tests/unit/e_110_execution_platform/f_130_handoff_routing/test_handoff_herdr_queue_enter_rail.py",
+    # Redmine #15842: the rail's two pure sibling leaves — the deterministic submit
+    # proof that keeps a provider's startup activity from confirming a swallowed
+    # Enter, and the move-only launch-generation predicates it displaced. Both are in
+    # the island because the rail's typed seam now flows through them.
+    "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/queue_enter_submit_proof.py",
+    "src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/queue_enter_generation_binding.py",
     # Redmine #13729 tranche 4: the common tmux transport rail slice (typed request +
     # Protocol port for the inject / marker gate / rollback / retry / turn-start / emit
     # side effects + a fully-annotated live adapter).
@@ -226,6 +232,23 @@ warn_return_any = true
 # adapter is a strict typed island, matching the surrounding handoff rail seams.
 [[tool.mypy.overrides]]
 module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.handoff_herdr_queue_enter_rail"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+
+# Redmine #15842: the rail's two pure sibling leaves are held to the same bar as
+# the rail itself — they are fully annotated and carry the submit-proof and
+# launch-generation decisions the rail's typed seam now flows through.
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.queue_enter_submit_proof"
+disallow_untyped_defs = true
+disallow_incomplete_defs = true
+check_untyped_defs = true
+warn_return_any = true
+
+[[tool.mypy.overrides]]
+module = "mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.queue_enter_generation_binding"
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true

@@ -1183,8 +1183,15 @@ allowlist:
     expires: "2027-11-30"
 
   - path: src/mozyo_bridge/e_110_execution_platform/f_130_handoff_routing/application/handoff_herdr_queue_enter_rail.py
-    lines: 1114
+    lines: 1104
     reason: >-
+      Tightened 1114 -> 1104 by #15842: the module sits AT its baseline, so the
+      deterministic submit proof could not be a self-approved bump. The pure,
+      session-independent launch-generation predicates moved out move-only to
+      ``queue_enter_generation_binding`` (the rail re-imports them under their
+      previous private names, so no call site or #15227 regression changed) and
+      the new submit-proof vocabulary landed in the sibling leaf
+      ``queue_enter_submit_proof``. Net -16 after the rail-side wiring.
       Raised 1110 -> 1114 for #15537 review j#106497: the module docstring's safety
       invariants now state the busy-series wait waiver / full effect fence and the
       composer-clear queued-submission proof instead of the causal-only universal

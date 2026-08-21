@@ -19,6 +19,10 @@ Safety invariants:
 - a busy receiver can be nudged, but busy-only evidence never confirms this
   delivery — the busy series proves its noncausal queued submission (``sent`` /
   ``queue_enter``) only by the injected body clearing the current composer;
+- NEITHER series confirms on busy-ness alone (Redmine #15842): a working
+  transition cannot separate "started this turn" from "still starting up", so
+  the causal series also requires the composer to have released the body
+  (``queue_enter_submit_proof``) before it claims a turn start;
 - telemetry remains on ``queue_enter_turn_start_observation`` so the delivery ledger
   continues to classify the outcome as the queue-enter rail.
 """
@@ -31,6 +35,15 @@ from dataclasses import dataclass, field
 from collections.abc import Mapping, Sequence
 from typing import Any, Callable, Iterator, Optional, Protocol, cast
 
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.queue_enter_generation_binding import (  # noqa: E501
+    canonical_private_generation_binding as _canonical_private_generation_binding,
+    public_generation_binding as _public_generation_binding,
+    same_terminal_generation as _same_terminal_generation,
+)
+from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.application.queue_enter_submit_proof import (  # noqa: E501
+    QueueEnterSubmitProof,
+    classify_submit_proof,
+)
 from mozyo_bridge.e_110_execution_platform.f_130_handoff_routing.domain.handoff import (
     QUEUE_ENTER_RETRY_MAX_SECONDS,
     QueueEnterRetryPolicy,
@@ -68,55 +81,6 @@ from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.
     TerminalTransportError,
 )
 
-_STABLE_GENERATION_FIELDS = (
-    "provider",
-    "assigned_name",
-    "locator",
-    "terminal_id",
-    "startup_action_id",
-)
-
-_PUBLIC_GENERATION_FIELDS = (
-    "provider",
-    "assigned_name",
-    "locator",
-    "row_revision",
-    "attestation_observed_at",
-    "startup_action_id",
-)
-
-
-def _canonical_private_generation_binding(binding: object) -> bool:
-    """Validate the terminal-bearing action-time shape without rendering it."""
-    if not isinstance(binding, dict):
-        return False
-    required = {
-        "provider", "assigned_name", "locator", "terminal_id", "row_revision",
-        "process_generation", "attestation_observed_at", "startup_action_id",
-    }
-    if set(binding) != required:
-        return False
-    if any(
-        type(binding[field]) is not str
-        or not binding[field]
-        or binding[field].strip() != binding[field]
-        for field in required
-    ):
-        return False
-    revision = binding["row_revision"]
-    if any(char not in "0123456789" for char in revision):
-        return False
-    if len(revision) > 1 and revision.startswith("0"):
-        return False
-    name = binding["assigned_name"]
-    terminal = binding["terminal_id"]
-    locator = binding["locator"]
-    expected = (
-        f"{len(name)}:{name}:{len(terminal)}:{terminal}:"
-        f"{len(locator)}:{locator}:r{revision}"
-    )
-    return binding["process_generation"] == expected
-
 _ACTIVE_ENTER_EFFECT_FENCE: ContextVar[Optional[Callable[[], None]]] = ContextVar(
     "mozyo_queue_enter_effect_fence", default=None
 )
@@ -145,22 +109,6 @@ def enforce_active_queue_enter_effect_fence() -> None:
     check = _ACTIVE_ENTER_EFFECT_FENCE.get()
     if check is not None:
         check()
-
-
-def _same_terminal_generation(left: object, right: object) -> bool:
-    """Compare stable v2 identity while allowing mutable terminal revision drift."""
-    if not isinstance(left, dict) or not isinstance(right, dict):
-        return False
-    return (
-        _canonical_private_generation_binding(left)
-        and _canonical_private_generation_binding(right)
-        and all(left[field] == right[field] for field in _STABLE_GENERATION_FIELDS)
-    )
-
-
-def _public_generation_binding(binding: dict[str, str]) -> dict[str, str]:
-    """Project the private terminal join onto the redaction-safe ledger shape."""
-    return {field: binding[field] for field in _PUBLIC_GENERATION_FIELDS}
 
 
 @dataclass(frozen=True)
@@ -297,6 +245,16 @@ class HerdrQueueEnterSession:
     #: The busy path's submission evidence: the injected body left the current composer
     #: after an Enter (the receiver CLI accepted it into its input queue).
     queued_submission_confirmed: bool = False
+    #: Redmine #15842: the causal series' deterministic submit verdict for the most
+    #: recent ``changed`` event. A working transition alone cannot tell "started this
+    #: turn" from "still starting up", so it confirms nothing until the composer is
+    #: observed to have released the body.
+    submit_proof: QueueEnterSubmitProof = QueueEnterSubmitProof()
+    #: Whether the CURRENT iteration's proof positively read the body still parked in
+    #: the composer. Deliberately separate from ``submit_proof``, which stays on the
+    #: last evaluated verdict so the durable record keeps the reason a send ended
+    #: unconfirmed: an authorisation must never outlive the observation behind it.
+    submit_retry_authorised: bool = False
 
     @property
     def retry_enabled(self) -> bool:
@@ -606,11 +564,31 @@ class HerdrQueueEnterSession:
             and _same_terminal_generation(self.pre_binding, current)
         )
 
+    def _prove_submission(self) -> bool:
+        """Require the composer to have released the body (Redmine #15842).
+
+        The armed working-transition wait proves only that the receiver process
+        became busy; on a freshly launched pane its own startup work supplies that
+        transition while the swallowed Enter leaves the marker+body parked in the
+        composer (j#109739). Reuse the resend gate's existing read — identity,
+        startup screen, current composer tail, runtime state — as the causal
+        series' submit evidence, exactly as the busy series has done since
+        ADR-0002 / #15537. A probe that raises still propagates: the outer rail
+        owns the ``transport_error`` terminal, and a read that failed is not proof.
+        """
+        self.submit_proof = classify_submit_proof(
+            self._evaluate_resend_gate().skip_reason
+        )
+        self.submit_retry_authorised = self.submit_proof.enter_retryable
+        return self.submit_proof.submitted
+
     def _causally_confirmed(self, wait_kind: str) -> bool:
+        self.submit_retry_authorised = False
         confirmed = (
             wait_kind == WAIT_CHANGED
             and self.causal_state in (RUNTIME_AWAITING_INPUT, RUNTIME_TURN_ENDED)
             and self._generation_coherent()
+            and self._prove_submission()
         )
         if confirmed:
             self.causal_start_confirmed = True
@@ -733,12 +711,20 @@ class HerdrQueueEnterSession:
             if not self.retry_enabled:
                 self.resend_skipped_reason = RESEND_SKIP_DISABLED
                 return
-            if wait_kind != WAIT_TIMEOUT:
+            if wait_kind != WAIT_TIMEOUT and not self.submit_retry_authorised:
                 # A changed event that cannot be attributed to this Enter is
                 # not a timeout and therefore cannot authorise another Enter.
                 # ``final_wait_kind`` plus the absent causal event telemetry
                 # explains the unconfirmed terminal without inventing a gate
                 # refusal that did not occur.
+                #
+                # Redmine #15842 carves out exactly one case: the submit proof
+                # POSITIVELY read the body still sitting in the current composer
+                # behind a clear screen, a live identity, and an injectable state.
+                # That is not an unattributable event — it is the swallowed-Enter
+                # signature, and ADR-0002 puts the bounded Enter-only budget
+                # exactly there rather than stalling the lane. The body is still
+                # never re-typed; the retry path below re-proves the full gate.
                 return
             if self.retry_deadline is None or self.last_enter_at is None:
                 self.resend_skipped_reason = RESEND_SKIP_BUDGET_EXHAUSTED
@@ -849,11 +835,15 @@ class HerdrQueueEnterSession:
                 "read_reason": "transport_error",
                 "poll_attempts": 0,
             }
-        extra = {
+        extra: dict[str, Any] = {
             "enter_attempts": self.enter_attempts,
             "first_event_wait_kind": self.first_wait_kind,
             "final_event_wait_kind": self.final_wait_kind,
             "resend_skipped_reason": self.resend_skipped_reason,
+            # Redmine #15842: additive, value-free tokens naming why the last causal
+            # event did or did not survive the submit proof. Absent when no causal
+            # event was ever observed, so a legacy-shaped record renders unchanged.
+            **self.submit_proof.telemetry(),
         }
         if self.busy_queue_path:
             # ADR-0002 (#15537): additive, value-free busy-path facts. Submission was
