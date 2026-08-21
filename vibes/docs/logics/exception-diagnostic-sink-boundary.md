@@ -60,10 +60,35 @@ typed refusal / blocked reason の体系は**この doc の対象外であり、
 **sink**: `${XDG_STATE_HOME:-~/.local/state}/mozyo-bridge/diagnostics/` 配下の **file**。
 
 - **XDG state を選ぶ理由**: 診断は config でも cache でもなく、再生成できないが設定でもない state である。repo には既に XDG 慣行がある (`shared/paths.py` の `CONFIG_HOME = XDG_CONFIG_HOME or ~/.config`) ので、新しい慣行を発明しない。
-- **guard 対象外であることの根拠**: shared-home guard の対象は `ambient_homes()` が返す `~/.mozyo_bridge` と `$MOZYO_BRIDGE_HOME` の 2 つだけであり (`test_home_fence.py`)、XDG state 配下はそこに含まれない。したがって sink への追記が `tests run` を鳴らすことはない。
+- **guard 対象外であることは「既定値ならそうなる」にすぎない**。下記の resolver で**強制**する。
 - **permission**: directory は `0700`、file は `0600`。作成時に明示的に設定する (umask 依存にしない)。
 - **retention**: 無限成長させない。上限 (件数または総 byte 数) を実装時に固定し、超過分は古い順に破棄する。
 - **file 形式**: 1 record 1 行の追記のみ。読む側が壊れた行を読み飛ばせること (診断が診断の障害で失われないため)。
+
+#### 訂正 — 禁止 surface は列挙ではなく強制する (review j#109680 `finding_xdgforbiddenoverlap`)
+
+本節は当初、guard 対象外である「根拠」として `ambient_homes()` が `~/.mozyo_bridge` と `$MOZYO_BRIDGE_HOME` の 2 つしか返さないことを挙げていた。**これは根拠になっていない。** `XDG_STATE_HOME` は環境入力であり、禁止 surface を指しうる。review が再現した:
+
+```
+MOZYO_BRIDGE_HOME=/tmp/review-15840/guarded
+XDG_STATE_HOME=/tmp/review-15840/guarded
+→ sink = /tmp/review-15840/guarded/mozyo-bridge/diagnostics   ← guarded home の子
+```
+
+決定 3 の初版と**同じ誤りの型**である: 既定ケースの観察を構造的保証として書いていた。禁止 surface を表で列挙しても、resolver がその外にいることを強制しなければ意味がない。
+
+#### resolver 契約 (fail-closed)
+
+sink root を返す resolver は次を満たす。正本実装は
+`e_110_execution_platform/f_150_runtime_observation_event_timeline/domain/diagnostic_sink_location.py`
+の `resolve_diagnostic_sink_root(candidate, *, forbidden_roots)`。
+
+1. **canonicalize する。** 候補 path と全禁止 root を `expanduser()` + `resolve()` で正規化し、**symlink を解決した後**で比較する。文字列比較で判定しない。
+2. **同一または子孫なら拒否する。** 候補が禁止 root のいずれかと等しいか、その配下にあれば拒否。禁止 root は `ambient_homes()` の**全要素**と、対象 repo / worktree root。
+3. **判定できなければ拒否する。** canonicalize が失敗する、禁止 root 集合が空である、候補が絶対 path でない — いずれも拒否。「たぶん外だろう」で書き始めない。
+4. **拒否時は診断を書かない。** 診断のために持ち出し境界を破らない。診断が取れないことは、秘密が漏れることより軽い。
+
+resolver は禁止 root を**引数で受け取る** pure 関数とする。`ambient_homes()` を直接 import しない — runtime の診断機構が CI 検証機構へ依存する層の逆転を避けるため。誰が禁止 root を供給するかは sink 実装 slice の配線事項であり、**供給が漏れれば禁止 root 集合が空になり、契約 3 により拒否される** (fail closed)。
 
 **禁止 surface (明示)**:
 
@@ -139,16 +164,20 @@ field は最小で次の 4 つとする (拡張は本 doc の改訂を伴う):
 
 | field | 内容 | durable record へ |
 | --- | --- | --- |
-| `exception_type` | `type(exc).__name__` | 可 |
+| `exception_kind` | **閉じた語彙のリテラル token**。`sublane_retire_application._DURABLE_FAILURE_KINDS` の値か `unclassified` のみ | 可 |
 | `exception_message` | `str(exc)` | 不可 |
 | `traceback` | formatted traceback | 不可 |
 | `durable_anchor` | `redmine:issue=N:journal=M` 等、既に durable な識別子 | 可 |
+
+> **訂正 (review j#109680 `finding_doccontractdrift`)**: 本表は当初 `exception_type` = `type(exc).__name__` を durable 可としていた。決定 3 が同じ doc の中でそれを禁止しているにもかかわらず、訂正が本表へ伝播していなかった。**normative な field 表は sink 実装 slice が従う契約であり、そこに旧 unsafe な定義が残っていれば、実証済みの漏洩がそのまま再導入される。** `type(exc).__name__` は durable 可の field として**存在しない**。この doc に class 名を durable 可として書き戻すことは、決定 3 への違反である。
 
 ## 決定 5: 書き始める前に決定 2〜4 を確定する
 
 一度書かれた log は、後から方針を変えても**既に書かれたものが残る**。したがって sink の実装より先に本 doc を確定させる。この順序は逆にできない。
 
-本 doc の初版 (#15840) は決定 2〜4 の確定までを扱い、実際の sink 実装と 578 箇所の捕捉は親 US #15839 の後続 slice で行う。#15840 が入れる捕捉は、決定 3 により **sink の完成を待たずに安全な class 名のみ**に限る。
+本 doc の初版 (#15840) は決定 2〜4 の確定までを扱い、実際の sink 実装と 578 箇所の捕捉は親 US #15839 の後続 slice で行う。#15840 が入れる捕捉は、決定 3 により **sink の完成を待たずに、この repo が所有するリテラル token のみ**に限る (`_DURABLE_FAILURE_KINDS` の値か `unclassified`)。
+
+> **訂正 (review j#109680 `finding_doccontractdrift`)**: 本節は当初「安全な class 名のみ」と書いていた。決定 3 の訂正が伝播していなかった。**class 名は安全ではない** — 反例と理由は決定 3 の訂正節を読む。
 
 ## 適用範囲
 

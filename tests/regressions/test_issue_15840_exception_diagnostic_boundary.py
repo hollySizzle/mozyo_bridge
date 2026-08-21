@@ -37,9 +37,11 @@ injected by patching one collaborator to raise.
 from __future__ import annotations
 
 import json
+import os
 import subprocess
 import sys
 import traceback
+import tempfile
 import unittest
 from pathlib import Path
 from unittest import mock
@@ -53,6 +55,14 @@ if _SRC.is_dir() and str(_SRC) not in sys.path:
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
     retire_admissibility,
+)
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.diagnostic_sink_location import (  # noqa: E402,E501
+    SINK_INSIDE_FORBIDDEN_ROOT,
+    SINK_IS_FORBIDDEN_ROOT,
+    SINK_NOT_ABSOLUTE,
+    SINK_NO_CANDIDATE,
+    SINK_NO_FORBIDDEN_ROOTS,
+    resolve_diagnostic_sink_root,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_application import (  # noqa: E402,E501
     _DURABLE_FAILURE_KINDS,
@@ -311,6 +321,95 @@ class TheDeterministicRefusalsAreUntouched(unittest.TestCase):
         self.assertNotIn(REASON_APPLICATION_ERROR, result.reason)
 
 
+class TheSinkRootRefusesEveryForbiddenSurface(unittest.TestCase):
+    """Review j#109680 ``finding_xdgforbiddenoverlap``.
+
+    The design first argued the XDG sink was outside the guarded home because
+    ``ambient_homes()`` returns only two paths. That holds for the DEFAULT ``XDG_STATE_HOME``
+    only — it is environment input, and the review reproduced it pointing straight into a
+    guarded home. Enumerating forbidden surfaces in a table does nothing unless something
+    refuses to resolve into them, so the refusal is pinned here per case.
+    """
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name).resolve()
+        self.guarded = self.root / "guarded_home"
+        self.repo = self.root / "repo"
+        for path in (self.guarded, self.repo):
+            path.mkdir()
+        self.forbidden = (self.guarded, self.repo)
+
+    def _resolve(self, candidate, forbidden=None):
+        return resolve_diagnostic_sink_root(
+            candidate,
+            forbidden_roots=self.forbidden if forbidden is None else forbidden,
+        )
+
+    def test_a_candidate_outside_every_forbidden_root_is_admitted(self):
+        """The control: the rule must not refuse everything."""
+        outside = self.root / "state" / "mozyo-bridge" / "diagnostics"
+        result = self._resolve(outside)
+        self.assertTrue(result.admissible, result.detail)
+        self.assertEqual(result.root, outside.resolve())
+
+    def test_the_guarded_home_itself_is_refused(self):
+        result = self._resolve(self.guarded)
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, SINK_IS_FORBIDDEN_ROOT)
+
+    def test_a_descendant_of_the_guarded_home_is_refused(self):
+        """The exact shape the review reproduced: XDG_STATE_HOME pointed at the guarded home."""
+        result = self._resolve(self.guarded / "mozyo-bridge" / "diagnostics")
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, SINK_INSIDE_FORBIDDEN_ROOT)
+
+    def test_the_repo_root_itself_is_refused(self):
+        result = self._resolve(self.repo)
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, SINK_IS_FORBIDDEN_ROOT)
+
+    def test_a_descendant_of_the_repo_is_refused(self):
+        """Raw diagnostics inside a checkout get committed and shared."""
+        result = self._resolve(self.repo / ".mozyo-bridge" / "diagnostics")
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, SINK_INSIDE_FORBIDDEN_ROOT)
+
+    def test_a_symlink_into_a_forbidden_root_is_refused(self):
+        """String comparison would pass this. Canonicalization is why it does not."""
+        link = self.root / "looks_safe"
+        link.symlink_to(self.guarded, target_is_directory=True)
+        result = self._resolve(link / "diagnostics")
+        self.assertFalse(result.admissible, result.as_payload())
+        self.assertEqual(result.reason, SINK_INSIDE_FORBIDDEN_ROOT)
+
+    def test_an_empty_forbidden_set_refuses_rather_than_admitting_everything(self):
+        """If the wiring is ever forgotten, the failure direction must be refusal."""
+        result = self._resolve(self.root / "state", forbidden=())
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, SINK_NO_FORBIDDEN_ROOTS)
+
+    def test_a_relative_candidate_is_refused(self):
+        result = self._resolve(Path("relative/diagnostics"))
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, SINK_NOT_ABSOLUTE)
+
+    def test_no_candidate_is_refused(self):
+        result = self._resolve(None)
+        self.assertFalse(result.admissible)
+        self.assertEqual(result.reason, SINK_NO_CANDIDATE)
+
+    def test_the_documented_default_lands_outside_a_realistically_placed_home(self):
+        """The default spelling still works — the rule constrains, it does not forbid."""
+        home = self.root / "home"
+        state = home / ".local" / "state" / "mozyo-bridge" / "diagnostics"
+        guarded = home / ".mozyo_bridge"
+        guarded.mkdir(parents=True)
+        result = resolve_diagnostic_sink_root(state, forbidden_roots=(guarded, self.repo))
+        self.assertTrue(result.admissible, result.detail)
+
+
 class TheBoundaryIsWrittenDown(unittest.TestCase):
     """The decision must be readable, not only encoded in one call site (#15840 順序 1)."""
 
@@ -333,6 +432,38 @@ class TheBoundaryIsWrittenDown(unittest.TestCase):
         self.assertIn("retention", text.lower())
         for forbidden_surface in ("repo / worktree", "stderr"):
             self.assertIn(forbidden_surface, text, forbidden_surface)
+        # `finding_xdgforbiddenoverlap`: the location must be enforced, not merely listed.
+        self.assertIn("resolve_diagnostic_sink_root", text)
+        self.assertIn("diagnostic_sink_location.py", text)
+
+    def test_the_normative_field_table_never_re_admits_the_class_name(self):
+        """`finding_doccontractdrift`: Decision 3 forbade the class name while Decision 4's
+        field table still listed it as durable-allowed, and Decision 5 still called it "safe".
+
+        That table is the contract a later sink slice follows, so the stale wording would have
+        reintroduced the leak review j#109671 had already demonstrated. Pinned as a targeted
+        regression so the normative text cannot drift back.
+        """
+        doc = (
+            Path(__file__).resolve().parents[2]
+            / "vibes/docs/logics/exception-diagnostic-sink-boundary.md"
+        )
+        text = doc.read_text(encoding="utf-8")
+        table_rows = [
+            line for line in text.splitlines()
+            if line.startswith("|") and line.rstrip().endswith("| 可 |")
+        ]
+        self.assertTrue(table_rows, "precondition: the field table has durable-allowed rows")
+        for row in table_rows:
+            self.assertNotIn("__name__", row, row)
+        self.assertIn("exception_kind", text)
+        # The superseded phrasing survives only inside the correction note that quotes it.
+        # Anything OUTSIDE a blockquote is normative text and must not carry it.
+        normative = [
+            line for line in text.splitlines() if not line.lstrip().startswith(">")
+        ]
+        for line in normative:
+            self.assertNotIn("安全な class 名のみ", line, line)
 
     def test_the_doc_is_registered_in_the_catalog(self):
         catalog = (
