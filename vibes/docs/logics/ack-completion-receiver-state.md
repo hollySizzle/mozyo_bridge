@@ -177,7 +177,9 @@ idle だけを許す standard `drive_turn_start` を流用しない。
 - `busy` は queue semantics 上、上記の全再確認を通過した追加 Enter を拒む理由ではない。しかし busy snapshot、
   busy baseline、既存 turn と区別できない event は **submission proof ではない**。pre-Enter state が
   `awaiting_input` / `turn_ended`、wait がその Enter より先に arm 済み、working transition が観測済み、
-  launch generation が前後で coherent、という因果関係が揃った場合だけ confirmation に使う。
+  launch generation が前後で coherent、**かつ injected body が current composer から消えている** (submit 証拠)
+  という因果関係が揃った場合だけ confirmation に使う。最後の 1 条件は Redmine #15842 の追加であり、
+  下記 `### 起動 busy と処理 busy は event で区別できない (Redmine #15842)` を正本とする。
 - `blocked` / `unknown` / state read failure、identity または generation の欠落・drift、current composer からの
   body 消失、startup/modal 検出、wait の arm 不能は追加 Enter を拒否する。「不明」は安全な retry の根拠では
   ない。
@@ -191,7 +193,7 @@ idle だけを許す standard `drive_turn_start` を流用しない。
 
 確認結果は queue 専用 `queue_enter_turn_start_observation` と queue delivery-ledger rail に残し、standard
 `turn_start_outcome` へ射影しない。後者へ射影すると queue delivery が別 rail として分類され、recovery 判断が
-変わるためである。idle / turn-ended 系列は causal event と coherent generation が揃った場合だけ、busy 系列は full effect fence 後の composer clear を証拠とした場合だけ (#15537)、`sent` (`ok` / `queue_enter`) / exit 0。wait absent は
+変わるためである。idle / turn-ended 系列は causal event と coherent generation と composer clear が揃った場合だけ (#15842)、busy 系列は full effect fence 後の composer clear を証拠とした場合だけ (#15537)、`sent` (`ok` / `queue_enter`) / exit 0。wait absent は
 `blocked` / `turn_start_absent`、fresh gate が runtime blocked を確認した場合は `blocked` /
 `receiver_blocked`、timeout / error / wait unarmed (idle / turn-ended 系列) / drift / body-screen-state 再確認不成立は `blocked` /
 `turn_start_unconfirmed`、送信 primitive の `TerminalTransportError` は `blocked` / `transport_error` へ写し、
@@ -204,6 +206,39 @@ structured outcome は `transport_failure.primitive=<同 token>` だけを持つ
 binary / repository path、任意 detail は ACK evidence ではなく、durable record や Unit Board に出さない。
 Unit Board の診断は `gateway_status=blocked` / `gateway_reason=transport_error` /
 `transport_primitive=<同 token>` の閉じた public-safe 射影に限る。この診断を completion evidence に昇格しない。
+
+### 起動 busy と処理 busy は event で区別できない (Redmine #15842)
+
+Redmine #15242 の causal gate は「先に arm した working transition なら、その busy 化はこの Enter に帰属
+できる」という前提に立っていた。#15842 j#109739 の実測はこの前提が **fresh に起動した pane では成立しない**
+ことを示した。
+
+- 実測 (#15841 の dispatch 停止、2026-08-21): `sublane create` が Codex gateway pane を起動し、同一操作で
+  IR を dispatch した。Codex TUI が submit-ready になる前に Enter が押され、起動 UI に吸われて marker+body
+  が composer に残った。決定的証拠は `Context 0% used` — 受信側は 1 バイトも処理していない。
+- それでも rail は `submitted_confirmed` を返した。起動直後の pane は banner の裏で `awaiting_input` を
+  返すので idle baseline check を通り、その後の **起動アクティビティ** が armed wait を `changed` にし、
+  generation は当然 coherent だったからである。3 つの gate すべてが、何も submit していない Enter によって
+  満たされた。
+- 結果は silent stall である: dispatcher は ACK で yield し、work は永久に始まらず callback も来ない。
+  検出は owner の pane 目視のみで、停止は 1 時間を超えた。回復は **Enter 1 手**だった。
+
+したがって contract 上の一般則は次のとおりである。
+
+- **busy 性は推論、composer clear は観測**。`busy` へ遷移したという事実は「この送信の turn が始まった」
+  ことを含意しない。provider process が busy になる原因は turn 開始だけではなく、起動・再描画・別 turn の
+  継続も同じ観測を生む。事前に arm していても、observe した遷移の **原因**は event からは決まらない。
+- したがって idle / turn-ended 系列も、busy 系列 (#15537) と同じ **composer clear** を submit 証拠として
+  要求する。両系列で証拠の種類が揃い、「どちらの系列も、送った本文が composer から消えたことを確認して
+  初めて submit を主張する」が単一の規則になる。
+- 「event は出たが body が composer に残る」は単なる未確認ではなく、**swallowed Enter の署名**である。
+  identity / screen / runtime state が健全な限り、ADR-0002 の bounded Enter-only budget はここで使う
+  (本文は再入力しない)。停止は二重送信より害が大きい、という owner 決定がそのまま適用される場面である。
+- 証拠が読めない場合 (pane unreadable / startup screen / identity drift / state not injectable) は
+  confirmation も追加 Enter も行わない。読めなかったことは、どちらの方向の証拠でもない。
+- tmux backend には同型の穴が無い。tmux queue-enter は causal 観測を一切持たないため
+  `turn_start_positively_observed` が常に偽であり、共有 `injection_stage` の carve-out が既にすべての
+  tmux queue-enter `ok` を `uncertain_partial` へ倒している。塞ぐべき観測面は herdr 側だけである。
 
 ### Minimal future runtime event vocabulary
 
@@ -302,7 +337,7 @@ ticket-system signal が増えても、それは layer 3 workflow truth の fres
 
 現行 `mozyo-bridge` の handoff / notify 経路は `tmux capture-pane` を通じた marker observation に依存している。これは現実的な compat layer として正しい選択だが、長期 contract として固定する対象ではない。
 
-- 短期的責務 (現行 tmux runtime に残す): `vibes/docs/logics/tmux-send-safety-contract.md` の `Fail-Closed Conditions` / `Queue-Enter Default Rail` / `### Deterministic Preflight Admission Control` が定める範囲で `wait_for_text` を **observability のため** に呼ぶ。Enter 発行の根拠は strict rail では marker 観測、tmux queue-enter では Layer B preflight 通過と durable anchor 整合。Herdr queue-enter の追加 Enter では、同文書 v0.21 の causal event / identity / generation gate に加えて、last prompt 以降の **current composer tail** に exact marker+body があることだけを retention evidence とする。scrollback 全体の substring は使わない。この current-composer check も retry を止めるための必要条件であって、ACK / completion の正本ではない。
+- 短期的責務 (現行 tmux runtime に残す): `vibes/docs/logics/tmux-send-safety-contract.md` の `Fail-Closed Conditions` / `Queue-Enter Default Rail` / `### Deterministic Preflight Admission Control` が定める範囲で `wait_for_text` を **observability のため** に呼ぶ。Enter 発行の根拠は strict rail では marker 観測、tmux queue-enter では Layer B preflight 通過と durable anchor 整合。Herdr queue-enter の追加 Enter では、同文書 v0.21 の causal event / identity / generation gate に加えて、last prompt 以降の **current composer tail** に exact marker+body があることだけを retention evidence とする。scrollback 全体の substring は使わない。同 v0.23 (#15842) 以降、この current-composer check は retry の必要条件であると同時に、**causal confirmation の必要条件**でもある (body が消えたことが submit 証拠)。ただしどちらの用途でも ACK / completion の正本ではない。
 - 長期方向: rendered text 観測は **fallback** であり、本命は sidecar / control-event ベースの machine-readable signal (`runtime.input.ack` / `runtime.process.exited` / `runtime.output.eof` 等) を、provider normalizer / event classifier 経由で agentd 内 durable event store に正規化する経路。詳細は `mozyo_bridge_pty/vibes/docs/specs/agentd-sidecar-ipc.md`、`mozyo_bridge_pty/vibes/docs/specs/pty-event-normalization.md`、`mozyo_bridge_pty/vibes/docs/specs/event-classifier-module-structure.md`。
 
 「capture-pane を強化する」「marker wrap 補修を入れる」方向の改善は、短期 wrap shape 起因の `marker_timeout` を救うための **compat fix** であって long-term contract の昇格ではない。doctrine 上の long-term direction は「rendered text を観測しなくても良くなる側」であり、それは PTY-first runtime の sidecar / control-event 経路でしか整わない。
@@ -375,9 +410,9 @@ doctrine としての position:
 6. **handoff の durable wording は ACK 層の正本**として書く。completion / processing の含意を持たせない。受領契約は引き続き「receiver は durable anchor を読む」であり、pane の rendered text に依存させない。
 7. **owner approval / review / close を runtime signal で自動化しない**。`runtime.input.ack`、`runtime.output.eof`、`assistant_turn_finished`、ticket webhook のいずれも、Review Gate / owner close approval / Close Gate の代替ではない。
 8. **ticket-system signal は provider 境界に閉じる**。Redmine / Asana の status、journal、approval record を読む場合は ticket provider adapter / governed workflow の layer 3 record として扱い、terminal runtime adapter や sidecar の ACK state に混ぜない。
-9. **Herdr queue-enter の確認不能を外側の自動再送へ読み替えない**。本文が既に composer にある可能性が
-   あるため、idle / turn-ended 系列の causal event + coherent generation と busy 系列 (#15537) の
-   composer clear のどちらの証拠も欠ける結果は precise `blocked` reason / non-zero かつ
+9. **Herdr queue-enter の確認不能を外側の自動再送へ読み替えない**。rail 内部の bounded Enter-only retry (ADR-0002 / #15842 の swallowed-Enter 系列を含む) は本文を再入力しないので本項の対象外である。本文が既に composer にある可能性が
+   あるため、idle / turn-ended 系列の causal event + coherent generation + composer clear (#15842) と
+   busy 系列 (#15537) の composer clear のどちらの証拠も欠ける結果は precise `blocked` reason / non-zero かつ
    injection stage `uncertain_partial` とし、同じ gateway command や本文を再実行しない。busy 系列の
    queued submission は stage `uncertain_partial` のまま非 causal な `sent` / `queue_enter` / exit 0 の
    positive delivery である。rail 内だけは body を再入力せず、

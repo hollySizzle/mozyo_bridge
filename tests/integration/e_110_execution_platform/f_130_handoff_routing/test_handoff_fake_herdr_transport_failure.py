@@ -375,12 +375,18 @@ class FakeHerdrTransportFailureClosesToTypedOutcomeTest(unittest.TestCase):
         self.assertEqual(ops.rollbacks, 0, "no C-u rollback on an uncertain delivery")
 
     def test_herdr_queue_enter_skips_the_tmux_landing_read(self):
-        port = _FakeHerdrPort(fail_on="read_pane")
+        # #15842 gave the rail one pane read AFTER the Enter (the submit proof), so
+        # "no read at all" no longer expresses the claim. The claim is about ordering:
+        # the tmux landing-marker wait would read BEFORE the Enter, and herdr does not.
+        port = _FakeHerdrPort(fail_on="")
         ops = _ops_over_fake_herdr(port)
         rc = TmuxTransportRailUseCase(ops).execute(_request())
         self.assertEqual(rc, 0)
-        self.assertNotIn(("read_pane", _TARGET), port.calls)
         self.assertEqual(ops.enter_presses, 1)
+        kinds = [call[0] for call in port.calls]
+        enter_index = kinds.index("send_keys")
+        self.assertNotIn("read_pane", kinds[:enter_index], msg=str(port.calls))
+        self.assertIn("read_pane", kinds[enter_index:], msg=str(port.calls))
 
     def test_adapter_exception_rather_than_a_reported_failure(self):
         """A primitive that *raises* (not one that reports ``ok=False``) is also contained."""

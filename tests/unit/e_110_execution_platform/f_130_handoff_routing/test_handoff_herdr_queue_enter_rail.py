@@ -347,7 +347,13 @@ class QueueEnterGenerationFenceTest(unittest.TestCase):
 
     def test_generation_is_pinned_before_body_and_stays_stable_through_enter(self) -> None:
         clock = _ManualClock()
-        ops = _FakeOps(clock, wait_kinds=[WAIT_CHANGED])
+        # #15842: a causal confirmation now also requires the composer to have
+        # released the body, so a genuinely landed Enter is declared as such.
+        ops = _FakeOps(
+            clock,
+            wait_kinds=[WAIT_CHANGED],
+            gates=[QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT)],
+        )
         session = _session(ops, clock)
 
         result = _drive(session, ops)
@@ -406,6 +412,7 @@ class QueueEnterGenerationFenceTest(unittest.TestCase):
             clock,
             bindings=[_GENERATION_A, _GENERATION_A_REV8],
             wait_kinds=[WAIT_CHANGED],
+            gates=[QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT)],  # #15842 submit proof
         )
         session = _session(ops, clock)
 
@@ -655,8 +662,13 @@ class QueueEnterCausalLoopTest(unittest.TestCase):
                     wait_kinds=[WAIT_TIMEOUT, WAIT_TIMEOUT, WAIT_CHANGED],
                     collect_advances=[2.0, 2.0, 0.0],
                     gates=[
+                        # Two gate reads per retry (pre-check + effect fence), then
+                        # #15842's submit proof on the confirming changed event.
                         QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
                         QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
+                        QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
+                        QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
+                        QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT),
                     ],
                 )
                 session = _session(ops, clock, policy=policy)
@@ -666,7 +678,7 @@ class QueueEnterCausalLoopTest(unittest.TestCase):
                 self.assertTrue(result.first_enter_sent)
                 self.assertEqual(result.extra_enter_times, (2.0, 4.0))
                 self.assertEqual(session.enter_attempts, 3)
-                self.assertEqual(len(ops.gate_calls), 4)
+                self.assertEqual(len(ops.gate_calls), 5)
                 self.assertEqual(len(ops.arm_calls), 3)
                 self.assertEqual(
                     [timeout for _target, timeout in ops.arm_calls],
@@ -674,14 +686,19 @@ class QueueEnterCausalLoopTest(unittest.TestCase):
                 )
                 self.assertEqual(
                     [call[1:] for call in ops.gate_calls],
-                    [(TEXT, RECEIVER, _GENERATION_A)] * 4,
+                    [(TEXT, RECEIVER, _GENERATION_A)] * 5,
                 )
                 self.assertFalse(hasattr(ops, "inject_body"))
                 self.assertFalse(hasattr(ops, "send_text"))
 
     def test_changed_event_on_idle_generation_is_causal_success(self) -> None:
         clock = _ManualClock()
-        ops = _FakeOps(clock, states=["turn_ended"], wait_kinds=[WAIT_CHANGED])
+        ops = _FakeOps(
+            clock,
+            states=["turn_ended"],
+            wait_kinds=[WAIT_CHANGED],
+            gates=[QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT)],  # #15842 submit proof
+        )
         session = _session(ops, clock)
 
         result = _drive(session, ops)
@@ -737,7 +754,11 @@ class QueueEnterCausalLoopTest(unittest.TestCase):
             states=["busy"],
             wait_kinds=[WAIT_TIMEOUT, WAIT_CHANGED],
             collect_advances=[2.0, 0.0],
-            gates=[QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended")],
+            gates=[
+                QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
+                QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
+                QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT),  # #15842 submit proof
+            ],
         )
         session = _session(ops, clock)
 
@@ -1118,7 +1139,11 @@ class QueueEnterDeadlineTest(unittest.TestCase):
             clock,
             wait_kinds=[WAIT_TIMEOUT, WAIT_CHANGED],
             collect_advances=[0.0, 0.0],
-            gates=[QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended")],
+            gates=[
+                QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
+                QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
+                QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT),  # #15842 submit proof
+            ],
         )
         session = _session(
             ops,
@@ -1411,7 +1436,12 @@ class BusyReceiverQueuedSubmissionTest(unittest.TestCase):
 
     def test_idle_baseline_never_takes_the_busy_path(self) -> None:
         clock = _ManualClock()
-        ops = _FakeOps(clock, states=["turn_ended"], wait_kinds=[WAIT_CHANGED])
+        ops = _FakeOps(
+            clock,
+            states=["turn_ended"],
+            wait_kinds=[WAIT_CHANGED],
+            gates=[QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT)],  # #15842 submit proof
+        )
         session = _session(ops, clock)
 
         result = _drive(session, ops)

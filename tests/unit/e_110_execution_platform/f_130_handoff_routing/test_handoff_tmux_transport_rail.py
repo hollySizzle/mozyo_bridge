@@ -855,13 +855,19 @@ class QueueEnterObservationOnlyWaitTests(unittest.TestCase):
 
     def test_timeout_rechecks_then_stops_after_the_confirming_retry(self) -> None:
         binding = self._binding()
-        ops = _V2FakeOps(
+        ops = _GateSequenceV2FakeOps(
             marker_observed=True,
             queue_enter_snapshot=self._snapshot(),
             wait_kinds=["timeout", "changed"],
             binding=binding,
             runtime_state="turn_ended",
-            resend_gate=QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),
+            resend_gates=[
+                QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),  # retry pre-check
+                QueueEnterResendGate(RESEND_SKIP_NONE, "turn_ended"),  # retry effect fence
+                # #15842: the confirming changed event now also has to prove the
+                # Enter submitted, by the composer having released the body.
+                QueueEnterResendGate(RESEND_SKIP_BODY_ABSENT),
+            ],
         )
         code, died = _run(ops, _request(mode=_MODE_QUEUE_ENTER, herdr_send=True))
         self.assertIsNone(died)
