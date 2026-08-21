@@ -544,6 +544,13 @@ live観測で上書きすると`sublane repair-pins` / owner判断が必要と�
 worktree変更は一切行わない。pairの片側だけを宣言するmode は持たない: declared pinが無いrowには
 「もう片方が何であったか」の記録が無く、半分の観測をpairとして宣言できないためである。
 
+**outcomeは書込みが実際に採用したaction-time observationを報告する** (#15811 review j#109452
+`finding_actiontimeoutcome`)。preflightと書込みは別々にinventoryを観測し (「callerが見たplanは表示であって
+書込みのauthorityではない」というreconciliation-rail規律)、restoreはその2観測の間にもpaneを動かし得る。
+したがって書込み側は自分が導出したplanを戻り値に載せ、成功・action-time拒否のいずれでもoutcomeはそれを
+報告する。preflight planを報告すると、書いたlocatorとも`reattest_lineage`のold->newとも食い違う記録になり、
+本railが要求する監査証拠にならない。
+
 flow:
 
 1. herdr binary を trusted env から解決 (未設定 / 未解決 → fail-closed)。

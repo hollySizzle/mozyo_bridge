@@ -21,12 +21,13 @@ own evidence). Every refusal is zero-write with a typed reason.
 
 from __future__ import annotations
 
-from typing import Optional, Protocol, runtime_checkable
+from typing import Protocol, runtime_checkable
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.restored_pair_adopt import (  # noqa: E501
     RestoredPairAdoptOutcome,
     RestoredPairAdoptPlan,
     RestoredPairAdoptRequest,
+    RestoredPairAdoptWriteResult,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.restored_pair_rebind import (  # noqa: E501
     STATUS_BLOCKED,
@@ -43,8 +44,13 @@ class RestoredPairAdoptOps(Protocol):
 
     def adopt(
         self, request: RestoredPairAdoptRequest
-    ) -> tuple[bool, Optional[int], str]:
-        """Re-observe, re-attest, and declare. Returns ``(applied, revision, detail)``."""
+    ) -> RestoredPairAdoptWriteResult:
+        """Re-observe, re-attest, and declare, returning the ACTION-TIME observation.
+
+        The result carries the plan the write actually derived — not the preflight one —
+        so the outcome can never report a locator / lineage the write did not act on
+        (review j#109452 ``finding_actiontimeoutcome``).
+        """
         ...
 
 
@@ -86,16 +92,19 @@ class SublaneRestoredPairAdoptUseCase:
                 detail="preflight blocked: " + ", ".join(plan.blocked_reasons),
                 journal=request.journal,
             )
-        applied, revision, detail = self._ops.adopt(request)
+        # From here the PREFLIGHT plan is discarded: the write re-derived its own evidence,
+        # and reporting anything else would name a locator / lineage the rail did not act on
+        # (review j#109452 finding_actiontimeoutcome).
+        result = self._ops.adopt(request)
         return RestoredPairAdoptOutcome(
-            issue=plan.issue,
-            lane=plan.lane,
-            status=STATUS_COMPLETED if applied else STATUS_REFUSED,
+            issue=result.plan.issue,
+            lane=result.plan.lane,
+            status=STATUS_COMPLETED if result.applied else STATUS_REFUSED,
             executed=True,
-            plan=plan,
-            applied=applied,
-            revision=revision,
-            detail=detail,
+            plan=result.plan,
+            applied=result.applied,
+            revision=result.revision,
+            detail=result.detail,
             journal=request.journal,
         )
 

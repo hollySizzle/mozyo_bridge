@@ -44,26 +44,19 @@ inventory at the NEW terminal — no real Herdr) and pin:
 
 from __future__ import annotations
 
-import argparse
 import tempfile
 import unittest
 from pathlib import Path
 
 from mozyo_bridge.core.state.herdr_identity_attestation import (
     HerdrIdentityAttestationStore,
-    IdentityAttestationRecord,
     VERDICT_MISSING,
-    VERDICT_PRESENT,
 )
 from mozyo_bridge.core.state.herdr_launch_generation import HerdrLaunchGenerationStore
-from mozyo_bridge.core.state.herdr_native_identity_binding import native_name_for
 from mozyo_bridge.core.state.lane_declaration import LaneDeclarationStore
 from mozyo_bridge.core.state.lane_lifecycle import (
-    BINDING_KIND_ISSUE,
     DISPOSITION_ACTIVE,
     DISPOSITION_HIBERNATED,
-    DecisionPointer,
-    LaneLifecycleKey,
     LaneLifecycleStore,
     ProcessGenerationPin,
 )
@@ -72,15 +65,9 @@ from mozyo_bridge.core.state.lane_pin_role import (
     PIN_PAIR_FOREIGN,
     read_declared_pin_pair,
 )
-from mozyo_bridge.core.state.startup_execution_events import (
-    STAGE_ATTESTATION_WRITE_SUCCEEDED,
-    append_execution_event,
-)
 from mozyo_bridge.core.state.startup_transaction_fence import (
     PHASE_COMPLETED_SUCCESS,
-    Participant,
     StartupTransactionFence,
-    StartupUnit,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_adopt_declaration import (  # noqa: E501
     ADOPT_DECL_OWNER_UNBOUND,
@@ -89,9 +76,6 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_adopt import (  # noqa: E501
     SublaneRestoredPairAdoptUseCase,
-)
-from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_adopt_cli import (  # noqa: E501
-    register_sublane_adopt_restored_pair_parser,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_adopt_live import (  # noqa: E501
     LiveRestoredPairAdoptOps,
@@ -111,178 +95,47 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     REBIND_BLOCK_DECLARED_SLOTS_UNRESOLVED,
     STATUS_BLOCKED,
     STATUS_COMPLETED,
+    STATUS_REFUSED,
     RestoredPairRebindRequest,
 )
 from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_launch_generation_binding import (  # noqa: E501
     verified_terminal_generation_token,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.application.herdr_startup_transaction import (  # noqa: E501
-    pane_bound_receipt,
+
+from tests.support.restored_pair_fixtures import (
+    DECISION,
+    GW_NAME,
+    GW_NEW,
+    GW_OLD,
+    GW_PROVIDER,
+    GW_TERM_NEW,
+    GW_TERM_OLD,
+    ISSUE,
+    JOURNAL,
+    KEY,
+    LANE,
+    REPO_ROOT,
+    TOKEN,
+    WK_NAME,
+    WK_NEW,
+    WK_OLD,
+    WK_PROVIDER,
+    WK_TERM_NEW,
+    WK_TERM_OLD,
+    WS,
+    FakeHostProbes,
+    declare_lane_row,
+    inventory_row,
+    moved_pane_rows,
+    preserved_pane_rows,
+    seed_generation_row,
+    seed_restored_lane_fixture,
+    seed_startup_action,
+    upsert_attestation,
 )
-from mozyo_bridge.e_140_adapter_provider.f_130_terminal_runtime_provider.domain.herdr_identity import (  # noqa: E501
-    encode_assigned_name,
-)
-
-ISSUE = "15811"
-JOURNAL = "109241"
-WS = "ws_main"
-LANE = "issue_15811_lane"
-TOKEN = "wt_issue_15811_token"
-GW_PROVIDER = "codex"
-WK_PROVIDER = "claude"
-GW_NAME = encode_assigned_name(WS, GW_PROVIDER, LANE)
-WK_NAME = encode_assigned_name(WS, WK_PROVIDER, LANE)
-GW_OLD, WK_OLD = "w1:%1", "w1:%2"
-GW_NEW, WK_NEW = "w9:%11", "w9:%12"
-GW_TERM_OLD, WK_TERM_OLD = "term-gw-1", "term-wk-1"
-GW_TERM_NEW, WK_TERM_NEW = "term-gw-2", "term-wk-2"
-KEY = LaneLifecycleKey(WS, LANE)
-DECISION = DecisionPointer(source="redmine", issue_id=ISSUE, journal_id=JOURNAL)
-OBSERVED_AT = "2026-08-20T09:31:00+00:00"
 
 
-def _row(
-    name: str,
-    locator: str,
-    terminal: str,
-    provider: str,
-    *,
-    surfaced_provider: str | None = None,
-    detected_agent: str | None = None,
-) -> dict:
-    """One raw ``agent list`` row. The surfaced provider / detected agent default to the
-    slot's provider and are overridable so a squatting / residue shape can be built."""
-    return {
-        "name": name,
-        "pane_id": locator,
-        "terminal_id": terminal,
-        "provider": provider if surfaced_provider is None else surfaced_provider,
-        "agent": provider if detected_agent is None else detected_agent,
-    }
-
-
-def _preserved_pane_rows() -> list[dict]:
-    """The measured shape: same stamps, same pane ids, NEW terminals."""
-    return [
-        _row(GW_NAME, GW_OLD, GW_TERM_NEW, GW_PROVIDER),
-        _row(WK_NAME, WK_OLD, WK_TERM_NEW, WK_PROVIDER),
-    ]
-
-
-def _moved_pane_rows() -> list[dict]:
-    """The restore also moved the panes: same stamps, NEW locators + terminals."""
-    return [
-        _row(GW_NAME, GW_NEW, GW_TERM_NEW, GW_PROVIDER),
-        _row(WK_NAME, WK_NEW, WK_TERM_NEW, WK_PROVIDER),
-    ]
-
-
-def seed_restored_lane_fixture(home: Path, *, slots=()) -> str:
-    """Build the #15811 shape on REAL stores under ``home`` and return the action token.
-
-    Module level (not a ``TestCase`` method) so the operator-view acceptance suite reuses
-    the identical fixture instead of re-deriving it: an active issue lifecycle row whose
-    ``declared_slots`` is ``slots`` (EMPTY by default — the create-path shape), a completed
-    startup transaction, launch-generation rows and self-attestations all recorded at the
-    PRE-restore locator / terminal.
-    """
-    outcome = LaneDeclarationStore(home=home).declare_lane(
-        KEY,
-        decision=DECISION,
-        binding_kind=BINDING_KIND_ISSUE,
-        issue_id=ISSUE,
-        declared_slots=slots,
-        worktree_identity=TOKEN,
-    )
-    assert outcome.applied, outcome.reason
-    fence = StartupTransactionFence(home=home)
-    action = fence.reserve(
-        StartupUnit(workspace_id=WS, lane_id=LANE, providers=(GW_PROVIDER, WK_PROVIDER)),
-        "nonce-15811",
-    )
-    generations = HerdrLaunchGenerationStore(home=home)
-    attestations = HerdrIdentityAttestationStore(home=home)
-    for provider, name, locator, terminal in (
-        (GW_PROVIDER, GW_NAME, GW_OLD, GW_TERM_OLD),
-        (WK_PROVIDER, WK_NAME, WK_OLD, WK_TERM_OLD),
-    ):
-        fence.record_participant(
-            action.action_id,
-            Participant(
-                role=provider,
-                assigned_name=name,
-                locator=locator,
-                receipt=pane_bound_receipt(
-                    target_workspace="w1",
-                    target_tab="w1:t1",
-                    native_name=native_name_for(name),
-                    terminal_id=terminal,
-                ),
-            ),
-        )
-        assert append_execution_event(
-            fence, action.action_id, STAGE_ATTESTATION_WRITE_SUCCEEDED, participant=name
-        )
-        generations.reserve_pending(
-            assigned_name=name,
-            startup_action_id=action.action_id,
-            workspace_id=WS,
-            role=provider,
-            lane_id=LANE,
-        )
-        generations.finalize(
-            assigned_name=name,
-            startup_action_id=action.action_id,
-            workspace_id=WS,
-            role=provider,
-            lane_id=LANE,
-            locator=locator,
-            terminal_id=terminal,
-            verdict=VERDICT_PRESENT,
-            observed_at=OBSERVED_AT,
-        )
-        attestations.upsert(
-            IdentityAttestationRecord(
-                assigned_name=name,
-                workspace_id=WS,
-                role=provider,
-                lane_id=LANE,
-                locator=locator,
-                verdict=VERDICT_PRESENT,
-                observed_at=OBSERVED_AT,
-                terminal_id=terminal,
-            )
-        )
-    fence.set_phase(action.action_id, PHASE_COMPLETED_SUCCESS)
-    return action.action_id
-
-
-class _FakeHostProbes:
-    """Host-probe seams faked; every store join stays real against the temp home."""
-
-    def _resolve_root(self):
-        return self.repo_root
-
-    def _workspace_id(self, root):
-        return self.test_workspace
-
-    def _worktree_identity(self, root, lane):
-        return self.test_token
-
-    def _worktree_readable(self, root):
-        return True
-
-    def _branch(self, root):
-        return self.test_branch
-
-    def _providers(self, root):
-        return self.test_providers
-
-    def _rows(self):
-        return list(self.test_rows)
-
-
-class _AdoptOps(_FakeHostProbes, LiveRestoredPairAdoptOps):
+class _AdoptOps(FakeHostProbes, LiveRestoredPairAdoptOps):
     def __init__(
         self,
         home: Path,
@@ -294,7 +147,7 @@ class _AdoptOps(_FakeHostProbes, LiveRestoredPairAdoptOps):
         branch: str = LANE,
     ):
         super().__init__(
-            repo_root=Path("/lane/issue_15811"),
+            repo_root=REPO_ROOT,
             env={},
             lifecycle_home=home,
             attestation_home=home,
@@ -306,10 +159,29 @@ class _AdoptOps(_FakeHostProbes, LiveRestoredPairAdoptOps):
         self.test_branch = branch
 
 
-class _RebindOps(_FakeHostProbes, LiveRestoredPairRebindOps):
+class _DriftingInventoryAdoptOps(_AdoptOps):
+    """The live panes move between the preflight observation and the write's own one.
+
+    The reproduction shape for review j#109452 ``finding_actiontimeoutcome``: read 1 (the
+    preflight) sees the panes preserved, every later read (the write re-deriving its
+    evidence) sees them moved. Both observations are legitimate — this is exactly what a
+    restore looks like mid-command — so the rail must ACT on and REPORT the second one.
+    """
+
+    def __init__(self, home: Path, *, later_rows=None):
+        super().__init__(home, preserved_pane_rows())
+        self.reads = 0
+        self.later_rows = moved_pane_rows() if later_rows is None else list(later_rows)
+
+    def _rows(self):
+        self.reads += 1
+        return preserved_pane_rows() if self.reads == 1 else list(self.later_rows)
+
+
+class _RebindOps(FakeHostProbes, LiveRestoredPairRebindOps):
     def __init__(self, home: Path, rows):
         super().__init__(
-            repo_root=Path("/lane/issue_15811"),
+            repo_root=REPO_ROOT,
             env={},
             lifecycle_home=home,
             attestation_home=home,
@@ -327,109 +199,21 @@ class _Base(unittest.TestCase):
         self.addCleanup(tmp.cleanup)
         self.home = Path(tmp.name)
 
-    # -- fixture: the launch-time truth, with the row's pins NEVER declared ----
+    # -- fixture: delegated to tests/support/restored_pair_fixtures.py -------
+    # (the shared, non-test fixture module two test buckets import; review j#109452
+    # finding_sharedtestsupport). Only the per-test VARIATIONS are named here.
 
     def declare(self, *, slots=()):
-        outcome = LaneDeclarationStore(home=self.home).declare_lane(
-            KEY,
-            decision=DECISION,
-            binding_kind=BINDING_KIND_ISSUE,
-            issue_id=ISSUE,
-            declared_slots=slots,
-            worktree_identity=TOKEN,
-        )
-        self.assertTrue(outcome.applied, outcome.reason)
+        declare_lane_row(self.home, slots=slots)
 
     def seed_action(self, *, phase: str = PHASE_COMPLETED_SUCCESS) -> str:
-        fence = StartupTransactionFence(home=self.home)
-        action = fence.reserve(
-            StartupUnit(
-                workspace_id=WS, lane_id=LANE, providers=(GW_PROVIDER, WK_PROVIDER)
-            ),
-            "nonce-15811",
-        )
-        for provider, name, locator, terminal in (
-            (GW_PROVIDER, GW_NAME, GW_OLD, GW_TERM_OLD),
-            (WK_PROVIDER, WK_NAME, WK_OLD, WK_TERM_OLD),
-        ):
-            fence.record_participant(
-                action.action_id,
-                Participant(
-                    role=provider,
-                    assigned_name=name,
-                    locator=locator,
-                    receipt=pane_bound_receipt(
-                        target_workspace="w1",
-                        target_tab="w1:t1",
-                        native_name=native_name_for(name),
-                        terminal_id=terminal,
-                    ),
-                ),
-            )
-            assert append_execution_event(
-                fence,
-                action.action_id,
-                STAGE_ATTESTATION_WRITE_SUCCEEDED,
-                participant=name,
-            )
-        fence.set_phase(action.action_id, phase)
-        return action.action_id
+        return seed_startup_action(self.home, phase=phase)
 
-    def seed_generation(
-        self,
-        token: str,
-        *,
-        name: str,
-        provider: str,
-        locator: str,
-        terminal: str,
-        lane: str = LANE,
-        finalize: bool = True,
-    ) -> None:
-        store = HerdrLaunchGenerationStore(home=self.home)
-        store.reserve_pending(
-            assigned_name=name,
-            startup_action_id=token,
-            workspace_id=WS,
-            role=provider,
-            lane_id=lane,
-        )
-        if not finalize:
-            return
-        store.finalize(
-            assigned_name=name,
-            startup_action_id=token,
-            workspace_id=WS,
-            role=provider,
-            lane_id=lane,
-            locator=locator,
-            terminal_id=terminal,
-            verdict=VERDICT_PRESENT,
-            observed_at=OBSERVED_AT,
-        )
+    def seed_generation(self, token: str, **kwargs) -> None:
+        seed_generation_row(self.home, token, **kwargs)
 
-    def attest(
-        self,
-        name: str,
-        provider: str,
-        locator: str,
-        terminal: str,
-        *,
-        workspace: str = WS,
-        verdict: str = VERDICT_PRESENT,
-    ) -> None:
-        HerdrIdentityAttestationStore(home=self.home).upsert(
-            IdentityAttestationRecord(
-                assigned_name=name,
-                workspace_id=workspace,
-                role=provider,
-                lane_id=LANE,
-                locator=locator,
-                verdict=verdict,
-                observed_at=OBSERVED_AT,
-                terminal_id=terminal,
-            )
-        )
+    def attest(self, *args, **kwargs) -> None:
+        upsert_attestation(self.home, *args, **kwargs)
 
     def seed_unpinned_restored_lane(self, *, slots=()) -> str:
         """The full #15811 shape: launch-time stores at OLD values, row pins ABSENT."""
@@ -517,7 +301,7 @@ class PreFixFourRailRefusal(_Base):
     def test_rebind_rail_has_no_old_pair_to_replace(self):
         self.seed_unpinned_restored_lane()
         outcome = SublaneRestoredPairRebindUseCase(
-            _RebindOps(self.home, _preserved_pane_rows())
+            _RebindOps(self.home, preserved_pane_rows())
         ).run(
             RestoredPairRebindRequest(issue=ISSUE, lane=LANE, journal=JOURNAL),
             execute=True,
@@ -538,7 +322,7 @@ class PreFixFourRailRefusal(_Base):
             workspace_id=WS,
             lane_id=LANE,
             providers=(GW_PROVIDER, WK_PROVIDER),
-            rows=_preserved_pane_rows(),
+            rows=preserved_pane_rows(),
             attestation_home=self.home,
             store_factory=lambda: LaneDeclarationStore(home=self.home),
         )
@@ -570,7 +354,7 @@ class RailRecoversThePair(_Base):
     def test_preflight_is_read_only_and_reports_the_reattest(self):
         self.seed_unpinned_restored_lane()
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _preserved_pane_rows()), execute=False
+            _AdoptOps(self.home, preserved_pane_rows()), execute=False
         )
         self.assertTrue(outcome.plan.may_adopt, outcome.plan.blocked_reasons)
         self.assertFalse(outcome.executed)
@@ -582,7 +366,7 @@ class RailRecoversThePair(_Base):
     def test_execute_declares_the_pair_and_the_unchanged_verifier_passes(self):
         token = self.seed_unpinned_restored_lane()
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _preserved_pane_rows()), execute=True
+            _AdoptOps(self.home, preserved_pane_rows()), execute=True
         )
         self.assertEqual(outcome.status, STATUS_COMPLETED, outcome.detail)
         self.assertTrue(outcome.applied)
@@ -620,7 +404,7 @@ class RailRecoversThePair(_Base):
     def test_moved_pane_shape_pins_the_live_locators_and_repins_the_participant(self):
         token = self.seed_unpinned_restored_lane()
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _moved_pane_rows()), execute=True
+            _AdoptOps(self.home, moved_pane_rows()), execute=True
         )
         self.assertEqual(outcome.status, STATUS_COMPLETED, outcome.detail)
         pair = read_declared_pin_pair(self.record())
@@ -636,7 +420,7 @@ class RailRecoversThePair(_Base):
     def test_lineage_records_the_old_to_new_terminal_and_carries_no_receipt_bytes(self):
         token = self.seed_unpinned_restored_lane()
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _preserved_pane_rows()), execute=True
+            _AdoptOps(self.home, preserved_pane_rows()), execute=True
         )
         lineage = {e["slot_role"]: e for e in outcome.plan.reattest_lineage}
         gateway = lineage["gateway"]
@@ -646,6 +430,71 @@ class RailRecoversThePair(_Base):
         self.assertIn("attested_generation_row_required", gateway["evidence"])
         self.assertIn("attestation_restore_stale_present", gateway["evidence"])
         self.assertNotIn("pane_bound", str(outcome.as_payload()))
+
+    def test_the_outcome_reports_the_plan_the_write_acted_on_not_the_preflight_one(self):
+        # Review j#109452 finding_actiontimeoutcome. `run(execute=True)` observes twice: the
+        # preflight, then the write's OWN re-derivation (the reconciliation-rail discipline
+        # — the plan a caller saw is display, never the write's authority). A restore can
+        # move a pane between those two reads, and the pre-fix code reported the FIRST
+        # observation on success: a completed run named locator w1:%1 while the pins it
+        # wrote — and the reattest_lineage this issue requires as durable old->new audit
+        # evidence — were w9:%11. An outcome that names a locator the rail did not act on
+        # is not an audit record.
+        seed_restored_lane_fixture(self.home)
+        ops = _DriftingInventoryAdoptOps(self.home)
+        outcome = self.run_adopt(ops, execute=True)
+
+        self.assertEqual(outcome.status, STATUS_COMPLETED, outcome.detail)
+        self.assertTrue(outcome.applied)
+        self.assertEqual(ops.reads, 2, "the write must re-observe, not reuse the plan")
+
+        # Every durable authority the write touched agrees on the LIVE values...
+        pair = read_declared_pin_pair(self.record())
+        self.assertEqual((pair.gateway.locator, pair.worker.locator), (GW_NEW, WK_NEW))
+        for name, locator, terminal in (
+            (GW_NAME, GW_NEW, GW_TERM_NEW),
+            (WK_NAME, WK_NEW, WK_TERM_NEW),
+        ):
+            generation = self.generation(name)
+            self.assertEqual((generation.locator, generation.terminal_id),
+                             (locator, terminal))
+            attestation = HerdrIdentityAttestationStore(home=self.home).read(name)
+            self.assertEqual((attestation.locator, attestation.terminal_id),
+                             (locator, terminal))
+        action = StartupTransactionFence(home=self.home).read(
+            outcome.plan.reattest_lineage[0]["startup_action_id"]
+        )
+        self.assertEqual(action.participant_for(GW_PROVIDER).locator, GW_NEW)
+        self.assertEqual(action.participant_for(WK_PROVIDER).locator, WK_NEW)
+
+        # ...and so does the REPORTED plan, including the lineage payload.
+        self.assertEqual(outcome.plan.gateway.live_locator, GW_NEW)
+        self.assertEqual(outcome.plan.worker.live_locator, WK_NEW)
+        lineage = {e["slot_role"]: e for e in outcome.plan.reattest_lineage}
+        self.assertEqual(lineage["gateway"]["new_locator"], GW_NEW)
+        self.assertEqual(lineage["worker"]["new_locator"], WK_NEW)
+        self.assertTrue(lineage["gateway"]["participant_locator_repin"])
+
+    def test_an_action_time_block_reports_the_action_time_plan(self):
+        # The same rule on the refusal side: when the preflight passes but the write's own
+        # re-observation refuses, the reported reasons must be the ones the write saw.
+        seed_restored_lane_fixture(self.home)
+        ops = _DriftingInventoryAdoptOps(
+            self.home,
+            later_rows=preserved_pane_rows()
+            + [inventory_row(GW_NAME, "w9:%99", "term-gw-dup", GW_PROVIDER)],
+        )
+        outcome = self.run_adopt(ops, execute=True)
+        # `refused`, not `blocked`: the write DID run and made its own decision (blocked is
+        # reserved for the caller-side refusal that never reaches the ops adapter). Either
+        # way the exit-code contract is a failure.
+        self.assertEqual(outcome.status, STATUS_REFUSED)
+        self.assertTrue(outcome.is_blocked)
+        self.assertIn(
+            "duplicate_live_candidates:gateway", ",".join(outcome.plan.blocked_reasons)
+        )
+        self.assertIn("action-time preflight blocked", outcome.detail)
+        self.assert_zero_write()
 
     def test_a_retry_after_a_partial_reattest_failure_completes_the_declaration(self):
         # The write order is retry-safe by construction (#15769): if the worker slot's
@@ -660,7 +509,7 @@ class RailRecoversThePair(_Base):
         )
 
         self.seed_unpinned_restored_lane()
-        ops = _AdoptOps(self.home, _preserved_pane_rows())
+        ops = _AdoptOps(self.home, preserved_pane_rows())
         real = _Store.reattest_restored_terminal
 
         def worker_explodes(store, **kwargs):
@@ -685,7 +534,7 @@ class RailRecoversThePair(_Base):
 
     def test_second_run_is_a_typed_refusal_not_a_second_write(self):
         self.seed_unpinned_restored_lane()
-        ops = _AdoptOps(self.home, _preserved_pane_rows())
+        ops = _AdoptOps(self.home, preserved_pane_rows())
         first = self.run_adopt(ops, execute=True)
         self.assertTrue(first.applied)
         revision = self.record().revision
@@ -717,7 +566,7 @@ class NonEmptySnapshotIsNeverOverwritten(_Base):
         self.seed_unpinned_restored_lane(slots=pins)
         encoded = self.record().declared_slots
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _preserved_pane_rows()), execute=True
+            _AdoptOps(self.home, preserved_pane_rows()), execute=True
         )
         self.assertEqual(outcome.status, STATUS_BLOCKED)
         self.assertIn(
@@ -744,7 +593,7 @@ class NonEmptySnapshotIsNeverOverwritten(_Base):
         encoded = self.record().declared_slots
         self.assertEqual(read_declared_pin_pair(self.record()).reason, PIN_PAIR_FOREIGN)
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _preserved_pane_rows()), execute=True
+            _AdoptOps(self.home, preserved_pane_rows()), execute=True
         )
         self.assertEqual(outcome.status, STATUS_BLOCKED)
         self.assertIn(
@@ -771,7 +620,7 @@ class ForeignAndUnprovableSlotsAreZeroWrite(_Base):
         self.attest(GW_NAME, GW_PROVIDER, GW_OLD, GW_TERM_OLD)
         self.attest(WK_NAME, WK_PROVIDER, WK_OLD, WK_TERM_OLD)
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _preserved_pane_rows()), execute=True
+            _AdoptOps(self.home, preserved_pane_rows()), execute=True
         )
         self.assertEqual(outcome.status, STATUS_BLOCKED)
         self.assertIn(
@@ -796,7 +645,7 @@ class ForeignAndUnprovableSlotsAreZeroWrite(_Base):
         self.attest(GW_NAME, GW_PROVIDER, GW_OLD, GW_TERM_OLD)
         self.attest(WK_NAME, WK_PROVIDER, WK_OLD, WK_TERM_OLD)
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _preserved_pane_rows()), execute=True
+            _AdoptOps(self.home, preserved_pane_rows()), execute=True
         )
         self.assertEqual(outcome.status, STATUS_BLOCKED)
         self.assertIn(
@@ -807,8 +656,8 @@ class ForeignAndUnprovableSlotsAreZeroWrite(_Base):
 
     def test_a_duplicate_live_name_is_never_guessed_past(self):
         self.seed_unpinned_restored_lane()
-        rows = _preserved_pane_rows() + [
-            _row(GW_NAME, "w9:%99", "term-gw-dup", GW_PROVIDER)
+        rows = preserved_pane_rows() + [
+            inventory_row(GW_NAME, "w9:%99", "term-gw-dup", GW_PROVIDER)
         ]
         outcome = self.run_adopt(_AdoptOps(self.home, rows), execute=True)
         self.assertEqual(outcome.status, STATUS_BLOCKED)
@@ -821,7 +670,7 @@ class ForeignAndUnprovableSlotsAreZeroWrite(_Base):
         self.seed_unpinned_restored_lane()
         self.attest(GW_NAME, GW_PROVIDER, GW_OLD, GW_TERM_OLD, workspace="ws_other")
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _preserved_pane_rows()), execute=True
+            _AdoptOps(self.home, preserved_pane_rows()), execute=True
         )
         self.assertEqual(outcome.status, STATUS_BLOCKED)
         self.assertIn(
@@ -836,7 +685,7 @@ class ForeignAndUnprovableSlotsAreZeroWrite(_Base):
             GW_NAME, GW_PROVIDER, GW_OLD, GW_TERM_OLD, verdict=VERDICT_MISSING
         )
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _preserved_pane_rows()), execute=True
+            _AdoptOps(self.home, preserved_pane_rows()), execute=True
         )
         self.assertEqual(outcome.status, STATUS_BLOCKED)
         self.assertIn(
@@ -847,11 +696,11 @@ class ForeignAndUnprovableSlotsAreZeroWrite(_Base):
     def test_a_shell_residue_is_never_a_slot(self):
         self.seed_unpinned_restored_lane()
         rows = [
-            _row(
+            inventory_row(
                 GW_NAME, GW_OLD, GW_TERM_NEW, GW_PROVIDER,
                 surfaced_provider="", detected_agent="",
             ),
-            _row(WK_NAME, WK_OLD, WK_TERM_NEW, WK_PROVIDER),
+            inventory_row(WK_NAME, WK_OLD, WK_TERM_NEW, WK_PROVIDER),
         ]
         outcome = self.run_adopt(_AdoptOps(self.home, rows), execute=True)
         self.assertEqual(outcome.status, STATUS_BLOCKED)
@@ -863,11 +712,11 @@ class ForeignAndUnprovableSlotsAreZeroWrite(_Base):
     def test_a_foreign_provider_squatting_on_the_name_is_refused(self):
         self.seed_unpinned_restored_lane()
         rows = [
-            _row(
+            inventory_row(
                 GW_NAME, GW_OLD, GW_TERM_NEW, GW_PROVIDER,
                 surfaced_provider="intruder",
             ),
-            _row(WK_NAME, WK_OLD, WK_TERM_NEW, WK_PROVIDER),
+            inventory_row(WK_NAME, WK_OLD, WK_TERM_NEW, WK_PROVIDER),
         ]
         outcome = self.run_adopt(_AdoptOps(self.home, rows), execute=True)
         self.assertEqual(outcome.status, STATUS_BLOCKED)
@@ -893,7 +742,7 @@ class ForeignAndUnprovableSlotsAreZeroWrite(_Base):
         self.attest(GW_NAME, GW_PROVIDER, GW_OLD, GW_TERM_OLD)
         self.attest(WK_NAME, WK_PROVIDER, WK_OLD, WK_TERM_OLD)
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _moved_pane_rows()), execute=True
+            _AdoptOps(self.home, moved_pane_rows()), execute=True
         )
         self.assertEqual(outcome.status, STATUS_BLOCKED)
         self.assertIn(
@@ -906,7 +755,7 @@ class ForeignAndUnprovableSlotsAreZeroWrite(_Base):
         # There is no single-slot mode: with no declared pin the row holds no record of
         # what the other half was, so half an observation cannot become a pair.
         self.seed_unpinned_restored_lane()
-        rows = [_row(GW_NAME, GW_OLD, GW_TERM_NEW, GW_PROVIDER)]
+        rows = [inventory_row(GW_NAME, GW_OLD, GW_TERM_NEW, GW_PROVIDER)]
         outcome = self.run_adopt(_AdoptOps(self.home, rows), execute=True)
         self.assertEqual(outcome.status, STATUS_BLOCKED)
         self.assertIn(
@@ -929,7 +778,7 @@ class LaneLevelGatesStayFailClosed(_Base):
         )
         self.assertTrue(moved.applied, moved.reason)
         outcome = self.run_adopt(
-            _AdoptOps(self.home, _preserved_pane_rows()), execute=True
+            _AdoptOps(self.home, preserved_pane_rows()), execute=True
         )
         self.assertEqual(outcome.status, STATUS_BLOCKED)
         self.assertIn("lane_not_active", outcome.plan.blocked_reasons)
@@ -937,7 +786,7 @@ class LaneLevelGatesStayFailClosed(_Base):
     def test_a_different_issue_is_refused(self):
         self.seed_unpinned_restored_lane()
         outcome = SublaneRestoredPairAdoptUseCase(
-            _AdoptOps(self.home, _preserved_pane_rows())
+            _AdoptOps(self.home, preserved_pane_rows())
         ).run(
             RestoredPairAdoptRequest(issue="99999", lane=LANE, journal=JOURNAL),
             execute=True,
@@ -949,7 +798,7 @@ class LaneLevelGatesStayFailClosed(_Base):
     def test_a_drifted_worktree_identity_is_refused(self):
         self.seed_unpinned_restored_lane()
         ops = _AdoptOps(
-            self.home, _preserved_pane_rows(), token="wt_some_other_lane_token"
+            self.home, preserved_pane_rows(), token="wt_some_other_lane_token"
         )
         outcome = self.run_adopt(ops, execute=True)
         self.assertEqual(outcome.status, STATUS_BLOCKED)
@@ -958,7 +807,7 @@ class LaneLevelGatesStayFailClosed(_Base):
 
     def test_a_drifted_branch_is_refused(self):
         self.seed_unpinned_restored_lane()
-        ops = _AdoptOps(self.home, _preserved_pane_rows(), branch="some_other_branch")
+        ops = _AdoptOps(self.home, preserved_pane_rows(), branch="some_other_branch")
         outcome = self.run_adopt(ops, execute=True)
         self.assertEqual(outcome.status, STATUS_BLOCKED)
         self.assertIn("branch_drifted", outcome.plan.blocked_reasons)
@@ -966,7 +815,7 @@ class LaneLevelGatesStayFailClosed(_Base):
 
     def test_an_unresolved_provider_is_refused(self):
         self.seed_unpinned_restored_lane()
-        ops = _AdoptOps(self.home, _preserved_pane_rows(), providers=("", ""))
+        ops = _AdoptOps(self.home, preserved_pane_rows(), providers=("", ""))
         outcome = self.run_adopt(ops, execute=True)
         self.assertEqual(outcome.status, STATUS_BLOCKED)
         self.assertIn("provider_unresolved", outcome.plan.blocked_reasons)
@@ -989,7 +838,7 @@ class ExistingRebindRailUnchanged(_Base):
         )
         self.seed_unpinned_restored_lane(slots=pins)
         outcome = SublaneRestoredPairRebindUseCase(
-            _RebindOps(self.home, _moved_pane_rows())
+            _RebindOps(self.home, moved_pane_rows())
         ).run(
             RestoredPairRebindRequest(issue=ISSUE, lane=LANE, journal=JOURNAL),
             execute=True,
@@ -998,48 +847,6 @@ class ExistingRebindRailUnchanged(_Base):
         pair = read_declared_pin_pair(self.record())
         self.assertEqual(pair.gateway.locator, GW_NEW)
         self.assertEqual(pair.worker.locator, WK_NEW)
-
-
-class CliContract(unittest.TestCase):
-    def test_parser_registers_the_rail_with_execute_off_by_default(self):
-        parser = argparse.ArgumentParser()
-        sub = parser.add_subparsers(dest="sublane_command")
-        register_sublane_adopt_restored_pair_parser(sub)
-        args = parser.parse_args(
-            ["adopt-restored-pair", "--issue", ISSUE, "--lane", LANE]
-        )
-        self.assertFalse(args.execute)
-        self.assertFalse(args.json)
-        args = parser.parse_args(
-            [
-                "adopt-restored-pair", "--issue", ISSUE, "--lane", LANE,
-                "--journal", JOURNAL, "--execute", "--json",
-            ]
-        )
-        self.assertTrue(args.execute)
-        self.assertTrue(args.json)
-        self.assertEqual(args.journal, JOURNAL)
-
-    def test_the_rail_is_registered_on_the_sublane_group(self):
-        from mozyo_bridge.application.cli_common import add_repo_option
-        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_sublane_group import (  # noqa: E501
-            register_sublane_group,
-        )
-
-        parser = argparse.ArgumentParser()
-        sub = parser.add_subparsers(dest="command")
-        register_sublane_group(
-            sub,
-            add_repo_option=add_repo_option,
-            add_lifecycle_json=lambda p: p.add_argument(
-                "--lifecycle-json", action="store_true"
-            ),
-        )
-        args = parser.parse_args(
-            ["sublane", "adopt-restored-pair", "--issue", ISSUE, "--lane", LANE]
-        )
-        self.assertEqual(args.sublane_command, "adopt-restored-pair")
-        self.assertFalse(args.execute)
 
 
 if __name__ == "__main__":

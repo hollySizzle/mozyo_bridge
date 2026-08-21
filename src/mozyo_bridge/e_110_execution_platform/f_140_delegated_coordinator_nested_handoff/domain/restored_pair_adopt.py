@@ -193,6 +193,29 @@ class RestoredPairAdoptPlan:
 
 
 @dataclass(frozen=True)
+class RestoredPairAdoptWriteResult:
+    """What the WRITE half did, carrying the observation it actually acted on (#15811).
+
+    The write re-derives its own evidence at action time (the reconciliation-rail
+    discipline: the plan a caller saw during preflight is display, never the write's
+    authority). Two observations of a live inventory can legitimately differ — a restore can
+    move a pane between them — so the write must hand its OWN plan back rather than let the
+    outcome report the preflight one. Review j#109452 ``finding_actiontimeoutcome``
+    reproduced the divergence: a completed run reported ``w1:%1`` while the pins it wrote,
+    and the ``reattest_lineage`` this issue requires as durable old->new audit evidence,
+    were ``w9:%11``.
+
+    ``plan`` is therefore the action-time observation for EVERY outcome the write produces —
+    an applied CAS, a refused CAS, a re-attest failure, and an action-time preflight block.
+    """
+
+    applied: bool
+    revision: Optional[int]
+    detail: str
+    plan: "RestoredPairAdoptPlan"
+
+
+@dataclass(frozen=True)
 class RestoredPairAdoptOutcome:
     """The command result. ``applied`` is True only for a completed declaration write."""
 
@@ -251,5 +274,6 @@ __all__ = (
     "RestoredPairAdoptOutcome",
     "RestoredPairAdoptPlan",
     "RestoredPairAdoptRequest",
+    "RestoredPairAdoptWriteResult",
     "slot_reason",
 )

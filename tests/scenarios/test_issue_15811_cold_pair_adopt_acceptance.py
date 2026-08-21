@@ -16,6 +16,11 @@ home, so nothing here launches a process, sends a notification or touches a work
 
 Scenarios pinned:
 
+- the command surface itself: the rail is reachable as ``sublane adopt-restored-pair`` off
+  the composed group, and ``--execute`` / ``--json`` are off by default (a write must be
+  asked for). These are public-contract assertions, which is why they live here and not in
+  the issue's regression file (`tests-placement-discovery-policy.md` R3-b; review j#109452
+  ``finding_sharedtestsupport``);
 - the read-only preflight on a recoverable lane exits 0 and reports ``may_adopt: True``;
 - ``--execute`` exits 0, reports the declaration, and the second run exits 1 with the typed
   ``declared_pins_present`` refusal rather than writing again;
@@ -40,77 +45,99 @@ from unittest import mock
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.application.cli_common import add_repo_option  # noqa: E402
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
     sublane_restored_pair_adopt_cli as cli,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_sublane_group import (  # noqa: E402,E501
+    register_sublane_group,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_restored_pair_adopt_live import (  # noqa: E402,E501
     LiveRestoredPairAdoptOps,
 )
 
-from tests.regressions.test_issue_15811_cold_pair_recovery import (  # noqa: E402
+from tests.support.restored_pair_fixtures import (  # noqa: E402
     GW_NAME,
-    GW_OLD,
     GW_PROVIDER,
-    GW_TERM_NEW,
     ISSUE,
     JOURNAL,
     LANE,
+    REPO_ROOT,
     TOKEN,
     WK_NAME,
-    WK_OLD,
     WK_PROVIDER,
-    WK_TERM_NEW,
     WS,
-    _row,
+    FakeHostProbes,
+    inventory_row,
+    preserved_pane_rows,
     seed_restored_lane_fixture,
 )
 
-#: A host-local path that must never appear in operator output.
-HOST_WORKTREE = "/home/operator/private/worktrees/issue_15811"
-
-
-def _live_rows() -> list[dict]:
-    """The restored fleet: same server-owned stamps, NEW terminal ids."""
-    return [
-        _row(GW_NAME, GW_OLD, GW_TERM_NEW, GW_PROVIDER),
-        _row(WK_NAME, WK_OLD, WK_TERM_NEW, WK_PROVIDER),
-    ]
+#: The faked host repo root — a host-local path that must never reach operator output.
+HOST_WORKTREE = str(REPO_ROOT)
 
 
 def _ops_factory(home: Path, rows):
     """A ``LiveRestoredPairAdoptOps`` bound to ``home`` with the host probes faked."""
 
-    class _Ops(LiveRestoredPairAdoptOps):
-        def _resolve_root(self):
-            return Path(HOST_WORKTREE)
-
-        def _workspace_id(self, root):
-            return WS
-
-        def _worktree_identity(self, root, lane):
-            return TOKEN
-
-        def _worktree_readable(self, root):
-            return True
-
-        def _branch(self, root):
-            return LANE
-
-        def _providers(self, root):
-            return (GW_PROVIDER, WK_PROVIDER)
-
-        def _rows(self):
-            return list(rows)
+    class _Ops(FakeHostProbes, LiveRestoredPairAdoptOps):
+        pass
 
     def factory(*, repo_root):
-        return _Ops(
+        ops = _Ops(
             repo_root=Path(repo_root),
             env={},
             lifecycle_home=home,
             attestation_home=home,
         )
+        ops.repo_root = REPO_ROOT
+        ops.test_workspace = WS
+        ops.test_token = TOKEN
+        ops.test_branch = LANE
+        ops.test_providers = (GW_PROVIDER, WK_PROVIDER)
+        ops.test_rows = list(rows)
+        return ops
 
     return factory
+
+
+class CommandSurface(unittest.TestCase):
+    """The operator's entry point exists and defaults to doing nothing."""
+
+    def test_the_rail_is_reachable_off_the_composed_sublane_group(self):
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="command")
+        register_sublane_group(
+            sub,
+            add_repo_option=add_repo_option,
+            add_lifecycle_json=lambda p: p.add_argument(
+                "--lifecycle-json", action="store_true"
+            ),
+        )
+        args = parser.parse_args(
+            ["sublane", "adopt-restored-pair", "--issue", ISSUE, "--lane", LANE]
+        )
+        self.assertEqual(args.sublane_command, "adopt-restored-pair")
+        self.assertFalse(args.execute)
+
+    def test_execute_and_json_are_off_unless_asked_for(self):
+        parser = argparse.ArgumentParser()
+        sub = parser.add_subparsers(dest="sublane_command")
+        cli.register_sublane_adopt_restored_pair_parser(sub)
+        args = parser.parse_args(
+            ["adopt-restored-pair", "--issue", ISSUE, "--lane", LANE]
+        )
+        self.assertFalse(args.execute)
+        self.assertFalse(args.json)
+        args = parser.parse_args(
+            [
+                "adopt-restored-pair", "--issue", ISSUE, "--lane", LANE,
+                "--journal", JOURNAL, "--execute", "--json",
+            ]
+        )
+        self.assertTrue(args.execute)
+        self.assertTrue(args.json)
+        self.assertEqual(args.journal, JOURNAL)
 
 
 class _Base(unittest.TestCase):
@@ -126,7 +153,9 @@ class _Base(unittest.TestCase):
         cli.register_sublane_adopt_restored_pair_parser(sub)
         args = parser.parse_args(argv)
         buffer = io.StringIO()
-        factory = _ops_factory(self.home, _live_rows() if rows is None else rows)
+        factory = _ops_factory(
+            self.home, preserved_pane_rows() if rows is None else rows
+        )
         with mock.patch.object(cli, "LiveRestoredPairAdoptOps", factory):
             with contextlib.redirect_stdout(buffer):
                 code = cli.cmd_sublane_adopt_restored_pair(args)
@@ -181,8 +210,9 @@ class RecoverableLane(_Base):
         self.assertEqual(payload["plan"]["blocked_reasons"], [])
         self.assertEqual(payload["plan"]["gateway"]["assigned_name"], GW_NAME)
         self.assertEqual(payload["plan"]["worker"]["assigned_name"], WK_NAME)
-        self.assertEqual(payload["plan"]["gateway"]["generation_state"],
-                         "reattest_needed")
+        self.assertEqual(
+            payload["plan"]["gateway"]["generation_state"], "reattest_needed"
+        )
 
     def test_no_host_local_worktree_path_reaches_the_operator_output(self):
         _, text = self.drive(
@@ -198,8 +228,8 @@ class RecoverableLane(_Base):
 class UnprovableLaneIsACommandFailure(_Base):
     def test_a_slot_the_rail_cannot_prove_exits_one_with_the_typed_reason(self):
         seed_restored_lane_fixture(self.home)
-        rows = _live_rows() + [
-            _row(GW_NAME, "w9:%99", "term-gw-dup", GW_PROVIDER)
+        rows = preserved_pane_rows() + [
+            inventory_row(GW_NAME, "w9:%99", "term-gw-dup", GW_PROVIDER)
         ]
         code, out = self.drive(
             ["adopt-restored-pair", "--issue", ISSUE, "--lane", LANE, "--execute"],

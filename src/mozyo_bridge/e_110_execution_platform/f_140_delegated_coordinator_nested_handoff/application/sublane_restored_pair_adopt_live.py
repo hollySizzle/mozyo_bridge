@@ -118,6 +118,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     AdoptSlotPlan,
     RestoredPairAdoptPlan,
     RestoredPairAdoptRequest,
+    RestoredPairAdoptWriteResult,
     slot_reason,
 )
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.restored_pair_rebind import (  # noqa: E501
@@ -479,13 +480,25 @@ class LiveRestoredPairAdoptOps(RestoredPairStoreSeams):
 
     def adopt(
         self, request: RestoredPairAdoptRequest
-    ) -> tuple[bool, Optional[int], str]:
+    ) -> RestoredPairAdoptWriteResult:
+        """Re-observe, re-attest and declare, reporting the ACTION-TIME observation.
+
+        Every return carries ``context.plan`` — the observation THIS call derived — never
+        the caller's preflight plan. Two reads of a live inventory can legitimately differ
+        (a restore can move a pane between them), and an outcome that named the earlier one
+        would misreport both the written locators and the ``reattest_lineage`` this rail
+        exists to record (review j#109452 ``finding_actiontimeoutcome``).
+        """
         context = self._context(request)
         if not context.plan.may_adopt:
-            return (
-                False,
-                None,
-                "preflight blocked: " + ", ".join(context.plan.blocked_reasons),
+            return RestoredPairAdoptWriteResult(
+                applied=False,
+                revision=None,
+                detail=(
+                    "action-time preflight blocked: "
+                    + ", ".join(context.plan.blocked_reasons)
+                ),
+                plan=context.plan,
             )
         assert context.key is not None
         # The #15769 write order, retry-safe: per slot, (1) the fence participant re-pin
@@ -497,10 +510,11 @@ class LiveRestoredPairAdoptOps(RestoredPairStoreSeams):
             try:
                 apply_slot_reattest(self, plan)
             except (Exception, SystemExit) as exc:  # noqa: BLE001 - typed zero-write
-                return (
-                    False,
-                    None,
-                    f"slot_reattest_refused:{plan.slot_role}:{type(exc).__name__}",
+                return RestoredPairAdoptWriteResult(
+                    applied=False,
+                    revision=None,
+                    detail=f"slot_reattest_refused:{plan.slot_role}:{type(exc).__name__}",
+                    plan=context.plan,
                 )
         try:
             result = LaneDeclarationStore(
@@ -513,8 +527,16 @@ class LiveRestoredPairAdoptOps(RestoredPairStoreSeams):
                 declared_slots=context.new_slots,
             )
         except (Exception, SystemExit) as exc:  # noqa: BLE001 - typed zero-write
-            return False, None, type(exc).__name__
-        return result.applied, result.revision, result.reason
+            return RestoredPairAdoptWriteResult(
+                applied=False, revision=None, detail=type(exc).__name__,
+                plan=context.plan,
+            )
+        return RestoredPairAdoptWriteResult(
+            applied=result.applied,
+            revision=result.revision,
+            detail=result.reason,
+            plan=context.plan,
+        )
 
 
 def _reattest_plan(
