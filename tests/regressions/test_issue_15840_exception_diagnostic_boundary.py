@@ -1,0 +1,226 @@
+"""Regression pins for the #15840 exception-diagnostic boundary (parent US #15839).
+
+Measured on 2026-08-20: ``src/`` imports ``logging`` zero times, and of 769 broad
+``except Exception`` / ``except BaseException`` handlers, 578 (75%) discard the exception
+entirely — 124 of those in mutating paths. The sharpest instance is the retire application's
+terminal handler, whose own comment says ``an exception may be after a side effect`` while the
+result it returns carries no trace of what was raised.
+
+Measured cost (#15789 j#109134): an investigation returned ``uncertain`` /
+``retire_application_error``, the cause could not be read off the result, and recovering it
+required instrumenting a throwaway harness and re-running. It turned out to be a
+``git worktree add`` refusal whose message was the load-bearing evidence for that issue's
+entire fix.
+
+What is pinned here, in one file per the R3-c same-issue grouping rule:
+
+1. the class name of the raised exception now reaches the caller;
+2. **the message, the traceback and any path do NOT** — the boundary in
+   ``vibes/docs/logics/exception-diagnostic-sink-boundary.md`` allows raw only in a host-local
+   sink and forbids copying it into a durable record, and this value flows into CLI JSON that
+   gets pasted into Redmine journals;
+3. the reason stays a prefix of the pre-#15840 token, so no consumer is renamed out from under;
+4. the typed refusal vocabulary is untouched — a deterministic refusal is still a deterministic
+   refusal, and only the genuinely-unexpected path gained a class name.
+
+Point 2 is the load-bearing pin. It fails loudly if a later slice wires the host-local sink and
+lets the raw text leak into the returned value on the way.
+
+Boundary: no repository writes, no lane mutation, no herdr / tmux contact. The exception is
+injected by patching one collaborator to raise.
+"""
+
+from __future__ import annotations
+
+import json
+import sys
+import traceback
+import unittest
+from pathlib import Path
+from unittest import mock
+
+_TESTS_ROOT = Path(__file__).resolve().parents[1]
+if str(_TESTS_ROOT) not in sys.path:
+    sys.path.insert(0, str(_TESTS_ROOT))
+_SRC = _TESTS_ROOT.parent / "src"
+if _SRC.is_dir() and str(_SRC) not in sys.path:
+    sys.path.insert(0, str(_SRC))
+
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (  # noqa: E402,E501
+    retire_admissibility,
+)
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_application import (  # noqa: E402,E501
+    REASON_APPLICATION_ERROR,
+    REASON_APPLICATION_ERROR_SEPARATOR,
+    RETIRE_RESULT_UNCERTAIN,
+    RetireApplicationRequest,
+    RetireAssertions,
+    run_retire_application,
+)
+
+#: A message shaped like the one that actually cost the time: it embeds an absolute path.
+#: ``lane_metadata`` declares such a path host-local private state that must never reach a
+#: durable Redmine record, so it is exactly what must NOT come back in the result.
+_SECRET_PATH = "/private/tmp/lane_wt_should_never_leak"
+_RAISED_MESSAGE = (
+    f"fatal: '{_SECRET_PATH}' is a missing but already registered worktree; "
+    "use 'add -f' to override, or 'prune'"
+)
+
+
+class _LeakyFailure(RuntimeError):
+    """An exception whose message carries a path, as real subprocess failures do."""
+
+
+def _request(repo_root: Path) -> RetireApplicationRequest:
+    return RetireApplicationRequest(
+        repo_root=repo_root,
+        issue="15840",
+        lane_label="issue_15840_probe",
+        assertions=RetireAssertions(),
+    )
+
+
+def _run_with_raised(exc: BaseException):
+    """Drive the real application facade with one collaborator raising ``exc``."""
+    with mock.patch.object(
+        retire_admissibility, "resolve_retire_evidence_target", side_effect=exc
+    ):
+        return run_retire_application(_request(Path(__file__).resolve().parents[2]))
+
+
+class TheUnexpectedExceptionNowNamesItsType(unittest.TestCase):
+    def test_the_result_is_still_uncertain_not_a_deterministic_refusal(self):
+        """The #15066 contract holds: exceptions never masquerade as a typed refusal."""
+        result = _run_with_raised(_LeakyFailure(_RAISED_MESSAGE))
+        self.assertEqual(result.state, RETIRE_RESULT_UNCERTAIN)
+        self.assertTrue(result.uncertain)
+        self.assertFalse(result.mutated)
+
+    def test_the_exception_class_name_reaches_the_caller(self):
+        result = _run_with_raised(_LeakyFailure(_RAISED_MESSAGE))
+        self.assertEqual(
+            result.reason,
+            REASON_APPLICATION_ERROR + REASON_APPLICATION_ERROR_SEPARATOR + "_LeakyFailure",
+        )
+
+    def test_a_different_exception_type_is_distinguishable(self):
+        """The whole point: subprocess failure vs logic bug must be told apart."""
+        first = _run_with_raised(_LeakyFailure(_RAISED_MESSAGE))
+        second = _run_with_raised(TypeError("unrelated logic bug"))
+        self.assertNotEqual(first.reason, second.reason)
+        self.assertTrue(second.reason.endswith("TypeError"))
+
+    def test_the_reason_stays_a_prefix_of_the_pre_change_token(self):
+        """No consumer is renamed out from under: the old token is still the prefix."""
+        result = _run_with_raised(_LeakyFailure(_RAISED_MESSAGE))
+        self.assertTrue(
+            result.reason.startswith(REASON_APPLICATION_ERROR),
+            result.reason,
+        )
+
+
+class TheRawTextNeverCrossesTheBoundary(unittest.TestCase):
+    """The load-bearing pin. Raw belongs in a host-local sink, never in this value.
+
+    This value reaches CLI JSON and from there Redmine journals. A later slice will wire the
+    host-local sink; these assertions fail loudly if the raw text is allowed to ride along.
+    """
+
+    def test_the_exception_message_is_not_returned(self):
+        result = _run_with_raised(_LeakyFailure(_RAISED_MESSAGE))
+        self.assertNotIn(_RAISED_MESSAGE, result.reason)
+        self.assertNotIn("missing but already registered", result.reason)
+
+    def test_no_path_from_the_message_is_returned(self):
+        result = _run_with_raised(_LeakyFailure(_RAISED_MESSAGE))
+        self.assertNotIn(_SECRET_PATH, result.reason)
+        self.assertNotIn(_SECRET_PATH, json.dumps(result.as_payload(), ensure_ascii=False))
+
+    def test_the_whole_serialized_payload_is_free_of_the_raw_text(self):
+        """`as_payload` is what the CLI prints; check the serialized form, not just a field."""
+        result = _run_with_raised(_LeakyFailure(_RAISED_MESSAGE))
+        serialized = json.dumps(result.as_payload(), ensure_ascii=False)
+        for forbidden in (_SECRET_PATH, _RAISED_MESSAGE, "add -f", "prune"):
+            self.assertNotIn(forbidden, serialized, forbidden)
+
+    def test_no_traceback_frame_is_returned(self):
+        """A traceback names source paths of the host; none of it may cross."""
+        try:
+            raise _LeakyFailure(_RAISED_MESSAGE)
+        except _LeakyFailure as exc:
+            captured = exc
+            frames = traceback.format_exception(
+                type(exc), exc, exc.__traceback__
+            )
+        result = _run_with_raised(captured)
+        serialized = json.dumps(result.as_payload(), ensure_ascii=False)
+        self.assertNotIn("Traceback", result.reason)
+        self.assertNotIn("Traceback", serialized)
+        self.assertNotIn(__file__, serialized)
+        self.assertTrue(frames, "precondition: a traceback was actually formatted")
+
+    def test_only_an_identifier_is_appended(self):
+        """A class name is an identifier by construction — that is the type-level guarantee.
+
+        Pinned as a property rather than a literal so a future exception type cannot quietly
+        introduce a value that is not identifier-shaped.
+        """
+        result = _run_with_raised(_LeakyFailure(_RAISED_MESSAGE))
+        appended = result.reason[
+            len(REASON_APPLICATION_ERROR + REASON_APPLICATION_ERROR_SEPARATOR) :
+        ]
+        self.assertTrue(appended.isidentifier(), appended)
+
+
+class TheDeterministicRefusalsAreUntouched(unittest.TestCase):
+    """The typed refusal vocabulary is out of this issue's scope and must not move."""
+
+    def test_a_non_applicable_flag_still_returns_its_own_typed_reason(self):
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.sublane_retire_application import (  # noqa: E501
+            REASON_WORKTREE_ABSENT_NOT_APPLICABLE,
+            RETIRE_INTENT_ACTIVE_UNBOUND_LIVE_ZERO,
+            RETIRE_RESULT_BLOCKED,
+        )
+
+        request = RetireApplicationRequest(
+            repo_root=Path(__file__).resolve().parents[2],
+            issue="15840",
+            lane_label="issue_15840_probe",
+            assertions=RetireAssertions(),
+            intent=RETIRE_INTENT_ACTIVE_UNBOUND_LIVE_ZERO,
+            worktree_absent=True,
+        )
+        result = run_retire_application(request)
+        self.assertEqual(result.state, RETIRE_RESULT_BLOCKED)
+        self.assertEqual(result.reason, REASON_WORKTREE_ABSENT_NOT_APPLICABLE)
+        self.assertNotIn(REASON_APPLICATION_ERROR, result.reason)
+
+
+class TheBoundaryIsWrittenDown(unittest.TestCase):
+    """The decision must be readable, not only encoded in one call site (#15840 順序 1)."""
+
+    def test_the_cataloged_boundary_doc_exists_and_states_both_constraints(self):
+        doc = (
+            Path(__file__).resolve().parents[2]
+            / "vibes/docs/logics/exception-diagnostic-sink-boundary.md"
+        )
+        self.assertTrue(doc.is_file(), doc)
+        text = doc.read_text(encoding="utf-8")
+        # Constraint A: the sink cannot live inside the guarded home.
+        self.assertIn("shared-home guard", text)
+        # Constraint B: raw is host-local only; never copied into a durable record.
+        self.assertIn("never copy it into a durable Redmine record", text)
+
+    def test_the_doc_is_registered_in_the_catalog(self):
+        catalog = (
+            Path(__file__).resolve().parents[2] / ".mozyo-bridge/docs/catalog.yaml"
+        ).read_text(encoding="utf-8")
+        self.assertIn("logic-exception-diagnostic-sink-boundary", catalog)
+        self.assertIn(
+            "vibes/docs/logics/exception-diagnostic-sink-boundary.md", catalog
+        )
+
+
+if __name__ == "__main__":  # pragma: no cover
+    unittest.main()

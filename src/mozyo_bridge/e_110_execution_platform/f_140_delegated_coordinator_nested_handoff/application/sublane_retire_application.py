@@ -52,6 +52,10 @@ REASON_INTENT_NOT_APPLICABLE = "retire_intent_not_applicable"
 REASON_IDENTITY_UNRESOLVED = "retire_identity_unresolved"
 REASON_IDENTITY_CHANGED = "retire_identity_changed"
 REASON_APPLICATION_ERROR = "retire_application_error"
+#: Separator between :data:`REASON_APPLICATION_ERROR` and the exception's class name (Redmine
+#: #15840). The reason stays a prefix match for every pre-#15840 caller: ``retire_application_error``
+#: becomes ``retire_application_error:OSError``, never a different token.
+REASON_APPLICATION_ERROR_SEPARATOR = ":"
 REASON_CLEANUP_ATOMIC_GUARD_UNAVAILABLE = "cleanup_atomic_guard_unavailable"
 #: ``--worktree-absent`` (Redmine #15789) was combined with an intent it does not apply to. It
 #: modifies exactly the two BOUND terminal retires; the unbound rails never had a checkout in
@@ -382,10 +386,30 @@ def run_retire_application(request: RetireApplicationRequest) -> RetireApplicati
             preflight=outcome,
             intents=intents,
         )
-    except Exception:  # noqa: BLE001 - an exception may be after a side effect
+    except Exception as exc:  # noqa: BLE001 - an exception may be after a side effect
+        # Redmine #15840: the handler's own comment says the exception may land AFTER a side
+        # effect, yet the result carried no trace of what was raised — the one outcome an
+        # operator most needs to diagnose was the one that recorded nothing. Measured cost
+        # (#15789 j#109134): an investigation returned `uncertain / retire_application_error`,
+        # the cause was unknowable from the result, and finding it took instrumenting a
+        # throwaway harness and re-running; it turned out to be a `git worktree add` refusal
+        # whose message was the load-bearing evidence for that issue's whole fix.
+        #
+        # Only the exception's CLASS NAME is carried. That is a type-level guarantee, not a
+        # case-by-case judgement: a Python class name is an identifier and cannot contain a
+        # path, a token, or personal data. `str(exc)` / `repr(exc)` / the traceback can and do
+        # — the very `git worktree add` refusal above embeds the recorded worktree's ABSOLUTE
+        # PATH, which `lane_metadata` declares host-local private state that must never reach a
+        # durable Redmine record. Those belong in the host-local sink, not in a value that
+        # flows into CLI JSON and gets pasted into a journal. Boundary:
+        # `vibes/docs/logics/exception-diagnostic-sink-boundary.md`.
         return RetireApplicationResult(
             state=RETIRE_RESULT_UNCERTAIN,
-            reason=REASON_APPLICATION_ERROR,
+            reason=(
+                REASON_APPLICATION_ERROR
+                + REASON_APPLICATION_ERROR_SEPARATOR
+                + type(exc).__name__
+            ),
             uncertain=True,
         )
 
@@ -411,6 +435,8 @@ __all__ = (
     "REASON_CLEANUP_ATOMIC_GUARD_UNAVAILABLE",
     "REASON_INTENT_NOT_APPLICABLE",
     "REASON_ABSENT_WORKTREE_UNPROVEN",
+    "REASON_APPLICATION_ERROR",
+    "REASON_APPLICATION_ERROR_SEPARATOR",
     "REASON_WORKTREE_ABSENT_NOT_APPLICABLE",
     "run_retire_application",
 )

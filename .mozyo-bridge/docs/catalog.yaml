@@ -869,6 +869,17 @@ documents:
       - spec-bounded-context-map
       - spec-project-map
 
+  - id: logic-exception-diagnostic-sink-boundary
+    type: logic
+    status: active
+    canonical_path: vibes/docs/logics/exception-diagnostic-sink-boundary.md
+    purpose: catch して破棄している想定外例外の証拠をどこに置き、そこから何を durable record へ持ち出してよいかを決める設計正本。
+    audit_role: exception_diagnostic_sink_boundary_logic
+    related_document_refs:
+      - logic-runtime-observability-boundary
+      - rule-public-private-boundary
+      - spec-project-map
+
   - id: logic-runtime-observability-boundary
     type: logic
     status: active
