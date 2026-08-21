@@ -80,10 +80,21 @@ effect_predicates:
     - {section: "1.E", rails: [resume, audit-failure-terminal]}
 ```
 
+**3 つの勘定を混ぜないこと** (round 8 deferred `effect_pair_count_prose` の是正)。数える対象が
+違うので数字も違う。
+
+| 勘定 | 数 | 何を数えているか |
+| --- | --- | --- |
+| **unique (section, rail) 組** | **27** | `effect_predicates` の分類単位。`## 1` の重複名 (`retire` の 7 行、`rehydrate-fleet` の 2 行) を section ごとに 1 組へ畳んだもの。検算 17a はこの 27 組を照合する |
+| **taxonomy の行数** | **33** | `## 1` の表の行。`retire` は intent ごとに 7 行、`rehydrate-fleet` は plan / `--execute` で 2 行に展開されている |
+| **fidelity 分類 (行数ベース)** | **strict 20 / routing 13** | 33 行を strict / routing へ振り分けたもの。1.C 8 + 1.D 3 + `hibernate` 1 + `supersede` 1 + `retire` 7 = 20 / 1.A 6 + 1.B 5 + `resume` 1 + `audit-failure-terminal` 1 = 13 |
+
+**effect 述語は排他ではない** — `supersede` と `retire` は (i) と (ii) の**両方**に現れる。
+したがって `effect_predicates` の各 group の要素数を足しても 27 にはならない。
+`fidelity_class: strict` の判定は「**述語を 1 つ以上持つ**」であって述語の個数ではない。
+
 **分類は command 単位ではなく (section, rail) 単位である** — `rehydrate-fleet` は 1.A の plan 行が
-routing、1.D の `--execute` 行が strict になる。行数では **strict 20 行 / routing 13 行**
-(1.C 8 + 1.D 3 + `hibernate` 1 + `supersede` 1 + `retire` 7 = 20 / 1.A 6 + 1.B 5 + `resume` 1 +
-`audit-failure-terminal` 1 = 13。合計 33 行)。
+routing、1.D の `--execute` 行が strict になる。
 
 **診断専用 rail (rule を持たない理由の明示)**: 次の 4 本は read-only の診断 surface で、
 決定木の `rail` にはならない。`reboot-audit` は precursor `P0` の `step`、`quarantine-inspect` は
@@ -231,6 +242,14 @@ pair_shape:
   worktree_boundary:  [clean_or_recorded, dirty_unrecorded, unknown]  # `dirty_worktree_without_boundary_journal`
   unpushed_commits:   [none, present, unknown]            # `unpushed_commits` (early hibernate は統合済みを前提とするため fail-closed)
   # quarantine の approval readiness (domain/quarantine_approval.py の 10 値)
+  # rail 固有の owner approval gate が「この action に対して」成立しているか。
+  # gate 名は rail ごとに違う (`## 2.2` の `approval_gate` で宣言)。実装は 6 module が
+  # `APPROVAL_GATE` 定数を持ち、いずれも approval_missing / approval_mismatch で block する。
+  rail_owner_approval: [granted_for_this_action, missing, mismatched, not_required, unknown]
+  # retire の guarded close (既定 `retire --execute`) の readiness。
+  # token は application/sublane_herdr_retire.py と sublane_retire_application.py の literal。
+  retire_guarded_close_readiness: [ready, worktree_binding_unverified, zero_close_unproven,
+                                   retire_identity_unresolved, retire_identity_changed, unknown]
   quarantine_approval: [ready, workspace_unresolved, inventory_unreadable, composer_unreadable,
                         receiver_absent, duplicate_receiver, revision_unreadable,
                         attestation_unreadable, known_marker_requires_q_enter,
@@ -319,7 +338,7 @@ ordered gate が行う。doc は `admission_source` (正本 module) / `admission
 token を再抽出して count を照合**、検算 14 が **符号化したと宣言した軸が実際に `when` にあるか**を
 検算する。**gate の完全再現は主張せず、正本の所在と符号化の実在を機械保証する。**
 
-実測 (base `289343db`): **19 rail / 合計 302 token / distinct 222**。うち
+実測 (base `289343db`): **19 rail / 合計 316 token / distinct 230**。うち
 `fidelity_class: strict` が 12 rail、`routing` が 7 rail。strict の残り 2 rail
 (`recover-pair-delivery` / `recover-worker-delivery`) は `## 3.1d` の `delivery_rails` 側で
 `admission` を宣言しており、検算 17(c) が **strict 集合の全件が `rail_admission` ∪ `delivery_rails`
@@ -342,27 +361,31 @@ rail_admission:
   - rail: recover-restored-pair
     rule: R4
     fidelity_class: routing
+    approval_gate: restored_pair_recovery_owner_approval
     admission_source: ['domain/restored_pair_recovery.py']
     admission_gate_count: 17
     routing_conditions_encoded: ['disposition', 'declared_pins', 'liveness', 'membership', 'cwd']
   - rail: recover-gateway
     rule: R5
     fidelity_class: strict
+    approval_gate: gateway_recovery_owner_approval
     admission_source: ['domain/gateway_turn_recovery.py']
     admission_gate_count: 17
-    routing_conditions_encoded: ['disposition', 'resume_anchor', 'issue_lane_match', 'launch_authority', 'counterpart_distinguished', 'authority_conflict', 'liveness', 'membership', 'generation_rank', 'productivity', 'composer', 'turn_class']
+    routing_conditions_encoded: [rail_owner_approval, 'disposition', 'resume_anchor', 'issue_lane_match', 'launch_authority', 'counterpart_distinguished', 'authority_conflict', 'liveness', 'membership', 'generation_rank', 'productivity', 'composer', 'turn_class']
   - rail: refresh-worker
     rule: R6
     fidelity_class: strict
+    approval_gate: worker_refresh_owner_approval
     admission_source: ['domain/worker_turn_recovery.py', 'domain/gateway_turn_recovery.py']
     admission_gate_count: 19
-    routing_conditions_encoded: ['disposition', 'resume_anchor', 'issue_lane_match', 'launch_authority', 'counterpart_distinguished', 'authority_conflict', 'liveness', 'membership', 'generation_rank', 'productivity', 'composer', 'turn_class', 'worktree']
+    routing_conditions_encoded: [rail_owner_approval, 'disposition', 'resume_anchor', 'issue_lane_match', 'launch_authority', 'counterpart_distinguished', 'authority_conflict', 'liveness', 'membership', 'generation_rank', 'productivity', 'composer', 'turn_class', 'worktree']
   - rail: recover-stale
     rule: R7
     fidelity_class: strict
+    approval_gate: stale_worker_recovery_owner_approval
     admission_source: ['domain/stale_worker_recovery.py']
     admission_gate_count: 9
-    routing_conditions_encoded: ['disposition', 'stale_signal', 'issue_lane_match', 'counterpart_distinguished', 'authority_conflict', 'liveness', 'membership', 'generation_rank', 'productivity', 'worktree']
+    routing_conditions_encoded: [rail_owner_approval, 'disposition', 'stale_signal', 'issue_lane_match', 'counterpart_distinguished', 'authority_conflict', 'liveness', 'membership', 'generation_rank', 'productivity', 'worktree']
   - rail: recover-pair
     rule: R12
     fidelity_class: strict
@@ -384,15 +407,17 @@ rail_admission:
   - rail: converge-bound-pair
     rule: R9b
     fidelity_class: strict
+    approval_gate: bound_pair_convergence_approval
     admission_source: ['domain/hibernated_bound_pair_convergence.py']
     admission_gate_count: 28
-    routing_conditions_encoded: ['disposition', 'worktree_identity', 'declared_pins', 'process_release', 'slot_verdict']
+    routing_conditions_encoded: [rail_owner_approval, 'disposition', 'worktree_identity', 'declared_pins', 'process_release', 'slot_verdict']
   - rail: prepare-bound-pair
     rule: R10
     fidelity_class: strict
+    approval_gate: bound_pair_composer_discard_approval
     admission_source: ['domain/hibernated_bound_pair_composer_discard.py']
     admission_gate_count: 21
-    routing_conditions_encoded: ['disposition', 'worktree_identity', 'declared_pins', 'slot_verdict']
+    routing_conditions_encoded: [rail_owner_approval, 'disposition', 'worktree_identity', 'declared_pins', 'slot_verdict']
   - rail: close-residue
     rule: P1
     fidelity_class: strict
@@ -408,9 +433,9 @@ rail_admission:
   - rail: retire
     rule: T1
     fidelity_class: strict
-    admission_source: ['application/sublane_retire_application.py']
-    admission_gate_count: 10
-    routing_conditions_encoded: ['issue_state', 'head_integrated']
+    admission_source: ['application/sublane_retire_application.py', 'application/sublane_herdr_retire.py']
+    admission_gate_count: 24
+    routing_conditions_encoded: [retire_guarded_close_readiness, 'issue_state', 'head_integrated']
   - rail: hibernate
     rule: T2
     fidelity_class: strict
@@ -422,9 +447,10 @@ rail_admission:
   - rail: quarantine
     rule: R8
     fidelity_class: strict
+    approval_gate: generation_mismatch_disposition_owner_approval
     admission_source: ["domain/quarantine_approval.py"]
     admission_gate_count: 10
-    routing_conditions_encoded: [disposition, quarantine_approval, composer]
+    routing_conditions_encoded: [rail_owner_approval, disposition, quarantine_approval, composer]
   - rail: reconcile-recovered-pair-pins
     rule: R15
     fidelity_class: routing
@@ -659,6 +685,12 @@ recovery_rules:
     when:
       disposition: active
       quarantine_approval: ready       # 10 値のうち `ready` 以外は approval を mint できず execute へ進めない
+      rail_owner_approval: [granted_for_this_action, not_required]
+                                       # generation mismatch かつ real pending input の path では
+                                       # `generation_mismatch_disposition_owner_approval` (5 つの
+                                       # `--approved-*` token) が追加で必要。それ以外の path では
+                                       # 不要なので `not_required` も許す (過剰条件化して
+                                       # false negative を作らないため)
       any_slot: {composer: pending}
     rail: quarantine
     precedence_basis: [{over: [R15], basis: precondition_of_later}, {over: [R5, R6, R7], basis: refused_by_later},
@@ -669,6 +701,7 @@ recovery_rules:
   - id: R5
     when:
       disposition: active
+      rail_owner_approval: granted_for_this_action
       slot_health.gateway:
         {liveness: live, membership: this_pair, generation_rank: current,
          productivity: turn_ended_unproductive, composer: settled,
@@ -684,6 +717,7 @@ recovery_rules:
   - id: R6
     when:
       disposition: active
+      rail_owner_approval: granted_for_this_action
       slot_health.worker:
         {liveness: live, membership: this_pair, generation_rank: current,
          productivity: turn_ended_unproductive, composer: settled,
@@ -698,6 +732,7 @@ recovery_rules:
   - id: R7
     when:
       disposition: active
+      rail_owner_approval: granted_for_this_action
       stale_signal: positive
       slot_health.worker:
         {liveness: shell_residue, membership: this_pair, generation_rank: current,
@@ -729,6 +764,7 @@ recovery_rules:
       worktree_identity: bound
       declared_pins: absent
       process_release: released
+      rail_owner_approval: granted_for_this_action   # `bound_pair_convergence_approval`。missing / mismatched は block
       all_slots: {slot_verdict: [recover_bad_generation, healthy_no_action]}
       any_slot:  {slot_verdict: recover_bad_generation}
     rail: converge-bound-pair
@@ -744,6 +780,7 @@ recovery_rules:
       worktree_identity: bound
       declared_pins: absent
       process_release: released      # 実装 `lifecycle_exact` は hibernated+released+bound+pins-empty の signature を要求する
+      rail_owner_approval: granted_for_this_action   # `bound_pair_composer_discard_approval`。未送信入力を捨てる破壊操作なので必須
       any_slot: {slot_verdict: preserve_pending_composer}
     rail: prepare-bound-pair
     precedence_basis: [{over: [R13], basis: precondition_of_later}]
@@ -831,8 +868,10 @@ terminal_rules:
         intent: ["--retire-active-live-zero"]
       - when: {disposition: active, worktree_identity: empty, live_pair: zero_live_positive}
         intent: ["--retire-active-unbound-live-zero"]
-      - when: {disposition: active, live_pair: both_live}
-        intent: []          # 既定 retire --execute (guarded close)
+      - when: {disposition: active, live_pair: both_live, retire_guarded_close_readiness: ready}
+        intent: []          # 既定 retire --execute (guarded close)。実装は
+                            # zero_close_unproven / worktree_binding_unverified /
+                            # retire_identity_unresolved / retire_identity_changed で拒否する
       - when: {}            # catch-all。上記 6 行が覆わない shape
         intent: []
         result: escalation
@@ -1136,6 +1175,12 @@ effect_budget_gaps:
 18. **selection fallback の実在性** — `fallback_if_primary_null` の要素が**実在する rule id**で
     あること (rail 名を並べると `matches_rule` を通せず、strict rail を match 無しで選ぶ経路が
     残る。round 7 `finding_strictfallbacktotality` の再発防止)。
+19. **approval gate の網羅** — (a) 実装で `*APPROVAL_GATE` 定数として定義されている owner
+    approval gate が**全件** `## 2.2` の `approval_gate` に宣言されていること、(b) approval gate を
+    持つ **strict** rail の rule が `rail_owner_approval` を条件化していること。
+    **承認 gate を持つ rail を 1 本ずつ手で拾うのをやめ、実装から全数走査する**
+    (round 8 `finding_strictapprovalgates` の再発防止。実際この検算が reviewer 指摘の 3 件に加えて
+    R5 / R6 / R7 と 7 つ目の gate `generation_mismatch_disposition_owner_approval` を検出した)。
 
 ### 3.4 gap (回復方向にどのレールも subject にしていない shape)
 
