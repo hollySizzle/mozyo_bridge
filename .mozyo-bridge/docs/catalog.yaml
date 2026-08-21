@@ -262,6 +262,22 @@ documents:
       - logic-coordinator-sublane-development-flow
       - logic-module-health-gate
 
+  - id: spec-recovery-rail-taxonomy
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/recovery-rail-taxonomy.md
+    purpose: 回復レール群 (`sublane` の recover / rebind / adopt / repair / reconcile / rehydrate / reboot-audit / retire / hibernate / resume / quarantine / close-residue 系 25 本) の taxonomy、pair shape 軸、レール選択の決定木、gap (どのレールも subject にしていない shape) と overlap (同一 shape を複数レールが扱う) の明示、および統合候補と「統合しても失ってはならない不変条件 = それを封じている regression test」の対応表 (製本 Phase 1、Redmine #15841)。統合の実施と可否判断は本 doc の scope 外 (Phase 2 / coordinator escalation)。
+    audit_role: recovery_rail_taxonomy_spec
+    related_document_refs:
+      - logic-managed-state-model
+      - spec-herdr-native-identity
+      - spec-route-identity-ledger
+      - spec-bounded-context-map
+      - rule-adr-index
+      - rule-project-agent-workflow
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-delegated-coordinator-role-profile
     type: spec
     status: active
