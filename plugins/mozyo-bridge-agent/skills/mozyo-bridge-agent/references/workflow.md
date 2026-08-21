@@ -628,7 +628,7 @@ Version 単位の roadmap を提案する場合は、各 Version について少
 
 `## Sublane の coordinator callback` は、sublane が handoff-worthy state に到達したとき coordinator へ*向けて*どう報告するかを定義する。しかし callback は best-effort の pointer であり、成長する cockpit では単に届かないことがある: sublane の Codex が routing callback を一度も記録しなかった、durable record は前進したが何もそれを指さなかった、あるいは送信自体が target 解決に失敗した。そうなると coordinator には沈黙しか見えず、lane が本当に blocked なのか、まだ作業中なのか、すでに完了しているのかを判断するために、現状では Redmine・worktree・pane を手で poll しなければならない (Redmine #11880、#11854 sublane PoC より)。本標準はその検出を機械的かつ durable-record-anchored にし、callback の欠落が cockpit 全体を stall させる代わりに graceful に degrade するようにする。
 
-本標準は `## Sublane の coordinator callback` の failure-mode 側の補完である。あちらは happy path (sublane が前進した state を指す) を扱い、こちらは pointer が欠落または遅延したとき coordinator が何をするかを扱う。`## Coordinator stop と next-action 標準` や `## Owner 承認の集約` を緩めない — 検出された stall も、同じ durable journal と同じ単一の owner 窓口集約点を通じて解決する。
+本標準は `## Sublane の coordinator callback` の failure-mode 側の補完である。あちらは happy path (sublane が前進した state を指す) を扱い、こちらは pointer が欠落または遅延したとき coordinator が何をするかを扱う。`## Coordinator stop と next-action 標準` や `## Owner 承認の集約` を緩めない — 検出された stall も、同じ durable journal と同じ単一の owner 窓口集約点を通じて解決する。本標準が扱うのは検出と分類までであり、検出した対象 agent が生きているのに turn を返せない場合の回復は `## 停滞・拒否からの context reset 回復` が扱う。
 
 ### stall candidate は pane ではなく durable record から定義する
 
@@ -669,6 +669,63 @@ routing callback は、lane が遊休しているからではなく、lane の *
 - **検出は完了済み作業の re-dispatch ではない。** 再通知の前に coordinator は issue を読み、`progress_without_callback` (done の state を拾う) と `no_progress_after_handoff` (本当に待っている) を切り分ける。durable record が既に前進済みと示す作業を盲目的に再送しない。
 - **stop / 集約の標準を bypass しない。** 検出された stall も、同じ `## Coordinator stop と next-action 標準` の next-action 提案を通じて解決し、owner 待ちの state については `## Owner 承認の集約` の同じ単一集約点を通る。stall 検出は state を見つけるのであって、close や carve-out や owner 判断を self-authorize しない。
 - **operator 固有の policy を OSS default に入れない。** 具体的な許容 window (どれだけ長ければ「長すぎる」のか)、stall candidate の列挙に使う Redmine の saved query / filter、private な再通知 cadence や escalation 順序は operator の runtime policy である (採用 repo の public / private 境界 rule を参照。`mozyo_bridge` では `vibes/docs/rules/public-private-boundary.md`)。portable な部分は *stall candidate が「delivered な dispatch journal + 欠落した期待 durable journal」として定義され、4 つの durable state に分類され、すべての stall check と再通知がそれ自体 issue に記録される*ことである。operator の具体的な timeout と query は operator 自身の runbook に属し、配布される skill や preset 本文には属さない。
+
+## 停滞・拒否からの context reset 回復
+
+`## Stall / no-progress 検出標準` は、durable record から stall candidate を*見つけて分類する*ところまでを固定する。`## 既知停止からの通常再開` は、停止原因が解消された後に agent 自身が*どう再開するか*を固定する。その間に、どちらも扱っていない state がある: **対象 agent は生きているのに turn を返せず、自分では再開できない**ときに、誰が何をしてよいかである (Redmine #15816 owner intent、発端観測 #15789 j#109183 / j#109186)。本節はその 1 点だけを portable に固定する。
+
+本節で **context reset** とは、agent session の累積会話文脈を破棄する provider client 側の操作を指す (Claude Code / Codex では `/clear` に相当する slash command)。runtime process の再起動、lane の retire、worktree の作り直し、handoff の再送のいずれとも別物であり、durable record も worktree も変更しない。捨てるのは session の会話文脈だけである。
+
+### 停滞・拒否の原因候補に累積 context を入れる
+
+agent が作業に入らない、拒否を返す、あるいは turn を返さないとき、原因を**送った message の内容だけに帰着させない**。同じ anchor と同じ依頼文でも、session に積み上がった文脈が provider 側の分類・安全判定・容量の閾値を越えると、内容が変わっていないのに通らなくなることがある。実際に観測された形は `### 観測層: provider 別挙動観測 (契約ではない)` にある。
+
+したがって停滞の原因は少なくとも次の 2 つに分かれる。対処が異なるので、切り分けずにどちらかへ倒さない。
+
+- **state 原因** — 累積 context が provider 側の閾値を越えている。同じ message 内容でも、文脈を作り直せば通りうる。
+- **内容原因** — その依頼自体が provider の制約に触れる。文脈をどう作り直しても同じ結果になる。
+
+### context reset + durable anchor 再注入で 1 回だけ切り分ける
+
+切り分けは次の形で行う。**1 回**である。
+
+1. **切り分けの実行前に durable record へ記録する。** 対象、観測した停滞 (どの durable journal を待っていて何が無いか、`## Stall / no-progress 検出標準` のどの分類か)、これから 1 回の context reset を行うこと、再注入する anchor を書く。事後の記録は本条件を満たさない — 記録は操作の許可であって、操作の要約ではない。
+2. **対象 session の context を reset する。**
+3. **durable anchor から再注入する。** 再注入するのは anchor への pointer と最小の state であり、reset した会話の要約ではなく、`## Handoff ライフサイクル` を迂回した新しい依頼でもない。durable record が正本であることは reset によって変わらない。
+4. **結果を分類して記録する。** 通れば **state 原因**であり、回復は完了している (作業は durable record 上で再開する)。通らなければ **内容原因**として扱い、reset を繰り返さずに provider 側の対処へ escalate する。
+
+### 無条件の reset + retry loop を標準にしない
+
+同一 anchor に対する context reset は、上の切り分けの **1 回**である。通らなかった相手に reset と再注入を回し続けることは、進捗を生まないまま偽の活動を durable record へ積む。`## Stall / no-progress 検出標準` が「durable record が既に前進済みと示す作業を盲目的に再送しない」と定めるのと同じ理由である。
+
+- 2 回目以降の reset は、**前回と異なる根拠**を durable record に書いてからにする。根拠は「まだ通らないから」ではなく、観測が変わったこと (別の停滞分類に移った、別の anchor である、reset 後に durable record が実際に前進した等) である。
+- 内容原因と分類した後に選ぶのは reset ではない — 依頼の分解、言い換え、別 provider への routing、owner への escalation のいずれかであり、その選択は `## Coordinator stop と next-action 標準` の next-action 提案として durable record に載せる。
+
+### 詰まった agent は自分を回復できない (回復の非対称性)
+
+context reset は、詰まった当人には打てない。**turn を返せない agent は、自分の session に対する操作も発行できない**からである。これは stall 回復の設計前提であり、運用手順はこの非対称性を前提に書く。
+
+- **従属 lane が詰まった場合**: 回復操作の所有者は、その lane を dispatch した上位である。上位は生きた turn を持つので、上の切り分けを実行できる。
+- **上位 (coordinator) 自身が詰まった場合**: 上位が居ないため、回復は **session の外側** — operator、watchdog、または peer — からしか入らない。coordinator が「自分で立ち直る」ことを前提に書かれた手順は、この場合に無言で成立しなくなる。
+- したがって coordinator 層の回復を coordinator 自身の責務として記述しない。外部からの回復経路が存在しない構成は可用性の gap であり、durable record に記録して rail / UI 側の改善対象として扱う (採用 repo の UI / 運用決定に従う。`mozyo_bridge` では手動操作が残る箇所を既知 gap として記録する `vibes/docs/adr/adr-0013-ui-hides-pane-operations.md`)。
+
+### 観測層: provider 別挙動観測 (契約ではない)
+
+以下は **観測** であり、契約でも仕様でもない。provider の model 版が変われば失効しうるため、各項目は **model 版と観測日**を必須とする。上のドクトリンは観測が 1 件も残らなくても成立する — 観測は「なぜ累積 context を原因候補に入れるのか」の実例であって、ドクトリンの根拠ではない。新しい provider 別観測はここに追記し、ドクトリン本文へ混ぜない。
+
+| model 版 | 観測日 | 観測 | anchor |
+| --- | --- | --- | --- |
+| `gpt-5.6-sol` (Codex) | 2026-08-20 | cybersecurity 隣接語彙が session に蓄積した状態で、依頼を cybersecurity 分類として拒否し、作業に入らないまま停止した。単発 message の内容ではなく累積文脈が閾値を越えたことが原因で、context reset + durable anchor 再注入の 1 回で回復した。 | Redmine #15789 j#109183 / j#109186 |
+
+失効の扱い: 記載した model 版が運用から外れた項目も、削除せず model 版と観測日を残したまま置く (同じ失敗が再発したとき「いつ何が観測されたか」を判別できることが価値である)。現行 model 版でも再現するなら、上書きせず新しい行として観測日つきで追記する。観測が 1 provider に偏ることは異常ではない — 観測されていない provider の行が無いことは、その provider が影響を受けないことの証拠にならない。
+
+### 本節が緩めない境界
+
+- **durable record が正本であり続ける。** context reset は session の状態を捨てる操作であって、durable record を捨てる操作ではない。reset の前後で作業の正本は Redmine issue / journal のままであり、reset の実行・分類・結果はすべて journal に載る。pane で完結する無言の reset は次の agent から見えず、許されない。
+- **検出を置き換えない。** reset は `## Stall / no-progress 検出標準` の検出・分類の *後* に来る。durable record を読まずに reset から始めることは、`progress_without_callback` (既に前進済み) の作業を捨てることになる。
+- **配送 rail の retry policy に触れない。** 本節が制限するのは **context reset の反復**であって、送信・Enter・配送確認の retry ではない。後者は採用 repo の配送方針が所有し、本節はそれを狭めない (`mozyo_bridge` では `vibes/docs/adr/adr-0002-enter-resend-priority.md`)。
+- **raw pane 操作の解禁ではない。** reset の実行手段は provider client / runtime が提供する sanctioned な surface に限る。手段が存在しない構成では、それは operator / 外部の操作であり、既知 gap として記録する対象である。低レベル tool で自前の reset 経路を組み立てることは、`## Wait / polling 効率標準` と `## 既知停止からの通常再開` が禁止する anti-pattern と同じ扱いになる。
+- **operator 固有の policy を OSS default に入れない。** どれだけ停滞したら切り分けへ移るかの閾値、reset を発行してよい actor の具体的な列挙、escalation の順序と宛先、watchdog の cadence は operator の runtime policy である (採用 repo の public / private 境界 rule を参照。`mozyo_bridge` では `vibes/docs/rules/public-private-boundary.md`)。portable な部分は *停滞の原因候補に累積 context を入れること / context reset + durable anchor 再注入で 1 回だけ切り分けること / 通れば state 原因・通らなければ内容原因として escalate すること / 無条件の reset ループを標準にしないこと / 詰まった agent は自分を回復できず coordinator 層は外部からの回復を要すること / provider 別観測を契約から分離し model 版と観測日を伴う観測として保つこと* である。
 
 ## Runtime fingerprint 検証規律
 
