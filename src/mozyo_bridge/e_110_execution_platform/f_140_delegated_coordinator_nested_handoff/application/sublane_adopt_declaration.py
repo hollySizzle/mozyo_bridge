@@ -47,6 +47,7 @@ generally relaxed.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable, Mapping, Optional, Sequence
 
@@ -232,21 +233,41 @@ def declared_worktree_identity(worktree_path: str, lane_label: str) -> Optional[
     return declared_lane_root_identity(resolved, lane_label).metadata_token
 
 
-def _resolve_attested_slot(
+@dataclass(frozen=True)
+class NamedSlotCandidate:
+    """The one live inventory row that IS a lane's ``provider`` slot (#15811 extraction).
+
+    ``assigned_name`` / ``locator`` are the normalized, non-empty values read off that row;
+    ``row`` is the raw inventory mapping so a caller can join further server-owned facts
+    (terminal identity) without re-selecting the candidate.
+    """
+
+    row: Mapping[str, object]
+    assigned_name: str
+    locator: str
+
+
+def select_named_slot_candidate(
     *,
     rows: Sequence[Mapping[str, object]],
     workspace_id: str,
     lane_id: str,
     provider: str,
-    role: str,
-    attestation_store,
-) -> tuple[Optional[ProcessGenerationPin], str]:
-    """Resolve ONE provider's live, attested slot into a typed pin, or a zero-write reason.
+) -> tuple[Optional[NamedSlotCandidate], str]:
+    """The live row that IS this lane's ``provider`` slot, or a zero-write reason.
 
-    Returns ``(pin, "")`` on success or ``(None, reason)`` on any fail-closed condition: a
-    duplicate assigned name (RAW candidate multiplicity), a stale shell residue, a missing
-    locator, or a startup self-attestation that is not present + generation-bound to the
-    live locator.
+    The identity half of :func:`_resolve_attested_slot`, extracted verbatim (Redmine #15811)
+    so the pin-ABSENT restored-pair adopt rail
+    (:mod:`.sublane_restored_pair_adopt_live`) resolves its slots through the SAME
+    reviewed discipline instead of authoring a second candidate selection: the lane's slots
+    are found by **decoding** the server-owned ``mzb1`` assigned names in the raw inventory
+    (never by matching a caller-supplied name), raw candidate multiplicity is refused before
+    liveness, a shell residue is never a slot, and a live row whose surfaced provider /
+    detected agent disagrees with the expected provider is a foreign process squatting on
+    the expected name.
+
+    The gate ORDER is part of the contract and unchanged: raw multiplicity -> liveness ->
+    surfaced provider stamps -> non-empty assigned name + locator.
     """
     want_lane = _norm_lane(lane_id)
     candidates = []
@@ -295,6 +316,35 @@ def _resolve_attested_slot(
     locator = _norm(_agent_locator(row))
     if not assigned_name or not locator:
         return (None, ADOPT_DECL_INCOMPLETE_PAIR)
+    return (
+        NamedSlotCandidate(row=row, assigned_name=assigned_name, locator=locator),
+        "",
+    )
+
+
+def _resolve_attested_slot(
+    *,
+    rows: Sequence[Mapping[str, object]],
+    workspace_id: str,
+    lane_id: str,
+    provider: str,
+    role: str,
+    attestation_store,
+) -> tuple[Optional[ProcessGenerationPin], str]:
+    """Resolve ONE provider's live, attested slot into a typed pin, or a zero-write reason.
+
+    Returns ``(pin, "")`` on success or ``(None, reason)`` on any fail-closed condition: a
+    duplicate assigned name (RAW candidate multiplicity), a stale shell residue, a missing
+    locator, or a startup self-attestation that is not present + generation-bound to the
+    live locator.
+    """
+    candidate, reason = select_named_slot_candidate(
+        rows=rows, workspace_id=workspace_id, lane_id=lane_id, provider=provider
+    )
+    if candidate is None:
+        return (None, reason)
+    assigned_name = candidate.assigned_name
+    locator = candidate.locator
     record = attestation_store.read(assigned_name)
     join = evaluate_attestation(
         record,
@@ -678,6 +728,8 @@ def _binding_has_required_pins(record, providers: tuple[str, str]) -> bool:
 
 
 __all__ = (
+    "NamedSlotCandidate",
+    "select_named_slot_candidate",
     "declared_lane_root_identity",
     "declared_worktree_identity",
     "declare_adopted_owner_row",
