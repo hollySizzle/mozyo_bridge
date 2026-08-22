@@ -61,17 +61,45 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
 #: carrying ``issue_1; printf X`` is a storable lane id — the guard has to live wherever
 #: that id is re-emitted.
 #:
-#: Measured before adopting the strict form (Redmine #15844 review j#109990): all 121 rows
-#: of the operator store (60 ``lane_lifecycle_records`` + 61 ``lane_metadata_records``)
-#: satisfy it, so being strict costs no legitimate lane.
-_LANE_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9_]+$")
+#: **The alphabet is the canonical producers', not a sample's** (Redmine #15844 review
+#: j#110012 finding_1; verdict j#110013). The first form here was ``^[A-Za-z0-9_]+$``,
+#: justified by all 121 rows of the operator store satisfying it — but that store happened
+#: to contain no project-gateway lane, and
+#: :func:`...workflow_role_authority.project_gateway_lane_id` builds ``pgwv1_<slug>-<digest>``,
+#: so **every** canonically derived gateway lane carries a hyphen and was refused a command.
+#: ``issue-15844-feature`` — which ``parse_issue_from_lane_label`` officially parses and
+#: ``SublaneCreateRequest`` accepts — was refused for the same reason. A sample bounds a
+#: measurement, not a vocabulary.
+#:
+#: The leading character stays non-hyphen deliberately: relaxing to a plain
+#: ``[A-Za-z0-9_-]+`` would admit ``-x`` / ``--execute`` and hand the argv-flag spoofing
+#: closed in R2 straight back through the hyphen. ``project_gateway_lane_id`` strips
+#: leading hyphens and prefixes ``pgwv1_``, so the constraint costs its output nothing
+#: (verified over its slug edge cases, including an all-hyphen and a non-ASCII scope).
+#:
+#: Deliberately still NARROWER than the create ingress: ``SublaneCreateRequest.missing_fields``
+#: only checks non-emptiness, so "accept whatever ingress accepts" would empty the guard.
+#: What this aligns with is the canonical producers' output and the documented naming
+#: conventions.
+_LANE_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
 
-#: C0, DEL and C1. Neutralized wherever a lane id reaches rendered text, because a raw
-#: newline in an id forges the OUTPUT'S OWN line structure — a fabricated ``$`` step line
-#: and a split ``lane <id>:`` line were both reproduced. ``shlex.quote`` does not help
-#: here: it single-quotes the value and leaves the newline inside, so the line still
+#: Characters neutralized wherever a lane id reaches rendered text or a payload.
+#:
+#: Covers C0, DEL and C1 — and **U+2028 / U+2029**, which ``str.splitlines()`` also treats
+#: as boundaries. The first version stopped at C1 and let a LINE SEPARATOR through, which
+#: still forged the record's line structure (measured: +3 lines, one per echo site;
+#: Redmine #15844 review j#110012 finding_2).
+#:
+#: The set was not guessed twice: sweeping the whole code-point space shows ``splitlines()``
+#: splits on exactly ten code points (0x0a 0x0b 0x0c 0x0d 0x1c 0x1d 0x1e 0x85 0x2028
+#: 0x2029), and the ranges below cover all ten. A regression re-derives that sweep so the
+#: set cannot silently drift from the runtime's own behaviour.
+#:
+#: A raw newline in an id forges the OUTPUT'S OWN line structure — a fabricated ``$`` step
+#: line and a split ``lane <id>:`` line were both reproduced. ``shlex.quote`` does not help
+#: here: it single-quotes the value and leaves the boundary inside, so the line still
 #: breaks. Quoting and line-safety are two different defects with two different fixes.
-_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
+_CONTROL_CHARS_RE = re.compile("[\\x00-\\x1f\\x7f-\\x9f\\u2028\\u2029]")
 
 #: The lane dispositions that mean "this lane is finished with"; the terminal set is
 #: ``managed-state-model.md``'s, not a second definition. ``hibernated`` is deliberately
@@ -130,7 +158,13 @@ def is_renderable_lane_id(lane_id: str) -> bool:
 
 def display_lane_id(lane_id: str) -> str:
     """A lane id that cannot forge the line structure of the text it is printed into."""
-    return _CONTROL_CHARS_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", lane_id or "")
+    return _CONTROL_CHARS_RE.sub(_escape_char, lane_id or "")
+
+
+def _escape_char(match: "re.Match[str]") -> str:
+    r"""``\xNN`` below U+0100, ``\uXXXX`` above — never the raw boundary character."""
+    code = ord(match.group())
+    return f"\\x{code:02x}" if code < 0x100 else f"\\u{code:04x}"
 
 
 def reboot_audit_command(lane_id: str) -> Optional[str]:

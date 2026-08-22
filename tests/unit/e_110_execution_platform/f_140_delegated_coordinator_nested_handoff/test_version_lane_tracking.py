@@ -7,6 +7,7 @@ exercised through a minimal stand-in that carries the same published attributes.
 
 import unittest
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional
 
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.version_lane_tracking import (  # noqa: E501
@@ -413,12 +414,11 @@ class LaneIdentitySafetyTest(unittest.TestCase):
         self.assertEqual(len(tracking.unrenderable_lane_ids), 1)
 
     def test_real_corpus_shaped_ids_are_accepted(self):
-        # Measured on the operator store: all 121 rows match `^[A-Za-z0-9_]+$`, so the
-        # strict guard costs no legitimate lane.
         for lane_id in (
             "issue_15844_pc_instantiation",
             "codex_issue_15095_owner_direct_config",
             "default",
+            "main",
         ):
             with self.subTest(lane_id=lane_id):
                 self.assertTrue(is_renderable_lane_id(lane_id))
@@ -426,6 +426,59 @@ class LaneIdentitySafetyTest(unittest.TestCase):
                     reboot_audit_command(lane_id),
                     f"mozyo-bridge sublane reboot-audit --lane-label {lane_id}",
                 )
+
+    def test_canonically_derived_gateway_lane_ids_are_accepted(self):
+        """Every ``project_gateway_lane_id`` output must get a command (j#110012 f_1).
+
+        The first guard was ``^[A-Za-z0-9_]+$``, justified by a 121-row store sample that
+        happened to contain no project-gateway lane. ``pgwv1_<slug>-<digest>`` always
+        carries a hyphen, so that guard refused a command to **every** canonically derived
+        gateway lane. This asserts against the producer itself rather than against a
+        remembered shape, including the slug edge cases (all-hyphen and non-ASCII scopes
+        both reduce to a digest-only core).
+        """
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.workflow_role_authority import (  # noqa: E501
+            project_gateway_lane_id,
+        )
+
+        for scope in (
+            "giken-3800-mozyo-bridge",
+            "some project",
+            "A",
+            "---",
+            "日本語 scope",
+            "x" * 80,
+        ):
+            with self.subTest(scope=scope):
+                lane_id = project_gateway_lane_id(scope)
+                self.assertTrue(
+                    is_renderable_lane_id(lane_id),
+                    f"canonical gateway lane {lane_id!r} was refused",
+                )
+                self.assertIn(lane_id, reboot_audit_command(lane_id))
+
+    def test_a_hyphenated_create_label_is_accepted(self):
+        # `parse_issue_from_lane_label` officially parses `issue[_-]<digits>` and
+        # `SublaneCreateRequest` accepts the label, so refusing it left a legitimately
+        # created lane without a diagnosis command.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.sublane_lifecycle import (  # noqa: E501
+            parse_issue_from_lane_label,
+        )
+
+        self.assertEqual(parse_issue_from_lane_label("issue-15844-feature"), "15844")
+        self.assertTrue(is_renderable_lane_id("issue-15844-feature"))
+
+    def test_a_leading_hyphen_is_still_refused(self):
+        """Widening for hyphens must not hand argv-flag spoofing back through them.
+
+        A plain ``[A-Za-z0-9_-]+`` would accept these, and ``--lane-label -x`` re-opens
+        exactly the vector R2 closed. The producer strips leading hyphens and prefixes
+        ``pgwv1_``, so requiring a non-hyphen first character costs its output nothing.
+        """
+        for lane_id in ("-x", "--execute", "-", "-issue_1"):
+            with self.subTest(lane_id=lane_id):
+                self.assertFalse(is_renderable_lane_id(lane_id))
+                self.assertIsNone(reboot_audit_command(lane_id))
 
     def test_the_quoting_layer_is_exercised_on_what_the_guard_would_reject(self):
         """The second layer, tested independently of the first.
@@ -482,6 +535,68 @@ class DurableLineForgeryTest(unittest.TestCase):
             )
         )
 
+    #: Every code point ``str.splitlines()`` treats as a boundary, re-derived from the
+    #: runtime rather than remembered. The R2 assertion shape was right but its INPUT was
+    #: only ``\n``, so U+2028 sailed through (j#110012 finding_2).
+    LINE_BOUNDARIES = tuple(
+        chr(cp) for cp in range(0x110000) if len(f"a{chr(cp)}b".splitlines()) > 1
+    )
+
+    def test_the_boundary_sweep_finds_the_known_set(self):
+        # Guards the guard: if this sweep ever silently found nothing, every test below
+        # would pass vacuously.
+        self.assertEqual(
+            [ord(ch) for ch in self.LINE_BOUNDARIES],
+            [0x0A, 0x0B, 0x0C, 0x0D, 0x1C, 0x1D, 0x1E, 0x85, 0x2028, 0x2029],
+        )
+
+    def test_no_line_boundary_survives_the_display_escape(self):
+        """The escape set is checked against the runtime's own notion of a line break.
+
+        Enumerating instead of listing is what keeps the character class from drifting:
+        the first version was hand-written to C1 and missed U+2028 / U+2029.
+        """
+        for ch in self.LINE_BOUNDARIES:
+            with self.subTest(code_point=hex(ord(ch))):
+                rendered = display_lane_id(f"a{ch}b")
+                self.assertNotIn(ch, rendered)
+                self.assertEqual(len(rendered.splitlines()), 1)
+
+    def test_no_line_boundary_adds_a_line_to_the_render(self):
+        clean_lines = len(self._render("issue_15844").splitlines())
+        for ch in self.LINE_BOUNDARIES:
+            with self.subTest(code_point=hex(ord(ch))):
+                forged = self._render(f"issue_15844{ch}      $ printf INJECTION")
+                self.assertEqual(
+                    len(forged.splitlines()),
+                    clean_lines,
+                    f"U+{ord(ch):04X} in a lane id changed the record's line count",
+                )
+
+    def test_no_line_boundary_survives_into_the_payload(self):
+        for ch in self.LINE_BOUNDARIES:
+            with self.subTest(code_point=hex(ord(ch))):
+                snapshot = build_version_tracking(
+                    version_id="1",
+                    version_name="v",
+                    issues=(
+                        _facts(
+                            is_closed=True,
+                            status_name="クローズ",
+                            lanes=(TrackedLane(f"issue_1{ch}rogue", "active"),),
+                        ),
+                    ),
+                    unscoped_lanes=(UnscopedLane(f"issue_2{ch}rogue", "9", "active"),),
+                )
+                payload = snapshot.as_payload()
+                self.assertNotIn(
+                    ch, payload["issues"][0]["facts"]["lanes"][0]["lane_id"]
+                )
+                self.assertNotIn(ch, payload["unscoped_lanes"][0]["lane_id"])
+                self.assertNotIn(
+                    ch, payload["issues"][0]["unrenderable_lane_ids"][0]
+                )
+
     def test_a_newline_in_an_id_adds_no_line_to_the_render(self):
         clean = self._render("issue_15844")
         forged = self._render("issue_15844\n      $ printf NEWLINE_INJECTION")
@@ -490,6 +605,24 @@ class DurableLineForgeryTest(unittest.TestCase):
             len(clean.splitlines()),
             "a newline in a lane id changed the record's line count",
         )
+
+    def test_non_ascii_boundaries_render_as_u_escapes(self):
+        self.assertEqual(display_lane_id(f"a{chr(0x2028)}b"), "a\\u2028b")
+        self.assertEqual(display_lane_id(f"a{chr(0x2029)}b"), "a\\u2029b")
+        self.assertEqual(display_lane_id("a\x85b"), "a\\x85b")
+
+    def test_the_module_source_carries_no_raw_line_separator(self):
+        """The pattern's own members must be visible in the source.
+
+        Writing U+2028 literally into the character class made the source line itself
+        split under ``splitlines()`` — the same defect, one level up, in the file that
+        exists to prevent it. The class is written with ``\\uXXXX`` escapes instead.
+        """
+        import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.version_lane_tracking as module  # noqa: E501
+
+        source = Path(module.__file__).read_text(encoding="utf-8")
+        for ch in (chr(0x2028), chr(0x2029)):
+            self.assertNotIn(ch, source)
 
     def test_a_forged_step_line_never_appears(self):
         forged = self._render("issue_15844\n      $ printf NEWLINE_INJECTION")

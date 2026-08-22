@@ -277,13 +277,27 @@ lane id は lifecycle store から来る値であり、**`LaneLifecycleKey` は�
 | --- | --- | --- | --- |
 | shell 注入 | `issue_1; printf X` | copy/paste で後半が別 command として走る | quoting または拒否 |
 | **argv flag 偽装** | `issue_1 --execute` | shell metacharacter を 1 つも含まないので「危険文字除去」型の対策を素通りするが、argv 上で別 flag に化ける | quoting または拒否 |
-| **行境界偽装** | `issue_1\n      $ ...` | 出力に**偽の `$` step 行が増え**、`lane <id>:` 行も分断される。envelope は journal に貼る前提なので、これは*記録*の偽造 | 制御文字の escape (**quoting では閉じない**) |
+| **行境界偽装** | `issue_1\n      $ ...` / `issue_1<U+2028>      $ ...` | 出力に**偽の `$` step 行が増え**、`lane <id>:` 行も分断される。envelope は journal に貼る前提なので、これは*記録*の偽造 | **全 line-boundary code point** の escape (**quoting では閉じない**) |
 
 規律:
 
-- **identity は fail-closed**: `^[A-Za-z0-9_]+$` (`herdr_identity._NAME_CHAR_RE` と同じ姿勢)。
-  採用前に代償を測った — operator store の 121 行 (lifecycle 60 + metadata 61) が**全て**
-  満たすので、正当な lane を 1 本も落とさない。
+- **identity は fail-closed**: `^[A-Za-z0-9_][A-Za-z0-9_-]*$`。姿勢は
+  `herdr_identity._NAME_CHAR_RE` と同じだが、**語彙は canonical producer の出力から採る**。
+  - 初版は `^[A-Za-z0-9_]+$` で、根拠は「operator store の 121 行が全て満たす」だった。これは
+    **誤り**である (#15844 review j#110012 finding_1 / verdict j#110013)。標本は測定の範囲を
+    決めるだけで、語彙の範囲を決めない。実際 `workflow_role_authority.project_gateway_lane_id`
+    は `pgwv1_<slug>-<digest>` を生成するので **canonical に導出される gateway lane は
+    ほぼ必ず hyphen を含み、初版の guard はその全てに command を出さなかった**。標本にたまたま
+    `pgwv1_` lane が 1 本も無かったので見えなかった。`issue-15844-feature`
+    (`parse_issue_from_lane_label` が正式に解釈し `SublaneCreateRequest` が受理する) も同様。
+  - **先頭 1 文字は非 hyphen に固定する**。素朴に `[A-Za-z0-9_-]+` へ緩めると `-x` /
+    `--execute` を受理し、argv flag 偽装が hyphen 経由で戻る。`project_gateway_lane_id` は
+    `.strip("-")` の上で `pgwv1_` を前置するので、この制約は producer の出力と衝突しない
+    (slug の端点 — 全 hyphen scope / 非 ASCII scope / 長大 scope — まで含めて実測済み)。
+  - **create ingress より意図的に狭いままにする**。`SublaneCreateRequest.missing_fields` は
+    非空しか検査しないので、「ingress が受理するものを全て受理する」と読むと guard が空になる。
+    整合させる相手は *canonical producer の生成語彙と文書化された命名規約*であって、検証を
+    一切しない ingress ではない。
 - **不正な id には command を出さない**。sanitize して「それらしい command」を作ることは、
   検証できていない identity から実行可能な文字列を手渡すことであり、本 doc の
   「読めなかったを読めたと報告しない」と同じ線で禁じる。**ただし finding は隠さない** —
@@ -291,6 +305,19 @@ lane id は lifecycle store から来る値であり、**`LaneLifecycleKey` は�
   無関係だからである。
 - **quoting と行安全化は別の対策**であり、両方要る。`shlex.quote("a\nb")` は改行を含んだまま
   単一引用するので、行分断は残る。
+- **行境界の集合は列挙せず走査で決める**。初版の escape 集合は C0/DEL/C1 を手書きしたもので、
+  **U+2028 / U+2029 を取りこぼした** (#15844 review j#110012 finding_2)。code point 全域を
+  走査すると `str.splitlines()` が境界とするのは**ちょうど 10 個**
+  (`0x0a 0x0b 0x0c 0x0d 0x1c 0x1d 0x1e 0x85 0x2028 0x2029`) で、現在の集合はこれを覆う。
+  同じ走査を回帰に置き、集合が runtime の挙動から drift できないようにする。
+  非 ASCII は `\uXXXX` 形式で出す。
+  - **pattern の中身は source 上で可視にする** (`\uXXXX` escape で書く)。文字クラスに U+2028 を
+    literal で書いたところ、**その source 行自身が `splitlines()` で分割された** — 防ごうと
+    している欠陥が、防ぐための file で 1 段上に再現した。回帰で module source に raw separator
+    が無いことを検査する。
+  - **既知の残余 (本 doc の scope 外と判断)**: bidi override (U+202E 等) は文字の*視覚順序*を
+    操作しうるが**行境界は作らない**ので、行数不変という本節の不変条件は保たれる。扱うなら
+    「視覚的同一性」という別の性質の話になるため、named residual として記録し実装しない。
 - command 描画は構造化 argv → per-token `shlex.quote` (`handoff.py` / `delegation_launch_adopt` /
   `grandchild_dispatch` の既存型。同型の指摘が #12162 review j#60107 で裁定済み)。
   **現在の strict guard 下では quoting が結果を変える入力は到達しない**ので、quoting 層は
