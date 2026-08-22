@@ -132,6 +132,15 @@ documents:
     related_document_refs:
       - rule-adr-index
 
+  - id: rule-adr-0014-dead-unit-proxy-recovery
+    type: rule
+    status: active
+    canonical_path: vibes/docs/adr/adr-0014-dead-unit-proxy-recovery.md
+    purpose: "ADR-0014: 死んだユニットの代理回収。その drain を担う上位層 (3階層=プロジェクトコーディネーター / 1階層=相方役) が代理で実状態を回収し、事実は回収するが完了は推測しない (権威証拠=レビュー記録+取り込み)。改修せず手で消して残骸を隠すのを禁じる (#15631)。"
+    audit_role: adr_0014_rule
+    related_document_refs:
+      - rule-adr-index
+
   - id: rule-release-distribution
     type: rule
     status: active

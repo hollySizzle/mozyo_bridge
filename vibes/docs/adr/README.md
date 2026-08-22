@@ -61,3 +61,4 @@ fail-closed 動作) は `vibes/docs/rules/agent-workflow.md` の `adr_conflict_g
 | [ADR-0011](adr-0011-three-layer-responsibility-division.md) | 3階層は責務の所在の分担であり多重レビューではない (サブレーン=実装+自己完結監査 / プロジェクトコーディネーター=drain 最重要+dispatch+統合 / コーディネーター=構成+リリース+Redmine ベース ADR 確認) | active |
 | [ADR-0012](adr-0012-supported-platforms.md) | 保守対応 platform は macOS と Linux (Windows 対象外) | active |
 | [ADR-0013](adr-0013-ui-hides-pane-operations.md) | ユーザーに pane / 内部操作を意識させない UI (UX 要件) | active |
+| [ADR-0014](adr-0014-dead-unit-proxy-recovery.md) | 死んだユニットの代理回収 — 上位層 (相方役) は「事実」を回収するが「完了」を推測しない | active |
