@@ -19,6 +19,9 @@ The properties this file exists for are the ones no unit test can hold:
 
 from __future__ import annotations
 
+import contextlib
+import io
+import json
 import sys
 import tempfile
 import unittest
@@ -45,10 +48,14 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     journal_id_carrying_key,
     run_stall_watch_leg,
 )
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_body_marker import (  # noqa: E501
+    resolve_body_marker,
+)
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_phase import (  # noqa: E501
     stall_watch_status,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_wiring import (  # noqa: E501
+    POLICY_DETAIL_LIMIT,
     build_stall_watch_leg_fn,
     lane_facts_snapshot,
     resolve_stall_watch_policy,
@@ -58,6 +65,9 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     STALL_ESCALATION_REASON,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_watch_policy import (  # noqa: E501
+    POLICY_ABSENT,
+    POLICY_CONFIG_UNREADABLE,
+    POLICY_INVALID,
     StallWatchPolicy,
 )
 
@@ -166,6 +176,7 @@ class LegBase(unittest.TestCase):
             wake=kwargs.pop("wake", self.wake),
             generation_for=kwargs.pop("generation_for", lambda lane: "g1"),
             issue_for=kwargs.pop("issue_for", lambda lane: "15855"),
+            body_marker_for=kwargs.pop("body_marker_for", None),
             budget=budget,
             clock=self._tick,
             sleep=lambda _s: None,
@@ -345,11 +356,37 @@ class ReadbackFenceTest(LegBase):
         # "The POST did not raise" is not "a journal exists".
         self.emit = _Emit(self.source, land=False)
         self.run_leg()
-        self.run_leg(at=T0 + timedelta(seconds=301))
+        budget = {"reads": 0, "mutated": False, "uncertain": False}
+        self.run_leg(at=T0 + timedelta(seconds=301), budget=budget)
         self.assertEqual(len(self.emit.calls), 1)
         self.assertEqual(self.wake.calls, [])
         (pending,) = self.store.unrecorded_pending(WS)
         self.assertEqual(pending.last_reason, "readback_unverified")
+        # ...and the possibly-landed POST is charged to the shared pass budget, so no later
+        # workspace performs a second external mutation behind it (j#110132 finding_1).
+        self.assertTrue(budget["uncertain"])
+        self.assertFalse(budget["mutated"])
+
+    def test_a_transport_error_is_uncertain_not_a_deterministic_refusal(self) -> None:
+        # The refusal allowlist is what separates "never reached Redmine" from "may have".
+        # A transport error is outside it, so it must spend the budget as uncertain.
+        self.emit = _Emit(self.source, recorded=False, reason="transport_error")
+        self.run_leg()
+        budget = {"reads": 0, "mutated": False, "uncertain": False}
+        self.run_leg(at=T0 + timedelta(seconds=301), budget=budget)
+        self.assertTrue(budget["uncertain"])
+        (pending,) = self.store.unrecorded_pending(WS)
+        self.assertEqual(pending.last_reason, "transport_error")
+
+    def test_an_unset_write_optin_is_a_deterministic_refusal(self) -> None:
+        # The other side of the same allowlist: nothing was attempted, so the pass keeps
+        # its remaining mutation slot.
+        self.emit = _Emit(self.source, recorded=False, reason="write_optin_unset")
+        self.run_leg()
+        budget = {"reads": 0, "mutated": False, "uncertain": False}
+        self.run_leg(at=T0 + timedelta(seconds=301), budget=budget)
+        self.assertFalse(budget["uncertain"])
+        self.assertFalse(budget["mutated"])
 
     def test_a_refused_write_records_the_reason_and_wakes_nobody(self) -> None:
         self.emit = _Emit(self.source, recorded=False, reason="write_optin_unset")
@@ -400,6 +437,134 @@ class NoiseTest(LegBase):
         outcome = self.run_leg(policy=policy)
         self.assertEqual(outcome.reason, LEG_NOTHING_TO_WATCH)
         self.assertEqual(self.reads, [])
+
+
+
+MARKER = "[mozyo:handoff:source=redmine:issue=15855:journal=110127:kind=review_request:to=claude]"
+#: A body sitting UNSENT in the live composer: the provider banner, then the composer
+#: prompt carrying the dispatched marker. `current_composer_retains_body` finds the last
+#: rendered prompt and looks below it, so the marker must follow the prompt -- a marker
+#: ABOVE it is transcript (already submitted) and correctly does not match.
+COMPOSER_SCREEN = f"claude 2.1.220\n\n> {MARKER}\n"
+
+
+class _LedgerRecord:
+    def __init__(self, marker=MARKER, receiver="claude", target=LOCATOR) -> None:
+        self.notification_marker = marker
+        self.receiver = receiver
+        self.target = target
+
+
+class _Ledger:
+    def __init__(self, records, *, raises=False) -> None:
+        self._records = records
+        self.raises = raises
+
+    def records_for_issue(self, issue_id):
+        if self.raises:
+            raise RuntimeError("ledger unreadable")
+        return list(self._records)
+
+
+class BodyMarkerJoinTest(unittest.TestCase):
+    """The join that makes ``unsent_composer`` reachable (review j#110132 finding_2)."""
+
+    def test_the_most_recent_matching_dispatch_wins(self) -> None:
+        older = "[mozyo:handoff:source=redmine:issue=15855:journal=1:kind=reply:to=claude]"
+        ledger = _Ledger([_LedgerRecord(marker=older), _LedgerRecord()])
+        self.assertEqual(
+            resolve_body_marker(ledger, issue="15855", role="claude", locator=LOCATOR),
+            MARKER,
+        )
+
+    def test_a_different_role_is_not_matched(self) -> None:
+        ledger = _Ledger([_LedgerRecord(receiver="codex")])
+        self.assertEqual(
+            resolve_body_marker(ledger, issue="15855", role="claude", locator=LOCATOR), ""
+        )
+
+    def test_a_different_locator_is_not_matched(self) -> None:
+        # The send went to a pane that is not the one being observed now.
+        ledger = _Ledger([_LedgerRecord(target="w9Q:pZ")])
+        self.assertEqual(
+            resolve_body_marker(ledger, issue="15855", role="claude", locator=LOCATOR), ""
+        )
+
+    def test_non_handoff_text_is_never_matched(self) -> None:
+        # Matching arbitrary recorded text would reintroduce the whole-screen substring
+        # guess `ack-completion-receiver-state.md` forbids.
+        ledger = _Ledger([_LedgerRecord(marker="some free-form note about the pane")])
+        self.assertEqual(
+            resolve_body_marker(ledger, issue="15855", role="claude", locator=LOCATOR), ""
+        )
+
+    def test_every_missing_input_yields_no_marker(self) -> None:
+        ledger = _Ledger([_LedgerRecord()])
+        for kwargs in (
+            {"issue": "", "role": "claude", "locator": LOCATOR},
+            {"issue": "15855", "role": "", "locator": LOCATOR},
+            {"issue": "15855", "role": "claude", "locator": ""},
+        ):
+            with self.subTest(**kwargs):
+                self.assertEqual(resolve_body_marker(ledger, **kwargs), "")
+        self.assertEqual(
+            resolve_body_marker(None, issue="15855", role="claude", locator=LOCATOR), ""
+        )
+
+    def test_an_unreadable_ledger_yields_no_marker(self) -> None:
+        ledger = _Ledger([], raises=True)
+        self.assertEqual(
+            resolve_body_marker(ledger, issue="15855", role="claude", locator=LOCATOR), ""
+        )
+
+
+class UnsentComposerReachabilityTest(LegBase):
+    """The whole point of finding_2: the class must be reachable in the PRODUCTION path."""
+
+    def _run(self, *, with_marker, at=None):
+        ledger = _Ledger([_LedgerRecord()]) if with_marker else _Ledger([])
+
+        def _marker(issue, role, locator):
+            return resolve_body_marker(
+                ledger, issue=issue, role=role, locator=locator
+            )
+
+        return self.run_leg(
+            read=lambda target: (True, COMPOSER_SCREEN),
+            body_marker_for=_marker,
+            at=at,
+        )
+
+    def _fire(self, *, with_marker):
+        self._run(with_marker=with_marker)
+        return self._run(with_marker=with_marker, at=T0 + timedelta(seconds=301))
+
+    def test_a_retained_body_is_classified_unsent_composer(self) -> None:
+        outcome = self._fire(with_marker=True)
+        self.assertEqual(outcome.observed.escalated, 1)
+        (call,) = self.emit.calls
+        self.assertIn("- stall_class: unsent_composer", call["body"])
+        # ADR-0002's bounded Enter-only budget, not patient waiting.
+        self.assertIn("- prescription: enter_only_retry", call["body"])
+
+    def test_without_the_join_the_same_screen_reports_the_wrong_class(self) -> None:
+        # The pre-fix behaviour, kept as the discriminator: the IDENTICAL screen falls
+        # through to the patient indeterminate class when no marker is supplied, so the
+        # durable record would name the wrong remedy.
+        outcome = self._fire(with_marker=False)
+        self.assertEqual(outcome.observed.escalated, 1)
+        (call,) = self.emit.calls
+        self.assertIn("- stall_class: unresponsive_indeterminate", call["body"])
+        self.assertIn("- prescription: patient_wait_then_retry", call["body"])
+
+    def test_the_class_reaches_the_note_but_the_screen_text_does_not(self) -> None:
+        self._fire(with_marker=True)
+        (call,) = self.emit.calls
+        self.assertIn("- stall_class: unsent_composer", call["body"])
+        # The marker is evidence the classifier consumed; it is NOT pane content and it is
+        # NOT reproduced in the durable record.
+        self.assertNotIn(MARKER, call["body"])
+        self.assertNotIn("claude 2.1.220", call["body"])
 
 
 class StatusTest(LegBase):
@@ -513,13 +678,52 @@ class PolicyResolutionTest(unittest.TestCase):
             resolve_stall_watch_policy(tempfile.mkdtemp()).enabled
         )
 
-    def test_a_malformed_block_watches_nothing_rather_than_defaults(self) -> None:
+    def _repo(self, body):
         root = Path(tempfile.mkdtemp())
         (root / ".mozyo-bridge").mkdir()
-        (root / ".mozyo-bridge" / "config.yaml").write_text(
-            "version: 2\nstall_watch:\n  cadence_seconds: soon\n"
+        (root / ".mozyo-bridge" / "config.yaml").write_text("version: 2\n" + body)
+        return root
+
+    def test_a_malformed_block_is_typed_invalid_not_absent(self) -> None:
+        # j#110121-2 asks for a TYPED no-op. Collapsing malformed into `absent` told an
+        # operator who mistyped a cadence that they had never configured anything
+        # (review j#110132 finding_4).
+        policy = resolve_stall_watch_policy(
+            self._repo("stall_watch:\n  cadence_seconds: soon\n")
         )
-        self.assertFalse(resolve_stall_watch_policy(root).enabled)
+        self.assertFalse(policy.enabled)
+        self.assertEqual(policy.reason, POLICY_INVALID)
+        self.assertIn("cadence_seconds", policy.detail)
+        self.assertEqual(policy.source, POLICY_INVALID)
+
+    def test_the_three_off_states_are_distinguishable(self) -> None:
+        absent = resolve_stall_watch_policy(tempfile.mkdtemp())
+        invalid = resolve_stall_watch_policy(
+            self._repo("stall_watch:\n  threshold: 0\n")
+        )
+        unreadable = resolve_stall_watch_policy(self._repo("  : : bad yaml [\n"))
+        reasons = {absent.reason, invalid.reason, unreadable.reason}
+        self.assertEqual(
+            reasons, {POLICY_ABSENT, POLICY_INVALID, POLICY_CONFIG_UNREADABLE}
+        )
+        for policy in (absent, invalid, unreadable):
+            with self.subTest(reason=policy.reason):
+                self.assertFalse(policy.enabled)
+
+    def test_a_sibling_block_error_is_not_blamed_on_stall_watch(self) -> None:
+        # The loader raises one error type for ANY invalid block; reporting a work_unit
+        # mistake as "your stall_watch block is malformed" would send the operator to the
+        # wrong line.
+        policy = resolve_stall_watch_policy(
+            self._repo("work_unit:\n  granularity: nonsense\n")
+        )
+        self.assertEqual(policy.reason, POLICY_CONFIG_UNREADABLE)
+
+    def test_the_detail_is_bounded(self) -> None:
+        policy = resolve_stall_watch_policy(
+            self._repo("stall_watch:\n  lanes: [%s]\n" % ", ".join(["x"] * 400))
+        )
+        self.assertLessEqual(len(policy.detail), POLICY_DETAIL_LIMIT)
 
     def test_a_declared_block_is_read(self) -> None:
         root = Path(tempfile.mkdtemp())
@@ -613,6 +817,148 @@ class WiringTest(unittest.TestCase):
         pending = store.unrecorded_pending(WS)
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0].last_reason, "write_optin_unset")
+
+
+
+class OperatorStatusSurfaceTest(unittest.TestCase):
+    """`workflow supervisor --status` must answer "is the watcher running, and is it stuck".
+
+    An earlier version implemented the projection but wired no production caller, so the
+    last/next due (j#110121-2) and the pending age (j#110121-6) were readable only from
+    tests — review j#110132 finding_3. These run the REAL CLI entrypoint against a temp
+    home, so a future regression that unwires it fails here rather than passing silently.
+    """
+
+    def setUp(self) -> None:
+        self.home = Path(tempfile.mkdtemp())
+        self.repo = Path(tempfile.mkdtemp())
+        (self.repo / ".mozyo-bridge").mkdir(parents=True)
+
+    def _register(self, config_body=""):
+        from mozyo_bridge.core.state.workspace_registry import register_workspace
+
+        (self.repo / ".mozyo-bridge" / "config.yaml").write_text(
+            "version: 2\n" + config_body
+        )
+        return register_workspace(self.repo, home=self.home)
+
+    def _status(self, as_json=False):
+        from mozyo_bridge.application.cli import main
+
+        argv = ["workflow", "supervisor", "--status", "--home", str(self.home)]
+        if as_json:
+            argv.append("--json")
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            rc = main(argv)
+        self.assertEqual(rc, 0)
+        return buffer.getvalue()
+
+    def test_an_unconfigured_workspace_is_reported_as_off_with_its_reason(self) -> None:
+        self._register()
+        text = self._status()
+        self.assertIn("stall_watch:", text)
+        self.assertIn(f"off ({POLICY_ABSENT})", text)
+
+    def test_a_malformed_block_is_reported_as_invalid_not_absent(self) -> None:
+        self._register("stall_watch:\n  cadence_seconds: soon\n")
+        self.assertIn(f"off ({POLICY_INVALID})", self._status())
+
+    def test_a_configured_workspace_reports_cadence_and_due_instants(self) -> None:
+        self._register("stall_watch:\n  lanes: [lane_a]\n  threshold: 3\n")
+        text = self._status()
+        self.assertIn("on (cadence=300s threshold=3)", text)
+        self.assertIn("next_due>=", text)
+        self.assertIn("pending:", text)
+
+    def test_the_pending_backlog_age_is_visible(self) -> None:
+        from mozyo_bridge.core.state.stall_escalation import (
+            PendingEscalation,
+            StallEscalationStore,
+        )
+
+        result = self._register("stall_watch:\n  lanes: [lane_a]\n")
+        workspace_id = result.record.workspace_id
+        StallEscalationStore(home=self.home).enqueue_pending(
+            PendingEscalation(
+                idempotency_key="k1",
+                workspace_id=workspace_id,
+                lane_id="lane_a",
+                role="claude",
+                stall_class="content_refusal",
+                prescription="context_reset_reinjection",
+                consecutive=2,
+                first_observed_at="2026-08-22T09:00:00+00:00",
+                escalated_at="2026-08-22T09:00:00+00:00",
+                issue="15855",
+            )
+        )
+        text = self._status()
+        self.assertIn("unrecorded=1", text)
+        self.assertIn("oldest_age=", text)
+        self.assertNotIn("oldest_age=-", text)
+
+    def test_the_json_surface_carries_the_full_projection(self) -> None:
+        self._register("stall_watch:\n  lanes: [lane_a]\n")
+        payload = json.loads(self._status(as_json=True))
+        (row,) = payload["stall_watch"]
+        self.assertTrue(row["policy"]["enabled"])
+        self.assertEqual(row["policy"]["lanes"], ["lane_a"])
+        self.assertIn("next_due_at", row["cadence"])
+        self.assertTrue(row["cadence"]["next_due_is_a_threshold_not_a_schedule"])
+        for key in (
+            "unrecorded",
+            "anchorless",
+            "recorded_but_unwoken",
+            "oldest_unrecorded_age_seconds",
+        ):
+            with self.subTest(key=key):
+                self.assertIn(key, row["pending"])
+
+    def test_status_survives_a_workspace_whose_policy_cannot_be_read(self) -> None:
+        self._register()
+        (self.repo / ".mozyo-bridge" / "config.yaml").write_text("  : : bad yaml [\n")
+        text = self._status()
+        self.assertIn("stall_watch:", text)
+        self.assertIn("off (", text)
+
+
+class SupervisorReportTelemetryTest(unittest.TestCase):
+    def test_a_raising_leg_is_reported_rather_than_swallowed(self) -> None:
+        # "The watcher blew up" and "the watcher had nothing to do" must not read the same.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_stall_watch_capture import (  # noqa: E501
+            STALL_WATCH_LEG_ERROR,
+            capture_stall_watch,
+        )
+
+        class _WS:
+            workspace_id = WS
+
+        def _boom(ws, *, pass_budget=None):
+            raise RuntimeError("watcher exploded")
+
+        captured = capture_stall_watch(_boom, _WS(), pass_budget=None)
+        self.assertEqual(captured["stall_watch_reason"], STALL_WATCH_LEG_ERROR)
+        self.assertEqual(captured["error"], "RuntimeError")
+        # The TYPE only -- a message could quote a path, a config value or a screen.
+        self.assertNotIn("exploded", json.dumps(captured))
+
+    def test_no_leg_wired_reports_nothing(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_stall_watch_capture import (  # noqa: E501
+            capture_stall_watch,
+        )
+
+        self.assertIsNone(capture_stall_watch(None, object()))
+
+    def test_the_report_payload_carries_the_leg_telemetry(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.workspace_callback_supervisor import (  # noqa: E501
+            build_supervisor,
+        )
+
+        supervisor = build_supervisor(holder="probe", home=Path(tempfile.mkdtemp()))
+        payload = supervisor.run_once().as_payload()
+        self.assertIn("stall_watch", payload)
+        self.assertEqual(payload["stall_watch"], [])
 
 
 class SupervisorHookTest(unittest.TestCase):

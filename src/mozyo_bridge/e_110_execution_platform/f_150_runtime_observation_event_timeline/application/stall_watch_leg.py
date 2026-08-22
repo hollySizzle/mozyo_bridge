@@ -27,6 +27,20 @@ only after a journal **id** is read back, and for a good reason: "the POST did n
 not the same as "a journal exists", and a pass that treated it as such would, after an
 uncertain write, write a second journal on the next pass.
 
+:func:`journal_id_carrying_key` closes that by making the escalation note *self-identifying*:
+the body carries ``idempotency_key: <key>`` (rendered by
+:func:`render_escalation_body`), so the id can be recovered by scanning the issue's journals
+for that key. The scan runs **before** the write as well as after it, which is what makes
+the whole rail idempotent across a crash: a firing whose journal already landed is bound to
+it and never written again, whatever the local store believes.
+
+A write is therefore classified three ways, not two (review j#110132 finding_1). "No journal
+id" is not one situation: a refused write never reached Redmine, while a POST that returned
+but could not be read back MAY have created a journal. The first leaves the shared pass
+budget untouched; the second must spend it as UNCERTAIN, or the next workspace in the same
+bounded pass performs a second external mutation behind an unknown partial effect. See
+:data:`DETERMINISTIC_NO_SEND_REASONS` for why the deterministic set is an allowlist.
+
 What the pass costs while it runs
 ---------------------------------
 The sensor samples each screen twice around one interval, and that interval is a real
@@ -45,12 +59,6 @@ value, and the whole classification — what counts as chrome movement versus a 
 — is tuned against it; re-picking it here would re-litigate that calibration in a module
 that does not own it.
 
-:func:`journal_id_carrying_key` closes that by making the escalation note *self-identifying*:
-the body carries ``idempotency_key: <key>`` (rendered by
-:func:`render_escalation_body`), so the id can be recovered by scanning the issue's journals
-for that key. The scan runs **before** the write as well as after it, which is what makes
-the whole rail idempotent across a crash: a firing whose journal already landed is bound to
-it and never written again, whatever the local store believes.
 """
 
 from __future__ import annotations
@@ -64,6 +72,10 @@ from mozyo_bridge.core.state.stall_escalation import (
     StallEscalationStore,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_escalation_pass import (  # noqa: E501
+    WRITE_NOT_SENT,
+    WRITE_RECORDED,
+    WRITE_UNCERTAIN,
+    JournalWriteResult,
     ObservedUnit,
     apply_escalation_gate,
     settle_pending_escalations,
@@ -160,6 +172,39 @@ def journal_id_carrying_key(source: object, issue: str, key: str) -> str:
     return best
 
 
+#: Refusal reasons that prove NOTHING reached Redmine. Every one of these is decided before
+#: (or by) the server without creating a journal: the write opt-in is unset, the transport
+#: has no base URL or credential, the server rejected the caller, or the sink had no anchor
+#: to write to.
+#:
+#: The set is an ALLOWLIST on purpose. Anything not named here — a transport error, a
+#: timeout, a reason a future transport invents — is treated as UNCERTAIN, because the cost
+#: of the two mistakes is not symmetric: calling a landed write "refused" leaves a real
+#: external mutation off the shared pass budget and lets a second one happen in the same
+#: bounded pass (review j#110132 finding_1), while calling a refused write "uncertain" only
+#: costs this pass its remaining mutation slot.
+DETERMINISTIC_NO_SEND_REASONS: frozenset[str] = frozenset(
+    {
+        "write_optin_unset",
+        "base_url_unset",
+        "credential_missing",
+        "unauthorized",
+        "no_anchor",
+        "disabled",
+        "unsupported_source",
+    }
+)
+
+
+def classify_refusal(reason: str) -> str:
+    """Map a gate-record refusal reason onto a budget outcome (fail-safe on unknowns)."""
+    return (
+        WRITE_NOT_SENT
+        if str(reason or "") in DETERMINISTIC_NO_SEND_REASONS
+        else WRITE_UNCERTAIN
+    )
+
+
 def build_journal_writer(
     *,
     policy: StallWatchPolicy,
@@ -187,12 +232,14 @@ def build_journal_writer(
         source=policy.source,
     )
 
-    def _write(pending: PendingEscalation) -> "tuple[str, str]":
+    def _write(pending: PendingEscalation) -> JournalWriteResult:
         # Readback FIRST: a firing whose journal already landed (an uncertain write, a
         # crash after the POST) is bound to it and never written twice.
         existing = journal_id_carrying_key(source, pending.issue, pending.idempotency_key)
         if existing:
-            return existing, "already_recorded"
+            return JournalWriteResult(
+                outcome=WRITE_RECORDED, journal_id=existing, reason="already_recorded"
+            )
 
         body = render_escalation_body(
             issue=pending.issue,
@@ -219,20 +266,31 @@ def build_journal_writer(
                 marker_fields={"blocker_recorded": True},
             )
         except Exception as exc:  # noqa: BLE001 - a writer never aborts a supervisor pass
-            return "", f"writer_raised_{type(exc).__name__}"
+            # The request may already have left; treat it as a possible external mutation.
+            return JournalWriteResult(
+                outcome=WRITE_UNCERTAIN, reason=f"writer_raised_{type(exc).__name__}"
+            )
 
         if not getattr(receipt, "recorded", False):
-            return "", str(getattr(receipt, "reason", "write_refused"))
+            reason = str(getattr(receipt, "reason", "write_refused"))
+            return JournalWriteResult(outcome=classify_refusal(reason), reason=reason)
 
         # The POST returned; now prove a journal exists and learn its id.
         journal_id = journal_id_carrying_key(
             source, pending.issue, pending.idempotency_key
         )
         if not journal_id:
-            # Posted but unverifiable. Reported as NOT recorded so the wake does not fire;
-            # the next pass's readback binds it without a second write.
-            return "", "readback_unverified"
-        return journal_id, "recorded"
+            # Posted but unverifiable. NOT recorded — so the wake does not fire and the next
+            # pass's readback binds it without a second write — but UNCERTAIN rather than
+            # refused, because the POST returned and a journal may well exist. Reporting it
+            # as a plain refusal (the pre-j#110132 behaviour) left a possibly-landed
+            # external mutation unaccounted for in the shared pass budget.
+            return JournalWriteResult(
+                outcome=WRITE_UNCERTAIN, reason="readback_unverified"
+            )
+        return JournalWriteResult(
+            outcome=WRITE_RECORDED, journal_id=journal_id, reason="recorded"
+        )
 
     return _write
 
@@ -249,6 +307,9 @@ def run_stall_watch_leg(
     generation_for: Optional[Callable[[str], str]] = None,
     issue_for: Optional[Callable[[str], str]] = None,
     provider_for: Optional[Callable[[str], str]] = None,
+    #: ``(issue, role, locator) -> marker``. Supplies the evidence the ``unsent_composer``
+    #: classification needs; without it that class is unreachable (j#110132 finding_2).
+    body_marker_for: Optional[Callable[[str, str, str], str]] = None,
     budget: Optional[dict] = None,
     signatures: object = None,
     clock: Callable[[], float] = None,
@@ -335,9 +396,25 @@ def run_stall_watch_leg(
     kwargs = {}
     if sample_interval_seconds is not None:
         kwargs["interval_seconds"] = float(sample_interval_seconds)
+    def _marker(unit: WatchUnit) -> str:
+        if body_marker_for is None:
+            return ""
+        try:
+            return str(
+                body_marker_for(unit.issue, unit.identity.role, unit.locator) or ""
+            )
+        except Exception:  # noqa: BLE001 - unresolved evidence is simply no evidence
+            return ""
+
     observations = run_stall_watch_pass(
         tuple(
-            StallWatchTarget(target=unit.locator, provider_id=unit.provider_id)
+            StallWatchTarget(
+                target=unit.locator,
+                provider_id=unit.provider_id,
+                # Without this the sensor's rule 5 can never match, so the periodic path
+                # would report every swallowed-Enter stall as patient-wait indeterminate.
+                pending_body_marker=_marker(unit),
+            )
             for unit in discovery.units
         ),
         read_screen=read_screen,
@@ -391,6 +468,8 @@ def run_stall_watch_leg(
 
 
 __all__ = (
+    "DETERMINISTIC_NO_SEND_REASONS",
+    "classify_refusal",
     "LEG_DISABLED",
     "LEG_NOTHING_TO_WATCH",
     "LEG_NOT_DUE",

@@ -77,11 +77,47 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     fold_observation,
 )
 
-#: Writes one escalation journal and returns ``(journal_id, reason)``. A blank
-#: ``journal_id`` means nothing was recorded and ``reason`` says why (``write_optin_unset``,
-#: ``credential_missing``, …) — never an exception, so one refused write cannot abort a
-#: supervisor pass.
-JournalWriter = Callable[[PendingEscalation], "tuple[str, str]"]
+#: What a journal write did to the world, in the vocabulary the shared pass budget speaks.
+#:
+#: The three-way split exists because "no journal id came back" is NOT one situation. A
+#: refused write never touched Redmine; a POST that returned but could not be read back MAY
+#: have created a journal. Collapsing them (as this module first did) leaves an external
+#: mutation unaccounted for, and the pass budget is shared across every workspace, so the
+#: next workspace then performs a SECOND external mutation in the same bounded pass —
+#: exactly what ``pass_external_budget`` exists to prevent ("an UNCERTAIN external effect
+#: consumes it (no blind continuation)").
+#: A deterministic zero-send. Nothing reached Redmine; the budget is untouched.
+WRITE_NOT_SENT = "not_sent"
+#: A journal exists and its id was read back. Spends the budget as ``mutated``.
+WRITE_RECORDED = "recorded"
+#: The write MAY have landed (POST returned but unverifiable, transport error, raise).
+#: Spends the budget as ``uncertain``.
+WRITE_UNCERTAIN = "uncertain"
+
+WRITE_OUTCOMES: frozenset[str] = frozenset(
+    {WRITE_NOT_SENT, WRITE_RECORDED, WRITE_UNCERTAIN}
+)
+
+
+@dataclass(frozen=True)
+class JournalWriteResult:
+    """One journal write attempt, classified for the shared external-mutation budget."""
+
+    outcome: str
+    journal_id: str = ""
+    reason: str = ""
+
+    def __post_init__(self) -> None:
+        if self.outcome not in WRITE_OUTCOMES:
+            raise ValueError(f"unknown journal write outcome {self.outcome!r}")
+        if self.outcome == WRITE_RECORDED and not self.journal_id:
+            raise ValueError("a recorded write must carry the journal id it read back")
+
+
+#: Writes one escalation journal and classifies what it did. It must not raise — a writer
+#: that blows up is wrapped by the caller, which treats the failure as UNCERTAIN because a
+#: raise after the POST is indistinguishable from a landed write.
+JournalWriter = Callable[[PendingEscalation], JournalWriteResult]
 
 #: Enqueues a coordinator wake for ``(workspace_id, issue)``; returns whether it stuck.
 WakeEnqueue = Callable[[str, str], bool]
@@ -95,8 +131,12 @@ SETTLE_BUDGET_SPENT = "external_mutation_budget_spent"
 SETTLE_NOTHING_PENDING = "nothing_pending"
 #: Settle reason: a journal was written and read back.
 SETTLE_RECORDED = "recorded"
-#: Settle reason: the writer refused; the firing stays pending and retryable.
+#: Settle reason: the writer deterministically sent nothing; the firing stays retryable.
 SETTLE_WRITE_REFUSED = "write_refused"
+#: Settle reason: the write MAY have landed. The firing stays unrecorded (so a later pass
+#: re-checks and binds it if a journal exists) AND the pass budget is spent as uncertain, so
+#: no later workspace mutates behind an unknown partial effect.
+SETTLE_WRITE_UNCERTAIN = "write_uncertain"
 
 
 def _utc_now_iso() -> str:
@@ -453,7 +493,17 @@ def settle_pending_escalations(
         reason = SETTLE_ANCHOR_UNRESOLVED if anchorless else SETTLE_NOTHING_PENDING
         return SettleOutcome(reason=reason, **common)  # type: ignore[arg-type]
 
-    if budget is not None and budget.get("mutated"):
+    # The canonical predicate, NOT a re-derivation. ``budget_spent`` is
+    # ``mutated OR uncertain`` (``pass_external_budget``), and every sibling leg
+    # (``workspace_retire_leg`` / ``workspace_hibernate_leg`` /
+    # ``retire_supervisor_wiring``) defers on both. An earlier version of this module
+    # checked ``mutated`` alone, which let this rail write behind another leg's UNCERTAIN
+    # partial effect — review j#110132 finding_1.
+    from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.pass_external_budget import (  # noqa: E501
+        budget_spent,
+    )
+
+    if budget is not None and budget_spent(budget):
         return SettleOutcome(reason=SETTLE_BUDGET_SPENT, **common)  # type: ignore[arg-type]
     if write_journal is None:
         return SettleOutcome(reason=SETTLE_WRITE_REFUSED, **common)  # type: ignore[arg-type]
@@ -461,19 +511,38 @@ def settle_pending_escalations(
     # Oldest first: a newer stall must not repeatedly overtake an older one.
     target = writable[0]
     try:
-        journal_id, reason = write_journal(target)
+        result = write_journal(target)
     except Exception as exc:  # noqa: BLE001 - a writer must never abort a supervisor pass
-        journal_id, reason = "", f"writer_raised_{type(exc).__name__}"
+        # A raise is indistinguishable from a landed POST, so it is UNCERTAIN — the same
+        # reading ``budgeted_sender`` applies to a sender that raises after the send edge.
+        result = JournalWriteResult(
+            outcome=WRITE_UNCERTAIN, reason=f"writer_raised_{type(exc).__name__}"
+        )
 
-    if not journal_id:
+    # Spend the budget BEFORE any further store work. A store error below must not be able
+    # to leave a possibly-landed external mutation unaccounted for, because the next
+    # workspace in this pass reads this same dict.
+    if budget is not None:
+        if result.outcome == WRITE_RECORDED:
+            budget["mutated"] = True
+        elif result.outcome == WRITE_UNCERTAIN:
+            budget["uncertain"] = True
+
+    if result.outcome != WRITE_RECORDED:
+        settle_reason = (
+            SETTLE_WRITE_UNCERTAIN
+            if result.outcome == WRITE_UNCERTAIN
+            else SETTLE_WRITE_REFUSED
+        )
         try:
-            store.record_attempt(target.idempotency_key, reason or SETTLE_WRITE_REFUSED,
-                                 now=now())
+            store.record_attempt(
+                target.idempotency_key, result.reason or settle_reason, now=now()
+            )
         except Exception as exc:  # noqa: BLE001
             errors.append(f"attempt record failed: {type(exc).__name__}")
         return SettleOutcome(
             workspace_id=ws,
-            reason=SETTLE_WRITE_REFUSED,
+            reason=settle_reason,
             woke=tuple(woke),
             unrecorded=len(unrecorded),
             anchorless=anchorless,
@@ -481,9 +550,7 @@ def settle_pending_escalations(
             errors=tuple(errors),
         )
 
-    # The journal exists and its id was read back: the budget is spent from here on.
-    if budget is not None:
-        budget["mutated"] = True
+    journal_id = result.journal_id
     try:
         store.mark_recorded(target.idempotency_key, journal_id, now=now())
     except Exception as exc:  # noqa: BLE001
@@ -521,7 +588,13 @@ __all__ = (
     "SETTLE_NOTHING_PENDING",
     "SETTLE_RECORDED",
     "SETTLE_WRITE_REFUSED",
+    "SETTLE_WRITE_UNCERTAIN",
+    "WRITE_NOT_SENT",
+    "WRITE_OUTCOMES",
+    "WRITE_RECORDED",
+    "WRITE_UNCERTAIN",
     "EscalationPassOutcome",
+    "JournalWriteResult",
     "JournalWriter",
     "ObservedUnit",
     "SettleOutcome",

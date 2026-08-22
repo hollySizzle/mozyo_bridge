@@ -3889,6 +3889,22 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
 
     #: repo-relative module -> (channels it can name, what it does with them).
     DISCIPLINES = {
+        # -- the #15855 stall watcher ---------------------------------------------------
+        "src/mozyo_bridge/e_110_execution_platform/f_150_runtime_observation_event_timeline/application/stall_watch_body_marker.py": (
+            ['handoff'],
+            "names the handoff token ONLY as a prefix guard and READS NO NOTE AT ALL: it "
+            "reads the herdr delivery ledger's stored `notification_marker` column to learn "
+            "which body was last dispatched to a watched pane, so the stall sensor can tell "
+            "an unsent composer from a frozen screen (Redmine #15855). It renders nothing. "
+            "The prefix check is a refusal, not a parse -- a stored value that is not a "
+            "handoff marker is skipped rather than matched, because matching arbitrary "
+            "recorded text would reintroduce the whole-screen substring guess "
+            "`ack-completion-receiver-state.md` forbids. Each ledger row carries exactly one "
+            "marker value, so the multi-marker question does not arise per row; when several "
+            "ROWS match the same (issue, receiver, target) the MOST RECENT wins, and any "
+            "ambiguity in the inputs (blank issue / role / locator, unreadable ledger) "
+            "resolves to no marker, which leaves the classification exactly as it was",
+        ),
         # -- the grammar owner ---------------------------------------------------------
         f"{_D}/domain/redmine_journal_source.py": (
             ["*", "*", "*:MARKER_RE"],
@@ -4112,6 +4128,15 @@ class ReviewJ92374MarkerTokenInventoryTests(unittest.TestCase):
     #: The trade is stated in ``test_no_module_shape_can_hide_a_capability_from_a_wildcard_consumer``:
     #: over-detection costs a declaration line, a missed reader costs a silent gate.
     INHERITED = {
+        "src/mozyo_bridge/e_110_execution_platform/f_150_runtime_observation_event_timeline/application/stall_watch_wiring.py": (
+            ['handoff'],
+            "inherits via a used import of stall_watch_body_marker's resolver factory "
+            "(Redmine #15855); names no marker token itself, reads no note and renders "
+            "nothing. It only binds the resolver to the home-scoped delivery ledger and hands "
+            "the resulting `(issue, role, locator) -> marker` callable to the watcher leg, so "
+            "every question about the token -- including which of several matching ledger rows "
+            "wins -- is answered by that owner",
+        ),
         "src/mozyo_bridge/e_110_execution_platform/f_180_llm_mcp_operation_entry/domain/blocker_claim.py": (
             ['handoff'],
             "inherits via a used import of hibernate_park_record's `governed_field`; names no "

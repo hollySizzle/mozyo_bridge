@@ -29,11 +29,16 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from mozyo_bridge.core.state.stall_escalation import StallEscalationStore
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_body_marker import (  # noqa: E501
+    default_body_marker_resolver,
+)
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_leg import (  # noqa: E501
     build_journal_writer,
     run_stall_watch_leg,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_watch_policy import (  # noqa: E501
+    POLICY_CONFIG_UNREADABLE,
+    POLICY_INVALID,
     StallWatchPolicy,
 )
 
@@ -42,13 +47,39 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
 WATCHABLE_DISPOSITIONS: frozenset[str] = frozenset({"active"})
 
 
+#: How much of a loader error is carried into the policy detail. The text comes from this
+#: repo's own validators ("stall_watch.cadence_seconds must be an integer, not str"), so it
+#: names keys and types rather than values — but it is truncated anyway, because a detail
+#: string ends up in an operator-facing status surface and an unbounded error message is not
+#: something this layer should promise to keep small.
+POLICY_DETAIL_LIMIT = 300
+
+#: The marker that says a loader error was about THIS block rather than a sibling.
+_STALL_WATCH_ERROR_MARKER = "stall_watch"
+
+
+def _detail(exc: BaseException) -> str:
+    text = " ".join(str(exc).split())
+    return text[:POLICY_DETAIL_LIMIT]
+
+
 def resolve_stall_watch_policy(repo_root: object) -> StallWatchPolicy:
     """Read the workspace's ``stall_watch`` policy, degrading to "watch nothing".
 
-    A repo with no config, an unreadable one, or one whose ``stall_watch`` block is
-    malformed all resolve to a disabled policy. The malformed case is the interesting one:
-    the loader raises, and turning that into *disabled* rather than into *defaults* is what
-    stops a mistyped cadence from silently becoming a running watcher (#15855 j#110121-2).
+    Every failure watches nothing, but they are **not** the same off-state, and j#110121-2
+    asks for a *typed* no-op rather than merely a silent one. Three outcomes are kept
+    distinct because they need three different operator actions:
+
+    - **absent** — no block is declared. Nothing to do; this is the shipped default.
+    - **invalid** (:data:`POLICY_INVALID`) — this block is malformed. Fix the block; the
+      detail names the offending key.
+    - **unreadable** (:data:`POLICY_CONFIG_UNREADABLE`) — the config could not be read at
+      all, or a *different* block is invalid. Fix the file; the stall-watch block may be
+      perfectly fine.
+
+    An earlier version collapsed all three into ``absent`` (review j#110132 finding_4),
+    which told an operator with a mistyped cadence that they had simply never configured
+    anything.
     """
     try:
         from mozyo_bridge.application.repo_local_config_loader import (
@@ -56,8 +87,15 @@ def resolve_stall_watch_policy(repo_root: object) -> StallWatchPolicy:
         )
 
         return load_repo_local_config(Path(str(repo_root))).stall_watch
-    except Exception:  # noqa: BLE001 - unreadable config watches nothing
-        return StallWatchPolicy.default()
+    except Exception as exc:  # noqa: BLE001 - every failure still watches nothing
+        # The loader raises one error type for ANY invalid block, so the block that broke it
+        # is identified from the message the loader itself composed
+        # (``f"stall_watch config is invalid: {exc}"``). A sibling block's error must not be
+        # reported as *this* block being malformed.
+        detail = _detail(exc)
+        if _STALL_WATCH_ERROR_MARKER in detail:
+            return StallWatchPolicy.disabled(POLICY_INVALID, detail)
+        return StallWatchPolicy.disabled(POLICY_CONFIG_UNREADABLE, detail)
 
 
 def lane_facts_snapshot(lifecycle_store: object, workspace_id: str) -> dict[str, tuple[str, str]]:
@@ -139,6 +177,7 @@ def build_stall_watch_leg_fn(
     clock: Optional[Callable[[], float]] = None,
     sleep: Optional[Callable[[float], None]] = None,
     sample_interval_seconds: Optional[float] = None,
+    body_marker_for: Optional[Callable[[str, str, str], str]] = None,
 ) -> Callable[..., object]:
     """Build the ``stall_watch_leg_fn`` the supervisor injects.
 
@@ -147,6 +186,10 @@ def build_stall_watch_leg_fn(
     with no reads of any kind.
     """
     escalation_store = store or StallEscalationStore(home=home)
+    # The delivery-history join that makes `unsent_composer` reachable. Bound once (the
+    # ledger handle is reused across passes); a host with no delivery history resolves every
+    # lookup to "" and simply classifies without that evidence.
+    resolve_marker = body_marker_for or default_body_marker_resolver(home)
 
     def _leg(ws, *, pass_budget=None):
         workspace_id = str(getattr(ws, "workspace_id", "") or "")
@@ -189,6 +232,7 @@ def build_stall_watch_leg_fn(
             wake=wake,
             generation_for=lambda lane_id: lanes.get(lane_id, ("", ""))[0],
             issue_for=lambda lane_id: lanes.get(lane_id, ("", ""))[1],
+            body_marker_for=resolve_marker,
             budget=pass_budget,
             clock=clock,
             sleep=sleep,
@@ -199,6 +243,7 @@ def build_stall_watch_leg_fn(
 
 
 __all__ = (
+    "POLICY_DETAIL_LIMIT",
     "WATCHABLE_DISPOSITIONS",
     "build_stall_watch_leg_fn",
     "default_inventory_rows",

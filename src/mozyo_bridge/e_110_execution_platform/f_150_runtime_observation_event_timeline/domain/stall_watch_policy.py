@@ -57,6 +57,12 @@ POLICY_ABSENT = "absent"
 POLICY_CONFIGURED = "configured"
 POLICY_INVALID = "invalid"
 POLICY_NO_SCOPE = "declared_without_scope"
+#: The config could not be read at all (missing loader, unparseable YAML, or a DIFFERENT
+#: block being invalid). Distinct from :data:`POLICY_INVALID`, which means this block itself
+#: was malformed: an operator who mistyped a cadence and an operator whose file will not
+#: parse need different next actions, and collapsing them into "absent" (the pre-j#110132
+#: behaviour) told them neither.
+POLICY_CONFIG_UNREADABLE = "config_unreadable"
 
 #: The recognized keys of the ``stall_watch`` block (closed).
 STALL_WATCH_KEYS: frozenset[str] = frozenset(
@@ -273,6 +279,7 @@ __all__ = (
     "MINIMUM_CADENCE_SECONDS",
     "POLICY_ABSENT",
     "POLICY_CONFIGURED",
+    "POLICY_CONFIG_UNREADABLE",
     "POLICY_INVALID",
     "POLICY_NO_SCOPE",
     "STALL_WATCH_KEYS",

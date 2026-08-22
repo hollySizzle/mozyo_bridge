@@ -28,6 +28,7 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.stall_escalation import (
+    PendingEscalation,
     StallEscalationStore,
     StallEscalationStoreError,
 )
@@ -37,6 +38,11 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     SETTLE_NOTHING_PENDING,
     SETTLE_RECORDED,
     SETTLE_WRITE_REFUSED,
+    SETTLE_WRITE_UNCERTAIN,
+    WRITE_NOT_SENT,
+    WRITE_RECORDED,
+    WRITE_UNCERTAIN,
+    JournalWriteResult,
     ObservedUnit,
     apply_escalation_gate,
     settle_pending_escalations,
@@ -108,12 +114,19 @@ class _Clock:
 
 
 class _Writer:
-    """Fake canonical-journal writer: records what it was asked to write."""
+    """Fake canonical-journal writer: records what it was asked to write.
 
-    def __init__(self, *, journal_ids=None, reason="write_optin_unset", raises=False) -> None:
+    ``outcome`` defaults to a DETERMINISTIC no-send, which is the only refusal shape that
+    leaves the shared pass budget untouched. Tests that want the possibly-landed shape pass
+    ``outcome=WRITE_UNCERTAIN`` explicitly, so the two can never be confused in an assertion.
+    """
+
+    def __init__(self, *, journal_ids=None, reason="write_optin_unset",
+                 outcome=WRITE_NOT_SENT, raises=False) -> None:
         self.calls = []
         self.journal_ids = list(journal_ids or [])
         self.reason = reason
+        self.outcome = outcome
         self.raises = raises
 
     def __call__(self, pending):
@@ -121,8 +134,12 @@ class _Writer:
         if self.raises:
             raise RuntimeError("transport exploded")
         if self.journal_ids:
-            return self.journal_ids.pop(0), "recorded"
-        return "", self.reason
+            return JournalWriteResult(
+                outcome=WRITE_RECORDED,
+                journal_id=self.journal_ids.pop(0),
+                reason="recorded",
+            )
+        return JournalWriteResult(outcome=self.outcome, reason=self.reason)
 
 
 class _Wake:
@@ -485,12 +502,114 @@ class BudgetTest(SettleBase):
         self.assertEqual(len(writer.calls), 2)
         self.assertEqual(self.store.open_pending(WS), ())
 
+    def test_an_uncertain_budget_defers_exactly_like_a_mutated_one(self) -> None:
+        # `budget_spent` is `mutated OR uncertain` (pass_external_budget). Checking only
+        # `mutated` -- the pre-j#110132 behaviour -- let this rail write behind another
+        # leg's UNCERTAIN partial effect.
+        self.fire()
+        writer = _Writer(journal_ids=["110130"])
+        budget = {"reads": 0, "mutated": False, "uncertain": True}
+        outcome = self.settle(budget=budget, write_journal=writer, wake=_Wake())
+        self.assertEqual(outcome.reason, SETTLE_BUDGET_SPENT)
+        self.assertEqual(writer.calls, [])
+
+    def test_an_uncertain_write_spends_the_budget_as_uncertain(self) -> None:
+        self.fire()
+        budget = {"reads": 0, "mutated": False, "uncertain": False}
+        wake = _Wake()
+        outcome = self.settle(
+            budget=budget,
+            write_journal=_Writer(outcome=WRITE_UNCERTAIN, reason="readback_unverified"),
+            wake=wake,
+        )
+        self.assertEqual(outcome.reason, SETTLE_WRITE_UNCERTAIN)
+        self.assertTrue(budget["uncertain"])
+        self.assertFalse(budget["mutated"])
+        # Unverifiable is not recorded, so nobody is woken to read a journal that may not
+        # exist -- and the firing stays retryable.
+        self.assertEqual(wake.calls, [])
+        self.assertEqual(len(self.store.unrecorded_pending(WS)), 1)
+
+    def test_a_deterministic_no_send_leaves_the_budget_untouched(self) -> None:
+        # A refusal that never reached Redmine must not cost the pass its slot.
+        self.fire()
+        budget = {"reads": 0, "mutated": False, "uncertain": False}
+        outcome = self.settle(
+            budget=budget,
+            write_journal=_Writer(outcome=WRITE_NOT_SENT, reason="write_optin_unset"),
+            wake=_Wake(),
+        )
+        self.assertEqual(outcome.reason, SETTLE_WRITE_REFUSED)
+        self.assertFalse(budget["mutated"])
+        self.assertFalse(budget["uncertain"])
+
+    def test_an_uncertain_write_blocks_a_later_workspace_in_the_same_pass(self) -> None:
+        # The budget dict is shared across every workspace in one bounded pass, so the
+        # second workspace must see the first one's uncertainty and defer.
+        self.fire(role="claude")
+        budget = {"reads": 0, "mutated": False, "uncertain": False}
+        first = self.settle(
+            budget=budget,
+            write_journal=_Writer(outcome=WRITE_UNCERTAIN, reason="transport_error"),
+            wake=_Wake(),
+        )
+        self.assertEqual(first.reason, SETTLE_WRITE_UNCERTAIN)
+
+        # A real pending firing in the OTHER workspace, so the deferral is about the budget
+        # rather than about there being nothing to write.
+        self.store.enqueue_pending(
+            PendingEscalation(
+                idempotency_key="other-workspace-firing",
+                workspace_id="wsB",
+                lane_id="lane_b",
+                role="claude",
+                stall_class=CLASS_CONTENT_REFUSAL,
+                prescription="context_reset_reinjection",
+                consecutive=2,
+                first_observed_at="t1",
+                escalated_at="t2",
+                issue="15999",
+            )
+        )
+        other_ws = _Writer(journal_ids=["110131"])
+        second = settle_pending_escalations(
+            workspace_id="wsB",
+            store=self.store,
+            now=self.clock,
+            budget=budget,
+            write_journal=other_ws,
+            wake=_Wake(),
+        )
+        self.assertEqual(second.reason, SETTLE_BUDGET_SPENT)
+        self.assertEqual(other_ws.calls, [])
+
     def test_no_budget_object_means_unconstrained(self) -> None:
         # A standalone caller (an operator command) has no supervisor budget to respect.
         self.fire()
         writer = _Writer(journal_ids=["110130"])
         outcome = self.settle(write_journal=writer, wake=_Wake())
         self.assertEqual(outcome.reason, SETTLE_RECORDED)
+
+
+class WriteResultShapeTest(unittest.TestCase):
+    """The write result is the budget's vocabulary, so its shape is enforced, not assumed."""
+
+    def test_a_recorded_write_must_carry_the_journal_id_it_read_back(self) -> None:
+        # A "recorded" result with no id would sail past the readback fence and let a
+        # coordinator be woken to read a journal nobody proved exists.
+        with self.assertRaises(ValueError):
+            JournalWriteResult(outcome=WRITE_RECORDED)
+        with self.assertRaises(ValueError):
+            JournalWriteResult(outcome=WRITE_RECORDED, journal_id="")
+
+    def test_an_unknown_outcome_is_refused(self) -> None:
+        with self.assertRaises(ValueError):
+            JournalWriteResult(outcome="probably_fine")
+
+    def test_the_non_recorded_outcomes_need_no_journal_id(self) -> None:
+        for outcome in (WRITE_NOT_SENT, WRITE_UNCERTAIN):
+            with self.subTest(outcome=outcome):
+                self.assertEqual(JournalWriteResult(outcome=outcome).journal_id, "")
 
 
 class FairnessTest(SettleBase):
@@ -556,12 +675,16 @@ class ReadbackFenceTest(SettleBase):
 
     def test_a_raising_writer_never_aborts_the_pass(self) -> None:
         self.fire()
+        budget = {"reads": 0, "mutated": False, "uncertain": False}
         outcome = self.settle(
-            budget={"reads": 0, "mutated": False, "uncertain": False},
-            write_journal=_Writer(raises=True),
-            wake=_Wake(),
+            budget=budget, write_journal=_Writer(raises=True), wake=_Wake()
         )
-        self.assertEqual(outcome.reason, SETTLE_WRITE_REFUSED)
+        # A raise is indistinguishable from a landed POST, so it is UNCERTAIN -- not a
+        # refusal. Reporting it as refused would leave a possibly-landed external mutation
+        # off the shared budget (review j#110132 finding_1).
+        self.assertEqual(outcome.reason, SETTLE_WRITE_UNCERTAIN)
+        self.assertTrue(budget["uncertain"])
+        self.assertFalse(budget["mutated"])
         (pending,) = self.store.unrecorded_pending(WS)
         self.assertIn("writer_raised", pending.last_reason)
 

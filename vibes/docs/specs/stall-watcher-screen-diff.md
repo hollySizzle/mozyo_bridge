@@ -2,7 +2,7 @@
 
 ## Status
 
-- version: `v0.2` (#15855 で運用配線を追加。v0.1 のセンサー / 分類 / 処方の記述は不変)
+- version: `v0.3` (#15855 運用配線 + j#110132 review の 4 指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
 - scope: watcher 層 (background / operator) が、pane の**描画画面が進んでいるか**だけを一次
   センサーとして停滞候補を拾い、種別を分類し、種別ごとの処方を**提示**するまで。
 - non-goal: 処方の自動適用、配送 rail の retry policy、completion 判定、receiver-state
@@ -325,6 +325,23 @@ generation を key に入れると relaunch のたびに孤児行が残るので
 generation が変われば run は restart する — 新しい process は自分の画面を持つのであり、
 前任者の停滞で新 agent を escalate してはならない。
 
+### operator が読める runtime status
+
+宣言した設定は `config status` が出す。**動いているかどうか**は別の面が要る。既存の
+`workflow supervisor --status` に runtime readback を足した (新 surface も新 gate も作らない):
+
+- policy の `enabled` と reason (`absent` / `declared_without_scope` / `invalid` /
+  `config_unreadable` の 4 状態を区別する。malformed を absent に潰すと、cadence を打ち間違えた
+  operator に「一度も設定していない」と答えることになる)、cadence と threshold の実効値;
+- `last_pass_at` と `next_due_at` (後者は閾値であって予定時刻ではない);
+- `out_of_reach` — live だが watcher の射程外の unit 数;
+- pending の内訳 `unrecorded` / `anchorless` / `recorded_but_unwoken` と
+  **`oldest_unrecorded_age_seconds`** — これが飢餓の可視化そのもの。
+
+sweep 側は leg の outcome を捨てず `SupervisorReport.stall_watch` に載せる。leg が例外を投げた
+場合も `leg_error` + 例外の**型のみ**を記録する (message は path や画面を引用しうるので載せない)。
+「watcher が壊れている」と「watcher に見るものが無かった」が operator から同じに見えてはいけない。
+
 ### 発火条件: 同一 class の N 連続。無evidence は数えない
 
 | class | 効果 |
@@ -360,12 +377,47 @@ note は固定 field のみを載せ、**pane content を構造的に運べな�
 完了したとも、処方が適用されたとも書かない。`policy` field は cadence / N / 出所を載せるので、
 「N 連続」が後の読者にとって意味を持つ。
 
+### 発火 class の evidence は配送履歴から join する
+
+`unsent_composer` は「dispatch した本文が composer に残っている」ときにだけ成立する。marker を
+渡さなければこの class は**定期実行経路では一度も成立しない** — 停滞自体は
+`unresponsive_indeterminate` として escalate されるが、durable record が名指しする処方が
+patient wait になり、#15842 が扱う swallowed-Enter 停滞に対して誤る。
+
+そこで herdr delivery ledger の `notification_marker` を join する。この marker は
+`[mozyo:handoff:source=…:issue=…:journal=…:kind=…:to=…]` という固定 token で、**pane content も
+message body も含まない**ので hygiene 規律を破らない。
+
+join は ledger が実際に持つものの連言とする: issue anchor / receiver が slot の role と一致 /
+送信時 target が現在観測中の locator と一致 / 最新 entry。どれか欠ければ marker 無し (= join
+導入前の挙動) に fail-close する。誤った marker は `unsent_composer` を主張して Enter を勧める
+方向の誤りなので、fail-close の向きはこちら。
+
+**named residual**: ledger に generation 列が無いため target 一致は同一 generation の証明では
+ない。境界は `current_composer_retains_body` 自身が持つ「current composer に限る」規律であり、
+古い marker が誤爆するのは「その本文が今まさに未送信で画面に出ている」場合だけ — それは class
+の定義そのものである。完全に閉じるには ledger への generation 列追加が要り、本 issue の scope
+外。
+
 ### 予算と冪等性
 
 Redmine journal append は external mutation であり、`workspace_callback_supervisor` の
 **pass あたり 1 external mutation** 予算を消費する。callback delivery の第一優先は反転しない。
 予算が既に使われている pass では escalation は local pending に留まり、次に空いている pass で
 1 件だけ書かれる。
+
+**書き込み結果は 3 値**である。「journal id が返らなかった」は 1 つの状況ではない: 拒否された
+書き込みは Redmine に届いていないが、POST が返ったのに readback できなかった書き込みは journal を
+作っている**かもしれない**。前者は予算を消費せず、後者は `uncertain` として消費しなければ、同一
+pass の次の workspace が未知の部分効果の後ろで 2 つ目の外部 mutation を実行する。判定には
+`pass_external_budget.budget_spent()` (= `mutated OR uncertain`) をそのまま使う — sibling leg が
+全部そうしているので、再導出して項を落とす余地を残さない。
+
+deterministic no-send と見なす refusal 理由は**allowlist**である (`write_optin_unset` /
+`base_url_unset` / `credential_missing` / `unauthorized` / `no_anchor` / `disabled` /
+`unsupported_source`)。未知の理由・transport error・writer の raise はすべて `uncertain` に倒す。
+2 種類の誤りの費用が非対称だからである: 着地した書き込みを「拒否」と呼ぶと外部 mutation が
+予算から漏れるが、拒否を「不確実」と呼んでも失うのはその pass の残り 1 枠だけである。
 
 順序は **pending → journal → readback → wake** で、各矢印に fence がある:
 

@@ -245,6 +245,12 @@ def _cmd_status(args: argparse.Namespace) -> int:
             }
             for rec in workspaces
         ],
+        # Redmine #15855 / review j#110132 finding_3: the stall watcher's RUNTIME state.
+        # The static `config status` surface shows what was declared; this shows what the
+        # watcher is actually doing with it — when it last ran, when it is next due, how
+        # many live units are outside its reach, and how long the oldest unwritten
+        # escalation has been waiting (the starvation visibility j#110121-6 requires).
+        "stall_watch": _stall_watch_status_rows(workspaces, home=home),
     }
     lines = [
         "action: status",
@@ -259,10 +265,86 @@ def _cmd_status(args: argparse.Namespace) -> int:
         lease = lease_holders.get(rec.workspace_id)
         held = f"leased by {lease.holder} until {lease.expires_at}" if lease else "unleased"
         lines.append(f"  ws {rec.workspace_id} ({rec.project_name}): {held}")
+    lines.extend(_stall_watch_status_lines(payload["stall_watch"]))
     _emit(
         payload, as_json=bool(getattr(args, "as_json", False)), text_lines=lambda: lines
     )
     return 0
+
+
+
+def _stall_watch_status_rows(workspaces, *, home) -> list:
+    """The stall watcher's runtime readback, one row per workspace (never raises).
+
+    Resolving this needs the same two inputs the leg itself uses — the workspace's declared
+    policy and the home-scoped escalation store — so it is read here rather than being
+    inferred from the last sweep: an operator must be able to run ``status`` on a host that
+    has not swept yet and still learn that the watcher is (say) unconfigured.
+    """
+    try:
+        from mozyo_bridge.core.state.stall_escalation import StallEscalationStore
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_phase import (  # noqa: E501
+            stall_watch_status,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_wiring import (  # noqa: E501
+            resolve_stall_watch_policy,
+        )
+    except Exception:  # noqa: BLE001 - status never fails because a projection is missing
+        return []
+
+    from datetime import datetime, timezone
+
+    now = datetime.now(timezone.utc)
+    store = StallEscalationStore(home=home)
+    rows = []
+    for rec in workspaces:
+        try:
+            policy = resolve_stall_watch_policy(
+                getattr(rec, "canonical_path", "") or getattr(rec, "root", "")
+            )
+            rows.append(
+                stall_watch_status(
+                    workspace_id=rec.workspace_id,
+                    store=store,
+                    policy=policy,
+                    now=now,
+                )
+            )
+        except Exception:  # noqa: BLE001 - one unreadable workspace never hides the rest
+            rows.append(
+                {"workspace_id": rec.workspace_id, "policy": {"enabled": False,
+                                                              "reason": "status_unavailable"}}
+            )
+    return rows
+
+
+def _stall_watch_status_lines(rows) -> list:
+    """Render the runtime readback for the text surface (JSON carries the full payload)."""
+    if not rows:
+        return []
+    lines = ["stall_watch:"]
+    for row in rows:
+        policy = row.get("policy") or {}
+        cadence = row.get("cadence") or {}
+        pending = row.get("pending") or {}
+        ws = row.get("workspace_id", "")
+        if not policy.get("enabled"):
+            lines.append(f"  ws {ws}: off ({policy.get('reason', 'unknown')})")
+            continue
+        lines.append(
+            f"  ws {ws}: on (cadence={policy.get('cadence_seconds')}s "
+            f"threshold={policy.get('threshold')}) "
+            f"last={cadence.get('last_pass_at') or '-'} "
+            f"next_due>={cadence.get('next_due_at') or '-'}"
+        )
+        age = pending.get("oldest_unrecorded_age_seconds")
+        lines.append(
+            f"    pending: unrecorded={pending.get('unrecorded', 0)} "
+            f"anchorless={pending.get('anchorless', 0)} "
+            f"unwoken={pending.get('recorded_but_unwoken', 0)} "
+            f"oldest_age={'-' if age is None else str(age) + 's'}"
+        )
+    return lines
 
 
 #: The deprecated cadence flag and what now carries its meaning (Redmine #15192 / j#102151 F3).

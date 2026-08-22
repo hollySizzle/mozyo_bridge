@@ -48,6 +48,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application import (
     workspace_hibernate_leg as _hibernate,
     workspace_retire_leg as _retire,
+    workspace_stall_watch_capture as _stall_watch,
     workspace_delivery_leg as _delivery,
     pass_external_budget as _pxb,
 )
@@ -225,6 +226,8 @@ class WorkspaceCallbackSupervisor:
         # budget, so an accepted push never follows a callback wake in the same bounded pass.
         self._auto_integration_leg_fn = auto_integration_leg_fn
         self._stall_watch_leg_fn = stall_watch_leg_fn
+        #: Per-sweep stall-watch telemetry, reset at the top of each ``run_once``.
+        self._stall_watch_telemetry: list[dict] = []
         # Redmine #13968 F1: the authoritative-workspace resolver — a home-global
         # ``{issue -> sole actively-owning workspace}`` map from the durable lifecycle authority.
         # When wired, each workspace supervises ONLY the issues it uniquely owns (owned-elsewhere /
@@ -294,6 +297,7 @@ class WorkspaceCallbackSupervisor:
         workspace and merged with the drained wakes. Bounded reconciliation (the whole-roster
         mode) is the loss recovery: a dropped wake is still caught because the roster is re-read.
         """
+        self._stall_watch_telemetry = []
         # Redmine #14150: the LOCAL outbox drain is a distinct execution path — it reads local state
         # only (the outbox + the local lifecycle authority) and delivers already-enqueued, locally
         # attestable coordinator rows through a provider-free sender. It never resolves a Redmine
@@ -310,13 +314,23 @@ class WorkspaceCallbackSupervisor:
                 self._drain_workspace_locally(ws, pass_budget=drain_budget)
                 for ws in sorted(self._workspaces_fn(), key=lambda w: str(w.workspace_id or ""))
             ]
-            return SupervisorReport(mode=mode, holder=self._holder, workspaces=tuple(outcomes))
+            return SupervisorReport(
+                mode=mode,
+                holder=self._holder,
+                workspaces=tuple(outcomes),
+                stall_watch=tuple(self._stall_watch_telemetry),
+            )
         # Redmine #14219: the standalone auto-hibernate seam — a production-unreachable internal /
         # test compatibility mode (T3 folds hibernate into the wake/reconcile passes instead; the
         # scheduler never selects this mode). Same per-workspace lease fence, zero outbox effects.
         if mode == SUPERVISION_HIBERNATE:
             outcomes = _hibernate.hibernate_sweep(self)
-            return SupervisorReport(mode=mode, holder=self._holder, workspaces=tuple(outcomes))
+            return SupervisorReport(
+                mode=mode,
+                holder=self._holder,
+                workspaces=tuple(outcomes),
+                stall_watch=tuple(self._stall_watch_telemetry),
+            )
         wake_by_ws = group_wake_hints(wake_hints)
         # Redmine #13968 F1: resolve the authoritative-workspace map ONCE per sweep (a single
         # home-global lifecycle read), so every workspace's authoritative filter reads the same
@@ -348,7 +362,12 @@ class WorkspaceCallbackSupervisor:
                     pass_budget=pass_budget,
                 )
             )
-        return SupervisorReport(mode=mode, holder=self._holder, workspaces=tuple(outcomes))
+        return SupervisorReport(
+                mode=mode,
+                holder=self._holder,
+                workspaces=tuple(outcomes),
+                stall_watch=tuple(self._stall_watch_telemetry),
+            )
 
     def _drain_wake_for(self, workspace_id: str) -> tuple[str, ...]:
         """Consume THIS workspace's durable local wakes into issue ids (fail-open, lease-owned).
@@ -426,11 +445,13 @@ class WorkspaceCallbackSupervisor:
                 # delivery-first priority j#110121-6 preserved: an escalation may only take
                 # the slot on a pass where nothing else needed it. It is also why the leg is
                 # cheap on most ticks -- its own cadence watermark returns immediately.
-                if self._stall_watch_leg_fn is not None:
-                    try:
-                        self._stall_watch_leg_fn(ws, pass_budget=pass_budget)
-                    except Exception:  # noqa: BLE001 - the watcher never breaks a sweep
-                        pass
+                # Reported, not discarded: "the watcher found nothing" and "the watcher
+                # blew up" must not read identically (review j#110132 finding_3).
+                captured = _stall_watch.capture_stall_watch(
+                    self._stall_watch_leg_fn, ws, pass_budget=pass_budget
+                )
+                if captured is not None:
+                    self._stall_watch_telemetry.append(captured)
             return outcome
         finally:
             # A bounded run-once releases each workspace at the end of its sweep so the next

@@ -667,6 +667,10 @@ class SupervisorReport:
     #: entrypoint (a clock read is impure, so the pure fold defaults it to 0). For a provider
     #: reconciliation pass this is the reconcile duration the close condition asks be measurable.
     duration_ms: int = 0
+    #: Redaction-safe stall-watch leg telemetry, one entry per workspace whose leg ran
+    #: (Redmine #15855 / review j#110132 finding_3). Empty unless a ``stall_watch`` policy
+    #: is configured; the sweep is the only place that knows what the leg did.
+    stall_watch: tuple[dict, ...] = field(default_factory=tuple)
 
     @property
     def workspaces_supervised(self) -> int:
@@ -823,6 +827,7 @@ class SupervisorReport:
             "backlog_recovered": self.backlog_recovered,
             "retire": _retire_rollup.payload(self.workspaces),
             "hibernate": self.hibernate_payload(),
+            "stall_watch": [dict(entry) for entry in self.stall_watch],
             "workspaces": [w.as_payload() for w in self.workspaces],
         }
 
