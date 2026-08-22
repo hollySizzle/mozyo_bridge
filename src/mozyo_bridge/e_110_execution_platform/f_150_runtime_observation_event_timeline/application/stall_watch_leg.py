@@ -173,6 +173,63 @@ def journal_id_carrying_key(source: object, issue: str, key: str) -> str:
     return best
 
 
+def build_journal_verifier(
+    *,
+    source: object,
+    budget: Optional[dict] = None,
+    read_cap: Optional[int] = None,
+) -> Callable[[object], str]:
+    """The wake admission's authority: which journal Redmine says carries a firing.
+
+    Deliberately the SAME :func:`journal_id_carrying_key` the writer's readback uses. The
+    write fence and the wake fence ask one question of one authority in one implementation
+    — a second implementation of "does this journal exist" would drift from the first, which
+    is the shape of every finding this round is answering.
+
+    Reads are bounded and accounted like every other provider read in a bounded pass
+    (``budget["reads"]`` against :data:`MAX_PROVIDER_READS_PER_PASS`, the same counter and
+    the same cap the hibernate leg threads). Past the cap the verifier answers ``""``, which
+    is a REFUSED wake, not a permitted one: the firing waits for the next pass rather than
+    being woken on an unverified claim, and the refusal is counted in the settle telemetry
+    so a capped pass is visible rather than silent.
+
+    Positive answers are cached for the pass and negative ones are not. A journal, once
+    written, does not stop existing, so caching a hit is free; caching a MISS would make the
+    firing this pass just wrote unverifiable until the next pass, because the miss would
+    have been recorded before the write.
+    """
+    if read_cap is None:
+        # The cap and the counter are the pass-wide ones, imported the way this rail already
+        # imports `budget_spent`: lazily, so the read budget stays one shared decision and
+        # f_150 does not take a load-time dependency on an f_140 wiring module.
+        from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
+            MAX_PROVIDER_READS_PER_PASS,
+        )
+
+        read_cap = MAX_PROVIDER_READS_PER_PASS
+    cache: dict[tuple[str, str], str] = {}
+
+    def verify(pending: object) -> str:
+        issue = str(getattr(pending, "issue", "") or "")
+        key = str(getattr(pending, "idempotency_key", "") or "")
+        if not issue or not key:
+            return ""
+        if (issue, key) in cache:
+            return cache[(issue, key)]
+        if source is None:
+            return ""
+        if budget is not None and int(budget.get("reads", 0)) >= read_cap:
+            return ""
+        if budget is not None:
+            budget["reads"] = int(budget.get("reads", 0)) + 1
+        found = journal_id_carrying_key(source, issue, key)
+        if found:
+            cache[(issue, key)] = found
+        return found
+
+    return verify
+
+
 #: Refusal reasons that prove NOTHING reached Redmine. Every one of these is decided before
 #: (or by) the server without creating a journal: the write opt-in is unset, the transport
 #: has no base URL or credential, the server rejected the caller, or the sink had no anchor
@@ -325,6 +382,10 @@ def run_stall_watch_leg(
     read_screen: Optional[Callable[[str], "tuple[bool, str]"]],
     write_journal: Optional[JournalWriter] = None,
     wake: Optional[Callable[[str, str], bool]] = None,
+    #: The wake admission's authority (:func:`build_journal_verifier`). Absent, no wake is
+    #: admitted at all: an unverifiable claim is not a weaker reason to wake a coordinator,
+    #: it is no reason (review j#110254 finding_stateauthority).
+    verify_journal: Optional[Callable[[object], str]] = None,
     generation_for: Optional[Callable[[str], str]] = None,
     issue_for: Optional[Callable[[str], str]] = None,
     provider_for: Optional[Callable[[str], str]] = None,
@@ -405,6 +466,7 @@ def run_stall_watch_leg(
                 budget=budget,
                 write_journal=write_journal,
                 wake=wake,
+                verify_journal=verify_journal,
                 now=lambda: stamp,
             ),
         )
@@ -481,6 +543,7 @@ def run_stall_watch_leg(
         budget=budget,
         write_journal=write_journal,
         wake=wake,
+        verify_journal=verify_journal,
         now=lambda: stamp,
     )
     return StallWatchLegOutcome(
@@ -501,6 +564,7 @@ __all__ = (
     "LEG_NO_READER",
     "LEG_RAN",
     "StallWatchLegOutcome",
+    "build_journal_verifier",
     "build_journal_writer",
     "journal_id_carrying_key",
     "run_stall_watch_leg",

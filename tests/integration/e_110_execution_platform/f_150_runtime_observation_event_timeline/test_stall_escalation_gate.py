@@ -156,11 +156,41 @@ class _Wake:
         return self.succeed
 
 
+class _Redmine:
+    """The one external system: which journal carries which firing.
+
+    Deliberately NOT per-writer state. A later pass builds a new writer while Redmine still
+    holds the journal an earlier pass wrote, so a per-writer authority would make "verify
+    what an earlier pass recorded" untestable — which is precisely the path review j#110254
+    found unguarded.
+    """
+
+    def __init__(self) -> None:
+        self.journals: dict = {}
+        self.reads = 0
+
+    def wrap(self, writer):
+        """A writer whose successful writes actually land in this fake Redmine."""
+
+        def write(pending):
+            result = writer(pending)
+            if result.outcome == WRITE_RECORDED and result.journal_id:
+                self.journals[(pending.issue, pending.idempotency_key)] = result.journal_id
+            return result
+
+        return write
+
+    def verify(self, pending) -> str:
+        self.reads += 1
+        return self.journals.get((pending.issue, pending.idempotency_key), "")
+
+
 class GateBase(unittest.TestCase):
     def setUp(self) -> None:
         self.dir = Path(tempfile.mkdtemp())
         self.store = StallEscalationStore(path=self.dir / "stall-escalation.sqlite")
         self.clock = _Clock()
+        self.redmine = _Redmine()
 
     def observe(self, units, **kwargs):
         return apply_escalation_gate(
@@ -168,6 +198,13 @@ class GateBase(unittest.TestCase):
         )
 
     def settle(self, **kwargs):
+        # The writer's successful writes land in the fake Redmine, and the wake admission
+        # asks that same Redmine. One external system, two faces: a test where the writer
+        # could report a journal the verifier cannot find would be modelling an inconsistent
+        # Redmine rather than a hostile one, and would pass for the wrong reason.
+        if kwargs.get("write_journal") is not None:
+            kwargs["write_journal"] = self.redmine.wrap(kwargs["write_journal"])
+        kwargs.setdefault("verify_journal", self.redmine.verify)
         return settle_pending_escalations(
             workspace_id=WS, store=self.store, now=self.clock, **kwargs
         )

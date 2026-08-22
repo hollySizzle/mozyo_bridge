@@ -68,14 +68,24 @@ from mozyo_bridge.core.state.stall_discovery_contract import (
 )
 from mozyo_bridge.core.state.stall_pending_contract import (
     PENDING_OK,
+    ROW_SEAL_FIELDS,
     StallPendingContractError,
     UNCLASSIFIED_REASON,
     canonical_journal_id,
+    canonical_numeric_id_sql,
     checked_reason,
     escalation_idempotency_key,
     pending_row_integrity,
+    pending_row_seal,
     pending_telemetry,
+    row_seal_for,
     validate_pending_fields,
+)
+from mozyo_bridge.core.state.stall_pending_transition import (
+    apply_sealed_transition,
+    plan_attempt,
+    plan_recorded,
+    plan_woken,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
@@ -83,9 +93,15 @@ from mozyo_bridge.shared.paths import mozyo_bridge_home
 STALL_ESCALATION_FILENAME = "stall-escalation.sqlite"
 
 #: Schema version stamped into ``PRAGMA user_version``. Unrecognized -> fail closed.
-STALL_ESCALATION_SCHEMA_VERSION = 1
+#:
+#: v2 adds ``stall_escalation_pending.row_seal``. v1 stays RECOGNIZED and is migrated in
+#: place on the first read-write connection: a v1 row simply has no seal, so it reads as a
+#: state-binding mismatch and is quarantined — preserved and operator-visible, never
+#: actuated. That is the same disposition every other pre-contract row gets, and it is why
+#: the migration does not need to invent seals for rows whose history it cannot verify.
+STALL_ESCALATION_SCHEMA_VERSION = 2
 
-_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1})
+_RECOGNIZED_SCHEMA_VERSIONS = frozenset({1, 2})
 
 _STREAK_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS stall_watch_streak (
@@ -124,7 +140,8 @@ CREATE TABLE IF NOT EXISTS stall_escalation_pending (
     woke_at           TEXT NOT NULL DEFAULT '',
     attempts          INTEGER NOT NULL DEFAULT 0,
     last_attempt_at   TEXT NOT NULL DEFAULT '',
-    last_reason       TEXT NOT NULL DEFAULT ''
+    last_reason       TEXT NOT NULL DEFAULT '',
+    row_seal          TEXT NOT NULL DEFAULT ''
 )
 """
 
@@ -248,6 +265,11 @@ class PendingEscalation:
     attempts: int = 0
     last_attempt_at: str = ""
     last_reason: str = ""
+    #: Tamper evidence over EVERY column the idempotency key does not already seal, derived
+    #: by the store at each transition and never accepted from a caller. It is what makes a
+    #: fully-forged SETTLED row visible at all (review j#110254 finding_stateauthority).
+    #: NOT an existence proof — that is :func:`admit_wake`, which asks Redmine.
+    row_seal: str = ""
     #: Whether this stored row still satisfies the closed contract. ``PENDING_OK`` rows are
     #: the only ones an external writer or a wake may ever see; anything else is preserved
     #: (the escalation really happened) but is never actuated.
@@ -294,7 +316,14 @@ _PENDING_COLUMNS = (
     "idempotency_key, workspace_id, lane_id, role, generation, target, issue, "
     "stall_class, prescription, matched_id, evidence_tier, consecutive, "
     "first_observed_at, escalated_at, journal_id, written_at, woke_at, attempts, "
-    "last_attempt_at, last_reason"
+    "last_attempt_at, last_reason, row_seal"
+)
+
+#: The same list with the v2 column supplied as a literal, for a v1 file opened READ-ONLY
+#: (a `--status` run can reach a store no read-write connection has migrated yet). The rows
+#: then carry an empty seal, which is a state-binding mismatch — the fail-closed direction.
+_PENDING_COLUMNS_PRE_V2 = _PENDING_COLUMNS.replace(
+    "row_seal", "'' AS row_seal"
 )
 
 
@@ -329,7 +358,28 @@ class StallEscalationStore:
             conn.execute(_PENDING_TABLE_SQL)
             conn.execute(_WATERMARK_TABLE_SQL)
             conn.execute(_DISCOVERY_TABLE_SQL)
+            if version < STALL_ESCALATION_SCHEMA_VERSION:
+                self._add_missing_pending_columns(conn)
+                conn.execute(f"PRAGMA user_version = {STALL_ESCALATION_SCHEMA_VERSION}")
         return conn
+
+    @classmethod
+    def _pending_columns(cls, conn: sqlite3.Connection) -> str:
+        """The column list this connection can serve (v1 files lack ``row_seal``)."""
+        present = frozenset(
+            str(row[1])
+            for row in conn.execute("PRAGMA table_info(stall_escalation_pending)")
+        )
+        return _PENDING_COLUMNS if "row_seal" in present else _PENDING_COLUMNS_PRE_V2
+
+    @classmethod
+    def _add_missing_pending_columns(cls, conn: sqlite3.Connection) -> None:
+        """Bring a pre-v2 pending table up to the current column set, additively."""
+        if cls._pending_columns(conn) is _PENDING_COLUMNS_PRE_V2:
+            conn.execute(
+                "ALTER TABLE stall_escalation_pending "
+                "ADD COLUMN row_seal TEXT NOT NULL DEFAULT ''"
+            )
 
     def _connect_ro(self) -> Optional[sqlite3.Connection]:
         if not self.path.exists():
@@ -515,14 +565,22 @@ class StallEscalationStore:
         # itself. Round six found those five unvalidated immediately after round five
         # declared the row closed: they were skipped because they are "ours", which forgets
         # that a store is not a trust boundary (review j#110218).
-        fields = validate_pending_fields(pending)
+        # DERIVED here, never taken from the caller. Note the ORDER: validate first, then
+        # seal what will actually be STORED -- `checked_timestamp` folds instants to UTC, so
+        # sealing the caller's values would make every row that needed normalizing read as
+        # tampered the moment the store itself wrote it.
+        fields = validate_pending_fields(replace(pending, row_seal=row_seal_for(pending)))
+        fields["row_seal"] = pending_row_seal(
+            idempotency_key=fields["idempotency_key"],
+            values={name: fields[name] for name in ROW_SEAL_FIELDS},
+        )
         first_observed_at = fields["first_observed_at"]
         escalated_at = fields["escalated_at"]
 
         def _work(conn):
             cursor = conn.execute(
                 f"INSERT INTO stall_escalation_pending ({_PENDING_COLUMNS}) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
                 "ON CONFLICT(idempotency_key) DO NOTHING",
                 (
                     pending.idempotency_key,
@@ -539,12 +597,13 @@ class StallEscalationStore:
                     fields["consecutive"],
                     first_observed_at,
                     escalated_at,
-                    pending.journal_id,
-                    pending.written_at,
-                    pending.woke_at,
-                    int(pending.attempts),
-                    pending.last_attempt_at,
+                    fields["journal_id"],
+                    fields["written_at"],
+                    fields["woke_at"],
+                    fields["attempts"],
+                    fields["last_attempt_at"],
                     fields["last_reason"],
+                    fields["row_seal"],
                 ),
             )
             return cursor.rowcount > 0
@@ -603,7 +662,7 @@ class StallEscalationStore:
             if not self._table_present(conn, "stall_escalation_pending"):
                 return ()
             sql = (
-                f"SELECT {_PENDING_COLUMNS} FROM stall_escalation_pending "
+                f"SELECT {self._pending_columns(conn)} FROM stall_escalation_pending "
                 f"WHERE ({predicate}) "
             )
             ws = str(workspace_id or "").strip()
@@ -662,94 +721,106 @@ class StallEscalationStore:
             attempts=r[17],
             last_attempt_at=str(r[18] or ""),
             last_reason=str(r[19] or ""),
+            row_seal=str(r[20] or ""),
         )
         return replace(row, integrity=pending_row_integrity(row))
+
+    def _transition(self, action: str, idempotency_key: str, plan, *, sql_guard: str = "") -> bool:
+        """Run one sealed persistence-state transition (rules in ``stall_pending_transition``).
+
+        The store supplies the connection, the column set and the row reader; it does not
+        decide what a transition may do. That separation is why the integrity verdict the
+        transition refuses on is the same verdict every read surface computes.
+        """
+        if not str(idempotency_key or "") or not self.path.exists():
+            return False
+
+        def _work(conn):
+            return apply_sealed_transition(
+                conn,
+                idempotency_key=idempotency_key,
+                select_sql=(
+                    f"SELECT {self._pending_columns(conn)} FROM stall_escalation_pending "
+                    "WHERE idempotency_key=?"
+                ),
+                row_reader=self._row_to_pending,
+                plan=plan,
+                sql_guard=sql_guard,
+            )
+
+        return bool(self._mutate(action, _work))
 
     def record_attempt(self, idempotency_key: str, reason: str, *, now: Optional[str] = None) -> bool:
         """Count one refused / failed write attempt against a firing, with its reason.
 
         A repeatedly-refused write must not look like an escalation nobody has reached yet;
         ``attempts`` and ``last_reason`` are what a status surface reads to tell the two
-        apart.
+        apart. The reason is held to the closed vocabulary on the way IN, because it reaches
+        the status surface: an unknown reason is recorded as a refusal to classify rather
+        than passed through verbatim.
         """
-        if not self.path.exists():
-            return False
-
-        def _work(conn):
-            cursor = conn.execute(
-                "UPDATE stall_escalation_pending SET attempts=attempts+1, "
-                "last_attempt_at=?, last_reason=? WHERE idempotency_key=? AND journal_id=''",
-                (
-                    checked_timestamp(
-                        _utc_now_iso() if now is None else now,
-                        field="observed_at.attempt",
-                    ),
-                    # `last_reason` reaches the status surface, so it is held to the same
-                    # closed vocabulary on the way in. An unknown reason is recorded as a
-                    # refusal to classify rather than passed through verbatim.
-                    _safe_reason(reason),
-                    idempotency_key,
-                ),
-            )
-            return cursor.rowcount > 0
-
-        return bool(self._mutate("pending attempt", _work))
+        return self._transition(
+            "pending attempt",
+            idempotency_key,
+            plan_attempt(
+                reason=_safe_reason(reason),
+                stamp=_utc_now_iso() if now is None else now,
+            ),
+        )
 
     def mark_recorded(
         self, idempotency_key: str, journal_id: str, *, now: Optional[str] = None
     ) -> bool:
         """Bind a firing to the Redmine journal that now carries it (readback fence).
 
-        ``journal_id`` must be non-empty: an "it probably wrote" with no readback is exactly
-        the uncertain state that would let the next pass write a duplicate, so a blank id is
-        refused and the firing stays unrecorded and retryable.
+        ``journal_id`` must satisfy the SAME grammar the row contract declares — not merely
+        be non-empty. A blank or malformed id is refused and the firing stays unrecorded and
+        retryable, which is the recoverable direction: the opposite stored a value that
+        every later surface then had to treat as corruption (review j#110254).
+
+        The check is not written here. It happens once, in the transition, against
+        :data:`PENDING_FIELD_CHECKERS` — the same table the read side uses. Duplicating it
+        here was provably equivalent (a mutation removing it changed nothing observable),
+        and a guard nothing can measure is a guard that will drift.
+
+        Also NOT ``.strip()``. Trimming was a repairing face of the same rule: ``" 110264"``
+        was silently stored as ``"110264"``, so this face answered "yes" to an input every
+        other face refused. The equivalence test found it; review had not.
         """
-        jid = str(journal_id or "").strip()
-        if not jid or not self.path.exists():
-            return False
-        stamp = checked_timestamp(
-            _utc_now_iso() if now is None else now, field="observed_at.written"
+        return self._transition(
+            "pending record",
+            idempotency_key,
+            plan_recorded(
+                journal_id=str(journal_id or ""),
+                stamp=_utc_now_iso() if now is None else now,
+            ),
         )
-
-        def _work(conn):
-            cursor = conn.execute(
-                "UPDATE stall_escalation_pending SET journal_id=?, written_at=?, "
-                "attempts=attempts+1, last_attempt_at=?, last_reason='' "
-                "WHERE idempotency_key=? AND journal_id=''",
-                (jid, stamp, stamp, idempotency_key),
-            )
-            return cursor.rowcount > 0
-
-        return bool(self._mutate("pending record", _work))
 
     def mark_woken(self, idempotency_key: str, *, now: Optional[str] = None) -> bool:
         """Record that the coordinator wake for a **recorded** firing was enqueued.
 
-        Guarded on ``journal_id<>''`` in SQL rather than by the caller: waking a coordinator
-        to read a journal that does not exist is the one ordering this whole rail is built
-        to prevent, so the store refuses it instead of trusting call order.
+        Fenced twice, in Python and in SQL, because waking a coordinator to read a journal
+        that does not exist is the one ordering this rail is built to prevent. Both fences
+        now come from the one grammar: the SQL predicate is generated by
+        :func:`canonical_numeric_id_sql` instead of being hand-written, which is how the
+        12-character bound went missing from it in the first place (review j#110254
+        finding_checkerdrift).
+
+        Note what neither fence can do: they check SHAPE. That the journal EXISTS is the
+        caller's admission to make, against Redmine, before it ever gets here
+        (:func:`admit_wake`).
+
+        The two fences MASK each other under single-point mutation, which is what defence in
+        depth looks like from a mutation harness. Rather than delete one to make a number go
+        green, the pair is measured AS a pair (removing both is red) and the SQL predicate is
+        separately tested against the Python grammar over a corpus.
         """
-        if not self.path.exists():
-            return False
-
-        def _work(conn):
-            cursor = conn.execute(
-                # `<>''` was not enough: any non-empty string passed, so a rewritten
-                # `journal_id` settled the firing. The predicate now demands a canonical
-                # id -- digits, and nothing but digits (review j#110218).
-                "UPDATE stall_escalation_pending SET woke_at=? "
-                "WHERE idempotency_key=? AND woke_at='' "
-                "AND journal_id GLOB '[0-9]*' AND NOT journal_id GLOB '*[^0-9]*'",
-                (
-                    checked_timestamp(
-                        _utc_now_iso() if now is None else now, field="observed_at.woke"
-                    ),
-                    idempotency_key,
-                ),
-            )
-            return cursor.rowcount > 0
-
-        return bool(self._mutate("pending wake", _work))
+        return self._transition(
+            "pending wake",
+            idempotency_key,
+            plan_woken(stamp=_utc_now_iso() if now is None else now),
+            sql_guard=f"woke_at='' AND {canonical_numeric_id_sql('journal_id')}",
+        )
 
 
     # -- cadence watermark ---------------------------------------------------------

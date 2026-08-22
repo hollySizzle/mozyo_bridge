@@ -2,7 +2,7 @@
 
 ## Status
 
-- version: `v0.8` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 / j#110192 / j#110218 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
+- version: `v0.9` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 / j#110192 / j#110218 / j#110254 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
 - scope: watcher 層 (background / operator) が、pane の**描画画面が進んでいるか**だけを一次
   センサーとして停滞候補を拾い、種別を分類し、種別ごとの処方を**提示**するまで。
 - non-goal: 処方の自動適用、配送 rail の retry policy、completion 判定、receiver-state
@@ -601,6 +601,112 @@ identity / routing / stall の列は閉じたが、persistence state の 5 列 (
 - **quarantine の走査を lifecycle で絞らない**。`journal_id` と `woke_at` を両方書き換えた row は
   lifecycle 述語から見ると settled であり、open 行だけ走査すると**最も完全な偽造が誰にも
   見えなくなる**。
+
+### 文法は存在を証明しない — 列の権威分類 (j#110254 finding_stateauthority / finding_checkerdrift)
+
+v0.8 は「全永続列に文法の表を置き、write / read / projection の 3 面が共用する」と書いた。
+**表は置けたが、共用は宣言だけだった。** そして表があっても閉じない層が 1 つ残っていた。
+
+#### 誤りの形は 3 round とも同じで、抽象度だけが 1 段ずつ上がっていた
+
+| round | 主張したこと | 実際 |
+| --- | --- | --- |
+| v0.7 (j#110218) | 「row 全体に契約を置いた」 | 宣言した**強制が実在しなかった** (state 5 列が素通し) |
+| v0.8 (j#110254 前) | 「表を 1 つ置き 3 面が共用する」 | 強制の**適用範囲を宣言しただけ**だった |
+| v0.8 の test | 「完全一致 test が次の漏れを見つける」 | **適用の証明を宣言しただけ**だった |
+
+完全一致 test が証明するのは「表に名前が揃っていること」だけである。**各面が実際にその表を
+読んでいることは 1 つも証明していない。** 実測では `journal_id` の規則について 5 つの面が
+異なる答えを返していた — 表は 13 桁を拒否し、`canonical_journal_id()` (手書きの
+`str.isdigit()`) と `mark_woken` の SQL 述語は受理し、`mark_recorded` は非空だけを見て
+`not-a-journal` を保存し、`JournalWriteResult` も非空しか見ていなかった。原因は単純で、
+**同じ規則を 2 度目に手で実装したこと**である。2 度目の実装は書いた瞬間に drift する。
+
+#### そして文法では原理的に届かない層がある
+
+`journal_id='999999'` は完全に canonical である。存在しないだけである。R6 で `issue` に
+ついて確定した「per-field grammar は routing を守れない (99999 は正当な issue id である)」と
+**同型**であり、`issue` には seal を足しながら `journal_id` には文法だけ足した。結果、偽造
+された `journal_id` が Redmine への照会なしに settle し、`woke_at` も書き換えれば
+**open からも quarantine からも消える**。停滞報告が「静かに完了した」ことになる。
+
+#### 是正の形 1: 2 つの seal で全列を**分割**する
+
+点の修正 (指摘された 2 箇所を直す) ではなく、**同型が入り込む余地そのもの**を閉じる。
+round 6 は `issue`、round 7 は state 5 列、round 8 は `journal_id` を封じた。毎回「そのとき
+危険が実演された列」だけを封じ、残りを次 round の指摘に残している。したがって今回封じるのは
+列ではなく**分割**である。
+
+    保存列 = IDENTITY_SEAL_FIELDS (idempotency key が封じる)
+           ∪ ROW_SEAL_FIELDS      (row seal が封じる)
+           ∪ {idempotency_key, row_seal}   (導出列そのもの)
+
+`ROW_SEAL_FIELDS` は「persistence state の列」ではなく **「key が覆わない全列」** である。
+`prescription` を `patient_wait_then_retry` から `owner_escalation` へ書き換える改竄は、
+文法上まったく合法で、grammar には見えず、そのまま durable な Redmine journal に載る。
+第 3 の分類 (「まだ誰も封じていない列」) が存在しないことを test が主張する。
+
+#### 是正の形 2: 列を「何であるか」で分類し、分類ごとに権威を名指しする
+
+seal は改竄を**検出**するが、「その値が正しい」ことは言わない。外部 record を名指す列には
+別に権威が要る。`PENDING_FIELD_CLASSES` が全永続列を 4 分類し、各分類が保証の出所を持つ。
+
+| 分類 | 保証する機構 | 対象列 |
+| --- | --- | --- |
+| `identity_component` | idempotency key の seal | `idempotency_key` / `workspace_id` / `lane_id` / `role` / `generation` / `stall_class` / `first_observed_at` |
+| `external_record_reference` | key/row seal **に加えて外部システムへの照会** (`EXTERNAL_REFERENCE_AUTHORITY` が照会点を列ごとに宣言) | `issue` (write admission) / `journal_id` (wake admission) |
+| `persistence_state` | row seal (`pending_row_seal`) | `written_at` / `woke_at` / `attempts` / `last_attempt_at` / `last_reason` / `row_seal` |
+| `rendered_value` | row seal + 文法 + render 境界 | `target` / `prescription` / `matched_id` / `evidence_tier` / `consecutive` / `escalated_at` |
+
+分類は**文書ではなく機械照合**である。test が (a) 分類表 == checker 表 == 保存 row の field
+集合、(b) 2 つの seal が保存列を**分割**していること (交差なし・漏れなし)、(c) **全列**に
+ついて「合法な別値への書き換え」が検出されること (key 側は routing mismatch、seal 側は row
+mismatch)、(d) 全 `external_record_reference` が照会点を宣言し、その照会点が実際に拒否する
+こと、(e) `row_seal` を除く全列が projection で文法を通ること、を列ごとに走査して確認する。
+**分類だけあって機構が発火しない列は test が落とす。**
+
+#### 各機構が何を証明し、何を証明しないか
+
+- **row seal は改竄の証拠であって存在証明ではない。** 「store が導出した値である」ことしか
+  言わない。秘密ではないので、seal ごと再計算できる攻撃者は j#110245 / j#110218 の deferred
+  能力 (store への write 権限 + 全再計算) に当たる。**wake の可否をこの seal に依存させない。**
+- **存在を答えられるのは外部システムだけ。** wake の admission は firing 自身の
+  `idempotency_key` を持つ journal を Redmine から読み戻し、**row が主張する id と exact 一致**
+  したときだけ通す (`admit_wake`)。verifier 不在・issue 読取不能・read cap 超過は
+  **wake しない** (`journal_unverified`)。照会不能は「弱い根拠」ではなく「根拠なし」である。
+- **照会は writer の readback と同一実装**である (`journal_id_carrying_key`)。「存在するか」を
+  2 度実装すれば、それがまさに今回の drift の形になる。read は external mutation ではないが
+  無料でもないので、pass 共有の `budget["reads"]` と `MAX_PROVIDER_READS_PER_PASS` で bound し、
+  **上限に当たった pass は refusal として settle telemetry に現れる** (silent cap にしない)。
+- **転移は洗浄しない。** 契約を満たさない row には transition を適用しない。改竄された値の上に
+  新しい seal を書けば、store が次の通常 pass で偽造を `ok` に戻す共犯になる。
+
+#### 同型の横断掃討 (この lane の他の保存列)
+
+`journal_id` を直して終わりにすると、次 round は必ず「同型の別の列」が指摘になる。lane が
+持つ 3 テーブルの全列を同じ問いで走査した結果:
+
+- `stall_escalation_pending` — 上表のとおり分類・機械照合済み。
+- `stall_watch_streak` の `generation` — 外部権威 (`LaneLifecycleStore`) の事実だが、**毎 pass
+  権威から読み直して比較し、変化すれば run を破棄する** (`fold_observation` の
+  generation_transition、j#110146 finding_3)。すなわち照会点は「使用の直前」で、既に
+  authority-consulted-at-use である。`target` は locator であり identity ではない (evidence
+  専用)。
+- `stall_watch_discovery` / `stall_watch_watermark` — count と instant のみ。外部 record を
+  名指す列は無い。
+
+#### test の形を変えた
+
+「名前が揃っている」ではなく **「同じ入力に全面が同じ答えを返す」等価性 test** にした。
+`journal_id` の 26 値 corpus (12 桁 / 13 桁の境界、非 ASCII 数字、末尾改行、U+2028、前後空白)
+を、checker 表 / `canonical_journal_id` / `recorded` property / `mark_recorded` /
+`mark_woken` の SQL 述語 / `JournalWriteResult` / projection の 7 面に通し、**答えが割れたら
+落ちる**。SQL 述語は文字列を手で書かず `canonical_numeric_id_sql()` が同じ定数から生成する。
+
+この test は導入直後に、指摘の外側にあった 2 件を自力で検出した — `mark_recorded` の
+`.strip()` (`" 110264"` を黙って直して保存する repairing face) と、`plan_recorded` が空
+`journal_id` を受理する経路である。**「A を直せ」に対して A だけ直す**のではなく、A の
+規則を 1 箇所にして全面を測ると、指摘されていない同型が測定で出てくる。
 
 ## Cross-References
 

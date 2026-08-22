@@ -18,6 +18,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[4]
@@ -38,6 +39,7 @@ from mozyo_bridge.core.state.stall_pending_contract import (
     UNCLASSIFIED_REASON,
     StallPendingContractError,
     checked_count,
+    row_seal_for,
 )
 from mozyo_bridge.core.state.stall_escalation import (
     DISCOVERY_BAD_COUNT,
@@ -121,7 +123,13 @@ def _pending(*, idempotency_key=None, lane_id=LANE, issue="15855", escalated_at=
         escalated_at=escalated_at,
     )
     base.update(overrides)
-    return PendingEscalation(**base)
+    row = PendingEscalation(**base)
+    # The state seal is derived from the row exactly as the store derives it, unless a test
+    # is deliberately supplying a wrong one. A fixture that skipped it would be testing a
+    # shape the store can never produce.
+    if "row_seal" not in overrides:
+        row = replace(row, row_seal=row_seal_for(row))
+    return row
 
 
 class StoreBase(unittest.TestCase):
@@ -801,7 +809,7 @@ class HygieneTest(StoreBase):
                 "target", "issue", "stall_class", "prescription", "matched_id",
                 "evidence_tier", "consecutive", "first_observed_at", "escalated_at",
                 "journal_id", "written_at", "woke_at", "attempts", "last_attempt_at",
-                "last_reason",
+                "last_reason", "row_seal",
             },
         )
 

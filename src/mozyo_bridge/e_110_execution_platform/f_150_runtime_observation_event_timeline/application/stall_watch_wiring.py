@@ -34,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     default_body_marker_resolver,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_leg import (  # noqa: E501
+    build_journal_verifier,
     build_journal_writer,
     run_stall_watch_leg,
 )
@@ -296,6 +297,11 @@ def build_stall_watch_leg_fn(
                 policy=policy, transport=note_transport(), source=source
             ),
             wake=wake,
+            # The wake admission's authority, built from the SAME journal source the write
+            # fence reads back through. Without it no wake is admitted at all, which is the
+            # intended direction on a host with no readable Redmine source: an unverifiable
+            # journal id is no reason to wake a coordinator (review j#110254).
+            verify_journal=build_journal_verifier(source=source, budget=pass_budget),
             generation_for=lambda lane_id: lanes.get(lane_id, ("", ""))[0],
             issue_for=lambda lane_id: lanes.get(lane_id, ("", ""))[1],
             body_marker_for=resolve_marker,

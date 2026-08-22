@@ -28,13 +28,20 @@ guarded:
 - the pending row is keyed by :func:`escalation_idempotency_key`, derived from the run's
   identity rather than the firing pass's clock, so a crash-and-retry collides instead of
   producing a second journal;
-- ``mark_recorded`` refuses a blank journal id, so an "it probably wrote" never counts as
-  written — the firing stays unrecorded and is retried, which is the correct direction when
-  the alternative is a stall nobody is told about;
-- ``mark_woken`` refuses a firing with no journal id **in SQL**, so a coordinator is never
-  woken to read a journal that does not exist. That ordering is enforced by the store
-  rather than trusted to call order, because it is the one inversion this rail exists to
-  prevent.
+- ``mark_recorded`` refuses a blank or malformed journal id — against the same grammar
+  table the stored column is held to, decided in one place — so an "it probably wrote"
+  never counts as written. The firing stays unrecorded and is retried, which is the correct
+  direction when the alternative is a stall nobody is told about;
+- ``mark_woken`` refuses a firing with no canonical journal id **in SQL**, so a coordinator
+  is never woken to read a journal that does not exist. That ordering is enforced by the
+  store rather than trusted to call order, because it is the one inversion this rail exists
+  to prevent;
+- and the wake itself is admitted only against the EXTERNAL authority. Every guard above
+  checks shape, and shape is not existence: a stored ``journal_id='999999'`` satisfies all
+  of them and names nothing (review j#110254 finding_stateauthority). So before a
+  coordinator is woken, the issue is read back and the journal carrying this firing's own
+  idempotency key must be **exactly** the one the row claims — see :func:`admit_wake`. No
+  verifier, or an unreadable issue, means no wake this pass; the firing waits.
 
 Fairness, stated as an assumption rather than assumed
 -----------------------------------------------------
@@ -63,6 +70,10 @@ from mozyo_bridge.core.state.stall_escalation import (
     StallEscalationStore,
     StreakRow,
     escalation_idempotency_key,
+)
+from mozyo_bridge.core.state.stall_pending_contract import (
+    admit_wake,
+    canonical_journal_id,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_pass import (  # noqa: E501
     StallObservation,
@@ -110,8 +121,14 @@ class JournalWriteResult:
     def __post_init__(self) -> None:
         if self.outcome not in WRITE_OUTCOMES:
             raise ValueError(f"unknown journal write outcome {self.outcome!r}")
-        if self.outcome == WRITE_RECORDED and not self.journal_id:
-            raise ValueError("a recorded write must carry the journal id it read back")
+        if self.outcome == WRITE_RECORDED and not canonical_journal_id(self.journal_id):
+            # Non-EMPTY was the old bar, and it let a writer report `not-a-journal` as a
+            # successful readback; the store then held a value every later surface had to
+            # treat as corruption (review j#110254 finding_checkerdrift). The bar is the
+            # same grammar the stored column is held to, from the same table.
+            raise ValueError(
+                "a recorded write must carry the canonical journal id it read back"
+            )
 
 
 #: Writes one escalation journal and classifies what it did. It must not raise — a writer
@@ -121,6 +138,12 @@ JournalWriter = Callable[[PendingEscalation], JournalWriteResult]
 
 #: Enqueues a coordinator wake for ``(workspace_id, issue)``; returns whether it stuck.
 WakeEnqueue = Callable[[str, str], bool]
+
+#: Asks the EXTERNAL system which journal carries a firing, and returns its id (``""`` when
+#: the authority cannot answer — an unreadable issue, a missing source, a spent read cap).
+#: This is the only thing in the rail that can distinguish a real journal id from a
+#: well-formed fabrication, because it is the only thing that asks Redmine.
+JournalVerifier = Callable[[PendingEscalation], str]
 
 #: Settle reason: the firing has no authoritative active issue anchor, so there is nowhere
 #: to write it. j#110121-5 forbids guessing an issue, so it stays local and visible.
@@ -203,6 +226,12 @@ class SettleOutcome:
     anchorless: int = 0
     oldest_unrecorded_at: str = ""
     errors: tuple[str, ...] = ()
+    #: Wakes this pass declined, as ``(refusal token, count)`` pairs from the closed
+    #: :data:`WAKE_REFUSALS` vocabulary. Present because a wake that is silently not
+    #: happening looks exactly like a cockpit with nothing wrong: a firing whose journal
+    #: cannot be verified is a stall that reached the durable record and stopped there, and
+    #: an operator has to be able to see the difference (review j#110254).
+    wake_refusals: tuple[tuple[str, int], ...] = ()
 
     @property
     def spent_budget(self) -> bool:
@@ -218,6 +247,8 @@ class SettleOutcome:
             "woke": list(self.woke),
             "spent_budget": self.spent_budget,
         }
+        if self.wake_refusals:
+            payload["wake_refusals"] = {token: count for token, count in self.wake_refusals}
         if self.oldest_unrecorded_at:
             payload["oldest_unrecorded_at"] = self.oldest_unrecorded_at
         if self.recorded is not None:
@@ -423,6 +454,76 @@ def apply_escalation_gate(
 # --------------------------------------------------------------------------------------
 
 
+class _WakeLedger:
+    """What one pass's wake attempts did, kept in one place so every return site reports it.
+
+    Refusals are counted by token rather than listed per row: the tokens are a closed
+    vocabulary and the identities are not, so counting is what makes this safe to render on
+    a status surface without deciding all over again which columns may be echoed.
+    """
+
+    def __init__(self) -> None:
+        self.woke: list[str] = []
+        self.refusals: dict[str, int] = {}
+        self.handled: set[str] = set()
+
+    def refuse(self, token: str) -> None:
+        self.refusals[token] = self.refusals.get(token, 0) + 1
+
+    def tally(self) -> tuple[tuple[str, int], ...]:
+        return tuple(sorted(self.refusals.items()))
+
+
+def _run_wake_round(
+    *,
+    workspace_id: str,
+    store: StallEscalationStore,
+    wake: Optional[WakeEnqueue],
+    verify_journal: Optional[JournalVerifier],
+    ledger: _WakeLedger,
+    now: Callable[[], str],
+    errors: list[str],
+) -> None:
+    """Wake coordinators for every recorded firing whose journal the authority confirms.
+
+    ONE round, called both before the write leg (for firings recorded on earlier passes)
+    and after it (for the firing recorded moments ago). The two used to be separate code
+    paths, and separate code paths for one rule is the defect this whole round is about —
+    the freshly written row now re-enters through the same supply surface and the same
+    admission as every other row, so "was it verified" cannot depend on which pass wrote it.
+    """
+    if wake is None:
+        return
+    try:
+        unwoken = store.unwoken_pending(workspace_id)
+    except Exception as exc:  # noqa: BLE001
+        errors.append(f"pending read failed: {type(exc).__name__}")
+        return
+    for pending in unwoken:
+        if pending.idempotency_key in ledger.handled:
+            continue
+        ledger.handled.add(pending.idempotency_key)
+        if not pending.issue:
+            continue
+        observed = ""
+        if verify_journal is not None:
+            try:
+                observed = str(verify_journal(pending) or "")
+            except Exception:  # noqa: BLE001 - an unreadable authority answers nothing
+                observed = ""
+        refusal = admit_wake(pending, observed)
+        if refusal:
+            ledger.refuse(refusal)
+            continue
+        try:
+            if wake(workspace_id, pending.issue) and store.mark_woken(
+                pending.idempotency_key, now=now()
+            ):
+                ledger.woke.append(pending.idempotency_key)
+        except Exception:  # noqa: BLE001 - a wake loss is recoverable; the row stays
+            continue
+
+
 def settle_pending_escalations(
     *,
     workspace_id: str,
@@ -430,6 +531,7 @@ def settle_pending_escalations(
     budget: Optional[dict] = None,
     write_journal: Optional[JournalWriter] = None,
     wake: Optional[WakeEnqueue] = None,
+    verify_journal: Optional[JournalVerifier] = None,
     now: Callable[[], str] = _utc_now_iso,
 ) -> SettleOutcome:
     """Advance the pending queue by at most one external mutation.
@@ -451,25 +553,14 @@ def settle_pending_escalations(
         )
 
     errors: list[str] = []
-    woke: list[str] = []
+    ledger = _WakeLedger()
 
-    # 1. Local, free, and first: wake coordinators for anything already recorded.
-    if wake is not None:
-        try:
-            unwoken = store.unwoken_pending(ws)
-        except Exception as exc:  # noqa: BLE001
-            unwoken = ()
-            errors.append(f"pending read failed: {type(exc).__name__}")
-        for pending in unwoken:
-            if not pending.issue:
-                continue
-            try:
-                if wake(ws, pending.issue) and store.mark_woken(
-                    pending.idempotency_key, now=now()
-                ):
-                    woke.append(pending.idempotency_key)
-            except Exception:  # noqa: BLE001 - a wake loss is recoverable; the row stays
-                continue
+    # 1. Local, free, and first: wake coordinators for anything already recorded — each one
+    #    admitted against the external authority, never against its own stored claim.
+    _run_wake_round(
+        workspace_id=ws, store=store, wake=wake, verify_journal=verify_journal,
+        ledger=ledger, now=now, errors=errors,
+    )
 
     try:
         unrecorded = store.unrecorded_pending(ws)
@@ -477,7 +568,8 @@ def settle_pending_escalations(
         return SettleOutcome(
             workspace_id=ws,
             reason=SETTLE_NOTHING_PENDING,
-            woke=tuple(woke),
+            woke=tuple(ledger.woke),
+            wake_refusals=ledger.tally(),
             errors=tuple(errors + [f"pending read failed: {type(exc).__name__}"]),
         )
 
@@ -485,7 +577,8 @@ def settle_pending_escalations(
     oldest = unrecorded[0].escalated_at if unrecorded else ""
     common = dict(
         workspace_id=ws,
-        woke=tuple(woke),
+        woke=tuple(ledger.woke),
+        wake_refusals=ledger.tally(),
         unrecorded=len(unrecorded),
         anchorless=anchorless,
         oldest_unrecorded_at=oldest,
@@ -547,7 +640,8 @@ def settle_pending_escalations(
         return SettleOutcome(
             workspace_id=ws,
             reason=settle_reason,
-            woke=tuple(woke),
+            woke=tuple(ledger.woke),
+            wake_refusals=ledger.tally(),
             unrecorded=len(unrecorded),
             anchorless=anchorless,
             oldest_unrecorded_at=oldest,
@@ -564,21 +658,22 @@ def settle_pending_escalations(
         **{**target.__dict__, "journal_id": journal_id, "written_at": now()}
     )
 
-    # Only now may a coordinator be woken: the journal it will be told to read exists.
-    if wake is not None and target.issue:
-        try:
-            if wake(ws, target.issue) and store.mark_woken(
-                target.idempotency_key, now=now()
-            ):
-                woke.append(target.idempotency_key)
-        except Exception:  # noqa: BLE001 - the journal is durable; the wake retries later
-            pass
+    # Only now may a coordinator be woken: the journal it will be told to read exists. The
+    # freshly recorded row goes back through the SAME supply surface and the SAME admission
+    # as every other row — it is not waved through for having been written in this pass.
+    # That also means it is only woken if `mark_recorded` really stored what the writer
+    # reported, which is a property nothing checked while the two paths were separate.
+    _run_wake_round(
+        workspace_id=ws, store=store, wake=wake, verify_journal=verify_journal,
+        ledger=ledger, now=now, errors=errors,
+    )
 
     return SettleOutcome(
         workspace_id=ws,
         reason=SETTLE_RECORDED,
         recorded=recorded,
-        woke=tuple(woke),
+        woke=tuple(ledger.woke),
+        wake_refusals=ledger.tally(),
         unrecorded=len(unrecorded) - 1,
         anchorless=anchorless,
         oldest_unrecorded_at=oldest,
@@ -598,6 +693,7 @@ __all__ = (
     "WRITE_RECORDED",
     "WRITE_UNCERTAIN",
     "EscalationPassOutcome",
+    "JournalVerifier",
     "JournalWriteResult",
     "JournalWriter",
     "ObservedUnit",

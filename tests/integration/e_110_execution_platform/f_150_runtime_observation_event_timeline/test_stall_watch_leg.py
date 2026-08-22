@@ -44,6 +44,7 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     LEG_NOT_DUE,
     LEG_NO_READER,
     LEG_RAN,
+    build_journal_verifier,
     build_journal_writer,
     journal_id_carrying_key,
     run_stall_watch_leg,
@@ -175,6 +176,12 @@ class LegBase(unittest.TestCase):
             read_screen=self._read if read is None else read,
             write_journal=writer,
             wake=kwargs.pop("wake", self.wake),
+            # The wake admission's authority, reading the SAME fake Redmine the writer's
+            # readback reads. Leaving it out would model a host with no journal source,
+            # where the correct behaviour is to wake nobody.
+            verify_journal=kwargs.pop(
+                "verify_journal", build_journal_verifier(source=self.source, budget=budget)
+            ),
             generation_for=kwargs.pop("generation_for", lambda lane: "g1"),
             issue_for=kwargs.pop("issue_for", lambda lane: "15855"),
             body_marker_for=kwargs.pop("body_marker_for", None),
@@ -333,21 +340,35 @@ class ReadbackFenceTest(LegBase):
     def test_a_journal_that_already_landed_is_bound_not_rewritten(self) -> None:
         # The crash-after-POST case: the durable record holds the firing, the local store
         # does not know it. A second write here would duplicate a coordinator-facing note.
+        #
+        # Reproduced by re-enqueueing the firing through the STORE, not by hand-editing the
+        # stored row back to "unrecorded". A crash between the POST and `mark_recorded`
+        # leaves a row the store itself wrote, seal and all; a hand-edited rollback is a row
+        # somebody else wrote, which is now (correctly) quarantined as tampering. Editing
+        # the DB here would quietly turn this into a test about the seal.
         self.run_leg()
-        self.run_leg(at=T0 + timedelta(seconds=301))
-        (pending_key,) = [c["body"] for c in self.emit.calls]
+        spent = {"reads": 0, "mutated": True, "uncertain": False}
+        self.run_leg(at=T0 + timedelta(seconds=301), budget=spent)
+        (fired,) = self.store.open_pending(WS)  # fired, budget-deferred, not yet written
+        self.assertEqual(fired.journal_id, "")
+
+        self.run_leg(at=T0 + timedelta(seconds=700))
+        self.assertEqual(len(self.emit.calls), 1)
         self.assertEqual(len(self.source.entries), 1)
 
-        # Force the local store back to "unrecorded" and run the writer again.
+        # Now lose the local binding the way a crash loses it: the firing is back in the
+        # store with no journal id, and the journal is already in Redmine.
         import sqlite3
 
         conn = sqlite3.connect(self.store.path)
         try:
-            conn.execute("UPDATE stall_escalation_pending SET journal_id='', woke_at=''")
+            conn.execute("DELETE FROM stall_escalation_pending")
             conn.commit()
         finally:
             conn.close()
-        self.run_leg(at=T0 + timedelta(seconds=700))
+        self.assertTrue(self.store.enqueue_pending(fired))
+
+        self.run_leg(at=T0 + timedelta(seconds=1100))
         self.assertEqual(len(self.emit.calls), 1)  # no second POST
         self.assertEqual(len(self.source.entries), 1)
         (pending,) = self.store.unwoken_pending(WS) or self.store.open_pending(WS) or (None,)
@@ -921,6 +942,96 @@ class WiringTest(unittest.TestCase):
         pending = store.unrecorded_pending(WS)
         self.assertEqual(len(pending), 1)
         self.assertEqual(pending[0].last_reason, "write_optin_unset")
+
+    class _WakeStore:
+        def __init__(self) -> None:
+            self.calls = []
+
+        def enqueue(self, workspace_id, issue):
+            self.calls.append((workspace_id, issue))
+            return True
+
+    def _recorded_firing(self, store, *, journal_id="110264"):
+        """A firing already bound to a journal, seeded through the store's own API."""
+        from mozyo_bridge.core.state.stall_escalation import (
+            PendingEscalation,
+            escalation_idempotency_key,
+        )
+
+        first = "2026-08-22T09:00:00+00:00"
+        key = escalation_idempotency_key(
+            workspace_id=WS, lane_id=LANE, role="claude", generation="g1",
+            stall_class="content_refusal", first_observed_at=first, issue="15855",
+        )
+        self.assertTrue(store.enqueue_pending(PendingEscalation(
+            idempotency_key=key, workspace_id=WS, lane_id=LANE, role="claude",
+            generation="g1", stall_class="content_refusal",
+            prescription="context_reset_reinjection", consecutive=2,
+            first_observed_at=first, escalated_at="2026-08-22T09:02:00+00:00",
+            issue="15855",
+        )))
+        self.assertTrue(store.mark_recorded(key, journal_id))
+        return key
+
+    def _wake_leg(self, *, home, store, source, wake_store):
+        return build_stall_watch_leg_fn(
+            home=home,
+            lifecycle_store=_LifecycleStore([_LaneRecord()]),
+            wake_store=wake_store,
+            redmine_source_fn=lambda ws: source,
+            inventory_rows=lambda: [
+                {"name": encode_assigned_name(WS, "claude", LANE), "pane_id": LOCATOR}
+            ],
+            screen_reader=lambda: (lambda target: (True, FROZEN_SCREEN)),
+            note_transport=lambda: None,
+            store=store,
+            sleep=lambda _s: None,
+            sample_interval_seconds=0.0,
+        )
+
+    def test_the_production_wiring_wakes_on_a_journal_redmine_confirms(self) -> None:
+        # Reachability, not plumbing: every other test in this file passes the verifier in
+        # by hand, so none of them would notice if the production composition stopped
+        # building one. THIS test does: an unwired verifier is a fail-closed one, so the
+        # wake simply never happens and the assertion below goes red. (Measured: deleting
+        # the `verify_journal=` line in `stall_watch_wiring` fails exactly this test.) The
+        # negative case below pins the other half -- that the answer is consulted, not just
+        # requested.
+        from mozyo_bridge.core.state.stall_escalation import StallEscalationStore
+
+        home = Path(tempfile.mkdtemp())
+        store = StallEscalationStore(home=home)
+        source = _Source()
+        wake_store = self._WakeStore()
+        key = self._recorded_firing(store)
+        source.append("15855", f"idempotency_key: {key}", "110264")
+
+        self._wake_leg(home=home, store=store, source=source, wake_store=wake_store)(
+            self._WS(self._repo("stall_watch:\n  lanes: [%s]\n" % LANE)),
+            pass_budget={"reads": 0, "mutated": False, "uncertain": False},
+        )
+
+        self.assertEqual(wake_store.calls, [(WS, "15855")])
+        self.assertEqual(store.open_pending(WS), ())
+
+    def test_the_production_wiring_refuses_a_journal_redmine_does_not_have(self) -> None:
+        from mozyo_bridge.core.state.stall_escalation import StallEscalationStore
+
+        home = Path(tempfile.mkdtemp())
+        store = StallEscalationStore(home=home)
+        source = _Source()  # Redmine has never heard of journal 110264
+        wake_store = self._WakeStore()
+        self._recorded_firing(store)
+
+        self._wake_leg(home=home, store=store, source=source, wake_store=wake_store)(
+            self._WS(self._repo("stall_watch:\n  lanes: [%s]\n" % LANE)),
+            pass_budget={"reads": 0, "mutated": False, "uncertain": False},
+        )
+
+        self.assertEqual(wake_store.calls, [])
+        self.assertEqual(len(store.unwoken_pending(WS)), 1)  # waits, not lost
+
+
 
 
 

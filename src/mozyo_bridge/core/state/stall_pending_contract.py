@@ -6,16 +6,25 @@ budget, and "what a valid row is" is a genuinely separable concern from "how row
 persisted". Nothing here touches SQLite, and nothing here decides policy — it decides only
 whether a set of values is admissible.
 
-The contract has two halves, because the fields carry different kinds of risk:
+The contract has three halves, because the fields carry different kinds of risk:
 
-- a per-field GRAMMAR (closed vocabularies, bounded identity tokens, digits-only ids), and
+- a per-field GRAMMAR (closed vocabularies, bounded identity tokens, digits-only ids),
 - a ROUTING INTEGRITY seal, which no per-field grammar can provide: ``issue`` is the target
-  of an external Redmine write, and one legitimate issue id looks exactly like another.
+  of an external Redmine write, and one legitimate issue id looks exactly like another, and
+- an AUTHORITY classification, which says who is allowed to vouch for each column, because
+  a grammar proves SHAPE and can never prove EXISTENCE (review j#110254).
 
-Review j#110192 finding_1 reproduced both halves failing at once — a direct-DB rewrite that
-redirected a gate write to issue 99999, a ``lane_id`` carrying an embedded newline that
+Review j#110192 finding_1 reproduced the first two failing at once — a direct-DB rewrite
+that redirected a gate write to issue 99999, a ``lane_id`` carrying an embedded newline that
 fabricated a line in a journal body, a ``consecutive`` of ``-3``, and an operator-unsafe
-``last_reason`` that surfaced verbatim in the status JSON.
+``last_reason`` that surfaced verbatim in the status JSON. Review j#110254 then reproduced
+the third: a canonical-shaped ``journal_id='999999'`` settled a firing, and the settled row
+vanished from both the open inventory and the quarantine surface, with Redmine never asked.
+
+Everything about one stored row lives in this ONE module on purpose. The three failures
+that cost this issue rounds six, seven and eight were all the same shape — a rule declared
+in one place and re-implemented, partially, somewhere else — so splitting "what a valid row
+is" from "who vouches for it" would rebuild the exact seam that keeps breaking.
 """
 
 from __future__ import annotations
@@ -101,6 +110,10 @@ PENDING_EVIDENCE_TIERS: frozenset[str] = frozenset(
     {"rendered_confirmed", "binary_read_unrendered"}
 )
 
+#: The shape :func:`pending_row_seal` produces. A distinct prefix from the idempotency key
+#: so the two can never be mistaken for one another in a row or a log line.
+ROW_SEAL_PATTERN = r"stallst1_[0-9a-f]{32}"
+
 #: Integrity verdicts for a stored pending row.
 PENDING_OK = "ok"
 #: The row's own fields no longer derive its stored idempotency key, so at least one of the
@@ -109,6 +122,13 @@ PENDING_OK = "ok"
 PENDING_ROUTING_MISMATCH = "routing_binding_mismatch"
 #: A field violates its grammar. Same disposition: preserved, never externally actuated.
 PENDING_FIELD_INVALID = "field_grammar_violation"
+#: The row's non-identity columns no longer derive their stored seal, so something the store
+#: wrote was rewritten afterwards. Same disposition — and this is the
+#: verdict that makes a fully-forged SETTLED row visible: a row whose ``journal_id`` and
+#: ``woke_at`` were both rewritten satisfies every lifecycle predicate and every grammar,
+#: and before the seal existed it appeared in neither the open inventory nor the quarantine
+#: surface (review j#110254 finding_stateauthority).
+PENDING_STATE_MISMATCH = "row_binding_mismatch"
 
 
 #: Rendered in place of a stored field that violates its grammar. The offending value is
@@ -227,6 +247,72 @@ def escalation_idempotency_key(
     return f"stallesc1_{digest[:32]}"
 
 
+#: The columns the idempotency key already seals, in the order it hashes them. Rewrite any
+#: one of them and the row stops deriving the key it is stored under.
+IDENTITY_SEAL_FIELDS: tuple[str, ...] = (
+    "workspace_id", "lane_id", "role", "generation", "stall_class", "first_observed_at",
+    "issue",
+)
+
+#: EVERY OTHER column, sealed by :func:`pending_row_seal`.
+#:
+#: "Every other" rather than "the persistence-state ones" is the point, and it is rounds six
+#: through eight compressed into one tuple. Each of those rounds sealed the columns whose
+#: risk had just been demonstrated and left the rest; each time, the next round's finding was
+#: a column from the rest — first ``issue``, then the five state columns, then ``journal_id``.
+#: A ``prescription`` rewritten from ``patient_wait_then_retry`` to ``owner_escalation`` is
+#: just as legal, just as invisible to a grammar, and reaches a durable Redmine journal just
+#: the same. So the partition is closed by construction and asserted by test: every stored
+#: column is in the key, in this seal, or IS one of the two derived columns.
+ROW_SEAL_FIELDS: tuple[str, ...] = (
+    "target", "prescription", "matched_id", "evidence_tier", "consecutive", "escalated_at",
+    "journal_id", "written_at", "woke_at", "attempts", "last_attempt_at", "last_reason",
+)
+
+
+def pending_row_seal(*, idempotency_key: str, values) -> str:
+    """Derive the tamper-evidence seal over every column the identity key does not cover.
+
+    Bound to ``idempotency_key`` so a seal cannot be lifted from one row onto another: the
+    settled state of a firing that really did reach a coordinator would otherwise be
+    copyable onto a firing that never did.
+
+    What this proves, and what it does not — stated plainly, because overstating exactly
+    this kind of check is what cost rounds six and seven. It detects columns rewritten
+    WITHOUT recomputing the seal. It is not a secret, and it is **not an existence proof**:
+    a seal says the store derived these values, never that the journal they name exists. An
+    attacker who also recomputes it is the capability deferred in j#110245 / j#110218 (store
+    write access plus full recomputation). The wake admission therefore does not consult
+    this seal for existence — it asks Redmine (:func:`admit_wake`).
+    """
+    digest = hashlib.sha256(
+        "\x1f".join(
+            (str(idempotency_key), *(str(values.get(name, "")) for name in ROW_SEAL_FIELDS))
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"stallst1_{digest[:32]}"
+
+
+def row_seal_for(row) -> str:
+    """The seal a row's own columns derive.
+
+    Derived from the row at the WRITE boundary and never accepted from a caller: a seal a
+    caller could supply would seal nothing.
+    """
+    return pending_row_seal(
+        idempotency_key=str(getattr(row, "idempotency_key", "")),
+        values={name: getattr(row, name, "") for name in ROW_SEAL_FIELDS},
+    )
+
+
+def checked_row_seal(value: object, *, name: str = "row_seal") -> str:
+    """The seal's own grammar. Whether it DERIVES the row is a separate check, on read."""
+    text = "" if value is None else str(value)
+    if re.fullmatch(ROW_SEAL_PATTERN, text) is None:
+        raise StallPendingContractError(f"pending {name} is not a canonical row seal")
+    return text
+
+
 #: Recorded in place of a reason the contract does not know. Distinct from every declared
 #: reason, so "the writer reported something unrecognised" is not silently indistinguishable
 #: from "the writer reported nothing".
@@ -340,6 +426,78 @@ PENDING_FIELD_CHECKERS = {
     "attempts": _count("attempts", minimum=0),
     "last_attempt_at": _instant("observed_at.attempt", allow_empty=True),
     "last_reason": checked_reason,
+    "row_seal": checked_row_seal,
+}
+
+
+# ======================================================================================
+# Authority classification: who is allowed to vouch for each column
+# ======================================================================================
+#
+# The grammar table above answers "is this value admissible". It cannot answer "is this
+# value TRUE", and three rounds of this issue were lost to not separating the two. So every
+# column is also classified by what kind of fact it holds, and each class names the one
+# mechanism entitled to vouch for it. The classification is machine-checked against the
+# stored row AND against the mechanisms, so a field declared `identity_component` that does
+# not actually change the idempotency key fails a test rather than a review round.
+
+#: Sealed into the idempotency key: change one and the row stops deriving its own key.
+FIELD_CLASS_IDENTITY = "identity_component"
+#: Sealed into the state seal: this store's own record of how far a firing got.
+FIELD_CLASS_STATE = "persistence_state"
+#: Names a record in an EXTERNAL system. Nothing local can vouch for it; see
+#: :data:`EXTERNAL_REFERENCE_AUTHORITY` for where the external system is actually asked.
+FIELD_CLASS_EXTERNAL = "external_record_reference"
+#: Neither routes nor asserts anything: grammar plus the render boundary is the whole story.
+FIELD_CLASS_RENDERED = "rendered_value"
+
+FIELD_CLASSES: frozenset[str] = frozenset(
+    {FIELD_CLASS_IDENTITY, FIELD_CLASS_STATE, FIELD_CLASS_EXTERNAL, FIELD_CLASS_RENDERED}
+)
+
+#: Every stored column, and what kind of fact it holds.
+#:
+#: ``issue`` and ``journal_id`` are BOTH external references, and they are the two fields
+#: this issue lost a round to, one after the other (j#110192 finding_1, then j#110254
+#: finding_stateauthority). They differ only in WHERE their authority is consulted, which is
+#: why that site is declared per field below instead of assumed.
+PENDING_FIELD_CLASSES: dict[str, str] = {
+    "idempotency_key": FIELD_CLASS_IDENTITY,
+    "workspace_id": FIELD_CLASS_IDENTITY,
+    "lane_id": FIELD_CLASS_IDENTITY,
+    "role": FIELD_CLASS_IDENTITY,
+    "generation": FIELD_CLASS_IDENTITY,
+    "stall_class": FIELD_CLASS_IDENTITY,
+    "first_observed_at": FIELD_CLASS_IDENTITY,
+    "issue": FIELD_CLASS_EXTERNAL,
+    "journal_id": FIELD_CLASS_EXTERNAL,
+    "written_at": FIELD_CLASS_STATE,
+    "woke_at": FIELD_CLASS_STATE,
+    "attempts": FIELD_CLASS_STATE,
+    "last_attempt_at": FIELD_CLASS_STATE,
+    "last_reason": FIELD_CLASS_STATE,
+    "row_seal": FIELD_CLASS_STATE,
+    "target": FIELD_CLASS_RENDERED,
+    "prescription": FIELD_CLASS_RENDERED,
+    "matched_id": FIELD_CLASS_RENDERED,
+    "evidence_tier": FIELD_CLASS_RENDERED,
+    "consecutive": FIELD_CLASS_RENDERED,
+    "escalated_at": FIELD_CLASS_RENDERED,
+}
+
+#: Where the external system is actually asked. An ``external_record_reference`` field with
+#: no entry here is a field whose existence NOBODY checks — precisely the state
+#: ``journal_id`` was in for two rounds while carrying a grammar that looked like rigour.
+#:
+#: - ``issue`` is checked by the write itself: a journal cannot be posted to an issue that
+#:   does not exist, so the external system answers at the moment of use — and a redirected
+#:   issue additionally breaks the idempotency key, which it is sealed into.
+#: - ``journal_id`` is checked at the WAKE admission by exact readback, because nothing else
+#:   in this rail ever consults it: the stored id is what a woken coordinator is told to go
+#:   read, so the wake is the entire external effect a fabricated id buys.
+EXTERNAL_REFERENCE_AUTHORITY: dict[str, str] = {
+    "issue": "write_admission",
+    "journal_id": "wake_admission",
 }
 
 
@@ -400,17 +558,100 @@ def pending_row_integrity(pending: "PendingEscalation") -> str:
     # an authentication check) -- an ordinary compare is what a reader should expect.
     if expected != pending.idempotency_key:
         return PENDING_ROUTING_MISMATCH
+    if row_seal_for(pending) != pending.row_seal:
+        return PENDING_STATE_MISMATCH
     return PENDING_OK
 
 
 def canonical_journal_id(value: object) -> bool:
-    """Whether a stored ``journal_id`` names a real Redmine journal: digits, and only digits.
+    """Whether a stored ``journal_id`` has the shape of a Redmine journal id.
 
-    Mirrored in SQL by :meth:`StallEscalationStore.mark_woken` so the fence holds whether
-    the caller asks in Python or the UPDATE runs on its own (review j#110218).
+    DERIVED from :data:`PENDING_FIELD_CHECKERS`, not a second implementation of it. The
+    previous version was a hand-written ``str.isdigit()``, which drifted from the table in
+    two directions at once: it admitted the 13-character ``1234567890123`` (the table's
+    12-character bound was missing) and it admitted non-ASCII digits (``str.isdigit()`` is
+    true for Arabic-Indic digits, which ``[0-9]`` is not). Review j#110254
+    finding_checkerdrift found the first; the second came free with the same mistake.
+
+    Note what this function does NOT claim, since claiming it is what cost round seven: a
+    canonical shape is not an existing journal. ``999999`` passes here and names nothing.
+    Existence is :func:`admit_wake`'s question, and only Redmine can answer it.
     """
-    text = str(value or "")
-    return bool(text) and text.isdigit()
+    try:
+        PENDING_FIELD_CHECKERS["journal_id"](value)
+    except StallPendingContractError:
+        return False
+    return bool(str(value or ""))
+
+
+#: The one place the digit alphabet is written for the SQL side.
+_SQL_DIGIT_CLASS = "[0-9]"
+
+
+def canonical_numeric_id_sql(column: str) -> str:
+    """A SQL predicate accepting exactly what :func:`canonical_journal_id` accepts.
+
+    ``GLOB '[0-9]*'`` alone admits ``110200x``; adding the negated class still admitted the
+    13-digit id the bound exists to refuse. Both halves and the bound now come from the same
+    constants the Python checker uses, and the equivalence is asserted over a corpus by test
+    rather than argued here — an argued equivalence is exactly what drifted.
+    """
+    name = checked_identity(column, name="sql column")
+    return (
+        f"{name} GLOB '{_SQL_DIGIT_CLASS}*' "
+        f"AND NOT {name} GLOB '*[^0-9]*' "
+        f"AND LENGTH({name}) BETWEEN 1 AND {NUMERIC_ID_MAX_LENGTH}"
+    )
+
+
+#: Admitted: the external authority answered with exactly the stored journal id.
+WAKE_ADMITTED = ""
+#: The row failed the stored-row contract, so nothing about it may drive an effect.
+WAKE_ROW_QUARANTINED = "row_quarantined"
+#: The stored id is not even shaped like a journal id.
+WAKE_JOURNAL_NOT_CANONICAL = "journal_not_canonical"
+#: The authority was not consulted, or could not answer. Fail-closed: no wake.
+WAKE_JOURNAL_UNVERIFIED = "journal_unverified"
+#: The authority answered with a DIFFERENT journal id than the row claims.
+WAKE_JOURNAL_MISMATCH = "journal_mismatch"
+
+WAKE_REFUSALS: frozenset[str] = frozenset(
+    {
+        WAKE_ROW_QUARANTINED,
+        WAKE_JOURNAL_NOT_CANONICAL,
+        WAKE_JOURNAL_UNVERIFIED,
+        WAKE_JOURNAL_MISMATCH,
+    }
+)
+
+
+def admit_wake(pending, observed_journal_id: object) -> str:
+    """Whether a coordinator may be woken for this row; ``""`` admits, else a refusal token.
+
+    ``observed_journal_id`` is what the EXTERNAL system says carries this firing — the id
+    found by matching the firing's own idempotency key in the issue's journals. It is not
+    the row's opinion of itself, which is the whole point: a row claiming
+    ``journal_id='999999'`` is what this admission exists to refuse.
+
+    Fail-closed on an unanswered authority. A wake that cannot be justified is skipped and
+    retried next pass; the other direction tells a coordinator to go read a journal that
+    does not exist, which is the failure this rail's readback fence was built to prevent.
+
+    ONE admission for both callers — the row recorded on an earlier pass and the row
+    recorded moments ago in the same pass. Two admissions would be two implementations of
+    one rule, and this issue has now lost three rounds to exactly that.
+    """
+    if not getattr(pending, "externally_writable", False):
+        return WAKE_ROW_QUARANTINED
+    stored = str(getattr(pending, "journal_id", "") or "")
+    if not canonical_journal_id(stored):
+        return WAKE_JOURNAL_NOT_CANONICAL
+    observed = "" if observed_journal_id is None else str(observed_journal_id)
+    if not observed:
+        return WAKE_JOURNAL_UNVERIFIED
+    if observed != stored:
+        return WAKE_JOURNAL_MISMATCH
+    return WAKE_ADMITTED
 
 
 def pending_telemetry(row) -> dict:
@@ -429,6 +670,13 @@ def pending_telemetry(row) -> dict:
     The checkers are :data:`PENDING_FIELD_CHECKERS`, the same table the write boundary
     uses. One table, both directions: a field cannot acquire a grammar on entry and quietly
     keep rendering raw on exit.
+
+    EVERY column goes through the table. The two instants did not, for one round — they were
+    assigned straight from the row in the same commit that introduced the table, so a row
+    that reached this function without passing through the store's own reader rendered
+    ``/etc/shadow`` as an ``escalated_at`` (review j#110254 finding_checkerdrift, face c).
+    :data:`PROJECTION_DERIVED_FIELDS` names the only columns that are deliberately absent,
+    and a test asserts every other column is present and renderable-checked.
     """
     check = PENDING_FIELD_CHECKERS
     payload: dict = {
@@ -443,8 +691,8 @@ def pending_telemetry(row) -> dict:
         "stall_class": rendered_field(row.stall_class, check["stall_class"]),
         "prescription": rendered_field(row.prescription, check["prescription"]),
         "consecutive": rendered_field(row.consecutive, check["consecutive"]),
-        "first_observed_at": row.first_observed_at,
-        "escalated_at": row.escalated_at,
+        "first_observed_at": rendered_field(row.first_observed_at, check["first_observed_at"]),
+        "escalated_at": rendered_field(row.escalated_at, check["escalated_at"]),
         "recorded": row.recorded,
         "settled": row.settled,
         "attempts": rendered_field(row.attempts, check["attempts"]),
@@ -454,7 +702,7 @@ def pending_telemetry(row) -> dict:
     }
     for name in (
         "generation", "target", "issue", "matched_id", "evidence_tier",
-        "journal_id", "last_reason",
+        "journal_id", "written_at", "woke_at", "last_attempt_at", "last_reason",
     ):
         value = getattr(row, name)
         if value:
@@ -462,9 +710,41 @@ def pending_telemetry(row) -> dict:
     return payload
 
 
+#: Columns deliberately absent from :func:`pending_telemetry`, and why.
+#:
+#: ``row_seal`` is a derivation of the other columns and carries no fact of its own;
+#: what an operator needs from it is the verdict, which is ``integrity``. Listing the
+#: exclusions rather than leaving them implicit is what lets the completeness test be a
+#: statement about ALL columns.
+PROJECTION_DERIVED_FIELDS: frozenset[str] = frozenset({"row_seal"})
+
+
 __all__ = (
     "COUNT_MAX",
+    "EXTERNAL_REFERENCE_AUTHORITY",
+    "FIELD_CLASSES",
+    "FIELD_CLASS_EXTERNAL",
+    "FIELD_CLASS_IDENTITY",
+    "FIELD_CLASS_RENDERED",
+    "FIELD_CLASS_STATE",
     "PENDING_FIELD_CHECKERS",
+    "PENDING_FIELD_CLASSES",
+    "PENDING_STATE_MISMATCH",
+    "PROJECTION_DERIVED_FIELDS",
+    "IDENTITY_SEAL_FIELDS",
+    "ROW_SEAL_FIELDS",
+    "ROW_SEAL_PATTERN",
+    "WAKE_ADMITTED",
+    "WAKE_JOURNAL_MISMATCH",
+    "WAKE_JOURNAL_NOT_CANONICAL",
+    "WAKE_JOURNAL_UNVERIFIED",
+    "WAKE_REFUSALS",
+    "WAKE_ROW_QUARANTINED",
+    "admit_wake",
+    "canonical_numeric_id_sql",
+    "checked_row_seal",
+    "pending_row_seal",
+    "row_seal_for",
     "IDEMPOTENCY_KEY_PATTERN",
     "IDENTITY_MAX_LENGTH",
     "IDENTITY_PATTERN",
