@@ -1,0 +1,358 @@
+"""The closed contract for one stored pending-escalation row (Redmine #15855).
+
+Split from :mod:`mozyo_bridge.core.state.stall_escalation` for the reason the module-health
+gate exists (``vibes/docs/logics/module-health-gate.md``): the store had grown past the line
+budget, and "what a valid row is" is a genuinely separable concern from "how rows are
+persisted". Nothing here touches SQLite, and nothing here decides policy — it decides only
+whether a set of values is admissible.
+
+The contract has two halves, because the fields carry different kinds of risk:
+
+- a per-field GRAMMAR (closed vocabularies, bounded identity tokens, digits-only ids), and
+- a ROUTING INTEGRITY seal, which no per-field grammar can provide: ``issue`` is the target
+  of an external Redmine write, and one legitimate issue id looks exactly like another.
+
+Review j#110192 finding_1 reproduced both halves failing at once — a direct-DB rewrite that
+redirected a gate write to issue 99999, a ``lane_id`` carrying an embedded newline that
+fabricated a line in a journal body, a ``consecutive`` of ``-3``, and an operator-unsafe
+``last_reason`` that surfaced verbatim in the status JSON.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import re
+
+from mozyo_bridge.core.state.stall_discovery_contract import checked_timestamp
+
+# ======================================================================================
+# The pending-escalation row contract (Redmine #15855; review j#110192 finding_1)
+# ======================================================================================
+#
+# The discovery row was closed field by field over three rounds, and each round left the
+# next field open. The pending row is closed as ONE contract instead, because its fields
+# are not all the same kind of risk:
+#
+# - ``issue`` is not a rendered value at all — it is the TARGET of an external Redmine
+#   write. A corrupted row redirected a real gate write to issue 99999 in the reproduction.
+# - ``lane_id`` and friends are interpolated into a journal BODY, so a newline in one
+#   fabricates a line in a durable record.
+# - ``stall_class`` / ``prescription`` / ``last_reason`` are rendered tokens.
+#
+# So the contract has two halves: a per-field grammar, and a ROUTING INTEGRITY check that
+# no per-field grammar can provide (issue 99999 is a perfectly valid issue id).
+
+#: Identity tokens: a leading non-hyphen, then word characters and hyphens. The leading
+#: character matters — a value starting with ``-`` can be read as an argv flag by anything
+#: that later builds a command from it (the lane-id vocabulary decision recorded in #15844).
+IDENTITY_PATTERN = r"[A-Za-z0-9_][A-Za-z0-9_.:-]*"
+IDENTITY_MAX_LENGTH = 128
+
+#: A Redmine issue / journal id: digits only. Bounded so a row cannot carry a long numeric
+#: blob into a write target.
+NUMERIC_ID_PATTERN = r"[0-9]+"
+NUMERIC_ID_MAX_LENGTH = 12
+
+#: The canonical shape :func:`escalation_idempotency_key` produces.
+IDEMPOTENCY_KEY_PATTERN = r"stallesc1_[0-9a-f]{32}"
+
+#: ``writer_raised_<ExceptionType>`` is generated from a live exception class name, so it
+#: cannot be enumerated — but it is still closed in shape.
+WRITER_RAISED_PATTERN = r"writer_raised_[A-Za-z_][A-Za-z0-9_]*"
+
+#: Every ``last_reason`` this rail can legitimately record. Anything else is refused rather
+#: than rendered: the reproduction put ``/private/example/operator-unsafe-reason`` straight
+#: into the status JSON.
+PENDING_REASONS: frozenset[str] = frozenset(
+    {
+        "write_optin_unset", "base_url_unset", "credential_missing", "unauthorized",
+        "no_anchor", "disabled", "unsupported_source", "transport_error",
+        "readback_unverified", "already_recorded", "recorded",
+        "write_refused", "write_uncertain", "issue_anchor_unresolved",
+        "external_mutation_budget_spent", "nothing_pending",
+        # The sentinel the store substitutes for a reason it does not recognise. It is a
+        # member of this set because a value the store WRITES must be a value the store can
+        # read back -- otherwise the substitution quarantines the very row it was protecting.
+        "unclassified_reason",
+    }
+)
+
+#: Declared in this store rather than imported from the policy layer, for the same reason
+#: :data:`DISCOVERY_DROP_REASONS` is: a state store that can reach the rules invites a rule
+#: to be written in it. Bidirectional equality with the policy vocabularies is enforced by
+#: test, so a value added on one side and not the other fails loudly.
+PENDING_STALL_CLASSES: frozenset[str] = frozenset(
+    {
+        "screen_progressing", "busy_likely", "startup_interaction", "content_refusal",
+        "unsent_composer", "provider_unresponsive_suspected",
+        "unresponsive_indeterminate", "screen_unreadable", "unknown",
+    }
+)
+
+PENDING_PRESCRIPTIONS: frozenset[str] = frozenset(
+    {
+        "no_action", "patient_wait_then_retry", "enter_only_retry",
+        "context_reset_reinjection", "operator_resolves_startup_screen",
+        "owner_escalation",
+    }
+)
+
+PENDING_EVIDENCE_TIERS: frozenset[str] = frozenset(
+    {"rendered_confirmed", "binary_read_unrendered"}
+)
+
+#: Integrity verdicts for a stored pending row.
+PENDING_OK = "ok"
+#: The row's own fields no longer derive its stored idempotency key, so at least one of the
+#: identity/routing facts was changed after it was written. The row is KEPT (the escalation
+#: happened) but is never handed to an external writer or a wake.
+PENDING_ROUTING_MISMATCH = "routing_binding_mismatch"
+#: A field violates its grammar. Same disposition: preserved, never externally actuated.
+PENDING_FIELD_INVALID = "field_grammar_violation"
+
+
+#: Rendered in place of a stored field that violates its grammar. The offending value is
+#: never echoed -- a status surface is exactly where the reproduction's
+#: ``/private/example/operator-unsafe-reason`` and ``rm -rf /`` came out.
+PENDING_UNRENDERABLE = "unrenderable"
+
+
+class StallPendingContractError(ValueError):
+    """A pending row violated the closed contract. Raised at the WRITE boundary only."""
+
+
+def _pattern(name: str, value: object, *, pattern: str, limit: int, allow_empty: bool) -> str:
+    text = "" if value is None else str(value)
+    if not text:
+        if allow_empty:
+            return ""
+        raise StallPendingContractError(f"pending {name} must not be empty")
+    if len(text) > limit:
+        raise StallPendingContractError(
+            f"pending {name} exceeds {limit} characters"
+        )
+    if re.fullmatch(pattern, text) is None:
+        # `fullmatch`, never `match` + `$`: Python's `$` also matches before a trailing
+        # newline, which is exactly the character this check exists to exclude (#15844).
+        # The offending value is not quoted -- an error message is read by an operator.
+        raise StallPendingContractError(
+            f"pending {name} does not match the declared grammar"
+        )
+    return text
+
+
+def checked_identity(value: object, *, name: str, allow_empty: bool = False) -> str:
+    """An identity token: bounded, no control characters, no leading hyphen."""
+    return _pattern(
+        name, value, pattern=IDENTITY_PATTERN, limit=IDENTITY_MAX_LENGTH,
+        allow_empty=allow_empty,
+    )
+
+
+def checked_numeric_id(value: object, *, name: str, allow_empty: bool = False) -> str:
+    """A Redmine issue / journal id: digits only, bounded."""
+    return _pattern(
+        name, value, pattern=NUMERIC_ID_PATTERN, limit=NUMERIC_ID_MAX_LENGTH,
+        allow_empty=allow_empty,
+    )
+
+
+def checked_member(value: object, *, name: str, vocabulary: frozenset) -> str:
+    """A value drawn from a closed set. The value is never echoed on refusal."""
+    text = "" if value is None else str(value)
+    if text not in vocabulary:
+        raise StallPendingContractError(
+            f"pending {name} is outside the declared vocabulary of "
+            f"{len(vocabulary)} value(s)"
+        )
+    return text
+
+
+def checked_reason(value: object, *, name: str = "last_reason") -> str:
+    """A recorded failure reason: a declared token, or ``writer_raised_<ExceptionType>``."""
+    text = "" if value is None else str(value)
+    if not text:
+        return ""
+    if text in PENDING_REASONS:
+        return text
+    if re.fullmatch(WRITER_RAISED_PATTERN, text) is not None:
+        return text
+    raise StallPendingContractError(
+        f"pending {name} is neither a declared reason nor a writer_raised_<Type> token"
+    )
+
+
+def escalation_idempotency_key(
+    *,
+    workspace_id: str,
+    lane_id: str,
+    role: str,
+    generation: str,
+    stall_class: str,
+    first_observed_at: str,
+    issue: str = "",
+) -> str:
+    """The stable key identifying ONE firing of ONE streak.
+
+    Derived from the run's own identity rather than from the firing pass's clock, so a
+    crash-and-retry of the same firing collides and a genuinely different run does not.
+    ``first_observed_at`` is what separates two runs of the same class on the same slot and
+    generation: the policy layer restarts ``first_observed_at`` on every restart, so two
+    runs separated by a reset produce two keys while one run retried across a crash keeps
+    producing the same one.
+
+    Deliberately NOT derived from ``escalated_at``: that moves on every pass, which would
+    make each retry look like a new escalation and write a duplicate Redmine journal — the
+    exact failure the readback fence exists to prevent.
+
+    ``issue`` participates because the key doubles as a **routing integrity** seal. The
+    issue is not a rendered value — it is the target of an external Redmine write — and no
+    per-field grammar can tell a legitimate issue id from a different legitimate issue id.
+    Binding it into the key means a row whose issue was altered after it was written no
+    longer derives its own key, which is detectable on read (review j#110192 finding_1).
+    """
+    digest = hashlib.sha256(
+        "\x1f".join(
+            (
+                workspace_id,
+                lane_id,
+                role,
+                generation,
+                stall_class,
+                first_observed_at,
+                issue,
+            )
+        ).encode("utf-8")
+    ).hexdigest()
+    return f"stallesc1_{digest[:32]}"
+
+
+#: Recorded in place of a reason the contract does not know. Distinct from every declared
+#: reason, so "the writer reported something unrecognised" is not silently indistinguishable
+#: from "the writer reported nothing".
+UNCLASSIFIED_REASON = "unclassified_reason"
+
+#: A streak counter above this is not a longer stall, it is a corrupted row. The threshold
+#: an operator can configure is a handful of passes; five digits of headroom is generous.
+CONSECUTIVE_MAX = 100_000
+
+
+def validate_pending_fields(pending, *, first_observed_at: str) -> dict:
+    """Hold an outbound pending row to the whole-row contract, or refuse to store it.
+
+    Raises :class:`StallPendingContractError`; the caller's ``_mutate`` turns that into a
+    refused write rather than a corrupted row. Returns the validated values so the INSERT
+    binds *these* rather than the originals — a validator whose result the caller can
+    forget to use is a validator that will eventually be bypassed.
+
+    ``consecutive`` is bounded on both sides. It is a streak counter the threshold compares
+    against, so a negative value (the reproduction used ``-3``) is not merely odd — it makes
+    the row unreachable by every ``>= threshold`` test while still occupying the slot.
+    """
+    try:
+        consecutive = int(pending.consecutive)
+    except (TypeError, ValueError):
+        raise StallPendingContractError("pending consecutive is not an integer") from None
+    if consecutive < 1 or consecutive > CONSECUTIVE_MAX:
+        raise StallPendingContractError(
+            f"pending consecutive must be between 1 and {CONSECUTIVE_MAX}"
+        )
+    if re.fullmatch(IDEMPOTENCY_KEY_PATTERN, str(pending.idempotency_key or "")) is None:
+        raise StallPendingContractError("pending idempotency_key is not canonical")
+    return {
+        "idempotency_key": str(pending.idempotency_key),
+        "workspace_id": checked_identity(pending.workspace_id, name="workspace_id"),
+        "lane_id": checked_identity(pending.lane_id, name="lane_id"),
+        "role": checked_identity(pending.role, name="role"),
+        "generation": checked_identity(pending.generation, name="generation", allow_empty=True),
+        "target": checked_identity(pending.target, name="target", allow_empty=True),
+        "issue": checked_numeric_id(pending.issue, name="issue", allow_empty=True),
+        "stall_class": checked_member(
+            pending.stall_class, name="stall_class", vocabulary=PENDING_STALL_CLASSES
+        ),
+        "prescription": checked_member(
+            pending.prescription, name="prescription", vocabulary=PENDING_PRESCRIPTIONS
+        ),
+        "matched_id": checked_identity(pending.matched_id, name="matched_id", allow_empty=True),
+        "evidence_tier": (
+            checked_member(
+                pending.evidence_tier, name="evidence_tier", vocabulary=PENDING_EVIDENCE_TIERS
+            )
+            if str(pending.evidence_tier or "")
+            else ""
+        ),
+        "consecutive": consecutive,
+        "last_reason": checked_reason(pending.last_reason),
+        "first_observed_at": first_observed_at,
+    }
+
+
+def rendered_field(value: object, checker) -> str:
+    """A stored field as it may be shown, or :data:`PENDING_UNRENDERABLE`.
+
+    Field-by-field rather than all-or-nothing on purpose: an operator looking at a
+    quarantined row still needs to see WHICH field is wrong, and blanking the whole row
+    would hide that as effectively as echoing it would leak.
+    """
+    try:
+        return checker(value)
+    except StallPendingContractError:
+        return PENDING_UNRENDERABLE
+
+
+def pending_row_integrity(pending: "PendingEscalation") -> str:
+    """Classify a row read back out of the store: OK, bad grammar, or bad routing.
+
+    The two failures are separate on purpose. A grammar violation is a value that could
+    never have been written; a ROUTING mismatch is a set of values that are each perfectly
+    legal but no longer derive the key they are stored under — the shape of the
+    reproduction that redirected a gate write to issue 99999, where every individual field
+    passed inspection.
+    """
+    try:
+        validate_pending_fields(pending, first_observed_at=pending.first_observed_at)
+    except StallPendingContractError:
+        return PENDING_FIELD_INVALID
+    expected = escalation_idempotency_key(
+        workspace_id=pending.workspace_id,
+        lane_id=pending.lane_id,
+        role=pending.role,
+        generation=pending.generation,
+        stall_class=pending.stall_class,
+        first_observed_at=pending.first_observed_at,
+        issue=pending.issue,
+    )
+    # Constant-time comparison is not the point here (this is a local corruption check, not
+    # an authentication check) -- an ordinary compare is what a reader should expect.
+    if expected != pending.idempotency_key:
+        return PENDING_ROUTING_MISMATCH
+    return PENDING_OK
+
+
+__all__ = (
+    "CONSECUTIVE_MAX",
+    "IDEMPOTENCY_KEY_PATTERN",
+    "IDENTITY_MAX_LENGTH",
+    "IDENTITY_PATTERN",
+    "NUMERIC_ID_MAX_LENGTH",
+    "NUMERIC_ID_PATTERN",
+    "PENDING_EVIDENCE_TIERS",
+    "PENDING_FIELD_INVALID",
+    "PENDING_OK",
+    "PENDING_PRESCRIPTIONS",
+    "PENDING_REASONS",
+    "PENDING_ROUTING_MISMATCH",
+    "PENDING_STALL_CLASSES",
+    "PENDING_UNRENDERABLE",
+    "UNCLASSIFIED_REASON",
+    "WRITER_RAISED_PATTERN",
+    "StallPendingContractError",
+    "checked_identity",
+    "checked_member",
+    "checked_numeric_id",
+    "checked_reason",
+    "escalation_idempotency_key",
+    "pending_row_integrity",
+    "rendered_field",
+    "validate_pending_fields",
+)

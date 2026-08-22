@@ -353,8 +353,9 @@ def stall_watch_status(
     try:
         unrecorded = store.unrecorded_pending(workspace_id)
         unwoken = store.unwoken_pending(workspace_id)
+        quarantined = store.quarantined_pending(workspace_id)
     except Exception:  # noqa: BLE001
-        unrecorded, unwoken = (), ()
+        unrecorded, unwoken, quarantined = (), (), ()
 
     oldest_age_seconds: Optional[int] = None
     if unrecorded:
@@ -381,6 +382,11 @@ def stall_watch_status(
             "unrecorded": len(unrecorded),
             "anchorless": sum(1 for p in unrecorded if not p.issue),
             "recorded_but_unwoken": len(unwoken),
+            # Rows that fired, are still open, and are held back from the writer because
+            # they no longer satisfy the stored-row contract. A COUNT only: the offending
+            # values are exactly what must not be rendered (review j#110192 finding_1).
+            # Non-zero means a durable escalation row was altered after it was written.
+            "quarantined": len(quarantined),
             "oldest_unrecorded_at": unrecorded[0].escalated_at if unrecorded else "",
             "oldest_unrecorded_age_seconds": oldest_age_seconds,
             "max_attempts": max((p.attempts for p in unrecorded), default=0),

@@ -42,8 +42,9 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
@@ -62,9 +63,31 @@ from mozyo_bridge.core.state.stall_discovery_contract import (
     StallDiscoveryContractError,
     checked_timestamp,
     discovery_reject_token,
+    timestamp_sort_key,
     rendered_timestamp,
     unreadable_discovery,
     validate_discovery,
+)
+from mozyo_bridge.core.state.stall_pending_contract import (
+    CONSECUTIVE_MAX,
+    IDEMPOTENCY_KEY_PATTERN,
+    PENDING_EVIDENCE_TIERS,
+    PENDING_PRESCRIPTIONS,
+    PENDING_STALL_CLASSES,
+    PENDING_UNRENDERABLE,
+    PENDING_FIELD_INVALID,
+    PENDING_OK,
+    PENDING_ROUTING_MISMATCH,
+    UNCLASSIFIED_REASON,
+    StallPendingContractError,
+    checked_identity,
+    checked_member,
+    checked_numeric_id,
+    checked_reason,
+    rendered_field,
+    escalation_idempotency_key,
+    pending_row_integrity,
+    validate_pending_fields,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
@@ -158,34 +181,34 @@ def stall_escalation_path(home: Optional[Path] = None) -> Path:
     return (home or mozyo_bridge_home()) / STALL_ESCALATION_FILENAME
 
 
-def escalation_idempotency_key(
-    *,
-    workspace_id: str,
-    lane_id: str,
-    role: str,
-    generation: str,
-    stall_class: str,
-    first_observed_at: str,
-) -> str:
-    """The stable key identifying ONE firing of ONE streak.
 
-    Derived from the run's own identity rather than from the firing pass's clock, so a
-    crash-and-retry of the same firing collides and a genuinely different run does not.
-    ``first_observed_at`` is what separates two runs of the same class on the same slot and
-    generation: the policy layer restarts ``first_observed_at`` on every restart, so two
-    runs separated by a reset produce two keys while one run retried across a crash keeps
-    producing the same one.
 
-    Deliberately NOT derived from ``escalated_at``: that moves on every pass, which would
-    make each retry look like a new escalation and write a duplicate Redmine journal — the
-    exact failure the readback fence exists to prevent.
-    """
-    digest = hashlib.sha256(
-        "\x1f".join(
-            (workspace_id, lane_id, role, generation, stall_class, first_observed_at)
-        ).encode("utf-8")
-    ).hexdigest()
-    return f"stallesc1_{digest[:32]}"
+def _identity(value: object) -> str:
+    """Render an identity token, whichever field it came from."""
+    return checked_identity(value, name="identity")
+
+
+def _numeric(value: object) -> str:
+    return checked_numeric_id(value, name="numeric_id")
+
+
+def _checked_key(value: object) -> str:
+    if re.fullmatch(IDEMPOTENCY_KEY_PATTERN, str(value or "")) is None:
+        raise StallPendingContractError("idempotency_key is not canonical")
+    return str(value)
+
+
+def _writable_only(rows) -> tuple:
+    """Keep only rows that may drive an external effect."""
+    return tuple(row for row in rows if row.externally_writable)
+
+
+def _safe_reason(reason: object) -> str:
+    """A declared reason token, or :data:`UNCLASSIFIED_REASON` when it is not one."""
+    try:
+        return checked_reason(reason)
+    except StallPendingContractError:
+        return UNCLASSIFIED_REASON
 
 
 @dataclass(frozen=True)
@@ -252,6 +275,14 @@ class PendingEscalation:
     attempts: int = 0
     last_attempt_at: str = ""
     last_reason: str = ""
+    #: Whether this stored row still satisfies the closed contract. ``PENDING_OK`` rows are
+    #: the only ones an external writer or a wake may ever see; anything else is preserved
+    #: (the escalation really happened) but is never actuated.
+    integrity: str = PENDING_OK
+
+    @property
+    def externally_writable(self) -> bool:
+        return self.integrity == PENDING_OK
 
     @property
     def slot_label(self) -> str:
@@ -267,30 +298,68 @@ class PendingEscalation:
         return bool(self.journal_id) and bool(self.woke_at)
 
     def telemetry(self) -> dict[str, object]:
-        """Classification-token-only projection, safe to paste into a durable record."""
+        """Classification-token-only projection, safe to paste into a durable record.
+
+        Every field passes through its own grammar on the way out, not just on the way in.
+        The store is not a trust boundary: a row can be altered after it was written, and a
+        projection that trusts what it read is how ``rm -rf /`` and an absolute private path
+        reached the status JSON in the review j#110192 finding_1 reproduction.
+
+        Nothing is dropped for being invalid — an invalid field renders as
+        :data:`PENDING_UNRENDERABLE`, so "this row has a bad prescription" stays legible
+        while the bad prescription itself does not.
+        """
         payload: dict[str, object] = {
-            "idempotency_key": self.idempotency_key,
-            "slot": self.slot_label,
-            "stall_class": self.stall_class,
-            "prescription": self.prescription,
+            "idempotency_key": rendered_field(
+                self.idempotency_key,
+                lambda v: _checked_key(v),
+            ),
+            "slot": "/".join(
+                (
+                    rendered_field(self.workspace_id, _identity),
+                    rendered_field(self.lane_id, _identity),
+                    rendered_field(self.role, _identity),
+                )
+            ),
+            "stall_class": rendered_field(
+                self.stall_class,
+                lambda v: checked_member(
+                    v, name="stall_class", vocabulary=PENDING_STALL_CLASSES
+                ),
+            ),
+            "prescription": rendered_field(
+                self.prescription,
+                lambda v: checked_member(
+                    v, name="prescription", vocabulary=PENDING_PRESCRIPTIONS
+                ),
+            ),
             "consecutive": self.consecutive,
             "first_observed_at": self.first_observed_at,
             "escalated_at": self.escalated_at,
             "recorded": self.recorded,
             "settled": self.settled,
             "attempts": self.attempts,
+            # Always present, including on a healthy row: an operator reading a status
+            # payload should not have to know that a MISSING key would have meant trouble.
+            "integrity": self.integrity,
         }
-        for key, value in (
-            ("generation", self.generation),
-            ("target", self.target),
-            ("issue", self.issue),
-            ("matched_id", self.matched_id),
-            ("evidence_tier", self.evidence_tier),
-            ("journal_id", self.journal_id),
-            ("last_reason", self.last_reason),
+        for key, value, checker in (
+            ("generation", self.generation, _identity),
+            ("target", self.target, _identity),
+            ("issue", self.issue, _numeric),
+            ("matched_id", self.matched_id, _identity),
+            (
+                "evidence_tier",
+                self.evidence_tier,
+                lambda v: checked_member(
+                    v, name="evidence_tier", vocabulary=PENDING_EVIDENCE_TIERS
+                ),
+            ),
+            ("journal_id", self.journal_id, _numeric),
+            ("last_reason", self.last_reason, checked_reason),
         ):
             if value:
-                payload[key] = value
+                payload[key] = rendered_field(value, checker)
         return payload
 
 
@@ -520,13 +589,14 @@ class StallEscalationStore:
         """
         if not pending.idempotency_key or not pending.workspace_id:
             return False
-        # Same closed render boundary as the discovery row, and for a stronger reason: these
-        # two reach a Redmine journal body verbatim through `render_escalation_body`, not
-        # just a status line. Validated at the public seam so no such row is ever created.
+        # The WHOLE row is held to the contract, not the two timestamps that happened to be
+        # named by an earlier review. `issue` is the strongest case: it is not rendered, it
+        # is the target of an external write (review j#110192 finding_1).
         first_observed_at = checked_timestamp(
             pending.first_observed_at, field="observed_at.first"
         )
         escalated_at = checked_timestamp(pending.escalated_at, field="observed_at.escalated")
+        fields = validate_pending_fields(pending, first_observed_at=first_observed_at)
 
         def _work(conn):
             cursor = conn.execute(
@@ -535,17 +605,17 @@ class StallEscalationStore:
                 "ON CONFLICT(idempotency_key) DO NOTHING",
                 (
                     pending.idempotency_key,
-                    pending.workspace_id,
-                    pending.lane_id,
-                    pending.role,
-                    pending.generation,
-                    pending.target,
-                    pending.issue,
-                    pending.stall_class,
-                    pending.prescription,
-                    pending.matched_id,
-                    pending.evidence_tier,
-                    int(pending.consecutive),
+                    fields["workspace_id"],
+                    fields["lane_id"],
+                    fields["role"],
+                    fields["generation"],
+                    fields["target"],
+                    fields["issue"],
+                    fields["stall_class"],
+                    fields["prescription"],
+                    fields["matched_id"],
+                    fields["evidence_tier"],
+                    fields["consecutive"],
                     first_observed_at,
                     escalated_at,
                     pending.journal_id,
@@ -553,7 +623,7 @@ class StallEscalationStore:
                     pending.woke_at,
                     int(pending.attempts),
                     pending.last_attempt_at,
-                    pending.last_reason,
+                    fields["last_reason"],
                 ),
             )
             return cursor.rowcount > 0
@@ -566,16 +636,37 @@ class StallEscalationStore:
         Oldest-first is the fairness order: whichever escalation has waited longest takes
         the next available write slot, so a busy cockpit cannot let a newer stall
         repeatedly overtake an older one.
+
+        This is the SUPPLY SIDE of the external Redmine write, so it is filtered to rows
+        that still satisfy the contract. Use :meth:`quarantined_pending` to see the rest.
         """
-        return self._read_pending("journal_id=''", workspace_id)
+        return _writable_only(self._read_pending("journal_id=''", workspace_id))
 
     def unwoken_pending(self, workspace_id: str = "") -> tuple[PendingEscalation, ...]:
-        """Firings whose journal exists but whose coordinator wake has not been enqueued."""
-        return self._read_pending("journal_id<>'' AND woke_at=''", workspace_id)
+        """Firings whose journal exists but whose coordinator wake has not been enqueued.
+
+        Filtered like :meth:`unrecorded_pending`: a wake is an effect on the coordinator.
+        """
+        return _writable_only(self._read_pending("journal_id<>'' AND woke_at=''", workspace_id))
 
     def open_pending(self, workspace_id: str = "") -> tuple[PendingEscalation, ...]:
-        """Every firing that is not fully settled (unwritten or unwoken)."""
+        """Every firing that is not fully settled (unwritten or unwoken).
+
+        Deliberately UNfiltered: this is the inventory surface, and an inventory that hides
+        the rows something went wrong with is the wrong inventory. Callers that actuate use
+        :meth:`unrecorded_pending` / :meth:`unwoken_pending`.
+        """
         return self._read_pending("journal_id='' OR woke_at=''", workspace_id)
+
+    def quarantined_pending(self, workspace_id: str = "") -> tuple[PendingEscalation, ...]:
+        """Open firings held back from actuation because they failed the row contract.
+
+        Non-empty here means a stored escalation was altered after it was written, which is
+        an operator-visible condition in its own right — not a reason to go quiet.
+        """
+        return tuple(
+            row for row in self.open_pending(workspace_id) if not row.externally_writable
+        )
 
     def _read_pending(self, predicate: str, workspace_id: str) -> tuple[PendingEscalation, ...]:
         conn = self._connect_ro()
@@ -599,34 +690,48 @@ class StallEscalationStore:
                 ).fetchall()
         finally:
             conn.close()
-        return tuple(
-            PendingEscalation(
-                idempotency_key=str(r[0]),
-                workspace_id=str(r[1]),
-                lane_id=str(r[2]),
-                role=str(r[3]),
-                generation=str(r[4] or ""),
-                target=str(r[5] or ""),
-                issue=str(r[6] or ""),
-                stall_class=str(r[7]),
-                prescription=str(r[8]),
-                matched_id=str(r[9] or ""),
-                evidence_tier=str(r[10] or ""),
-                consecutive=int(r[11]),
-                # A row that predates this build (or was hand-edited) can still hold junk
-                # here. The row is KEPT -- it is a real escalation and dropping it would
-                # lose the stall report -- but nothing arbitrary is rendered from it.
-                first_observed_at=rendered_timestamp(r[12], field="observed_at.first"),
-                escalated_at=rendered_timestamp(r[13], field="observed_at.escalated"),
-                journal_id=str(r[14] or ""),
-                written_at=str(r[15] or ""),
-                woke_at=str(r[16] or ""),
-                attempts=int(r[17]),
-                last_attempt_at=str(r[18] or ""),
-                last_reason=str(r[19] or ""),
-            )
-            for r in rows
+        # The SQL ORDER BY is a deterministic BASE, not the ordering AUTHORITY: it sorts
+        # the raw stored text, which a corrupted row can place anywhere. Oldest-first is a
+        # fairness contract, so the order is re-derived here from validated instants
+        # (review j#110192 finding_2).
+        built = [(timestamp_sort_key(r[13]), str(r[0]), self._row_to_pending(r)) for r in rows]
+        built.sort(key=lambda item: (item[0], item[1]))
+        return tuple(item[2] for item in built)
+
+    @staticmethod
+    def _row_to_pending(r) -> PendingEscalation:
+        """One stored row as a value object, classified against the whole-row contract.
+
+        Nothing is dropped here. A corrupted row is still evidence that a stall fired, and
+        deleting it would turn a tampering signal into silence. It is stamped instead, and
+        the actuation surfaces filter on that stamp.
+        """
+        row = PendingEscalation(
+            idempotency_key=str(r[0]),
+            workspace_id=str(r[1]),
+            lane_id=str(r[2]),
+            role=str(r[3]),
+            generation=str(r[4] or ""),
+            target=str(r[5] or ""),
+            issue=str(r[6] or ""),
+            stall_class=str(r[7]),
+            prescription=str(r[8]),
+            matched_id=str(r[9] or ""),
+            evidence_tier=str(r[10] or ""),
+            consecutive=int(r[11]),
+            # A row that predates this build (or was hand-edited) can still hold junk here.
+            # The row is KEPT -- it is a real escalation and dropping it would lose the
+            # stall report -- but nothing arbitrary is rendered from it.
+            first_observed_at=rendered_timestamp(r[12], field="observed_at.first"),
+            escalated_at=rendered_timestamp(r[13], field="observed_at.escalated"),
+            journal_id=str(r[14] or ""),
+            written_at=str(r[15] or ""),
+            woke_at=str(r[16] or ""),
+            attempts=int(r[17]),
+            last_attempt_at=str(r[18] or ""),
+            last_reason=str(r[19] or ""),
         )
+        return replace(row, integrity=pending_row_integrity(row))
 
     def record_attempt(self, idempotency_key: str, reason: str, *, now: Optional[str] = None) -> bool:
         """Count one refused / failed write attempt against a firing, with its reason.
@@ -647,7 +752,10 @@ class StallEscalationStore:
                         _utc_now_iso() if now is None else now,
                         field="observed_at.attempt",
                     ),
-                    str(reason or ""),
+                    # `last_reason` reaches the status surface, so it is held to the same
+                    # closed vocabulary on the way in. An unknown reason is recorded as a
+                    # refusal to classify rather than passed through verbatim.
+                    _safe_reason(reason),
                     idempotency_key,
                 ),
             )

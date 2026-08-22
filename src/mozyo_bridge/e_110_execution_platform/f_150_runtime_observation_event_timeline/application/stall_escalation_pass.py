@@ -359,6 +359,10 @@ def apply_escalation_gate(
                     generation=identity.generation,
                     stall_class=state.stall_class,
                     first_observed_at=state.first_observed_at,
+                    # The write TARGET is sealed into the key, so a row whose issue is
+                    # altered later no longer derives its own key and is detected on read
+                    # (review j#110192 finding_1).
+                    issue=str(unit.issue or ""),
                 ),
                 workspace_id=identity.workspace_id,
                 lane_id=identity.lane_id,

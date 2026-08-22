@@ -364,6 +364,15 @@ def _stall_watch_status_lines(rows) -> list:
             f"unwoken={pending.get('recorded_but_unwoken', 0)} "
             f"oldest_age={'-' if age is None else str(age) + 's'}"
         )
+        # Only shown when non-zero. A row held back from the writer is an abnormal state,
+        # not a routine tally, and a permanent `quarantined=0` would train an operator to
+        # stop reading the line (review j#110192 finding_1).
+        quarantined = int(pending.get("quarantined", 0) or 0)
+        if quarantined:
+            lines.append(
+                f"    pending: quarantined={quarantined} "
+                "(stored escalation rows failed the row contract; not offered to the writer)"
+            )
     return lines
 
 

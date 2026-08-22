@@ -29,6 +29,7 @@ sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.stall_escalation import (
     PendingEscalation,
+    escalation_idempotency_key,
     StallEscalationStore,
     StallEscalationStoreError,
 )
@@ -559,7 +560,15 @@ class BudgetTest(SettleBase):
         # rather than about there being nothing to write.
         self.store.enqueue_pending(
             PendingEscalation(
-                idempotency_key="other-workspace-firing",
+                idempotency_key=escalation_idempotency_key(
+                    workspace_id="wsB",
+                    lane_id="lane_b",
+                    role="claude",
+                    generation="",
+                    stall_class=CLASS_CONTENT_REFUSAL,
+                    first_observed_at="2026-08-22T09:01:00+00:00",
+                    issue="15999",
+                ),
                 workspace_id="wsB",
                 lane_id="lane_b",
                 role="claude",

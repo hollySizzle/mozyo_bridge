@@ -2,7 +2,7 @@
 
 ## Status
 
-- version: `v0.6` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
+- version: `v0.7` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 / j#110192 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
 - scope: watcher 層 (background / operator) が、pane の**描画画面が進んでいるか**だけを一次
   センサーとして停滞候補を拾い、種別を分類し、種別ごとの処方を**提示**するまで。
 - non-goal: 処方の自動適用、配送 rail の retry policy、completion 判定、receiver-state
@@ -365,7 +365,13 @@ verbatim に入るので exposure がより強い)、watermark の `last_pass_at
 
 read 側の倒し方は面によって変える: discovery と watermark は値を捨てて typed token に倒せるが、
 pending row は**実際の escalation そのもの**なので row を落とさず timestamp だけを閉じた token へ
-置換する (落とすと停滞報告が失われる。SQL の `ORDER BY escalated_at` も影響を受けない)。
+置換する (落とすと停滞報告が失われる)。
+
+> **v0.6 の誤りの訂正**: v0.6 はここで「SQL の `ORDER BY escalated_at` も影響を受けない」と書いた。
+> これは**誤り**である。`ORDER BY` は**保存されている生テキスト**を並べるので、壊れた値は文字列
+> 順序で任意の位置に入りうる。read 側で値を token へ倒しても、その row が backlog の**先頭**に
+> 居座れば oldest-first という公平性契約が壊れる (j#110192 finding_2)。順序の**権威**は検証済み
+> instant から read 側で再導出する。SQL の `ORDER BY` は決定的な**基準**でしかない。
 
 なお `x or default` は「空文字を既定値で黙って修復する」ので使わない。明示的に渡された空文字は
 caller の誤りであり、修復ではなく拒否が正しい。
@@ -509,6 +515,45 @@ silent にはならない。age を上限で縛るために delivery-first を�
 
 裁定の正本: #15855 j#110121-5 / j#110121-6。
 
+
+### 保存 row 全体の契約と routing integrity (j#110192 finding_1)
+
+ここまでの 4 round は、指摘された **field を 1 つずつ**閉じてきた。その都度、次の field が開いた
+ままだった。pending row については個別対応をやめ、**row 全体に 1 つの契約**を置く。
+
+理由は「網羅的にやる方が綺麗だから」ではない。**field ごとに危険の種類が違う**からである。
+
+- `stall_class` / `prescription` / `last_reason` は**描画される token** である。閉じた語彙で足りる。
+- `lane_id` / `role` / `target` などの identity は **journal 本文へ補間**される。改行 1 つで durable
+  record に行が捏造される。先頭ハイフンも同様に禁じる (後段で argv flag として読まれうる)。
+- `issue` は**描画値ですらない**。**外部 write の宛先**である。そして per-field grammar は原理的に
+  これを守れない — 正当な issue id と、別の正当な issue id は見分けがつかない。実測では直接 DB を
+  書き換えて gate write が issue 99999 へ**転送**された。
+
+したがって契約は 2 層になる。
+
+1. **per-field grammar** — 閉じた語彙、長さ上限つき identity 文法、数字のみの id、正の整数の
+   `consecutive` (実測値 `-3` は「変な値」ではない。`>= threshold` のどの比較にも当たらなくなる
+   ので、slot を占有したまま**永久に到達不能**になる)。
+2. **routing integrity seal** — `escalation_idempotency_key` の導出に **`issue` を含める**。read 時に
+   row 自身の field から鍵を再導出し、保存されている鍵と照合する。不一致は「この row の routing
+   facts が書かれた後に変更された」ことを意味する。per-field grammar が原理的に見られない層を、
+   ここで見る。
+
+**不一致 row を消さない**。row は「停滞が実際に発火した」という証拠であり、消すのは改竄の signal を
+沈黙に変えることである。typed な verdict を stamp し、**外部効果に至る面からだけ**外す:
+
+- `unrecorded_pending` (writer の供給面) と `unwoken_pending` (coordinator wake の供給面) は filter する。
+- `open_pending` (在庫面) は **filter しない**。問題のある row を隠す在庫表は在庫表ではない。
+- `quarantined_pending` と `--status` の `quarantined=` count で可視化する。この行は**非ゼロのときだけ**
+  出す。常時 `quarantined=0` を出す行は、operator がやがて読まなくなる。
+
+`telemetry()` も **field 単位**で文法を通す。all-or-nothing で伏せない: quarantine された row を見る
+operator は「**どの field が**壊れているか」を知る必要があり、row ごと伏せるのは echo するのと同じ
+くらい確実にそれを隠す。落ちた field は `unrenderable` token になる。
+
+store が代替値を書く場合 (未知の refusal reason → `unclassified_reason`)、**その代替値自身が語彙の
+member でなければならない**。さもなくば、守ろうとした当の row を自分で quarantine する。
 
 ## Cross-References
 

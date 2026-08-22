@@ -23,6 +23,19 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
+from mozyo_bridge.core.state.stall_pending_contract import (
+    CONSECUTIVE_MAX,
+    IDENTITY_MAX_LENGTH,
+    PENDING_EVIDENCE_TIERS,
+    PENDING_FIELD_INVALID,
+    PENDING_OK,
+    PENDING_PRESCRIPTIONS,
+    PENDING_REASONS,
+    PENDING_ROUTING_MISMATCH,
+    PENDING_STALL_CLASSES,
+    UNCLASSIFIED_REASON,
+    StallPendingContractError,
+)
 from mozyo_bridge.core.state.stall_escalation import (
     DISCOVERY_BAD_COUNT,
     DISCOVERY_BAD_REASON_TOKEN,
@@ -37,6 +50,7 @@ from mozyo_bridge.core.state.stall_escalation import (
     StallEscalationStoreError,
     StreakRow,
     escalation_idempotency_key,
+    validate_pending_fields,
     stall_escalation_path,
 )
 
@@ -75,6 +89,7 @@ def _key(**overrides):
         generation="g1",
         stall_class="content_refusal",
         first_observed_at="2026-08-22T09:01:00+00:00",
+        issue="15855",
     )
     base.update(overrides)
     return escalation_idempotency_key(**base)
@@ -83,8 +98,12 @@ def _key(**overrides):
 def _pending(*, idempotency_key=None, lane_id=LANE, issue="15855", escalated_at="2026-08-22T09:02:00+00:00",
              **overrides):
     base = dict(
+        # The key seals the ROUTING facts, `issue` included (review j#110192 finding_1),
+        # so the fixture must derive it the same way production does.
         idempotency_key=(
-            _key(lane_id=lane_id) if idempotency_key is None else idempotency_key
+            _key(lane_id=lane_id, issue=issue)
+            if idempotency_key is None
+            else idempotency_key
         ),
         workspace_id=WS,
         lane_id=lane_id,
@@ -348,7 +367,10 @@ class FairnessOrderTest(StoreBase):
     def test_pending_is_scoped_per_workspace_when_asked(self) -> None:
         self.store.enqueue_pending(_pending())
         self.store.enqueue_pending(
-            _pending(idempotency_key="other", workspace_id="wsB")
+            _pending(
+                workspace_id="wsB",
+                idempotency_key=_key(workspace_id="wsB", issue="15855"),
+            )
         )
         self.assertEqual(len(self.store.unrecorded_pending()), 2)
         self.assertEqual(len(self.store.unrecorded_pending("wsB")), 1)
@@ -603,9 +625,14 @@ class TimestampContractTest(DiscoveryContractBase):
         self._corrupt(
             "UPDATE stall_escalation_pending SET first_observed_at='/etc/shadow'"
         )
-        (pending,) = self.store.unrecorded_pending(WS)
+        # Read through the INVENTORY surface: `first_observed_at` is sealed into the
+        # idempotency key, so rewriting it also breaks the routing binding and the row is
+        # held back from actuation (review j#110192 finding_1). Both properties are asserted
+        # -- the row survives, and the path that reaches Redmine no longer offers it.
+        (pending,) = self.store.open_pending(WS)
         self.assertEqual(pending.first_observed_at, TIMESTAMP_UNREADABLE)
         self.assertNotIn("shadow", json.dumps(pending.telemetry()))
+        self.assertEqual(self.store.unrecorded_pending(WS), ())
 
     def test_the_watermark_is_held_to_the_same_grammar(self) -> None:
         # `last_pass_at` reaches `--status` as `last=`, so it is the same class of column.
@@ -779,6 +806,240 @@ class HygieneTest(StoreBase):
         self.assertNotIn("issue", payload)
         self.assertNotIn("matched_id", payload)
         self.assertFalse(payload["recorded"])
+
+
+class PendingRowContractTest(StoreBase):
+    """The whole stored row is closed, not the two timestamps a prior round happened to name.
+
+    Review j#110192 finding_1: `lane_id` carried an embedded newline into a journal body,
+    `stall_class` and `prescription` accepted values outside their vocabularies (including
+    `rm -rf /`), `consecutive` accepted -3, and `last_reason` carried an operator-unsafe
+    string into the status JSON.
+    """
+
+    def _corrupt(self, sql, *args):
+        conn = sqlite3.connect(self.store.path)
+        try:
+            conn.execute(sql, args)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_the_write_refuses_a_row_whose_identity_carries_a_newline(self) -> None:
+        # The reproduction's value. It reaches a journal BODY, where a newline does not
+        # merely look wrong -- it fabricates a line in a durable record.
+        with self.assertRaises(StallPendingContractError):
+            validate_pending_fields(
+                _pending(lane_id="lane\n- injected: line"),
+                first_observed_at="2026-08-22T09:01:00+00:00",
+            )
+        # The public seam refuses too, and refuses LOUDLY -- the same convention the
+        # discovery write already uses. A silently-skipped escalation would be worse than
+        # a refused one.
+        with self.assertRaises(StallPendingContractError):
+            self.store.enqueue_pending(_pending(lane_id="lane\n- injected"))
+        self.assertEqual(self.store.open_pending(WS), ())
+
+    def test_the_write_refuses_a_leading_hyphen_in_an_identity(self) -> None:
+        # Not a cosmetic rule: a leading hyphen is how a value later becomes an argv flag.
+        with self.assertRaises(StallPendingContractError):
+            validate_pending_fields(
+                _pending(lane_id="-rf"), first_observed_at="2026-08-22T09:01:00+00:00"
+            )
+
+    def test_the_write_refuses_values_outside_the_closed_vocabularies(self) -> None:
+        for field, value in (
+            ("stall_class", "not_a_class"),
+            ("prescription", "rm -rf /"),
+            ("evidence_tier", "forged_tier"),
+            ("last_reason", "/private/example/operator-unsafe-reason"),
+        ):
+            with self.subTest(field=field):
+                with self.assertRaises(StallPendingContractError):
+                    validate_pending_fields(
+                        _pending(**{field: value}),
+                        first_observed_at="2026-08-22T09:01:00+00:00",
+                    )
+
+    def test_the_write_refuses_a_non_numeric_or_non_positive_number(self) -> None:
+        for field, value in (
+            # Both shapes. The second has NO whitespace, so it is the one that actually
+            # tests "digits only" rather than "no spaces" -- the mutation sweep found the
+            # first case alone left the digit rule vacuous.
+            ("issue", "15855; DROP"),
+            ("issue", "../99999"),
+            ("issue", "15855a"),
+            ("consecutive", -3),
+            ("consecutive", 0),
+            ("consecutive", CONSECUTIVE_MAX + 1),
+        ):
+            with self.subTest(field=field, value=value):
+                with self.assertRaises(StallPendingContractError):
+                    validate_pending_fields(
+                        _pending(**{field: value}),
+                        first_observed_at="2026-08-22T09:01:00+00:00",
+                    )
+
+    def test_an_over_long_identity_is_refused(self) -> None:
+        # A bounded grammar without a bound is a pattern, not a bound. `[A-Za-z0-9_.:-]*`
+        # happily matches a megabyte of legal characters, and every one of them would be
+        # interpolated into a journal body.
+        with self.assertRaises(StallPendingContractError):
+            validate_pending_fields(
+                _pending(lane_id="l" * (IDENTITY_MAX_LENGTH + 1)),
+                first_observed_at="2026-08-22T09:01:00+00:00",
+            )
+        # The boundary itself is admissible: a bound that is off by one refuses real lanes.
+        validate_pending_fields(
+            _pending(lane_id="l" * IDENTITY_MAX_LENGTH),
+            first_observed_at="2026-08-22T09:01:00+00:00",
+        )
+
+    def test_the_integrity_verdict_is_always_projected(self) -> None:
+        # Present on a HEALTHY row too. If the key only appeared when something was wrong,
+        # an operator would have to know that a missing key is the alarm -- and a payload
+        # consumer could not tell "no verdict" from "old build".
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        (row,) = self.store.unrecorded_pending(WS)
+        self.assertEqual(row.telemetry()["integrity"], PENDING_OK)
+        self._corrupt("UPDATE stall_escalation_pending SET issue='99999'")
+        (bad,) = self.store.open_pending(WS)
+        self.assertEqual(bad.telemetry()["integrity"], PENDING_ROUTING_MISMATCH)
+
+
+    def test_the_write_refuses_a_non_canonical_idempotency_key(self) -> None:
+        with self.assertRaises(StallPendingContractError):
+            validate_pending_fields(
+                _pending(idempotency_key="not-canonical"),
+                first_observed_at="2026-08-22T09:01:00+00:00",
+            )
+
+    def test_a_valid_row_still_round_trips_as_ok(self) -> None:
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        (row,) = self.store.unrecorded_pending(WS)
+        self.assertEqual(row.integrity, PENDING_OK)
+        self.assertTrue(row.externally_writable)
+
+    def test_a_rewritten_issue_breaks_the_routing_seal_and_is_quarantined(self) -> None:
+        # THE finding. Every field here stays individually legal -- 99999 is a perfectly
+        # well-formed issue id -- so only the binding between the row and its key can
+        # detect it. The row is preserved (the escalation happened) but is never offered
+        # to the writer.
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self._corrupt("UPDATE stall_escalation_pending SET issue='99999'")
+        self.assertEqual(self.store.unrecorded_pending(WS), ())
+        (row,) = self.store.open_pending(WS)
+        self.assertEqual(row.integrity, PENDING_ROUTING_MISMATCH)
+        self.assertFalse(row.externally_writable)
+        self.assertEqual(len(self.store.quarantined_pending(WS)), 1)
+
+    def test_a_rewritten_identity_is_quarantined_the_same_way(self) -> None:
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self._corrupt("UPDATE stall_escalation_pending SET lane_id='lane_other'")
+        self.assertEqual(self.store.unrecorded_pending(WS), ())
+        self.assertEqual(
+            self.store.open_pending(WS)[0].integrity, PENDING_ROUTING_MISMATCH
+        )
+
+    def test_a_grammar_violation_is_reported_separately_from_a_routing_break(self) -> None:
+        # Two different operator situations: a value that could never have been written,
+        # versus values that are each legal but no longer derive their own key.
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self._corrupt("UPDATE stall_escalation_pending SET prescription='rm -rf /'")
+        (row,) = self.store.open_pending(WS)
+        self.assertEqual(row.integrity, PENDING_FIELD_INVALID)
+
+    def test_a_quarantined_row_is_withheld_from_the_wake_too(self) -> None:
+        # A wake is an effect on the coordinator, so it is gated on the same stamp.
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self.assertTrue(
+            self.store.mark_recorded(_key(issue="15855"), "110200", now="2026-08-22T09:03:00+00:00")
+        )
+        self.assertEqual(len(self.store.unwoken_pending(WS)), 1)
+        self._corrupt("UPDATE stall_escalation_pending SET issue='99999'")
+        self.assertEqual(self.store.unwoken_pending(WS), ())
+        self.assertEqual(len(self.store.quarantined_pending(WS)), 1)
+
+    def test_an_unrecognised_attempt_reason_is_classified_not_echoed(self) -> None:
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self.store.record_attempt(
+            _key(issue="15855"),
+            "/private/example/operator-unsafe-reason",
+            now="2026-08-22T09:04:00+00:00",
+        )
+        (row,) = self.store.unrecorded_pending(WS)
+        self.assertEqual(row.last_reason, UNCLASSIFIED_REASON)
+        self.assertNotIn("operator-unsafe", json.dumps(row.telemetry()))
+
+    def test_a_declared_attempt_reason_survives_verbatim(self) -> None:
+        # The classifier must not be a shredder: a real reason is what the operator reads.
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self.store.record_attempt(
+            _key(issue="15855"), "credential_missing", now="2026-08-22T09:04:00+00:00"
+        )
+        self.assertEqual(self.store.unrecorded_pending(WS)[0].last_reason, "credential_missing")
+
+    def test_a_writer_raised_reason_survives_because_it_cannot_be_enumerated(self) -> None:
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self.store.record_attempt(
+            _key(issue="15855"), "writer_raised_TimeoutError", now="2026-08-22T09:04:00+00:00"
+        )
+        self.assertEqual(
+            self.store.unrecorded_pending(WS)[0].last_reason, "writer_raised_TimeoutError"
+        )
+
+
+class PendingVocabularyDriftTest(unittest.TestCase):
+    """The store declares its own copies; a value added on one side only must fail loudly.
+
+    The store must not import the policy layer (a state store that can reach the rules
+    invites a rule to be written in it), so the vocabularies are duplicated deliberately.
+    Duplication without a drift test is how the two silently diverge, and divergence here
+    means legitimate escalations start being refused at the write boundary.
+    """
+
+    def test_the_stall_class_vocabularies_match_in_both_directions(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_disposition import (  # noqa: E501
+            STALL_CLASSES,
+        )
+
+        self.assertEqual(set(PENDING_STALL_CLASSES), set(STALL_CLASSES))
+
+    def test_the_prescription_vocabularies_match_in_both_directions(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_disposition import (  # noqa: E501
+            STALL_PRESCRIPTIONS,
+        )
+
+        self.assertEqual(set(PENDING_PRESCRIPTIONS), set(STALL_PRESCRIPTIONS))
+
+    def test_the_evidence_tier_vocabularies_match_in_both_directions(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_disposition import (  # noqa: E501
+            EVIDENCE_TIERS,
+        )
+
+        self.assertEqual(set(PENDING_EVIDENCE_TIERS), set(EVIDENCE_TIERS))
+
+    def test_every_refusal_reason_the_writer_can_return_is_a_declared_reason(self) -> None:
+        # If this drifts, a real refusal reason silently becomes `unclassified_reason` and
+        # the operator loses the one field that says WHY the write is not happening.
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_leg import (  # noqa: E501
+            DETERMINISTIC_NO_SEND_REASONS,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application import (  # noqa: E501
+            stall_escalation_pass as _pass,
+        )
+
+        settle_reasons = {
+            _pass.SETTLE_ANCHOR_UNRESOLVED,
+            _pass.SETTLE_BUDGET_SPENT,
+            _pass.SETTLE_NOTHING_PENDING,
+            _pass.SETTLE_RECORDED,
+            _pass.SETTLE_WRITE_REFUSED,
+            _pass.SETTLE_WRITE_UNCERTAIN,
+        }
+        self.assertLessEqual(
+            set(DETERMINISTIC_NO_SEND_REASONS) | settle_reasons, set(PENDING_REASONS)
+        )
 
 
 if __name__ == "__main__":  # pragma: no cover

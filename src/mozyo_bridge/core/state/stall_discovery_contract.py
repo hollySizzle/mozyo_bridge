@@ -31,7 +31,7 @@ Two refusal disciplines are shared by every check here:
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional
 
 #: The canonical drop-reason vocabulary a discovery row may name.
@@ -111,7 +111,30 @@ def checked_timestamp(value: object, *, field: str) -> str:
         raise StallDiscoveryContractError(
             f"discovery {field} must carry a timezone offset"
         )
-    return parsed.isoformat(timespec="seconds")
+    # Folded to UTC, not merely reformatted. An earlier version normalized the FORMAT and
+    # left the offset alone, so ``2026-08-22T10:00:00+09:00`` (= 01:00Z) stored as-is and
+    # sorted lexically AFTER ``2026-08-22T02:00:00+00:00`` — reversing the oldest-first
+    # settle order the fairness contract depends on (review j#110192 finding_2). Folding to
+    # a single fixed-width UTC form is what makes lexical order == chronological order.
+    return parsed.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
+#: Sort key for a stored timestamp, used where ORDER is a CONTRACT rather than a display.
+#:
+#: Raw stored text must never be the ordering authority: a corrupted value sorts wherever
+#: its bytes fall, and a high-sorting one ("zzzz-...") pushed a preserved escalation behind
+#: every valid row, starving it for as long as valid rows kept arriving (review j#110192
+#: finding_2).
+#:
+#: Unreadable values are therefore bucketed FIRST rather than last. The trade is deliberate
+#: and stated: a corrupt row preceding valid ones is bounded — this build cannot create one,
+#: so their number is finite and shrinks as they are settled — while placing them last is
+#: unbounded starvation of a real escalation that was deliberately preserved.
+def timestamp_sort_key(value: object) -> "tuple[int, str]":
+    try:
+        return (1, checked_timestamp(value, field="observed_at.order"))
+    except StallDiscoveryContractError:
+        return (0, "")
 
 
 #: What an unparseable stored timestamp is replaced by on a PENDING row. A pending row is a
@@ -255,6 +278,7 @@ __all__ = (
     "StallDiscoveryContractError",
     "checked_count",
     "checked_timestamp",
+    "timestamp_sort_key",
     "discovery_reject_token",
     "rendered_timestamp",
     "unreadable_discovery",

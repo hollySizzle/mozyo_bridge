@@ -1013,13 +1013,22 @@ class OperatorStatusSurfaceTest(unittest.TestCase):
         from mozyo_bridge.core.state.stall_escalation import (
             PendingEscalation,
             StallEscalationStore,
+            escalation_idempotency_key,
         )
 
         result = self._register("stall_watch:\n  lanes: [lane_a]\n")
         workspace_id = result.record.workspace_id
         StallEscalationStore(home=self.home).enqueue_pending(
             PendingEscalation(
-                idempotency_key="k1",
+                idempotency_key=escalation_idempotency_key(
+                    workspace_id=workspace_id,
+                    lane_id="lane_a",
+                    role="claude",
+                    generation="",
+                    stall_class="content_refusal",
+                    first_observed_at="2026-08-22T09:00:00+00:00",
+                    issue="15855",
+                ),
                 workspace_id=workspace_id,
                 lane_id="lane_a",
                 role="claude",
@@ -1035,6 +1044,74 @@ class OperatorStatusSurfaceTest(unittest.TestCase):
         self.assertIn("unrecorded=1", text)
         self.assertIn("oldest_age=", text)
         self.assertNotIn("oldest_age=-", text)
+
+    def test_a_tampered_row_is_counted_in_status_without_rendering_its_values(self) -> None:
+        """The real CLI, both renderings (review j#110192 finding_1).
+
+        Two claims at once, because either alone would be satisfiable the wrong way: the
+        operator IS told a stored escalation row failed the contract, and the values that
+        made it fail do NOT appear in the output.
+        """
+        import sqlite3
+
+        from mozyo_bridge.core.state.stall_escalation import (
+            PendingEscalation,
+            StallEscalationStore,
+            escalation_idempotency_key,
+        )
+
+        result = self._register("stall_watch:\n  lanes: [lane_a]\n")
+        workspace_id = result.record.workspace_id
+        store = StallEscalationStore(home=self.home)
+        store.enqueue_pending(
+            PendingEscalation(
+                idempotency_key=escalation_idempotency_key(
+                    workspace_id=workspace_id,
+                    lane_id="lane_a",
+                    role="claude",
+                    generation="",
+                    stall_class="content_refusal",
+                    first_observed_at="2026-08-22T09:00:00+00:00",
+                    issue="15855",
+                ),
+                workspace_id=workspace_id,
+                lane_id="lane_a",
+                role="claude",
+                stall_class="content_refusal",
+                prescription="context_reset_reinjection",
+                consecutive=2,
+                first_observed_at="2026-08-22T09:00:00+00:00",
+                escalated_at="2026-08-22T09:00:00+00:00",
+                issue="15855",
+            )
+        )
+        # Behind the store's back, exactly as the reproduction did.
+        conn = sqlite3.connect(store.path)
+        try:
+            conn.execute(
+                "UPDATE stall_escalation_pending SET issue='99999', prescription='rm -rf /'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        text = self._status()
+        self.assertIn("quarantined=1", text)
+        self.assertIn("unrecorded=0", text)
+        self.assertNotIn("rm -rf", text)
+        self.assertNotIn("99999", text)
+
+        payload = json.loads(self._status(as_json=True))["stall_watch"][0]
+        self.assertEqual(payload["pending"]["quarantined"], 1)
+        self.assertEqual(payload["pending"]["unrecorded"], 0)
+        blob = json.dumps(payload)
+        self.assertNotIn("rm -rf", blob)
+        self.assertNotIn("99999", blob)
+
+    def test_a_healthy_backlog_does_not_print_the_quarantine_line(self) -> None:
+        # The counter-test: a line that is always present is a line nobody reads.
+        self._register("stall_watch:\n  lanes: [lane_a]\n")
+        self.assertNotIn("quarantined=", self._status())
 
     def test_coverage_is_absent_until_a_pass_has_run(self) -> None:
         # "never ran" and "ran and watched nothing" are different operator situations.
