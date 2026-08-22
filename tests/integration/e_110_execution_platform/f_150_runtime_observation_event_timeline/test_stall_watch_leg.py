@@ -44,6 +44,7 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     LEG_NOT_DUE,
     LEG_NO_READER,
     LEG_RAN,
+    build_journal_readback,
     build_journal_verifier,
     build_journal_writer,
     journal_id_carrying_key,
@@ -159,12 +160,18 @@ class LegBase(unittest.TestCase):
         return self.clock_value
 
     def run_leg(self, *, budget=None, read=None, at=None, **kwargs):
+        # ONE readback seam per pass, exactly as `build_stall_watch_leg_fn` composes it:
+        # the writer's two lookups and the wake admission share one cache and one entry in
+        # the pass-wide provider-read budget.
+        readback = kwargs.pop(
+            "readback", build_journal_readback(source=self.source, budget=budget)
+        )
         writer = kwargs.pop(
             "write_journal",
             build_journal_writer(
                 policy=self.policy,
                 transport=object(),
-                source=self.source,
+                readback=readback,
                 emit=self.emit,
             ),
         )
@@ -180,7 +187,7 @@ class LegBase(unittest.TestCase):
             # readback reads. Leaving it out would model a host with no journal source,
             # where the correct behaviour is to wake nobody.
             verify_journal=kwargs.pop(
-                "verify_journal", build_journal_verifier(source=self.source, budget=budget)
+                "verify_journal", build_journal_verifier(readback=readback)
             ),
             generation_for=kwargs.pop("generation_for", lambda lane: "g1"),
             issue_for=kwargs.pop("issue_for", lambda lane: "15855"),
@@ -254,7 +261,10 @@ class CadenceGateTest(LegBase):
             inventory_rows=self._rows,
             read_screen=None,
             write_journal=build_journal_writer(
-                policy=self.policy, transport=object(), source=self.source, emit=self.emit
+                policy=self.policy,
+                transport=object(),
+                readback=build_journal_readback(source=self.source),
+                emit=self.emit,
             ),
             wake=self.wake,
             generation_for=lambda lane: "g1",
@@ -419,11 +429,17 @@ class ReadbackFenceTest(LegBase):
         self.assertEqual(pending.last_reason, "write_optin_unset")
 
     def test_journal_id_carrying_key_matches_only_the_exact_key(self) -> None:
-        self.source.append("15855", "- idempotency_key: stallesc1_aaa\n", "1")
-        self.source.append("15855", "- idempotency_key: stallesc1_bbb\n", "2")
-        self.assertEqual(
-            journal_id_carrying_key(self.source, "15855", "stallesc1_bbb"), "2"
-        )
+        # This test's NAME claimed exactness for seven rounds while it measured only
+        # difference: `stallesc1_aaa` and `stallesc1_bbb` are not prefixes of one another,
+        # so the substring matcher it was written against passed it too (review j#110281
+        # finding_exactmatch). The keys are canonical now and the neighbours are the shapes
+        # that actually distinguish the two implementations.
+        key = "stallesc1_" + "a" * 32
+        other = "stallesc1_" + "b" * 32
+        self.source.append("15855", f"- idempotency_key: {other}", "1")
+        self.source.append("15855", f"- idempotency_key: {key}", "2")
+        self.assertEqual(journal_id_carrying_key(self.source, "15855", key), "2")
+        self.assertEqual(journal_id_carrying_key(self.source, "15855", other), "1")
         self.assertEqual(journal_id_carrying_key(self.source, "15855", "nope"), "")
 
     def test_an_unreadable_source_reports_not_recorded(self) -> None:
@@ -1004,7 +1020,7 @@ class WiringTest(unittest.TestCase):
         source = _Source()
         wake_store = self._WakeStore()
         key = self._recorded_firing(store)
-        source.append("15855", f"idempotency_key: {key}", "110264")
+        source.append("15855", f"- idempotency_key: {key}", "110264")
 
         self._wake_leg(home=home, store=store, source=source, wake_store=wake_store)(
             self._WS(self._repo("stall_watch:\n  lanes: [%s]\n" % LANE)),

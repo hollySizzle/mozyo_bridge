@@ -22,6 +22,7 @@ and can only be caught on read.
 
 from __future__ import annotations
 
+import ast
 import json
 import sqlite3
 import sys
@@ -69,7 +70,9 @@ from mozyo_bridge.core.state.stall_pending_contract import (  # noqa: E402
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_escalation_pass import (  # noqa: E402,E501
     SETTLE_NOTHING_PENDING,
+    WRITE_NOT_SENT,
     WRITE_RECORDED,
+    WRITE_UNCERTAIN,
     JournalWriteResult,
     settle_pending_escalations,
 )
@@ -77,10 +80,22 @@ from mozyo_bridge.core.state.stall_pending_transition import (  # noqa: E402
     bumped_attempts,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_leg import (  # noqa: E402,E501
+    build_journal_writer,
+    journal_id_carrying_key,
+    READBACK_ABSENT,
+    READBACK_CAPPED,
+    READBACK_FOUND,
+    READBACK_UNREADABLE,
+    ReadbackResult,
+    build_journal_readback,
     build_journal_verifier,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_escalation_note import (  # noqa: E402,E501
+    note_declares_key,
     render_escalation_body,
+)
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_watch_policy import (  # noqa: E402,E501
+    StallWatchPolicy,
 )
 
 WS = "wsA"
@@ -910,14 +925,14 @@ class VerifierTest(unittest.TestCase):
     def _append(self, journal_id: str) -> None:
         self.source.entries.append(
             _VerifierSource.Entry(
-                REAL_ISSUE, journal_id, f"idempotency_key: {self.row.idempotency_key}"
+                REAL_ISSUE, journal_id, f"- idempotency_key: {self.row.idempotency_key}"
             )
         )
 
     def test_an_absent_journal_is_not_cached(self) -> None:
         # The firing this pass is about to WRITE must not be unverifiable for the rest of
         # the pass because a lookup before the write recorded a miss.
-        verify = build_journal_verifier(source=self.source)
+        verify = build_journal_verifier(readback=build_journal_readback(source=self.source))
         self.assertEqual(verify(self.row), "")
         self._append("110264")
         self.assertEqual(verify(self.row), "110264")
@@ -925,7 +940,7 @@ class VerifierTest(unittest.TestCase):
     def test_a_found_journal_is_cached(self) -> None:
         # A journal, once written, does not stop existing, so re-reading it costs a pass
         # budget nothing to skip.
-        verify = build_journal_verifier(source=self.source)
+        verify = build_journal_verifier(readback=build_journal_readback(source=self.source))
         self._append("110264")
         self.assertEqual(verify(self.row), "110264")
         self.assertEqual(verify(self.row), "110264")
@@ -934,7 +949,9 @@ class VerifierTest(unittest.TestCase):
     def test_reads_are_counted_against_the_shared_pass_budget(self) -> None:
         budget = {"reads": 0, "mutated": False, "uncertain": False}
         self._append("110264")
-        build_journal_verifier(source=self.source, budget=budget)(self.row)
+        build_journal_verifier(
+            readback=build_journal_readback(source=self.source, budget=budget)
+        )(self.row)
         self.assertEqual(budget["reads"], 1)
         # A provider read is not an external mutation (Final Disposition j#87188).
         self.assertFalse(budget["mutated"])
@@ -944,7 +961,9 @@ class VerifierTest(unittest.TestCase):
         # a question nobody asked.
         budget = {"reads": 7, "mutated": False, "uncertain": False}
         self._append("110264")
-        verify = build_journal_verifier(source=self.source, budget=budget, read_cap=7)
+        verify = build_journal_verifier(
+            readback=build_journal_readback(source=self.source, budget=budget, read_cap=7)
+        )
         self.assertEqual(verify(self.row), "")
         self.assertEqual(self.source.reads, 0)
         # A recorded row whose authority went unasked is refused as UNVERIFIED, which is
@@ -957,7 +976,391 @@ class VerifierTest(unittest.TestCase):
             def read_entries(self, issue_id):
                 raise RuntimeError("redmine unreachable")
 
-        self.assertEqual(build_journal_verifier(source=_Broken())(self.row), "")
+        self.assertEqual(
+            build_journal_verifier(readback=build_journal_readback(source=_Broken()))(self.row),
+            "",
+        )
+
+
+
+# ======================================================================================
+# Review j#110281: the authority itself was loose (exact match, and one counted seam)
+# ======================================================================================
+#
+# R8 added an existence check to the wake admission and declared "existence is a question
+# only the external system can answer". Both findings here are about the ASKING: the
+# question was matched with a substring search (so a journal that merely mentions the key
+# answered "yes"), and one of the two callers walked past the provider-read cap the other
+# honoured. An authority that answers loosely is not an authority, and a cap one caller
+# ignores is not a cap.
+
+#: The line shape :func:`render_escalation_body` actually emits. Every acceptance test below
+#: is written against the RENDERER rather than against a hand-typed lookalike, because a
+#: parser tested only against strings the test author typed proves nothing about the notes
+#: production writes.
+CANONICAL_KEY = "stallesc1_" + "a" * 32
+OTHER_KEY = "stallesc1_" + "b" * 32
+
+
+def _rendered_note(key: str = CANONICAL_KEY) -> str:
+    return render_escalation_body(
+        issue=REAL_ISSUE,
+        slot_label=f"{WS}/{LANE}/{ROLE}",
+        generation="g1",
+        target="w1V:pK",
+        provider_id=ROLE,
+        stall_class="content_refusal",
+        prescription="context_reset_reinjection",
+        consecutive=3,
+        first_observed_at=FIRST,
+        last_observed_at="2026-08-22T09:05:00+00:00",
+        policy_id="stallwatch1_300s_2_config",
+        idempotency_key=key,
+    )
+
+
+class _AuthoritySource:
+    """The minimum a Redmine journal source has to look like, plus a read counter."""
+
+    class Entry:
+        def __init__(self, issue_id, journal_id, notes):
+            self.issue_id, self.journal_id, self.notes = issue_id, journal_id, notes
+
+    def __init__(self) -> None:
+        self.entries: list = []
+        self.reads = 0
+
+    def read_entries(self, issue_id):
+        self.reads += 1
+        return [e for e in self.entries if e.issue_id == str(issue_id)]
+
+    def append(self, notes, journal_id="110264", issue=REAL_ISSUE):
+        self.entries.append(self.Entry(issue, journal_id, notes))
+
+
+class AuthorityExactMatchTest(unittest.TestCase):
+    """The one external authority answers on a canonical field, not on a substring."""
+
+    def _lookup(self, notes, key=CANONICAL_KEY) -> str:
+        source = _AuthoritySource()
+        source.append(notes)
+        return journal_id_carrying_key(source, REAL_ISSUE, key)
+
+    def test_the_renderer_s_own_note_is_found(self) -> None:
+        # The property that matters, stated as a round trip: whatever the renderer emits,
+        # the parser finds. Hand-typed lookalikes cannot establish this.
+        self.assertEqual(self._lookup(_rendered_note()), "110264")
+        self.assertEqual(note_declares_key(_rendered_note()), CANONICAL_KEY)
+
+    def test_every_near_miss_is_refused(self) -> None:
+        # All six were ACCEPTED by the substring matcher, reproduced before the fix.
+        for label, notes in (
+            ("longer key with our prefix", f"- idempotency_key: {CANONICAL_KEY}-suffix"),
+            ("longer key, extra digits", f"- idempotency_key: {CANONICAL_KEY}0"),
+            ("prose mention", f"see the note whose idempotency_key: {CANONICAL_KEY} was cited"),
+            ("quotation of another note", f'> "- idempotency_key: {CANONICAL_KEY}"'),
+            # A markdown blockquote of the field, unquoted. This is the shape that separates
+            # "the line IS the field" from "the line CONTAINS the field": everything after
+            # the prefix is exactly the key, so a parser that searched instead of anchoring
+            # would accept a journal that is merely quoting another one.
+            ("blockquoted field", f"> - idempotency_key: {CANONICAL_KEY}"),
+            ("mid-line, not a field", f"the string idempotency_key: {CANONICAL_KEY} appears"),
+            ("trailing junk on the field", f"- idempotency_key: {CANONICAL_KEY} (stale)"),
+        ):
+            with self.subTest(shape=label):
+                self.assertEqual(self._lookup(notes), "")
+
+    def test_a_note_declaring_two_different_keys_proves_neither(self) -> None:
+        # Ambiguity is refused, not resolved: picking either would let a crafted journal
+        # stand as proof for a firing it does not carry.
+        notes = f"- idempotency_key: {OTHER_KEY}\n- idempotency_key: {CANONICAL_KEY}"
+        self.assertEqual(note_declares_key(notes), "")
+        self.assertEqual(self._lookup(notes), "")
+
+    def test_a_non_canonical_request_is_refused_rather_than_compared(self) -> None:
+        # No fishing with a prefix: the request itself has to be a real key.
+        source = _AuthoritySource()
+        source.append(_rendered_note())
+        for bogus in ("", "stallesc1_", CANONICAL_KEY[:20], "nope", CANONICAL_KEY + "0"):
+            with self.subTest(key=bogus):
+                self.assertEqual(journal_id_carrying_key(source, REAL_ISSUE, bogus), "")
+
+    def test_a_note_declaring_a_junk_key_cannot_be_matched_by_asking_for_junk(self) -> None:
+        # The case that separates "the request is validated" from "the request is merely
+        # compared": a note that literally declares `not-a-key` still proves nothing, because
+        # `not-a-key` is not a key. Without the guard this pair matches each other happily.
+        source = _AuthoritySource()
+        source.append("- idempotency_key: not-a-key")
+        self.assertEqual(note_declares_key("- idempotency_key: not-a-key"), "not-a-key")
+        self.assertEqual(journal_id_carrying_key(source, REAL_ISSUE, "not-a-key"), "")
+
+    def test_the_right_journal_is_picked_out_of_several(self) -> None:
+        source = _AuthoritySource()
+        source.append(_rendered_note(OTHER_KEY), journal_id="110100")
+        source.append("- idempotency_key: not-a-key", journal_id="110101")
+        source.append(_rendered_note(CANONICAL_KEY), journal_id="110102")
+        self.assertEqual(journal_id_carrying_key(source, REAL_ISSUE, CANONICAL_KEY), "110102")
+        self.assertEqual(journal_id_carrying_key(source, REAL_ISSUE, OTHER_KEY), "110100")
+
+    def test_indentation_and_trailing_space_do_not_change_the_answer(self) -> None:
+        # A markdown list item may be indented; that is still the canonical field.
+        self.assertEqual(self._lookup(f"   - idempotency_key: {CANONICAL_KEY}   "), "110264")
+
+
+class _CapEmit:
+    """A gate writer that actually lands the rendered note in the fake source."""
+
+    def __init__(self, source, journal_id="110264") -> None:
+        self.source, self.journal_id, self.calls = source, journal_id, []
+
+    def __call__(self, issue, gate, *, body="", transport=None, marker_fields=None,
+                 review_findings=None):
+        self.calls.append(issue)
+        self.source.append(body, journal_id=self.journal_id, issue=str(issue))
+
+        class _Receipt:
+            recorded = True
+            reason = "ok"
+
+        return _Receipt()
+
+
+class ReadCapTest(unittest.TestCase):
+    """Every readback in the pass is counted and capped, writer's included."""
+
+    def setUp(self) -> None:
+        self.source = _AuthoritySource()
+        self.emit = _CapEmit(self.source)
+        self.row = _pending(idempotency_key=CANONICAL_KEY)
+
+    def _writer(self, readback):
+        return build_journal_writer(
+            policy=StallWatchPolicy.from_record({"lanes": [LANE]}),
+            transport=object(),
+            readback=readback,
+            emit=self.emit,
+        )
+
+    def test_at_the_cap_the_writer_reads_nothing_and_posts_nothing(self) -> None:
+        # Before the fix this performed TWO real provider reads and a POST, with the shared
+        # counter never moving.
+        budget = {"reads": 4, "mutated": False, "uncertain": False}
+        result = self._writer(
+            build_journal_readback(source=self.source, budget=budget, read_cap=4)
+        )(self.row)
+
+        self.assertEqual(result.outcome, WRITE_NOT_SENT)
+        self.assertEqual(result.reason, READBACK_CAPPED)
+        self.assertEqual(self.source.reads, 0)
+        self.assertEqual(self.emit.calls, [])
+        self.assertEqual(budget["reads"], 4)
+        # A deterministic zero-send: the external-mutation budget stays untouched, so the
+        # pass's one mutation is still available to whatever needs it.
+        self.assertFalse(budget["mutated"])
+        self.assertFalse(budget["uncertain"])
+
+    def test_below_the_cap_the_writer_still_writes(self) -> None:
+        # The control. A writer that refused everything would pass the test above for free.
+        budget = {"reads": 0, "mutated": False, "uncertain": False}
+        result = self._writer(
+            build_journal_readback(source=self.source, budget=budget, read_cap=4)
+        )(self.row)
+
+        self.assertEqual(result.outcome, WRITE_RECORDED)
+        self.assertEqual(result.journal_id, "110264")
+        self.assertEqual(self.emit.calls, [REAL_ISSUE])
+        self.assertEqual(budget["reads"], 2)  # pre-POST check + post-POST verification
+
+    def test_a_cap_reached_AFTER_the_post_is_uncertain_not_refused(self) -> None:
+        # The POST already happened, so "we never looked" and "we looked and saw nothing"
+        # have the same consequence: an external effect this pass cannot account for.
+        budget = {"reads": 0, "mutated": False, "uncertain": False}
+        result = self._writer(
+            build_journal_readback(source=self.source, budget=budget, read_cap=1)
+        )(self.row)
+
+        self.assertEqual(result.outcome, WRITE_UNCERTAIN)
+        self.assertEqual(result.reason, "readback_unverified")
+        self.assertEqual(self.emit.calls, [REAL_ISSUE])  # the POST did happen
+        self.assertEqual(self.source.reads, 1)  # exactly the one read the cap allowed
+
+    def test_the_writer_and_the_verifier_share_one_counter_and_one_cache(self) -> None:
+        # One seam per pass: the answer the writer paid for is the answer the wake
+        # admission uses, and neither can spend the budget the other is honouring.
+        budget = {"reads": 0, "mutated": False, "uncertain": False}
+        readback = build_journal_readback(source=self.source, budget=budget, read_cap=8)
+        recorded = self._writer(readback)(self.row)
+        self.assertEqual(recorded.outcome, WRITE_RECORDED)
+        reads_after_write = budget["reads"]
+
+        observed = build_journal_verifier(readback=readback)(
+            _pending(idempotency_key=CANONICAL_KEY, journal_id="110264")
+        )
+
+        self.assertEqual(observed, "110264")
+        self.assertEqual(budget["reads"], reads_after_write)  # served from the shared cache
+
+    def test_a_result_cannot_carry_an_id_it_did_not_find(self) -> None:
+        # The invariant that makes every caller's `if result.found` unnecessary rather than
+        # merely conventional.
+        for outcome in (READBACK_ABSENT, READBACK_CAPPED, READBACK_UNREADABLE):
+            with self.subTest(outcome=outcome):
+                with self.assertRaises(ValueError):
+                    ReadbackResult(outcome=outcome, journal_id="110264")
+        with self.assertRaises(ValueError):
+            ReadbackResult(outcome=READBACK_FOUND)
+
+    def test_the_readback_outcomes_are_distinguishable(self) -> None:
+        # "No journal carries this" and "we never looked" are opposite facts, and only the
+        # first may ever authorise anything.
+        empty = build_journal_readback(source=self.source, read_cap=4)
+        self.assertEqual(empty(REAL_ISSUE, CANONICAL_KEY).outcome, READBACK_ABSENT)
+        self.source.append(_rendered_note())
+        self.assertEqual(empty(REAL_ISSUE, CANONICAL_KEY).outcome, READBACK_FOUND)
+        capped = build_journal_readback(
+            source=self.source, budget={"reads": 9}, read_cap=4
+        )
+        self.assertEqual(capped(REAL_ISSUE, CANONICAL_KEY).outcome, READBACK_CAPPED)
+        self.assertEqual(
+            build_journal_readback(source=None)(REAL_ISSUE, CANONICAL_KEY).outcome,
+            READBACK_UNREADABLE,
+        )
+
+
+class RootClosureTest(unittest.TestCase):
+    """There is no SECOND matcher and no SECOND provider-read path in this subsystem.
+
+    The point rounds six through nine keep proving: closing the path a review named leaves
+    the next path open. These two scans assert the *absence* of alternatives structurally,
+    so a future edit that adds a second way to ask the authority — or a second way to reach
+    the provider — fails here rather than in a review three rounds later.
+
+    Scope is declared, not implied: the stall-watch feature plus its state modules. Other
+    subsystems read journals through their own counted seams and are not this test's
+    business.
+    """
+
+    SUBSYSTEM = (
+        "src/mozyo_bridge/e_110_execution_platform/f_150_runtime_observation_event_timeline",
+    )
+    STATE_MODULES = ("src/mozyo_bridge/core/state",)
+
+    def _modules(self):
+        for root in (*self.SUBSYSTEM, *self.STATE_MODULES):
+            base = ROOT / root
+            for path in sorted(base.rglob("*.py")):
+                if "__pycache__" in path.parts:
+                    continue
+                if root in self.STATE_MODULES and not path.name.startswith("stall_"):
+                    continue
+                yield path, ast.parse(path.read_text())
+
+    @staticmethod
+    def _enclosing_functions(tree, predicate) -> set:
+        """Names of the functions containing a node the predicate accepts."""
+        found = set()
+
+        class _Walk(ast.NodeVisitor):
+            def __init__(self):
+                self.stack = []
+
+            def visit_FunctionDef(self, node):  # noqa: N802
+                self.stack.append(node.name)
+                self.generic_visit(node)
+                self.stack.pop()
+
+            def generic_visit(self, node):
+                if predicate(node) and self.stack:
+                    found.add(self.stack[-1])
+                super().generic_visit(node)
+
+        _Walk().visit(tree)
+        return found
+
+    def test_only_one_function_reaches_the_journal_provider(self) -> None:
+        callers = set()
+        for path, tree in self._modules():
+            names = self._enclosing_functions(
+                tree,
+                lambda n: isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Attribute)
+                and n.func.attr == "read_entries",
+            )
+            callers |= {f"{path.name}:{name}" for name in names}
+        self.assertEqual(callers, {"stall_watch_leg.py:journal_id_carrying_key"})
+
+    def test_only_the_counted_seam_calls_that_function(self) -> None:
+        callers = set()
+        for path, tree in self._modules():
+            names = self._enclosing_functions(
+                tree,
+                lambda n: isinstance(n, ast.Call)
+                and isinstance(n.func, ast.Name)
+                and n.func.id == "journal_id_carrying_key",
+            )
+            callers |= {f"{path.name}:{name}" for name in names}
+        # `read` is the inner function `build_journal_readback` returns: the counted, capped
+        # seam. Anything else here would be an uncounted provider read.
+        self.assertEqual(callers, {"stall_watch_leg.py:read"})
+
+    @staticmethod
+    def _docstring_nodes(tree) -> set:
+        """Ids of the string constants that are docstrings, not values in the code."""
+        holders = (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)
+        ids = set()
+        for node in ast.walk(tree):
+            if not isinstance(node, holders) or not getattr(node, "body", None):
+                continue
+            first = node.body[0]
+            if isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant):
+                if isinstance(first.value.value, str):
+                    ids.add(id(first.value))
+        return ids
+
+    def test_the_production_composition_builds_exactly_one_seam_per_pass(self) -> None:
+        # Structural, because the behavioural difference between one seam and two is a
+        # cached read — invisible in any single-consumer test, and precisely what
+        # finding_readcap was: two consumers, two answers, one of them uncounted.
+        wiring = ROOT / (
+            "src/mozyo_bridge/e_110_execution_platform/"
+            "f_150_runtime_observation_event_timeline/application/stall_watch_wiring.py"
+        )
+        tree = ast.parse(wiring.read_text())
+        builds = [
+            node for node in ast.walk(tree)
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            and node.func.id == "build_journal_readback"
+        ]
+        self.assertEqual(len(builds), 1, "one pass, one readback seam")
+        consumers = {}
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)):
+                continue
+            if node.func.id not in ("build_journal_writer", "build_journal_verifier"):
+                continue
+            passed = {
+                kw.value.id for kw in node.keywords
+                if kw.arg == "readback" and isinstance(kw.value, ast.Name)
+            }
+            consumers[node.func.id] = passed
+        self.assertEqual(set(consumers), {"build_journal_writer", "build_journal_verifier"})
+        names = set().union(*consumers.values())
+        self.assertEqual(len(names), 1, f"both consumers must share one seam, got {consumers}")
+
+    def test_only_the_note_module_spells_the_field_literal(self) -> None:
+        # A second place that BUILDS or MATCHES `idempotency_key: ` is a second parser
+        # waiting to drift from the renderer. Docstrings are excluded on purpose: prose that
+        # explains the field is not a second implementation of it, and a rule that forbade
+        # explaining the format would be a rule against documentation.
+        owners = set()
+        for path, tree in self._modules():
+            docstrings = self._docstring_nodes(tree)
+            for node in ast.walk(tree):
+                if not isinstance(node, ast.Constant) or id(node) in docstrings:
+                    continue
+                if isinstance(node.value, str) and "idempotency_key:" in node.value:
+                    owners.add(path.name)
+        self.assertEqual(owners, {"stall_escalation_note.py"})
 
 
 if __name__ == "__main__":  # pragma: no cover

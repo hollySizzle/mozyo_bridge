@@ -34,6 +34,7 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     default_body_marker_resolver,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_leg import (  # noqa: E501
+    build_journal_readback,
     build_journal_verifier,
     build_journal_writer,
     run_stall_watch_leg,
@@ -287,6 +288,13 @@ def build_stall_watch_leg_fn(
                 except Exception:  # noqa: BLE001 - a wake loss retries next pass
                     return False
 
+        # ONE readback seam for the whole pass: the writer's idempotency check, the
+        # writer's post-POST verification and the wake admission all go through it, so they
+        # share one cache and one entry in the pass-wide provider-read budget. Two seams in
+        # a pass is what let the writer walk past a cap the verifier honoured (review
+        # j#110281 finding_readcap).
+        readback = build_journal_readback(source=source, budget=pass_budget)
+
         return run_stall_watch_leg(
             workspace_id=workspace_id,
             store=escalation_store,
@@ -294,14 +302,15 @@ def build_stall_watch_leg_fn(
             inventory_rows=inventory_rows,
             read_screen=screen_reader(),
             write_journal=build_journal_writer(
-                policy=policy, transport=note_transport(), source=source
+                policy=policy, transport=note_transport(), readback=readback
             ),
             wake=wake,
-            # The wake admission's authority, built from the SAME journal source the write
-            # fence reads back through. Without it no wake is admitted at all, which is the
-            # intended direction on a host with no readable Redmine source: an unverifiable
-            # journal id is no reason to wake a coordinator (review j#110254).
-            verify_journal=build_journal_verifier(source=source, budget=pass_budget),
+            # The wake admission's authority — the same seam, so an answer the writer already
+            # paid for is reused and a cap the writer hit is a cap here too. Without a
+            # verifier no wake is admitted at all, which is the intended direction on a host
+            # with no readable Redmine source: an unverifiable journal id is no reason to
+            # wake a coordinator (review j#110254).
+            verify_journal=build_journal_verifier(readback=readback),
             generation_for=lambda lane_id: lanes.get(lane_id, ("", ""))[0],
             issue_for=lambda lane_id: lanes.get(lane_id, ("", ""))[1],
             body_marker_for=resolve_marker,

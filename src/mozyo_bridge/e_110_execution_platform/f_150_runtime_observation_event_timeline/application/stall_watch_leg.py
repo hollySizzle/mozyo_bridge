@@ -71,6 +71,7 @@ from mozyo_bridge.core.state.stall_escalation import (
     PendingEscalation,
     StallEscalationStore,
 )
+from mozyo_bridge.core.state.stall_pending_contract import canonical_idempotency_key
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_escalation_pass import (  # noqa: E501
     WRITE_NOT_SENT,
     WRITE_RECORDED,
@@ -92,6 +93,7 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_escalation_note import (  # noqa: E501
     STALL_ESCALATION_GATE,
+    note_declares_key,
     render_escalation_body,
     render_policy_id,
 )
@@ -144,27 +146,35 @@ class StallWatchLegOutcome:
 def journal_id_carrying_key(source: object, issue: str, key: str) -> str:
     """The id of the issue journal whose note carries ``key``, or ``""``.
 
-    The readback half of the write fence. Matching on the rendered
-    ``idempotency_key: <key>`` line rather than on prose or on a timestamp is what makes it
-    exact: the key is derived from the run's identity, so exactly one journal can ever
-    carry it, and finding it is proof the durable record holds this firing.
+    The readback half of the write fence. The key is derived from the run's identity, so
+    exactly one journal can ever carry it, and finding it is proof the durable record holds
+    this firing.
 
-    Fail-soft by design — an unreadable source returns ``""``, which reports the firing as
-    *not yet recorded*. That direction retries a write that may be redundant; the opposite
-    direction would bind a firing to a journal that does not exist and wake a coordinator to
-    read nothing.
+    Matching is :func:`note_declares_key` — the canonical field parser that lives beside the
+    renderer — compared for EQUALITY with the firing's own key. It used to be
+    ``needle in notes``, a substring search, while this docstring already claimed an exact
+    line match: a journal declaring ``<key>-suffix``, or merely quoting another journal's
+    key in prose, was accepted as proof that this firing had been recorded (review j#110281
+    finding_exactmatch). A false claim here is the worst kind this rail can hold, because
+    this readback is its ONLY external authority — it binds the writer to an existing
+    journal and it admits every coordinator wake.
+
+    A non-canonical ``key`` matches nothing: the request itself is refused rather than
+    compared, so a caller cannot go fishing with a prefix.
+
+    Fail-soft on an unreadable source is the CALLER's decision now, not this function's:
+    ``read_journal_authority`` returns a typed result and each caller chooses. This function
+    keeps returning ``""`` for "no journal carries this key" only.
     """
-    if source is None or not key:
+    if source is None or not key or not canonical_idempotency_key(key):
         return ""
     try:
         entries = source.read_entries(str(issue))  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001 - an unreadable issue is "not recorded", never a crash
         return ""
-    needle = f"idempotency_key: {key}"
     best = ""
     for entry in entries or ():
-        notes = str(getattr(entry, "notes", "") or "")
-        if needle in notes:
+        if note_declares_key(getattr(entry, "notes", "")) == key:
             candidate = str(getattr(entry, "journal_id", "") or "")
             # Last match wins: a duplicate can only arise from a pre-fence write, and the
             # later journal is the one a reader following the issue will act on.
@@ -173,35 +183,82 @@ def journal_id_carrying_key(source: object, issue: str, key: str) -> str:
     return best
 
 
-def build_journal_verifier(
+#: A journal carrying this firing was found; ``journal_id`` holds its id.
+READBACK_FOUND = "found"
+#: The authority was asked and no journal carries this firing.
+READBACK_ABSENT = "absent"
+#: The authority was NOT asked: the pass has spent its provider-read budget.
+READBACK_CAPPED = "read_cap_reached"
+#: The authority was asked and could not answer (no source, or the read raised).
+READBACK_UNREADABLE = "unreadable"
+
+READBACK_OUTCOMES: frozenset[str] = frozenset(
+    {READBACK_FOUND, READBACK_ABSENT, READBACK_CAPPED, READBACK_UNREADABLE}
+)
+
+
+@dataclass(frozen=True)
+class ReadbackResult:
+    """What the external authority said, and whether it was asked at all.
+
+    Three distinguishable answers, because collapsing them is what let the cap leak. "No
+    journal carries this" and "we never looked" are opposite facts that a boolean cannot
+    tell apart, and the second must never authorise anything.
+    """
+
+    outcome: str
+    journal_id: str = ""
+
+    def __post_init__(self) -> None:
+        if self.outcome not in READBACK_OUTCOMES:
+            raise ValueError(f"unknown readback outcome {self.outcome!r}")
+        if bool(self.journal_id) != (self.outcome == READBACK_FOUND):
+            # An id on a result that did not find one is a claim with no answer behind it,
+            # and an empty id on a FOUND result is a found nothing. Enforced in the type
+            # rather than trusted at each call site: a caller-side `if result.found` guard
+            # is unmeasurable while nothing can construct the shape it defends against.
+            raise ValueError(
+                f"a {self.outcome!r} readback must "
+                f"{'carry' if self.outcome == READBACK_FOUND else 'not carry'} a journal id"
+            )
+
+    @property
+    def found(self) -> bool:
+        return self.outcome == READBACK_FOUND
+
+    @property
+    def asked(self) -> bool:
+        """Whether the authority was actually consulted (cap and no-source are not asks)."""
+        return self.outcome in (READBACK_FOUND, READBACK_ABSENT)
+
+
+def build_journal_readback(
     *,
     source: object,
     budget: Optional[dict] = None,
     read_cap: Optional[int] = None,
-) -> Callable[[object], str]:
-    """The wake admission's authority: which journal Redmine says carries a firing.
+) -> Callable[[str, str], ReadbackResult]:
+    """The ONE counted, capped way this rail asks Redmine whether a journal exists.
 
-    Deliberately the SAME :func:`journal_id_carrying_key` the writer's readback uses. The
-    write fence and the wake fence ask one question of one authority in one implementation
-    — a second implementation of "does this journal exist" would drift from the first, which
-    is the shape of every finding this round is answering.
+    Every readback in the leg goes through this seam — the writer's pre-POST idempotency
+    check, the writer's post-POST verification, and the wake admission's verifier. Before,
+    only the verifier consulted ``budget["reads"]``; the writer called the underlying lookup
+    directly, so a pass already at the cap still performed two real provider reads and the
+    shared counter never moved (review j#110281 finding_readcap). A cap one caller honours
+    and another walks past is not a cap, and the telemetry that reports it is fiction.
 
-    Reads are bounded and accounted like every other provider read in a bounded pass
-    (``budget["reads"]`` against :data:`MAX_PROVIDER_READS_PER_PASS`, the same counter and
-    the same cap the hibernate leg threads). Past the cap the verifier answers ``""``, which
-    is a REFUSED wake, not a permitted one: the firing waits for the next pass rather than
-    being woken on an unverified claim, and the refusal is counted in the settle telemetry
-    so a capped pass is visible rather than silent.
+    The counter and the ceiling are the pass-wide ones the hibernate leg threads
+    (``budget["reads"]`` / :data:`MAX_PROVIDER_READS_PER_PASS`) — imported rather than
+    re-picked, so "how many provider reads may a bounded pass make" stays ONE decision.
 
-    Positive answers are cached for the pass and negative ones are not. A journal, once
-    written, does not stop existing, so caching a hit is free; caching a MISS would make the
-    firing this pass just wrote unverifiable until the next pass, because the miss would
-    have been recorded before the write.
+    Positive answers are cached for the pass; absences are not. A journal, once written,
+    does not stop existing, so a hit is free to reuse — while caching a MISS would make the
+    firing this pass is about to write unverifiable for the rest of the pass, because the
+    miss would have been recorded before the write.
     """
     if read_cap is None:
-        # The cap and the counter are the pass-wide ones, imported the way this rail already
-        # imports `budget_spent`: lazily, so the read budget stays one shared decision and
-        # f_150 does not take a load-time dependency on an f_140 wiring module.
+        # Lazily, the way this rail already imports `budget_spent`: the read budget stays one
+        # shared decision and f_150 takes no load-time dependency on an f_140 wiring module.
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.hibernate_supervisor_wiring import (  # noqa: E501
             MAX_PROVIDER_READS_PER_PASS,
         )
@@ -209,23 +266,50 @@ def build_journal_verifier(
         read_cap = MAX_PROVIDER_READS_PER_PASS
     cache: dict[tuple[str, str], str] = {}
 
-    def verify(pending: object) -> str:
-        issue = str(getattr(pending, "issue", "") or "")
-        key = str(getattr(pending, "idempotency_key", "") or "")
+    def read(issue: str, key: str) -> ReadbackResult:
+        issue, key = str(issue or ""), str(key or "")
         if not issue or not key:
-            return ""
+            return ReadbackResult(outcome=READBACK_UNREADABLE)
         if (issue, key) in cache:
-            return cache[(issue, key)]
+            return ReadbackResult(outcome=READBACK_FOUND, journal_id=cache[(issue, key)])
         if source is None:
-            return ""
+            return ReadbackResult(outcome=READBACK_UNREADABLE)
         if budget is not None and int(budget.get("reads", 0)) >= read_cap:
-            return ""
+            return ReadbackResult(outcome=READBACK_CAPPED)
         if budget is not None:
             budget["reads"] = int(budget.get("reads", 0)) + 1
         found = journal_id_carrying_key(source, issue, key)
         if found:
             cache[(issue, key)] = found
-        return found
+            return ReadbackResult(outcome=READBACK_FOUND, journal_id=found)
+        return ReadbackResult(outcome=READBACK_ABSENT)
+
+    return read
+
+
+def build_journal_verifier(
+    *, readback: Callable[[str, str], ReadbackResult]
+) -> Callable[[object], str]:
+    """The wake admission's authority: which journal Redmine says carries a firing.
+
+    A thin adapter over :func:`build_journal_readback` — the same seam, the same counter and
+    the same cap the writer uses. Anything that is not a confirmed FOUND answers ``""``,
+    which :func:`admit_wake` reads as a refused wake: a firing waits for the next pass
+    rather than being woken on a claim nobody checked, and the refusal is counted in the
+    settle telemetry so a capped pass is visible rather than silent.
+
+    The seam is a required argument rather than something this function can build for
+    itself. A verifier that could quietly construct its own would be a SECOND seam in the
+    same pass — its own cache, its own counter — which is finding_readcap's exact shape one
+    level up. One pass, one seam, passed in.
+    """
+
+    def verify(pending: object) -> str:
+        result = readback(
+            str(getattr(pending, "issue", "") or ""),
+            str(getattr(pending, "idempotency_key", "") or ""),
+        )
+        return result.journal_id if result.found else ""
 
     return verify
 
@@ -250,6 +334,11 @@ DETERMINISTIC_NO_SEND_REASONS: frozenset[str] = frozenset(
         "no_anchor",
         "disabled",
         "unsupported_source",
+        # Not a transport reason: the writer's own refusal when the pass has spent its
+        # provider-read budget and the idempotency check therefore could not run. It belongs
+        # in this allowlist because it proves the same thing every other member does —
+        # nothing reached Redmine (review j#110281 finding_readcap).
+        READBACK_CAPPED,
     }
 )
 
@@ -267,15 +356,20 @@ def build_journal_writer(
     *,
     policy: StallWatchPolicy,
     transport: object,
-    source: object,
+    readback: Callable[[str, str], ReadbackResult],
     emit: Optional[Callable[..., object]] = None,
 ) -> JournalWriter:
     """Bind the canonical gate writer into the :class:`JournalWriteResult` seam.
 
     ``transport`` is the credential-gated, opt-in note transport every durable write in this
     repo already uses; ``None`` means the opt-in is unset and the writer refuses with
-    ``write_optin_unset`` — never a silent success. ``source`` is the same workspace's
-    Redmine journal source, used for the readback.
+    ``write_optin_unset`` — never a silent success.
+
+    ``readback`` is the shared counted/capped authority seam
+    (:func:`build_journal_readback`), and it is REQUIRED. Passing the same object the
+    verifier uses is the whole point: one pass, one counter, one cache. Letting this
+    function build its own from a bare source is precisely how the writer came to walk past
+    a cap the verifier was honouring (review j#110281 finding_readcap).
     """
     if emit is None:
         from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.callback_gate_record import (  # noqa: E501
@@ -293,10 +387,26 @@ def build_journal_writer(
     def _write(pending: PendingEscalation) -> JournalWriteResult:
         # Readback FIRST: a firing whose journal already landed (an uncertain write, a
         # crash after the POST) is bound to it and never written twice.
-        existing = journal_id_carrying_key(source, pending.issue, pending.idempotency_key)
-        if existing:
+        existing = readback(pending.issue, pending.idempotency_key)
+        if existing.found:
             return JournalWriteResult(
-                outcome=WRITE_RECORDED, journal_id=existing, reason="already_recorded"
+                outcome=WRITE_RECORDED,
+                journal_id=existing.journal_id,
+                reason="already_recorded",
+            )
+        if existing.outcome == READBACK_CAPPED:
+            # The pass has spent its provider-read budget, so the idempotency check could
+            # not run. Posting anyway would risk a SECOND journal for one firing, and the
+            # cost of waiting is nothing: the firing stays pending and the next pass writes
+            # it. This is a deterministic zero-send — nothing reached Redmine — so the
+            # external-mutation budget is untouched (review j#110281 finding_readcap).
+            #
+            # Note the asymmetry with an UNREADABLE source below, which is deliberate. A cap
+            # is a deferral: another pass follows in minutes and the report is not lost. An
+            # outage is not: refusing there would mean never reporting the stall, which is
+            # the exact failure this whole issue exists to end.
+            return JournalWriteResult(
+                outcome=WRITE_NOT_SENT, reason=READBACK_CAPPED
             )
 
         body = render_escalation_body(
@@ -334,20 +444,23 @@ def build_journal_writer(
             return JournalWriteResult(outcome=classify_refusal(reason), reason=reason)
 
         # The POST returned; now prove a journal exists and learn its id.
-        journal_id = journal_id_carrying_key(
-            source, pending.issue, pending.idempotency_key
-        )
-        if not journal_id:
+        verified = readback(pending.issue, pending.idempotency_key)
+        if not verified.found:
             # Posted but unverifiable. NOT recorded — so the wake does not fire and the next
             # pass's readback binds it without a second write — but UNCERTAIN rather than
             # refused, because the POST returned and a journal may well exist. Reporting it
             # as a plain refusal (the pre-j#110132 behaviour) left a possibly-landed
             # external mutation unaccounted for in the shared pass budget.
+            #
+            # A cap reached HERE is the same situation, not a deferral: the POST already
+            # happened, so "we never looked" and "we looked and saw nothing" have identical
+            # consequences for this pass — an external effect that cannot be accounted for
+            # (review j#110281 finding_readcap).
             return JournalWriteResult(
                 outcome=WRITE_UNCERTAIN, reason="readback_unverified"
             )
         return JournalWriteResult(
-            outcome=WRITE_RECORDED, journal_id=journal_id, reason="recorded"
+            outcome=WRITE_RECORDED, journal_id=verified.journal_id, reason="recorded"
         )
 
     return _write
@@ -564,6 +677,13 @@ __all__ = (
     "LEG_NO_READER",
     "LEG_RAN",
     "StallWatchLegOutcome",
+    "READBACK_ABSENT",
+    "READBACK_CAPPED",
+    "READBACK_FOUND",
+    "READBACK_OUTCOMES",
+    "READBACK_UNREADABLE",
+    "ReadbackResult",
+    "build_journal_readback",
     "build_journal_verifier",
     "build_journal_writer",
     "journal_id_carrying_key",

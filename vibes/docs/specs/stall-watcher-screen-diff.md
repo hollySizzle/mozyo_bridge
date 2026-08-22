@@ -2,7 +2,7 @@
 
 ## Status
 
-- version: `v0.9` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 / j#110192 / j#110218 / j#110254 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
+- version: `v0.10` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 / j#110192 / j#110218 / j#110254 / j#110281 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
 - scope: watcher 層 (background / operator) が、pane の**描画画面が進んでいるか**だけを一次
   センサーとして停滞候補を拾い、種別を分類し、種別ごとの処方を**提示**するまで。
 - non-goal: 処方の自動適用、配送 rail の retry policy、completion 判定、receiver-state
@@ -707,6 +707,77 @@ mismatch)、(d) 全 `external_record_reference` が照会点を宣言し、そ�
 `.strip()` (`" 110264"` を黙って直して保存する repairing face) と、`plan_recorded` が空
 `journal_id` を受理する経路である。**「A を直せ」に対して A だけ直す**のではなく、A の
 規則を 1 箇所にして全面を測ると、指摘されていない同型が測定で出てくる。
+
+### 権威は「照会したこと」ではなく「正確に照会したこと」で成立する (j#110281 finding_exactmatch / finding_readcap)
+
+v0.9 は「存在は外部システムだけが答えられるので wake admission で照会する」と書いた。
+**照会を足したことは正しかったが、照会の仕方を検査していなかった。**
+
+#### 誤りの形は 4 round とも同じで、1 段ずつ外側にずれていた
+
+| round | 閉じたと宣言したもの | 実際に空いていた 1 段外側 |
+| --- | --- | --- |
+| R6 (j#110218) | row 全体の契約 | persistence state 列が素通し |
+| R7 (j#110254 前) | 全列の文法表 | 各面が表を**使っている**保証がない |
+| R8 (j#110254) | 存在照会の admission | **照会そのものが部分文字列一致** |
+| R8 (同) | read を budget に載せた | **writer 側 readback が cap を迂回** |
+
+#### finding_exactmatch: 唯一の権威が部分文字列一致だった
+
+`journal_id_carrying_key` は docstring で `exact` を謳いながら `if needle in notes` だった。
+実測で**次の 7 形すべてが受理された** — key + `-suffix`、key + 追加数字、散文中の言及、
+引用中の言及、行途中の出現、同一 note 内の複数宣言、そして正規の field。つまり
+**「この firing を記録した journal である」という証明が、key に言及しただけの journal で成立していた**。
+この関数は writer の binding と wake admission の**唯一の外部権威**なので、ここが緩ければ
+R8 で足した admission 層は丸ごと無効である。
+
+さらに悪いことに、この欠陥は **`test_journal_id_carrying_key_matches_only_the_exact_key`
+という名前の test の後ろにあった**。その test は `stallesc1_aaa` と `stallesc1_bbb` という
+互いに prefix でない 2 値を使っており、**部分文字列実装でも通る**。名前が主張する性質を
+測っていない test は、その性質を守っていないどころか、**守られていると誤認させる**。
+
+是正: parser を **renderer と同じ module** (`stall_escalation_note.py`) に置き、
+`note_declares_key()` が「行頭が canonical field prefix」「値が field の全体」「同一 note 内で
+宣言が 1 つだけ」を満たす行だけを返す。同一 note が異なる key を 2 つ宣言していたら
+**解決せず拒否**する (どちらかを選べば、持っていない firing の証明に使われる)。要求側の key も
+canonical でなければ**比較せず拒否**する (prefix で釣らせない)。
+正本 test は **round trip** である — 「renderer が出す note を parser が必ず見つけ、それ以外は
+受理しない」。手書きの lookalike に対する test は production の note について何も証明しない。
+
+#### finding_readcap: cap を守る caller と迂回する caller がいた
+
+verifier は `budget["reads"]` / `MAX_PROVIDER_READS_PER_PASS` を見るが、writer は
+`journal_id_carrying_key` を POST 前後で**直接**呼んでいた。cap 到達状態で実測すると
+verifier は 0 read、writer は **2 read**、共有 counter は**動かない**。
+**一方が守り他方が素通りする cap は cap ではなく、それを報告する telemetry は虚偽である。**
+
+是正: `build_journal_readback()` を**唯一の照会 seam**とし、writer の 2 回と wake admission の
+1 回をすべてそこへ通す。seam は writer / verifier に**必須引数**として渡す (自前で作れる余地を
+残せば「1 pass に 2 seam」が再発する)。cap 到達時の扱いは**位置で 2 分する**:
+
+- **POST 前** = 冪等性検査ができない → **書かない** (`read_cap_reached`、deterministic zero-send。
+  external-mutation budget は不使用)。cap は**先送り**であり、次 pass が数分後に来て firing は
+  pending に残るので失われない。
+- **POST 後** = 照合できない → **uncertain** (POST は起きたので、外部効果を予算計上する)。
+
+なお **read 不能 (source 断)** は cap と対称に扱わない。cap は先送りだが outage は先送りにならず、
+そこで拒否すれば**停滞報告が永久に出ない** — 本 issue が終わらせようとしている失敗そのものである。
+`ReadbackResult` は `found` / `absent` / `read_cap_reached` / `unreadable` を**型で区別**し、
+「見て無かった」と「見ていない」を混同できないようにする (id を持てるのは `found` だけで、
+これは型の `__post_init__` が強制する)。
+
+#### root closure: 「第 2 の実装が存在しない」を機械で主張する
+
+点の修正では 4 round 同じ形を繰り返す。今回は**代替経路の不在**を test で固定した:
+
+1. subsystem 内で `read_entries` を呼ぶ関数は `journal_id_carrying_key` **ただ 1 つ**。
+2. その関数を呼ぶのは counted seam の内部関数 **ただ 1 つ**。
+3. `idempotency_key:` という literal を持つ module は `stall_escalation_note.py` **のみ**
+   (docstring は除外 — 書式を説明する散文は第 2 の実装ではない)。
+4. production wiring は seam を **1 回だけ**構築し、writer と verifier に**同じ名前**を渡す。
+
+いずれも「第 2 の matcher / 第 2 の read 経路 / 第 2 の seam を足すと落ちる」形で、
+実際に注入して赤になることを確認している。
 
 ## Cross-References
 

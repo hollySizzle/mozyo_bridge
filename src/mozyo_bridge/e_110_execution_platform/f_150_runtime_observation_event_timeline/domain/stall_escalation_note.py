@@ -127,9 +127,55 @@ def render_escalation_body(
     return "\n".join(lines)
 
 
+#: The field name the note carries so one firing can be found again, and the EXACT line
+#: shape :func:`render_escalation_body` writes it in.
+#:
+#: Parser and renderer live in the same module deliberately. The readback is the rail's only
+#: external authority — the one thing that can say a journal really exists — and it was a
+#: substring search while its docstring claimed an exact line match (review j#110281
+#: finding_exactmatch). A parser kept next to the renderer can be held to the property that
+#: actually matters and is asserted by test: **whatever the renderer emits, the parser finds;
+#: nothing else is accepted.**
+IDEMPOTENCY_FIELD = "idempotency_key"
+_KEY_LINE_PREFIX = f"- {IDEMPOTENCY_FIELD}: "
+
+
+def note_declares_key(notes: object) -> str:
+    """The ONE idempotency key a note declares as a canonical field, or ``""``.
+
+    ``""`` for a note that declares none — and equally for one that declares SEVERAL
+    different keys. A note claiming two firings is malformed, and picking either one would
+    let a crafted journal be accepted as proof for a firing it does not carry. Ambiguity is
+    refused rather than resolved.
+
+    Only the renderer's own line shape counts. Everything the substring search used to
+    accept is refused here, and each of these was reproduced as accepted before the fix:
+
+    - ``- idempotency_key: <key>-suffix`` — a longer key that merely starts with this one;
+    - ``the string idempotency_key: <key> appears here`` — a prose mention;
+    - ``> "idempotency_key: <key>"`` — a quotation of another journal.
+
+    The value is returned verbatim rather than validated here. The caller compares it with
+    the firing's own key, which is canonical by construction, so a malformed declaration can
+    never match one — and the key's grammar stays in the single place that owns it instead
+    of acquiring a second implementation in this module.
+    """
+    declared = set()
+    for raw in str(notes or "").splitlines():
+        line = raw.strip()
+        if not line.startswith(_KEY_LINE_PREFIX):
+            continue
+        declared.add(line[len(_KEY_LINE_PREFIX):].strip())
+    if len(declared) != 1:
+        return ""
+    return declared.pop()
+
+
 __all__ = (
+    "IDEMPOTENCY_FIELD",
     "STALL_ESCALATION_GATE",
     "STALL_ESCALATION_REASON",
+    "note_declares_key",
     "render_escalation_body",
     "render_policy_id",
 )

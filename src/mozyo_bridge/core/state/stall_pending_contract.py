@@ -79,6 +79,14 @@ PENDING_REASONS: frozenset[str] = frozenset(
         "readback_unverified", "already_recorded", "recorded",
         "write_refused", "write_uncertain", "issue_anchor_unresolved",
         "external_mutation_budget_spent", "nothing_pending",
+        # The writer's own deterministic refusal when the pass has spent its provider-read
+        # budget and the idempotency check therefore could not run (review j#110281
+        # finding_readcap). Spelled here rather than imported, for the same reason the stall
+        # classes are: a state store that can reach the application layer invites a rule to
+        # be written in it. `READBACK_CAPPED` must equal this literal, and a test asserts it
+        # — a reason that drifts silently becomes `unclassified_reason`, which is exactly
+        # the field an operator reads to learn WHY nothing is being written.
+        "read_cap_reached",
         # The sentinel the store substitutes for a reason it does not recognise. It is a
         # member of this set because a value the store WRITES must be a value the store can
         # read back -- otherwise the substitution quarantines the very row it was protecting.
@@ -584,6 +592,21 @@ def canonical_journal_id(value: object) -> bool:
     return bool(str(value or ""))
 
 
+def canonical_idempotency_key(value: object) -> bool:
+    """Whether a value has the shape :func:`escalation_idempotency_key` produces.
+
+    DERIVED from :data:`PENDING_FIELD_CHECKERS`, for the same reason
+    :func:`canonical_journal_id` is. The external-authority readback uses it to refuse a
+    request outright rather than compare it: a caller must not be able to go fishing with a
+    prefix, and "is this even a key" is not a question that deserves a second implementation.
+    """
+    try:
+        PENDING_FIELD_CHECKERS["idempotency_key"](value)
+    except StallPendingContractError:
+        return False
+    return True
+
+
 #: The one place the digit alphabet is written for the SQL side.
 _SQL_DIGIT_CLASS = "[0-9]"
 
@@ -741,6 +764,7 @@ __all__ = (
     "WAKE_REFUSALS",
     "WAKE_ROW_QUARANTINED",
     "admit_wake",
+    "canonical_idempotency_key",
     "canonical_numeric_id_sql",
     "checked_row_seal",
     "pending_row_seal",
