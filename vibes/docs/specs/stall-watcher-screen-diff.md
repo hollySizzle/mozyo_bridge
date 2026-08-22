@@ -2,7 +2,7 @@
 
 ## Status
 
-- version: `v0.7` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 / j#110192 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
+- version: `v0.8` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 / j#110192 / j#110218 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
 - scope: watcher 層 (background / operator) が、pane の**描画画面が進んでいるか**だけを一次
   センサーとして停滞候補を拾い、種別を分類し、種別ごとの処方を**提示**するまで。
 - non-goal: 処方の自動適用、配送 rail の retry policy、completion 判定、receiver-state
@@ -521,6 +521,11 @@ silent にはならない。age を上限で縛るために delivery-first を�
 ここまでの 4 round は、指摘された **field を 1 つずつ**閉じてきた。その都度、次の field が開いた
 ままだった。pending row については個別対応をやめ、**row 全体に 1 つの契約**を置く。
 
+> **v0.7 の誤りの訂正**: v0.7 のこの節は「row 全体」と書いたが、実際に閉じたのは
+> identity / routing / stall の列だけで、persistence state の 5 列は素通しだった。
+> 適用範囲を機械照合する形への是正は下記「契約の適用範囲は『列』ではなく『全列』で定義する」
+> を読む (j#110218)。
+
 理由は「網羅的にやる方が綺麗だから」ではない。**field ごとに危険の種類が違う**からである。
 
 - `stall_class` / `prescription` / `last_reason` は**描画される token** である。閉じた語彙で足りる。
@@ -554,6 +559,48 @@ operator は「**どの field が**壊れているか」を知る必要があり
 
 store が代替値を書く場合 (未知の refusal reason → `unclassified_reason`)、**その代替値自身が語彙の
 member でなければならない**。さもなくば、守ろうとした当の row を自分で quarantine する。
+
+### 契約の適用範囲は「列」ではなく「全列」で定義する (j#110218 finding_pendingcontract)
+
+v0.7 は「pending row 全体に 1 つの契約を置いた」と書いた。**実際には置けていなかった。**
+identity / routing / stall の列は閉じたが、persistence state の 5 列 (`journal_id` /
+`written_at` / `woke_at` / `attempts` / `last_attempt_at`) は素通しだった。
+
+**なぜ漏れたか**が、この節で残す価値のある唯一の内容である。実装者 (私) は
+`idempotency_key` に**含まれる**列を契約の対象と考え、state 列を「自分が書く列だから」と
+無意識に対象外にした。これは本 doc が v0.6 で自分で書いた **「store は信頼境界ではない」**
+の直接の否定である。原則を書いたことと、その原則を自分の設計の適用範囲に適用することは別の
+作業だった。
+
+漏れた結果は 3 つで、深刻さの順は直感と逆だった。
+
+1. **偽の settle** — `recorded` が `bool(journal_id)` だったので、`journal_id='not-a-journal'`
+   が「書かれた」と読まれ、wake が escalation を settled にした。**存在しない journal を根拠に
+   停滞報告が閉じられる**。
+2. **可視化面が最初に落ちる** — 非数値の count が `int()` で `ValueError` を上げ、
+   `open_pending` / `unrecorded_pending` / **`quarantined_pending`** の全読取面から漏れた。
+   `--status` は「status surface must not raise」で例外を握り潰すので、**壊れた row があるほど
+   画面が静かになる**。fail-closed を主張した実装が fail-silent だった。**改竄の可視化面は、
+   改竄に対して最も頑健でなければならない。最初に落ちる可視化面は、可視化面ではない。**
+3. **捏造された既成事実** — `attempts=-5` は「壊れた値」ではなく「試行より少ない試行回数」で
+   あり、refusal の履歴を消す方向に働く。
+
+#### 是正の形
+
+「指摘された 5 列を足す」ではない。それは 6 round 続けた対応の 7 度目になる。
+
+- **`PENDING_FIELD_CHECKERS`**: 全永続列 → 文法の表を 1 つ置き、**write / read / projection の
+  3 面すべてが同じ表を使う**。1 つの表・両方向。field が入口だけ文法を得て出口は生のまま、
+  という分裂が構造的に起きない。
+- **表の完全性を test で機械照合する**。`PendingEscalation` の field 集合との**完全一致**。
+  文法を持たない列を足すとそこで落ちる。次の漏れを見つけるのは reviewer ではなく test である。
+- **型変換を quarantine 判定の内側へ置く**。read boundary は生値を運び、contract が typed
+  verdict に倒す。**どの読取面も例外を出さない。**
+- **fence は述語のある場所に置く**。`mark_woken` は key だけで到達できるので、
+  canonical `journal_id` の条件は Python 側だけでなく **UPDATE の WHERE 句**にも要る。
+- **quarantine の走査を lifecycle で絞らない**。`journal_id` と `woke_at` を両方書き換えた row は
+  lifecycle 述語から見ると settled であり、open 行だけ走査すると**最も完全な偽造が誰にも
+  見えなくなる**。
 
 ## Cross-References
 

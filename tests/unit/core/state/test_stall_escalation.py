@@ -24,17 +24,20 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.stall_pending_contract import (
-    CONSECUTIVE_MAX,
+    COUNT_MAX,
     IDENTITY_MAX_LENGTH,
     PENDING_EVIDENCE_TIERS,
     PENDING_FIELD_INVALID,
     PENDING_OK,
     PENDING_PRESCRIPTIONS,
     PENDING_REASONS,
+    PENDING_FIELD_CHECKERS,
     PENDING_ROUTING_MISMATCH,
     PENDING_STALL_CLASSES,
+    PENDING_UNRENDERABLE,
     UNCLASSIFIED_REASON,
     StallPendingContractError,
+    checked_count,
 )
 from mozyo_bridge.core.state.stall_escalation import (
     DISCOVERY_BAD_COUNT,
@@ -613,7 +616,10 @@ class TimestampContractTest(DiscoveryContractBase):
             with self.subTest(field=field):
                 kwargs = {"first_observed_at": self.GOOD, "escalated_at": self.GOOD}
                 kwargs[field] = "/home/alice/private/secret"
-                with self.assertRaises(StallDiscoveryContractError):
+                # One error type for one class of problem: both pending timestamps are
+                # refused by the pending-row table, not one by it and one by a separate
+                # pre-normalization step (review j#110218).
+                with self.assertRaises(StallPendingContractError):
                     self.store.enqueue_pending(_pending(**kwargs))
 
     def test_a_corrupted_pending_timestamp_is_replaced_not_dropped(self) -> None:
@@ -871,7 +877,7 @@ class PendingRowContractTest(StoreBase):
             ("issue", "15855a"),
             ("consecutive", -3),
             ("consecutive", 0),
-            ("consecutive", CONSECUTIVE_MAX + 1),
+            ("consecutive", COUNT_MAX + 1),
         ):
             with self.subTest(field=field, value=value):
                 with self.assertRaises(StallPendingContractError):
@@ -987,6 +993,182 @@ class PendingRowContractTest(StoreBase):
         self.assertEqual(
             self.store.unrecorded_pending(WS)[0].last_reason, "writer_raised_TimeoutError"
         )
+
+
+class PendingStateColumnContractTest(StoreBase):
+    """The persistence-state columns are held to the contract too (review j#110218).
+
+    Round five closed the identity / routing / stall columns and declared the row closed.
+    It was not: ``journal_id`` / ``written_at`` / ``woke_at`` / ``attempts`` /
+    ``last_attempt_at`` were still unvalidated, because they are the columns this store
+    writes itself — which forgets that a store is not a trust boundary.
+    """
+
+    def _corrupt(self, sql, *args):
+        conn = sqlite3.connect(self.store.path)
+        try:
+            conn.execute(sql, args)
+            conn.commit()
+        finally:
+            conn.close()
+
+    def test_the_checker_table_covers_every_persisted_column(self) -> None:
+        """The guard against a seventh round of the same mistake.
+
+        A new column added without a grammar fails HERE, rather than being found by the
+        next reviewer. Both directions: an unchecked column and a checker for a column that
+        no longer exists are equally wrong.
+        """
+        declared = set(PENDING_FIELD_CHECKERS)
+        stored = set(PendingEscalation.__dataclass_fields__) - {"integrity"}
+        self.assertEqual(declared, stored)
+
+    def test_a_non_canonical_journal_id_is_refused_on_write(self) -> None:
+        for value in ("not-a-journal", "11 0200", "-110200", "110200x"):
+            with self.subTest(value=value):
+                with self.assertRaises(StallPendingContractError):
+                    self.store.enqueue_pending(_pending(journal_id=value))
+
+    def test_a_direct_db_journal_id_cannot_settle_the_firing(self) -> None:
+        # THE finding. `bool(journal_id)` treated any non-empty string as "written", so a
+        # rewritten value settled an escalation against a journal nobody read back.
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self._corrupt(
+            "UPDATE stall_escalation_pending SET journal_id='not-a-journal', "
+            "written_at='whenever'"
+        )
+        self.assertEqual(self.store.unwoken_pending(WS), ())
+        self.assertFalse(self.store.mark_woken(_key(issue="15855"), now="2026-08-22T09:09:00+00:00"))
+        # Preserved, not deleted, and counted.
+        (row,) = self.store.open_pending(WS)
+        self.assertFalse(row.recorded)
+        self.assertFalse(row.settled)
+        self.assertEqual(len(self.store.quarantined_pending(WS)), 1)
+
+    def test_the_wake_fence_holds_in_sql_not_only_in_python(self) -> None:
+        # `mark_woken` is reachable by key alone, so the predicate must live in the UPDATE.
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self._corrupt("UPDATE stall_escalation_pending SET journal_id='not-a-journal'")
+        self.assertFalse(self.store.mark_woken(_key(issue="15855"), now="2026-08-22T09:09:00+00:00"))
+        conn = sqlite3.connect(self.store.path)
+        try:
+            (woke,) = conn.execute(
+                "SELECT woke_at FROM stall_escalation_pending"
+            ).fetchone()
+        finally:
+            conn.close()
+        self.assertEqual(woke, "")
+
+    def test_a_canonical_journal_id_still_settles_normally(self) -> None:
+        # The control: a fence that refuses everything would pass the tests above.
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self.assertTrue(
+            self.store.mark_recorded(_key(issue="15855"), "110200", now="2026-08-22T09:03:00+00:00")
+        )
+        self.assertEqual(len(self.store.unwoken_pending(WS)), 1)
+        self.assertTrue(self.store.mark_woken(_key(issue="15855"), now="2026-08-22T09:09:00+00:00"))
+        self.assertEqual(self.store.open_pending(WS), ())
+
+    def test_a_non_numeric_count_never_raises_out_of_a_read_surface(self) -> None:
+        """The worst shape in the finding: the visibility surface crashed first.
+
+        `quarantined_pending` exists to make tampered rows visible. When a non-numeric count
+        raised out of it, `--status` (which swallows exceptions so a status surface cannot
+        crash) went QUIET — so the more corrupted the store, the less the operator saw.
+        """
+        for column in ("consecutive", "attempts"):
+            with self.subTest(column=column):
+                store = StallEscalationStore(path=self.dir / f"count-{column}.sqlite")
+                store.enqueue_pending(_pending())
+                conn = sqlite3.connect(store.path)
+                try:
+                    conn.execute(
+                        f"UPDATE stall_escalation_pending SET {column}='not-an-int'"  # noqa: S608
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                self.assertEqual(store.unrecorded_pending(WS), ())
+                self.assertEqual(len(store.open_pending(WS)), 1)
+                self.assertEqual(len(store.quarantined_pending(WS)), 1)
+                self.assertEqual(
+                    store.open_pending(WS)[0].integrity, PENDING_FIELD_INVALID
+                )
+
+    def test_a_negative_count_is_a_violation_not_a_smaller_number(self) -> None:
+        # `attempts=-5` reads as "tried less than never": it erases a refusal history
+        # rather than reporting one.
+        with self.assertRaises(StallPendingContractError):
+            self.store.enqueue_pending(_pending(attempts=-5))
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self._corrupt("UPDATE stall_escalation_pending SET attempts=-5")
+        (row,) = self.store.open_pending(WS)
+        self.assertEqual(row.integrity, PENDING_FIELD_INVALID)
+        self.assertEqual(row.telemetry()["attempts"], PENDING_UNRENDERABLE)
+
+    def test_a_bool_is_not_a_count(self) -> None:
+        # `int(True) == 1` would let a boolean masquerade as a one-pass streak.
+        with self.assertRaises(StallPendingContractError):
+            checked_count(True, name="consecutive", minimum=1)
+
+    def test_a_junk_journal_id_is_not_settled_even_once_woken(self) -> None:
+        """`settled` must ask whether the journal is REAL, not whether both columns are set.
+
+        The mutation sweep found this: every earlier test left `woke_at` empty, so
+        `bool(journal_id) and bool(woke_at)` gave the same answer as the correct check and
+        the `recorded` half was never actually exercised.
+        """
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self._corrupt(
+            "UPDATE stall_escalation_pending SET journal_id='not-a-journal', "
+            "woke_at='2026-08-22T09:09:00+00:00'"
+        )
+        # Read through the quarantine surface: to the lifecycle predicate this row now
+        # looks settled, which is exactly why that surface must not be scoped to open rows.
+        (row,) = self.store.quarantined_pending(WS)
+        self.assertFalse(row.recorded)
+        self.assertFalse(row.settled)
+        self.assertEqual(self.store.open_pending(WS), ())
+
+    def test_the_wake_fence_rejects_a_numeric_prefix(self) -> None:
+        # `GLOB '[0-9]*'` alone matches '110200x'. "Starts with digits" is not "is an id",
+        # and every earlier case used a value that failed both checks at once.
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self._corrupt("UPDATE stall_escalation_pending SET journal_id='110200x'")
+        self.assertFalse(
+            self.store.mark_woken(_key(issue="15855"), now="2026-08-22T09:09:00+00:00")
+        )
+        self.assertEqual(self.store.unwoken_pending(WS), ())
+        self.assertEqual(len(self.store.quarantined_pending(WS)), 1)
+
+    def test_a_corrupted_consecutive_is_not_rendered_either(self) -> None:
+        # `attempts` was covered and `consecutive` was not, which left the projection's
+        # count checker half-tested.
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self._corrupt("UPDATE stall_escalation_pending SET consecutive='not-an-int'")
+        (row,) = self.store.open_pending(WS)
+        self.assertEqual(row.integrity, PENDING_FIELD_INVALID)
+        self.assertEqual(row.telemetry()["consecutive"], PENDING_UNRENDERABLE)
+        self.assertNotIn("not-an-int", json.dumps(row.telemetry()))
+
+
+    def test_state_timestamps_are_held_to_the_instant_grammar(self) -> None:
+        for column in ("written_at", "woke_at", "last_attempt_at"):
+            with self.subTest(column=column):
+                with self.assertRaises(StallPendingContractError):
+                    self.store.enqueue_pending(
+                        _pending(**{column: "/private/example/unsafe"})
+                    )
+
+    def test_a_corrupted_state_timestamp_is_quarantined_and_not_echoed(self) -> None:
+        self.assertTrue(self.store.enqueue_pending(_pending()))
+        self._corrupt(
+            "UPDATE stall_escalation_pending SET last_attempt_at='/private/example/unsafe'"
+        )
+        (row,) = self.store.open_pending(WS)
+        self.assertEqual(row.integrity, PENDING_FIELD_INVALID)
+        self.assertNotIn("private", json.dumps(row.telemetry()))
+        self.assertEqual(self.store.unrecorded_pending(WS), ())
 
 
 class PendingVocabularyDriftTest(unittest.TestCase):

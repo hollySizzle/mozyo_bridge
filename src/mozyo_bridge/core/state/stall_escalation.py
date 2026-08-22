@@ -40,9 +40,7 @@ Store discipline mirrors the sibling home-scoped stores (``supervisor_wake`` /
 
 from __future__ import annotations
 
-import hashlib
 import json
-import re
 import sqlite3
 from dataclasses import dataclass, replace
 from datetime import datetime, timezone
@@ -69,24 +67,14 @@ from mozyo_bridge.core.state.stall_discovery_contract import (
     validate_discovery,
 )
 from mozyo_bridge.core.state.stall_pending_contract import (
-    CONSECUTIVE_MAX,
-    IDEMPOTENCY_KEY_PATTERN,
-    PENDING_EVIDENCE_TIERS,
-    PENDING_PRESCRIPTIONS,
-    PENDING_STALL_CLASSES,
-    PENDING_UNRENDERABLE,
-    PENDING_FIELD_INVALID,
     PENDING_OK,
-    PENDING_ROUTING_MISMATCH,
-    UNCLASSIFIED_REASON,
     StallPendingContractError,
-    checked_identity,
-    checked_member,
-    checked_numeric_id,
+    UNCLASSIFIED_REASON,
+    canonical_journal_id,
     checked_reason,
-    rendered_field,
     escalation_idempotency_key,
     pending_row_integrity,
+    pending_telemetry,
     validate_pending_fields,
 )
 from mozyo_bridge.shared.paths import mozyo_bridge_home
@@ -183,21 +171,6 @@ def stall_escalation_path(home: Optional[Path] = None) -> Path:
 
 
 
-def _identity(value: object) -> str:
-    """Render an identity token, whichever field it came from."""
-    return checked_identity(value, name="identity")
-
-
-def _numeric(value: object) -> str:
-    return checked_numeric_id(value, name="numeric_id")
-
-
-def _checked_key(value: object) -> str:
-    if re.fullmatch(IDEMPOTENCY_KEY_PATTERN, str(value or "")) is None:
-        raise StallPendingContractError("idempotency_key is not canonical")
-    return str(value)
-
-
 def _writable_only(rows) -> tuple:
     """Keep only rows that may drive an external effect."""
     return tuple(row for row in rows if row.externally_writable)
@@ -290,77 +263,26 @@ class PendingEscalation:
 
     @property
     def recorded(self) -> bool:
-        """Whether the durable record (the Redmine journal) exists for this firing."""
-        return bool(self.journal_id)
+        """Whether the durable record (the Redmine journal) exists for this firing.
+
+        A journal id that is not a canonical id is not a journal. ``bool(...)`` alone made
+        ``journal_id='not-a-journal'`` read as recorded, which let a wake settle a firing
+        against a journal nobody read back (review j#110218).
+        """
+        return canonical_journal_id(self.journal_id)
 
     @property
     def settled(self) -> bool:
-        return bool(self.journal_id) and bool(self.woke_at)
+        return self.recorded and bool(self.woke_at)
 
     def telemetry(self) -> dict[str, object]:
         """Classification-token-only projection, safe to paste into a durable record.
 
-        Every field passes through its own grammar on the way out, not just on the way in.
-        The store is not a trust boundary: a row can be altered after it was written, and a
-        projection that trusts what it read is how ``rm -rf /`` and an absolute private path
-        reached the status JSON in the review j#110192 finding_1 reproduction.
-
-        Nothing is dropped for being invalid — an invalid field renders as
-        :data:`PENDING_UNRENDERABLE`, so "this row has a bad prescription" stays legible
-        while the bad prescription itself does not.
+        Delegated to the contract module: "how a row renders" is the same concern as "what
+        a valid row is", and keeping the two together is what stops a field from acquiring
+        a checker on the way IN without acquiring one on the way OUT.
         """
-        payload: dict[str, object] = {
-            "idempotency_key": rendered_field(
-                self.idempotency_key,
-                lambda v: _checked_key(v),
-            ),
-            "slot": "/".join(
-                (
-                    rendered_field(self.workspace_id, _identity),
-                    rendered_field(self.lane_id, _identity),
-                    rendered_field(self.role, _identity),
-                )
-            ),
-            "stall_class": rendered_field(
-                self.stall_class,
-                lambda v: checked_member(
-                    v, name="stall_class", vocabulary=PENDING_STALL_CLASSES
-                ),
-            ),
-            "prescription": rendered_field(
-                self.prescription,
-                lambda v: checked_member(
-                    v, name="prescription", vocabulary=PENDING_PRESCRIPTIONS
-                ),
-            ),
-            "consecutive": self.consecutive,
-            "first_observed_at": self.first_observed_at,
-            "escalated_at": self.escalated_at,
-            "recorded": self.recorded,
-            "settled": self.settled,
-            "attempts": self.attempts,
-            # Always present, including on a healthy row: an operator reading a status
-            # payload should not have to know that a MISSING key would have meant trouble.
-            "integrity": self.integrity,
-        }
-        for key, value, checker in (
-            ("generation", self.generation, _identity),
-            ("target", self.target, _identity),
-            ("issue", self.issue, _numeric),
-            ("matched_id", self.matched_id, _identity),
-            (
-                "evidence_tier",
-                self.evidence_tier,
-                lambda v: checked_member(
-                    v, name="evidence_tier", vocabulary=PENDING_EVIDENCE_TIERS
-                ),
-            ),
-            ("journal_id", self.journal_id, _numeric),
-            ("last_reason", self.last_reason, checked_reason),
-        ):
-            if value:
-                payload[key] = rendered_field(value, checker)
-        return payload
+        return pending_telemetry(self)
 
 
 _STREAK_COLUMNS = (
@@ -589,14 +511,13 @@ class StallEscalationStore:
         """
         if not pending.idempotency_key or not pending.workspace_id:
             return False
-        # The WHOLE row is held to the contract, not the two timestamps that happened to be
-        # named by an earlier review. `issue` is the strongest case: it is not rendered, it
-        # is the target of an external write (review j#110192 finding_1).
-        first_observed_at = checked_timestamp(
-            pending.first_observed_at, field="observed_at.first"
-        )
-        escalated_at = checked_timestamp(pending.escalated_at, field="observed_at.escalated")
-        fields = validate_pending_fields(pending, first_observed_at=first_observed_at)
+        # EVERY persisted column, including the persistence-state ones this store writes
+        # itself. Round six found those five unvalidated immediately after round five
+        # declared the row closed: they were skipped because they are "ours", which forgets
+        # that a store is not a trust boundary (review j#110218).
+        fields = validate_pending_fields(pending)
+        first_observed_at = fields["first_observed_at"]
+        escalated_at = fields["escalated_at"]
 
         def _work(conn):
             cursor = conn.execute(
@@ -659,13 +580,19 @@ class StallEscalationStore:
         return self._read_pending("journal_id='' OR woke_at=''", workspace_id)
 
     def quarantined_pending(self, workspace_id: str = "") -> tuple[PendingEscalation, ...]:
-        """Open firings held back from actuation because they failed the row contract.
+        """Every stored firing that failed the row contract, at any lifecycle stage.
 
         Non-empty here means a stored escalation was altered after it was written, which is
         an operator-visible condition in its own right — not a reason to go quiet.
+
+        Deliberately NOT built on :meth:`open_pending`. A row whose ``journal_id`` and
+        ``woke_at`` were both rewritten looks *settled* to the lifecycle predicate, so
+        scoping the scan to open rows would let the most complete forgery be the one nobody
+        can see (review j#110218).
         """
         return tuple(
-            row for row in self.open_pending(workspace_id) if not row.externally_writable
+            row for row in self._read_pending("1=1", workspace_id)
+            if not row.externally_writable
         )
 
     def _read_pending(self, predicate: str, workspace_id: str) -> tuple[PendingEscalation, ...]:
@@ -718,7 +645,12 @@ class StallEscalationStore:
             prescription=str(r[8]),
             matched_id=str(r[9] or ""),
             evidence_tier=str(r[10] or ""),
-            consecutive=int(r[11]),
+            # NOT `int(...)`. Coercing here made a non-numeric stored value raise a
+            # ValueError out of every read surface -- including `quarantined_pending`,
+            # whose entire job is to make corrupted rows visible (review j#110218). The
+            # raw value is carried and the contract turns it into a typed verdict, so the
+            # annotation is what a VALID row holds, not a promise about a tampered one.
+            consecutive=r[11],
             # A row that predates this build (or was hand-edited) can still hold junk here.
             # The row is KEPT -- it is a real escalation and dropping it would lose the
             # stall report -- but nothing arbitrary is rendered from it.
@@ -727,7 +659,7 @@ class StallEscalationStore:
             journal_id=str(r[14] or ""),
             written_at=str(r[15] or ""),
             woke_at=str(r[16] or ""),
-            attempts=int(r[17]),
+            attempts=r[17],
             last_attempt_at=str(r[18] or ""),
             last_reason=str(r[19] or ""),
         )
@@ -802,8 +734,12 @@ class StallEscalationStore:
 
         def _work(conn):
             cursor = conn.execute(
+                # `<>''` was not enough: any non-empty string passed, so a rewritten
+                # `journal_id` settled the firing. The predicate now demands a canonical
+                # id -- digits, and nothing but digits (review j#110218).
                 "UPDATE stall_escalation_pending SET woke_at=? "
-                "WHERE idempotency_key=? AND journal_id<>'' AND woke_at=''",
+                "WHERE idempotency_key=? AND woke_at='' "
+                "AND journal_id GLOB '[0-9]*' AND NOT journal_id GLOB '*[^0-9]*'",
                 (
                     checked_timestamp(
                         _utc_now_iso() if now is None else now, field="observed_at.woke"

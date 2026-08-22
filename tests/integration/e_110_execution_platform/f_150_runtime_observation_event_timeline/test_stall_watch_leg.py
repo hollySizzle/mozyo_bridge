@@ -1108,6 +1108,69 @@ class OperatorStatusSurfaceTest(unittest.TestCase):
         self.assertNotIn("rm -rf", blob)
         self.assertNotIn("99999", blob)
 
+    def test_a_corrupted_count_leaves_status_louder_not_quieter(self) -> None:
+        """The real CLI, on the shape that used to make it go silent (j#110218).
+
+        `_stall_watch_status_*` swallows exceptions so a status command cannot crash. While
+        a non-numeric count raised out of the read surfaces, that swallowing meant a
+        tampered store produced LESS output than a healthy one. The count must survive.
+        """
+        import sqlite3
+
+        from mozyo_bridge.core.state.stall_escalation import (
+            PendingEscalation,
+            StallEscalationStore,
+            escalation_idempotency_key,
+        )
+
+        result = self._register("stall_watch:\n  lanes: [lane_a]\n")
+        workspace_id = result.record.workspace_id
+        store = StallEscalationStore(home=self.home)
+        store.enqueue_pending(
+            PendingEscalation(
+                idempotency_key=escalation_idempotency_key(
+                    workspace_id=workspace_id,
+                    lane_id="lane_a",
+                    role="claude",
+                    generation="",
+                    stall_class="content_refusal",
+                    first_observed_at="2026-08-22T09:00:00+00:00",
+                    issue="15855",
+                ),
+                workspace_id=workspace_id,
+                lane_id="lane_a",
+                role="claude",
+                stall_class="content_refusal",
+                prescription="context_reset_reinjection",
+                consecutive=2,
+                first_observed_at="2026-08-22T09:00:00+00:00",
+                escalated_at="2026-08-22T09:00:00+00:00",
+                issue="15855",
+            )
+        )
+        conn = sqlite3.connect(store.path)
+        try:
+            conn.execute(
+                "UPDATE stall_escalation_pending SET consecutive='not-an-int', "
+                "journal_id='not-a-journal'"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        text = self._status()
+        self.assertIn("quarantined=1", text)
+        self.assertNotIn("not-an-int", text)
+        self.assertNotIn("not-a-journal", text)
+
+        payload = json.loads(self._status(as_json=True))["stall_watch"][0]
+        self.assertEqual(payload["pending"]["quarantined"], 1)
+        self.assertEqual(payload["pending"]["unrecorded"], 0)
+        self.assertEqual(payload["pending"]["recorded_but_unwoken"], 0)
+        blob = json.dumps(payload)
+        self.assertNotIn("not-an-int", blob)
+        self.assertNotIn("not-a-journal", blob)
+
     def test_a_healthy_backlog_does_not_print_the_quarantine_line(self) -> None:
         # The counter-test: a line that is always present is a line nobody reads.
         self._register("stall_watch:\n  lanes: [lane_a]\n")

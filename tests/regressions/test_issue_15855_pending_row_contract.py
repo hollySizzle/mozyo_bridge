@@ -276,5 +276,82 @@ class NoSentinelOnAnySurfaceTest(RegressionBase):
         self.assertIn("## Gate: blocked", body)
 
 
+class PersistenceStateColumnTest(RegressionBase):
+    """The state columns end-to-end (review j#110218 finding_pendingcontract).
+
+    Round five closed identity / routing / stall and called the row closed; the five
+    persistence-state columns were still open. These are the two properties that only hold
+    end-to-end: a fake ``journal_id`` never settles a firing, and no read surface raises.
+    """
+
+    def test_a_fake_journal_id_does_not_settle_the_firing(self) -> None:
+        self.store.enqueue_pending(_pending())
+        self._corrupt(
+            "UPDATE stall_escalation_pending SET journal_id=?, written_at=?",
+            "not-a-journal",
+            "whenever",
+        )
+
+        outcome = self._settle()
+
+        # Not written, not woken, and still open: the escalation is preserved as unfinished
+        # rather than closed out against a journal nobody read back.
+        self.assertEqual(self.wake.calls, [])
+        self.assertEqual(outcome.reason, SETTLE_NOTHING_PENDING)
+        (row,) = self.store.open_pending(WS)
+        self.assertFalse(row.recorded)
+        self.assertFalse(row.settled)
+        self.assertEqual(len(self.store.quarantined_pending(WS)), 1)
+
+    def test_a_real_journal_id_still_settles(self) -> None:
+        # The control. A fence that refuses every wake passes the test above for free.
+        self.store.enqueue_pending(_pending())
+
+        self._settle()
+
+        self.assertEqual(len(self.wake.calls), 1)
+        self.assertEqual(self.store.open_pending(WS), ())
+
+    def test_no_read_surface_raises_on_a_non_numeric_count(self) -> None:
+        """The visibility surface must be the LAST thing to break, not the first.
+
+        `--status` swallows exceptions so a status command cannot crash. When a corrupted
+        count raised out of `quarantined_pending`, that swallowing turned a tampered store
+        into a QUIETER display than a healthy one.
+        """
+        for column in ("consecutive", "attempts"):
+            with self.subTest(column=column):
+                store = StallEscalationStore(path=self.dir / f"cnt-{column}.sqlite")
+                store.enqueue_pending(_pending())
+                conn = sqlite3.connect(store.path)
+                try:
+                    conn.execute(
+                        f"UPDATE stall_escalation_pending SET {column}='not-an-int'"  # noqa: S608
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                for surface in ("open_pending", "unrecorded_pending", "unwoken_pending",
+                                "quarantined_pending"):
+                    with self.subTest(surface=surface):
+                        getattr(store, surface)(WS)  # must not raise
+                self.assertEqual(len(store.quarantined_pending(WS)), 1)
+                self.assertEqual(store.unrecorded_pending(WS), ())
+
+    def test_no_state_column_value_reaches_the_projection(self) -> None:
+        self.store.enqueue_pending(_pending())
+        self._corrupt(
+            "UPDATE stall_escalation_pending SET last_attempt_at=?, woke_at=?, attempts=-5",
+            "/private/example/operator-unsafe-reason",
+            "/etc/shadow",
+        )
+        (row,) = self.store.open_pending(WS)
+        projected = json.dumps(row.telemetry())
+        self.assertNotIn("operator-unsafe", projected)
+        self.assertNotIn("shadow", projected)
+        self.assertIn(PENDING_UNRENDERABLE, projected)
+        self.assertEqual(self.store.unrecorded_pending(WS), ())
+
+
 if __name__ == "__main__":  # pragma: no cover
     unittest.main()
