@@ -41,6 +41,7 @@ Store discipline mirrors the sibling home-scoped stores (``supervisor_wake`` /
 from __future__ import annotations
 
 import hashlib
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -98,6 +99,25 @@ CREATE TABLE IF NOT EXISTS stall_escalation_pending (
 )
 """
 
+
+#: The last discovery pass's COUNTS (never identities). An operator asking "is the watcher
+#: covering my cockpit" must be answerable at any moment, not only just after a sweep — and
+#: `--status` must not answer it by reading panes, which would turn a read-only status
+#: command into a screen reader. So the leg persists its coverage summary and status projects
+#: it with the instant it was taken (review j#110146 finding_1).
+#:
+#: ``dropped`` is a JSON object of fixed reason token -> count. Both halves are closed
+#: vocabulary, so the row stays as safe to render as every other column here.
+_DISCOVERY_TABLE_SQL = """
+CREATE TABLE IF NOT EXISTS stall_watch_discovery (
+    workspace_id TEXT NOT NULL PRIMARY KEY,
+    observed_at  TEXT NOT NULL,
+    candidates   INTEGER NOT NULL DEFAULT 0,
+    watched      INTEGER NOT NULL DEFAULT 0,
+    out_of_reach INTEGER NOT NULL DEFAULT 0,
+    dropped      TEXT NOT NULL DEFAULT '{}'
+)
+"""
 
 _WATERMARK_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS stall_watch_watermark (
@@ -286,6 +306,7 @@ class StallEscalationStore:
             conn.execute(_STREAK_TABLE_SQL)
             conn.execute(_PENDING_TABLE_SQL)
             conn.execute(_WATERMARK_TABLE_SQL)
+            conn.execute(_DISCOVERY_TABLE_SQL)
             conn.execute(f"PRAGMA user_version = {STALL_ESCALATION_SCHEMA_VERSION}")
         elif version not in _RECOGNIZED_SCHEMA_VERSIONS:
             conn.close()
@@ -298,6 +319,7 @@ class StallEscalationStore:
             conn.execute(_STREAK_TABLE_SQL)
             conn.execute(_PENDING_TABLE_SQL)
             conn.execute(_WATERMARK_TABLE_SQL)
+            conn.execute(_DISCOVERY_TABLE_SQL)
         return conn
 
     def _connect_ro(self) -> Optional[sqlite3.Connection]:
@@ -686,6 +708,82 @@ class StallEscalationStore:
                 (ws, stamp),
             ),
         )
+
+
+    # -- discovery coverage --------------------------------------------------------
+
+    def record_discovery(
+        self,
+        workspace_id: str,
+        *,
+        candidates: int,
+        watched: int,
+        out_of_reach: int,
+        dropped: Optional[dict] = None,
+        now: Optional[str] = None,
+    ) -> None:
+        """Persist the last pass's coverage COUNTS for this workspace.
+
+        Counts only — no lane id, no locator, no reason beyond the fixed drop tokens. The
+        row exists so a later ``--status`` can answer "what is this watcher NOT seeing"
+        without re-running discovery, so it must be as safe to render as it is to store.
+        """
+        ws = str(workspace_id or "").strip()
+        if not ws:
+            return
+        payload = json.dumps(
+            {str(k): int(v) for k, v in sorted((dropped or {}).items())},
+            sort_keys=True,
+        )
+        stamp = now or _utc_now_iso()
+        self._mutate(
+            "discovery write",
+            lambda conn: conn.execute(
+                "INSERT INTO stall_watch_discovery (workspace_id, observed_at, candidates, "
+                "watched, out_of_reach, dropped) VALUES (?, ?, ?, ?, ?, ?) "
+                "ON CONFLICT(workspace_id) DO UPDATE SET observed_at=excluded.observed_at, "
+                "candidates=excluded.candidates, watched=excluded.watched, "
+                "out_of_reach=excluded.out_of_reach, dropped=excluded.dropped",
+                (ws, stamp, int(candidates), int(watched), int(out_of_reach), payload),
+            ),
+        )
+
+    def last_discovery(self, workspace_id: str) -> Optional[dict]:
+        """The last recorded coverage summary, or ``None`` when the leg has never run.
+
+        ``None`` is a real answer and must stay distinguishable from "zero units watched":
+        a watcher that has not run yet and a watcher that ran and found nothing are
+        different operator situations.
+        """
+        ws = str(workspace_id or "").strip()
+        if not ws:
+            return None
+        conn = self._connect_ro()
+        if conn is None:
+            return None
+        try:
+            if not self._table_present(conn, "stall_watch_discovery"):
+                return None
+            row = conn.execute(
+                "SELECT observed_at, candidates, watched, out_of_reach, dropped "
+                "FROM stall_watch_discovery WHERE workspace_id=?",
+                (ws,),
+            ).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        try:
+            dropped = json.loads(str(row[4]) or "{}")
+        except ValueError:
+            dropped = {}
+        return {
+            "observed_at": str(row[0]),
+            "candidates": int(row[1]),
+            "watched": int(row[2]),
+            "out_of_reach": int(row[3]),
+            "dropped": dropped if isinstance(dropped, dict) else {},
+        }
 
 
 __all__ = (

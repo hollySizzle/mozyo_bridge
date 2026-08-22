@@ -431,9 +431,11 @@ class GenerationBindingTest(unittest.TestCase):
         self.assertTrue(decision.escalates)
         self.assertEqual(decision.consecutive, 1)
 
-    def test_a_held_pass_does_not_rebind_the_generation(self) -> None:
-        # A held pass proves nothing about which process is behind the slot, so adopting
-        # the newly reported generation would silently re-bind an existing run.
+    def test_a_held_pass_on_a_NEW_generation_discards_the_old_run(self) -> None:
+        # The generation is read from the lane lifecycle store, an AUTHORITY -- not from
+        # the screen. So it is settled before the class's effect is consulted: an
+        # unreadable screen taken just after a relaunch must not preserve the dead
+        # process's run (review j#110146 finding_3).
         first = _fold(None, CLASS_CONTENT_REFUSAL, at="t1")
         held = _fold(
             first.next_state,
@@ -441,7 +443,70 @@ class GenerationBindingTest(unittest.TestCase):
             at="t2",
             identity=_identity(generation="g2"),
         )
+        self.assertEqual(held.effect, STREAK_HOLD)
+        self.assertTrue(held.generation_transition)
+        self.assertIsNone(held.next_state)
+
+    def test_a_held_pass_on_the_SAME_generation_still_holds(self) -> None:
+        # HOLD itself is unchanged: within one generation it neither advances nor resets.
+        first = _fold(None, CLASS_CONTENT_REFUSAL, at="t1")
+        held = _fold(first.next_state, CLASS_SCREEN_UNREADABLE, at="t2")
+        self.assertFalse(held.generation_transition)
+        self.assertIsNotNone(held.next_state)
+        self.assertEqual(held.next_state.consecutive, 1)
         self.assertEqual(held.next_state.identity.generation, "g1")
+
+    def test_a_generation_change_drops_the_latch_under_every_effect(self) -> None:
+        # The latch is the dangerous half: inheriting it would SUPPRESS an escalation the
+        # new process earned. Checked across all three effects rather than at one class.
+        latched = StreakState(
+            identity=IDENTITY,
+            stall_class=CLASS_CONTENT_REFUSAL,
+            consecutive=9,
+            first_observed_at="t0",
+            last_observed_at="t8",
+            escalated_at="t2",
+        )
+        for stall_class in (
+            CLASS_SCREEN_UNREADABLE,
+            CLASS_UNKNOWN,
+            CLASS_BUSY_LIKELY,
+            CLASS_SCREEN_PROGRESSING,
+        ):
+            with self.subTest(stall_class=stall_class):
+                decision = _fold(
+                    latched, stall_class, at="t9", identity=_identity(generation="g2")
+                )
+                self.assertTrue(decision.generation_transition)
+                self.assertIsNone(decision.next_state)
+        advancing = _fold(
+            latched, CLASS_CONTENT_REFUSAL, at="t9", identity=_identity(generation="g2")
+        )
+        self.assertTrue(advancing.generation_transition)
+        self.assertEqual(advancing.consecutive, 1)
+        self.assertEqual(advancing.next_state.escalated_at, "")
+
+    def test_the_new_generation_can_escalate_on_its_own_merits(self) -> None:
+        # The failure the latch inheritance caused: a relaunched unit that is genuinely
+        # stuck must still be able to reach the threshold.
+        latched = StreakState(
+            identity=IDENTITY,
+            stall_class=CLASS_CONTENT_REFUSAL,
+            consecutive=9,
+            first_observed_at="t0",
+            last_observed_at="t8",
+            escalated_at="t2",
+        )
+        g2 = _identity(generation="g2")
+        first = _fold(latched, CLASS_CONTENT_REFUSAL, at="t9", identity=g2)
+        self.assertFalse(first.escalates)
+        second = _fold(first.next_state, CLASS_CONTENT_REFUSAL, at="t10", identity=g2)
+        self.assertTrue(second.escalates)
+
+    def test_the_transition_flag_is_false_without_a_previous_run(self) -> None:
+        decision = _fold(None, CLASS_CONTENT_REFUSAL)
+        self.assertFalse(decision.generation_transition)
+        self.assertFalse(decision.telemetry()["generation_transition"])
 
 
 if __name__ == "__main__":  # pragma: no cover

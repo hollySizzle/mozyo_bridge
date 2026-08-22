@@ -55,6 +55,7 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     stall_watch_status,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_wiring import (  # noqa: E501
+    CONFIG_UNREADABLE_DETAIL,
     POLICY_DETAIL_LIMIT,
     build_stall_watch_leg_fn,
     lane_facts_snapshot,
@@ -696,6 +697,109 @@ class PolicyResolutionTest(unittest.TestCase):
         self.assertIn("cadence_seconds", policy.detail)
         self.assertEqual(policy.source, POLICY_INVALID)
 
+    def test_the_detail_never_carries_the_raw_exception(self) -> None:
+        # `detail` reaches --status --json. A YAML failure's message carries the absolute
+        # config path AND a fragment of the file's own content, so truncating it is not
+        # redaction (review j#110146 finding_2).
+        root = self._repo("  : : bad yaml [\n")
+        policy = resolve_stall_watch_policy(root)
+        self.assertEqual(policy.reason, POLICY_CONFIG_UNREADABLE)
+        self.assertNotIn(str(root), policy.detail)
+        self.assertNotIn("bad yaml", policy.detail)
+        self.assertNotIn("block end", policy.detail)
+        self.assertIn(CONFIG_UNREADABLE_DETAIL, policy.detail)
+        # ...and the same holds through the surface it actually reaches.
+        self.assertNotIn(str(root), json.dumps(policy.telemetry()))
+
+    def test_a_private_path_never_reaches_the_detail(self) -> None:
+        root = self._repo("stall_watch:\n  lanes: [ok]\n  cadence_seconds: [1,2]\n")
+        policy = resolve_stall_watch_policy(root)
+        self.assertNotIn(str(root), policy.detail)
+        self.assertNotIn("private", policy.detail)
+
+    def test_a_sibling_key_is_not_misfiled_as_this_block_being_malformed(self) -> None:
+        # `stall_watch_extra` CONTAINS the substring `stall_watch`; a substring test
+        # reported it as this block being invalid and sent the operator to the wrong line.
+        policy = resolve_stall_watch_policy(
+            self._repo("stall_watch_extra:\n  x: 1\n")
+        )
+        self.assertEqual(policy.reason, POLICY_CONFIG_UNREADABLE)
+        self.assertNotIn("stall_watch_extra", policy.detail)
+
+    def test_classification_is_a_type_decision_not_a_string_decision(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_wiring import (  # noqa: E501
+            own_validator_error,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_watch_policy import (  # noqa: E501
+            StallWatchPolicyError,
+        )
+
+        own = StallWatchPolicyError("stall_watch.threshold must be at least 1")
+        wrapped = RuntimeError("loader failed")
+        wrapped.__cause__ = own
+        self.assertIs(own_validator_error(wrapped), own)
+        # A message that merely MENTIONS the block is not this block's error.
+        self.assertIsNone(own_validator_error(RuntimeError("stall_watch is fine")))
+
+    def test_the_cause_walk_is_bounded_against_a_cyclic_chain(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_wiring import (  # noqa: E501
+            own_validator_error,
+        )
+
+        a, b = RuntimeError("a"), RuntimeError("b")
+        a.__cause__, b.__cause__ = b, a
+        self.assertIsNone(own_validator_error(a))
+
+    def test_a_key_that_only_appears_as_a_SUBSTRING_is_not_named(self) -> None:
+        # The discriminator between exact-token and substring matching. `lanes` is a
+        # substring of the VALUE below but is not a token in it; a substring matcher would
+        # sort `lanes` ahead of the real key and send the operator to the wrong setting.
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_wiring import (  # noqa: E501
+            redacted_detail,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_watch_policy import (  # noqa: E501
+            StallWatchPolicyError,
+        )
+
+        own = StallWatchPolicyError(
+            "stall_watch.roles entries must be non-empty strings; got 'my_lanes_backup'"
+        )
+        self.assertEqual(
+            redacted_detail(own, own=own), "StallWatchPolicyError: stall_watch.roles"
+        )
+
+    def test_the_detail_bound_holds_for_an_oversized_exception_type(self) -> None:
+        # The closed vocabulary keeps the detail short in every case the parser produces,
+        # so the bound is not observable through `from_record`. It is exercised directly
+        # instead of deleted: it is what still holds if a future caller passes an exception
+        # this module did not construct.
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_wiring import (  # noqa: E501
+            POLICY_DETAIL_LIMIT,
+            redacted_detail,
+        )
+
+        huge = type("E" * (POLICY_DETAIL_LIMIT * 3), (RuntimeError,), {})
+        detail = redacted_detail(huge("boom"), own=None)
+        self.assertEqual(len(detail), POLICY_DETAIL_LIMIT)
+
+    def test_the_named_key_comes_from_the_declared_set(self) -> None:
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_wiring import (  # noqa: E501
+            UNIDENTIFIED_KEY,
+            redacted_detail,
+        )
+        from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_watch_policy import (  # noqa: E501
+            StallWatchPolicyError,
+        )
+
+        own = StallWatchPolicyError("stall_watch.threshold must be at least 1; got 0")
+        self.assertEqual(
+            redacted_detail(own, own=own), "StallWatchPolicyError: stall_watch.threshold"
+        )
+        vague = StallWatchPolicyError("something went wrong at /home/alice/secret")
+        detail = redacted_detail(vague, own=vague)
+        self.assertIn(UNIDENTIFIED_KEY, detail)
+        self.assertNotIn("/home/alice", detail)
+
     def test_the_three_off_states_are_distinguishable(self) -> None:
         absent = resolve_stall_watch_policy(tempfile.mkdtemp())
         invalid = resolve_stall_watch_policy(
@@ -820,6 +924,40 @@ class WiringTest(unittest.TestCase):
 
 
 
+
+class DiscoveryCoverageTest(LegBase):
+    """The leg must leave its coverage behind, so `--status` never has to read a pane."""
+
+    def test_a_pass_records_its_coverage(self) -> None:
+        self.run_leg()
+        recorded = self.store.last_discovery(WS)
+        self.assertEqual(recorded["watched"], 1)
+        self.assertEqual(recorded["candidates"], 1)
+        self.assertEqual(recorded["out_of_reach"], 0)
+        self.assertTrue(recorded["observed_at"])
+
+    def test_a_pass_that_watches_nothing_still_records_why(self) -> None:
+        # The early return is exactly when an operator most wants the answer.
+        outcome = self.run_leg(issue_for=lambda lane: "")
+        self.assertEqual(outcome.reason, LEG_NOTHING_TO_WATCH)
+        recorded = self.store.last_discovery(WS)
+        self.assertEqual(recorded["watched"], 0)
+        self.assertEqual(recorded["out_of_reach"], 1)
+        self.assertEqual(recorded["dropped"], {"issue_anchor_unresolved": 1})
+
+    def test_coverage_is_absent_before_any_pass(self) -> None:
+        self.assertIsNone(self.store.last_discovery(WS))
+
+    def test_the_recorded_coverage_carries_counts_only(self) -> None:
+        # Identities would make the row unsafe to render; only counts and fixed reason
+        # tokens are stored.
+        self.run_leg(issue_for=lambda lane: "")
+        blob = json.dumps(self.store.last_discovery(WS))
+        self.assertNotIn(LOCATOR, blob)
+        self.assertNotIn(LANE, blob)
+        self.assertNotIn(FROZEN_SCREEN.strip(), blob)
+
+
 class OperatorStatusSurfaceTest(unittest.TestCase):
     """`workflow supervisor --status` must answer "is the watcher running, and is it stuck".
 
@@ -897,6 +1035,40 @@ class OperatorStatusSurfaceTest(unittest.TestCase):
         self.assertIn("unrecorded=1", text)
         self.assertIn("oldest_age=", text)
         self.assertNotIn("oldest_age=-", text)
+
+    def test_coverage_is_absent_until_a_pass_has_run(self) -> None:
+        # "never ran" and "ran and watched nothing" are different operator situations.
+        self._register("stall_watch:\n  lanes: [lane_a]\n")
+        self.assertIn("coverage: no pass recorded yet", self._status())
+        payload = json.loads(self._status(as_json=True))
+        self.assertIsNone(payload["stall_watch"][0]["discovery"])
+
+    def test_out_of_reach_is_visible_in_text_and_json(self) -> None:
+        # The whole of finding_1: an operator asking "is the watcher covering my cockpit"
+        # must get an answer from --status at ANY instant, not only just after a sweep.
+        from mozyo_bridge.core.state.stall_escalation import StallEscalationStore
+
+        result = self._register("stall_watch:\n  lanes: [lane_a]\n")
+        StallEscalationStore(home=self.home).record_discovery(
+            result.record.workspace_id,
+            candidates=5,
+            watched=2,
+            out_of_reach=2,
+            dropped={"issue_anchor_unresolved": 2, "foreign_workspace": 1},
+            now="2026-08-22T09:00:00+00:00",
+        )
+        text = self._status()
+        self.assertIn("out_of_reach=2", text)
+        self.assertIn("watched=2", text)
+        self.assertIn("candidates=5", text)
+        self.assertIn("issue_anchor_unresolved=2", text)
+
+        discovery = json.loads(self._status(as_json=True))["stall_watch"][0]["discovery"]
+        self.assertEqual(discovery["out_of_reach"], 2)
+        self.assertEqual(discovery["watched"], 2)
+        self.assertEqual(discovery["candidates"], 5)
+        self.assertEqual(discovery["observed_at"], "2026-08-22T09:00:00+00:00")
+        self.assertEqual(discovery["dropped"]["issue_anchor_unresolved"], 2)
 
     def test_the_json_surface_carries_the_full_projection(self) -> None:
         self._register("stall_watch:\n  lanes: [lane_a]\n")

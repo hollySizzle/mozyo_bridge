@@ -55,9 +55,18 @@ from getting this wrong, and both are the kind a watcher would report as a stall
   logical agent to a new locator, and a locator-keyed run would silently restart — so a
   unit that has been wedged across a rebind could never reach any threshold.
 
-``generation`` is bound rather than merely recorded: a **generation change restarts the
-run**, exactly as a class change does. A new generation is a new process with a new screen;
-inheriting the old run would let a fresh agent be escalated for its predecessor's stall.
+``generation`` is bound rather than merely recorded: a **generation change discards the
+run**, and it does so *before* the observation's own class is consulted. A new generation is
+a new process with a new screen; inheriting the old run would let a fresh agent be escalated
+for its predecessor's stall, and inheriting the old **latch** would do the opposite — it
+would suppress an escalation the new process earned.
+
+The ordering matters because the generation is **not screen-derived evidence**. It is read
+from the lane lifecycle store, a durable authority, so a change in it is a fact about which
+process occupies the slot rather than an inference about what a screen showed. Treating it
+as screen evidence — and therefore deferring it behind the no-evidence HOLD path — is
+exactly the defect review j#110146 finding_3 caught.
+
 The identity's ``target`` field is the transient locator, kept for evidence only — nothing
 in this module compares it.
 
@@ -266,6 +275,10 @@ class StreakDecision:
     effect: str
     next_state: Optional[StreakState]
     escalates: bool = False
+    #: The stored run belonged to a DIFFERENT terminal generation and was discarded before
+    #: this observation was applied. Surfaced rather than left implicit so the discard is
+    #: assertable on its own, independent of whichever effect the class happened to have.
+    generation_transition: bool = False
 
     @property
     def consecutive(self) -> int:
@@ -280,6 +293,7 @@ class StreakDecision:
             "streak_effect": self.effect,
             "consecutive": self.consecutive,
             "escalates": self.escalates,
+            "generation_transition": self.generation_transition,
         }
         if self.next_state is not None:
             payload["stall_class"] = self.next_state.stall_class
@@ -329,38 +343,55 @@ def fold_observation(
             f"{identity.slot_label!r}"
         )
 
+    # An authoritative generation transition is settled FIRST, before the class's effect is
+    # even consulted. The generation is not screen-derived evidence -- it comes from the
+    # lane lifecycle store, a durable authority -- so a change in it is a fact about which
+    # process occupies the slot, not an inference about what a screen showed.
+    #
+    # Getting this order wrong is what review j#110146 finding_3 caught: HOLD returned
+    # ``previous`` before any generation comparison, so an unreadable screen taken just
+    # after a relaunch preserved the DEAD process's run **and its latch** — which then
+    # suppressed the escalation the new process might have earned. Discarding the stale run
+    # here is not "HOLD acting as a reset": it retires a record about a different process,
+    # and the current observation is applied afterwards to an empty state, where HOLD still
+    # neither advances nor resets anything.
+    generation_transition = previous is not None and not previous.identity.same_generation(
+        identity
+    )
+    if generation_transition:
+        previous = None
+
     effect = escalation_effect(stall_class)
 
     if effect == STREAK_RESET:
         # Alive. Drop the row and the latch together.
-        return StreakDecision(identity=identity, effect=effect, next_state=None)
+        return StreakDecision(
+            identity=identity,
+            effect=effect,
+            next_state=None,
+            generation_transition=generation_transition,
+        )
 
     if effect == STREAK_HOLD:
         # No evidence either way: the row is returned unchanged, so a caller that writes
         # it back writes the same bytes. Notably ``last_observed_at`` is NOT refreshed --
         # this pass observed nothing about the unit, and claiming otherwise would let an
         # unreadable target look freshly confirmed to anything reading the timestamps.
-        #
-        # The stored identity is likewise NOT refreshed to this pass's generation: a held
-        # pass proves nothing about which process is behind the slot, so adopting the newly
-        # reported generation here would let an unreadable screen silently re-bind an
-        # existing run onto a different process. The next advancing or resetting pass
-        # settles it.
-        return StreakDecision(identity=identity, effect=effect, next_state=previous)
+        # (After a generation transition ``previous`` is already ``None``, so a held pass
+        # on a freshly relaunched slot holds nothing rather than holding a stranger's run.)
+        return StreakDecision(
+            identity=identity,
+            effect=effect,
+            next_state=previous,
+            generation_transition=generation_transition,
+        )
 
-    # STREAK_ADVANCE. Two things restart the run, for the same reason: the evidence is no
-    # longer about the same thing.
-    #   - a CLASS change (see the module docstring: a flapping diagnosis is not a
-    #     consistent detection);
-    #   - a GENERATION change: a new process behind the slot has its own screen, and
-    #     inheriting the old run would escalate a fresh agent for its predecessor's stall.
+    # STREAK_ADVANCE. A CLASS change restarts the run — a flapping diagnosis is not a
+    # consistent detection (see the module docstring). A generation change has already been
+    # settled above, so ``previous`` is ``None`` here whenever the process was replaced.
     # A restart also drops the latch, so the newly identified stall may escalate on its
     # own merits.
-    restarts = (
-        previous is None
-        or previous.stall_class != stall_class
-        or not previous.identity.same_generation(identity)
-    )
+    restarts = previous is None or previous.stall_class != stall_class
     if restarts:
         state = StreakState(
             identity=identity,
@@ -392,7 +423,11 @@ def fold_observation(
         )
 
     return StreakDecision(
-        identity=identity, effect=effect, next_state=state, escalates=fires
+        identity=identity,
+        effect=effect,
+        next_state=state,
+        escalates=fires,
+        generation_transition=generation_transition,
     )
 
 

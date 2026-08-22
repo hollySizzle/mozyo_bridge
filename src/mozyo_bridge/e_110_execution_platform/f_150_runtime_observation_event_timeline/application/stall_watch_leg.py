@@ -76,6 +76,7 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     WRITE_RECORDED,
     WRITE_UNCERTAIN,
     JournalWriteResult,
+    JournalWriter,
     ObservedUnit,
     apply_escalation_gate,
     settle_pending_escalations,
@@ -211,8 +212,8 @@ def build_journal_writer(
     transport: object,
     source: object,
     emit: Optional[Callable[..., object]] = None,
-) -> Callable[[PendingEscalation], "tuple[str, str]"]:
-    """Bind the canonical gate writer into the ``(journal_id, reason)`` seam.
+) -> JournalWriter:
+    """Bind the canonical gate writer into the :class:`JournalWriteResult` seam.
 
     ``transport`` is the credential-gated, opt-in note transport every durable write in this
     repo already uses; ``None`` means the opt-in is unset and the writer refuses with
@@ -295,6 +296,26 @@ def build_journal_writer(
     return _write
 
 
+def _record_discovery(store, workspace_id: str, discovery, stamp: str) -> None:
+    """Persist the pass's coverage counts (best-effort; never fails a pass).
+
+    Status must be answerable at any instant, not only just after a sweep, and it must not
+    answer by reading panes — so the leg leaves the counts behind (review j#110146
+    finding_1). A failure here loses observability, not correctness, so it is swallowed.
+    """
+    try:
+        store.record_discovery(
+            workspace_id,
+            candidates=discovery.candidates,
+            watched=discovery.watched,
+            out_of_reach=discovery.out_of_reach,
+            dropped=dict(discovery.dropped),
+            now=stamp,
+        )
+    except Exception:  # noqa: BLE001 - observability loss never breaks the sweep
+        pass
+
+
 def run_stall_watch_leg(
     *,
     workspace_id: str,
@@ -302,7 +323,7 @@ def run_stall_watch_leg(
     policy: StallWatchPolicy,
     inventory_rows: Callable[[], Sequence[object]],
     read_screen: Optional[Callable[[str], "tuple[bool, str]"]],
-    write_journal: Optional[Callable[[PendingEscalation], "tuple[str, str]"]] = None,
+    write_journal: Optional[JournalWriter] = None,
     wake: Optional[Callable[[str, str], bool]] = None,
     generation_for: Optional[Callable[[str], str]] = None,
     issue_for: Optional[Callable[[str], str]] = None,
@@ -312,8 +333,8 @@ def run_stall_watch_leg(
     body_marker_for: Optional[Callable[[str, str, str], str]] = None,
     budget: Optional[dict] = None,
     signatures: object = None,
-    clock: Callable[[], float] = None,
-    sleep: Callable[[float], None] = None,
+    clock: Optional[Callable[[], float]] = None,
+    sleep: Optional[Callable[[float], None]] = None,
     now: Callable[[], datetime] = _utc_now,
     sample_interval_seconds: Optional[float] = None,
 ) -> StallWatchLegOutcome:
@@ -357,6 +378,10 @@ def run_stall_watch_leg(
         issue_for=issue_for,
         provider_for=provider_for,
     )
+    # Persist the coverage BEFORE the early return, so "watched nothing, and here is why"
+    # is readable from `--status` even on a pass that found no units at all.
+    _record_discovery(store, ws, discovery, stamp)
+
     if not discovery.units:
         store.mark_pass(ws, now=stamp)
         return StallWatchLegOutcome(

@@ -341,6 +341,55 @@ class FairnessOrderTest(StoreBase):
         self.assertEqual(len(self.store.unrecorded_pending("wsB")), 1)
 
 
+class DiscoveryCoverageTest(StoreBase):
+    """Coverage counts, and the difference between "never ran" and "ran, saw nothing"."""
+
+    def test_record_then_read_round_trips(self) -> None:
+        self.store.record_discovery(
+            "wsA", candidates=5, watched=2, out_of_reach=2,
+            dropped={"issue_anchor_unresolved": 2}, now="t1",
+        )
+        self.assertEqual(
+            self.store.last_discovery("wsA"),
+            {
+                "observed_at": "t1",
+                "candidates": 5,
+                "watched": 2,
+                "out_of_reach": 2,
+                "dropped": {"issue_anchor_unresolved": 2},
+            },
+        )
+
+    def test_a_workspace_with_no_row_is_None_even_though_the_db_exists(self) -> None:
+        # The discriminating case: another workspace HAS recorded, so the file and the
+        # table are both present. "Never ran" must still be None rather than zeros --
+        # zeros would claim this watcher ran and saw nothing.
+        self.store.record_discovery("wsB", candidates=1, watched=1, out_of_reach=0)
+        self.assertTrue(self.store.path.exists())
+        self.assertIsNone(self.store.last_discovery("wsA"))
+
+    def test_a_later_pass_replaces_the_earlier_summary(self) -> None:
+        self.store.record_discovery("wsA", candidates=1, watched=1, out_of_reach=0, now="t1")
+        self.store.record_discovery("wsA", candidates=9, watched=3, out_of_reach=6, now="t2")
+        recorded = self.store.last_discovery("wsA")
+        self.assertEqual(recorded["observed_at"], "t2")
+        self.assertEqual(recorded["out_of_reach"], 6)
+
+    def test_a_blank_workspace_records_nothing(self) -> None:
+        self.store.record_discovery("", candidates=1, watched=1, out_of_reach=0)
+        self.assertIsNone(self.store.last_discovery(""))
+
+    def test_an_unreadable_dropped_blob_degrades_to_empty(self) -> None:
+        self.store.record_discovery("wsA", candidates=1, watched=0, out_of_reach=1)
+        conn = sqlite3.connect(self.store.path)
+        try:
+            conn.execute("UPDATE stall_watch_discovery SET dropped='not json'")
+            conn.commit()
+        finally:
+            conn.close()
+        self.assertEqual(self.store.last_discovery("wsA")["dropped"], {})
+
+
 class SchemaTest(StoreBase):
     def test_version_is_stamped_on_creation(self) -> None:
         self.store.write_streak(_row())

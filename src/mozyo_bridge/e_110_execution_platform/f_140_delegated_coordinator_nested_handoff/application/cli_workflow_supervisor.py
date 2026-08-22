@@ -337,6 +337,18 @@ def _stall_watch_status_lines(rows) -> list:
             f"last={cadence.get('last_pass_at') or '-'} "
             f"next_due>={cadence.get('next_due_at') or '-'}"
         )
+        discovery = row.get("discovery")
+        if discovery is None:
+            lines.append("    coverage: no pass recorded yet")
+        else:
+            dropped = discovery.get("dropped") or {}
+            reasons = " ".join(f"{k}={v}" for k, v in sorted(dropped.items())) or "-"
+            lines.append(
+                f"    coverage: watched={discovery.get('watched', 0)} "
+                f"out_of_reach={discovery.get('out_of_reach', 0)} "
+                f"candidates={discovery.get('candidates', 0)} "
+                f"at={discovery.get('observed_at', '-')} [{reasons}]"
+            )
         age = pending.get("oldest_unrecorded_age_seconds")
         lines.append(
             f"    pending: unrecorded={pending.get('unrecorded', 0)} "

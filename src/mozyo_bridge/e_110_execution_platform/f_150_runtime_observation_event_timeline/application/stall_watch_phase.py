@@ -339,8 +339,10 @@ def stall_watch_status(
 
     j#110121-2 requires the configured surface AND the effective values to be provable from
     a readback rather than inferred, and j#110121-6 requires the pending backlog's age to be
-    visible so a starved queue is legible instead of silent. Both are projected here from
-    stored state only — this function makes no decision and mutates nothing.
+    visible so a starved queue is legible instead of silent. Review j#110146 finding_1 added
+    the third: the discovery COVERAGE (how many live units are outside this watcher's
+    reach, and why). All three are projected here from stored state only — this function
+    makes no decision, mutates nothing, and in particular never reads a pane.
     """
     try:
         last_pass_at = store.last_pass_at(workspace_id)
@@ -360,10 +362,20 @@ def stall_watch_status(
         if parsed is not None:
             oldest_age_seconds = max(0, int((now - parsed).total_seconds()))
 
+    try:
+        discovery = store.last_discovery(workspace_id)
+    except Exception:  # noqa: BLE001 - a status surface must not raise
+        discovery = None
+
     payload: dict[str, object] = {
         "workspace_id": workspace_id,
         "policy": policy.telemetry(),
         "cadence": verdict.telemetry(),
+        # The coverage question -- "what is this watcher NOT seeing" -- answered from the
+        # last pass's persisted counts rather than by re-running discovery here, which would
+        # make a read-only status command read panes (review j#110146 finding_1).
+        # ``None`` means the leg has never run: distinct from "ran and watched nothing".
+        "discovery": discovery,
         "pending": {
             # Unwritten == the durable record does not know about these stalls yet.
             "unrecorded": len(unrecorded),

@@ -2,7 +2,7 @@
 
 ## Status
 
-- version: `v0.3` (#15855 運用配線 + j#110132 review の 4 指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
+- version: `v0.4` (#15855 運用配線 + j#110132 / j#110146 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
 - scope: watcher 層 (background / operator) が、pane の**描画画面が進んでいるか**だけを一次
   センサーとして停滞候補を拾い、種別を分類し、種別ごとの処方を**提示**するまで。
 - non-goal: 処方の自動適用、配送 rail の retry policy、completion 判定、receiver-state
@@ -309,6 +309,17 @@ escalate しない。代替は「どの issue の停滞か推測して coordinat
 書く」ことであり、そちらが遥かに悪い。死角は隠さない: 落ちた候補は理由別に数えられ、status
 が「N 台が watcher の射程外、内訳はこれ」と出す。
 
+### generation は画面の証拠ではなく権威の事実として先に処理する
+
+generation は `LaneLifecycleStore` という durable な権威記録から来る。画面から推論した値では
+ない。したがって **generation の変化は、観測 class の効果を見るより前に決着させる**。
+
+後回しにすると次が起きる (j#110146 finding_3 の実測): relaunch 直後に新 process の画面が読めない
+と、HOLD 分岐が generation 比較より先に返るため**死んだ process の run がそのまま残り、しかも
+その latch が新 process の escalation を抑制する**。旧 run を破棄するのは「HOLD が reset として
+振る舞う」ことではない — 別 process についての記録を退役させているだけで、現在の観測はその後で
+空の状態に適用され、HOLD はそこでも advance にも reset にもならない。
+
 ### streak は slot に束縛する。locator ではない
 
 run の identity は `workspace_id + lane_id + role` (durable slot) で、terminal `generation` は
@@ -325,6 +336,18 @@ generation を key に入れると relaunch のたびに孤児行が残るので
 generation が変われば run は restart する — 新しい process は自分の画面を持つのであり、
 前任者の停滞で新 agent を escalate してはならない。
 
+### operator surface へ出す文字列は閉じた語彙だけ
+
+policy の `detail` は `--status --json` に出る。**raw な例外文字列を載せてはいけない** — YAML
+parse 失敗の message は config の絶対 path と file 本文の断片を両方含む (j#110146 finding_2 の
+実測)。切り詰めは redaction ではない。載せるのは例外の型名と、**本 block 自身の validator の
+場合に限り**宣言済みキー名との完全一致 token だけにする。
+
+分類も文字列一致でやらない。「本 block が malformed」か「別の理由で読めない」かは **exception
+chain の型** (`__cause__` を辿って自 validator の error 型を見つけるか) で決める。message に
+`stall_watch` が含まれるかで判定すると、`stall_watch_extra` のような **sibling key を本 block の
+malformed と誤報する**。
+
 ### operator が読める runtime status
 
 宣言した設定は `config status` が出す。**動いているかどうか**は別の面が要る。既存の
@@ -334,7 +357,10 @@ generation が変われば run は restart する — 新しい process は自�
   `config_unreadable` の 4 状態を区別する。malformed を absent に潰すと、cadence を打ち間違えた
   operator に「一度も設定していない」と答えることになる)、cadence と threshold の実効値;
 - `last_pass_at` と `next_due_at` (後者は閾値であって予定時刻ではない);
-- `out_of_reach` — live だが watcher の射程外の unit 数;
+- `out_of_reach` — live だが watcher の射程外の unit 数。**status が discovery を再実行して求める
+  のではなく、leg が各 pass で永続化した集計を観測時刻つきで projection する** — status が pane を
+  読む command になってしまうのを避けるため。記録が無い状態 (`null`) は「まだ 1 度も走っていない」
+  であり「走ったが 0 台だった」とは区別する;
 - pending の内訳 `unrecorded` / `anchorless` / `recorded_but_unwoken` と
   **`oldest_unrecorded_age_seconds`** — これが飢餓の可視化そのもの。
 

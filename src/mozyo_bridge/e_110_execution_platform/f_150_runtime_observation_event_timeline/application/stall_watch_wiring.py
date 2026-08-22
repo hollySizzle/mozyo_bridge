@@ -25,6 +25,7 @@ firing stays visible in the local pending queue instead of being silently droppe
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -37,9 +38,12 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     run_stall_watch_leg,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_watch_policy import (  # noqa: E501
+    POLICY_ABSENT,
     POLICY_CONFIG_UNREADABLE,
     POLICY_INVALID,
+    STALL_WATCH_KEYS,
     StallWatchPolicy,
+    StallWatchPolicyError,
 )
 
 #: Lane dispositions whose units are worth watching. A superseded / retired / hibernated
@@ -47,20 +51,82 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
 WATCHABLE_DISPOSITIONS: frozenset[str] = frozenset({"active"})
 
 
-#: How much of a loader error is carried into the policy detail. The text comes from this
-#: repo's own validators ("stall_watch.cadence_seconds must be an integer, not str"), so it
-#: names keys and types rather than values — but it is truncated anyway, because a detail
-#: string ends up in an operator-facing status surface and an unbounded error message is not
-#: something this layer should promise to keep small.
-POLICY_DETAIL_LIMIT = 300
+#: The redaction rule for the policy ``detail`` an operator sees in ``--status``.
+#:
+#: ``detail`` reaches ``policy.telemetry()`` and therefore ``--status --json``. An earlier
+#: version put ``str(exc)`` there and merely truncated it, on the assumption that loader
+#: errors only name keys and types. That assumption holds for THIS block's own validator and
+#: for nothing else: review j#110146 finding_2 reproduced a YAML parse failure whose message
+#: carried both the absolute config path (``/home/alice/private/...``) and a fragment of the
+#: file's own content. Truncation is not redaction.
+#:
+#: So no raw message is ever carried. The detail is assembled from a CLOSED vocabulary: the
+#: exception's type name, plus -- only for this block's own validator -- whichever declared
+#: ``stall_watch`` key the error names, matched by exact token against
+#: :data:`STALL_WATCH_KEYS` rather than by scanning the message.
+POLICY_DETAIL_LIMIT = 200
 
-#: The marker that says a loader error was about THIS block rather than a sibling.
-_STALL_WATCH_ERROR_MARKER = "stall_watch"
+#: Emitted when the offending key cannot be identified by a closed match.
+UNIDENTIFIED_KEY = "unidentified_key"
+
+#: How far :func:`own_validator_error` follows ``__cause__``. ``__cause__`` is a writable
+#: attribute, so a chain can be made cyclic; an unbounded walk over one hangs a supervisor
+#: pass with no output at all. A genuine ``raise ... from`` chain is a few links deep.
+CAUSE_CHAIN_LIMIT = 8
+
+#: What an operator is told when the failure was NOT this block's own validator. It names
+#: WHAT failed and where to look, never what the failure said.
+CONFIG_UNREADABLE_DETAIL = (
+    "the repo-local config could not be read, so the stall_watch policy is unknown; "
+    "run `mozyo-bridge config status` for the underlying error"
+)
 
 
-def _detail(exc: BaseException) -> str:
-    text = " ".join(str(exc).split())
-    return text[:POLICY_DETAIL_LIMIT]
+def _stall_watch_key_in(message: str) -> str:
+    """The declared ``stall_watch`` key an error names, by EXACT token match.
+
+    Matching against the declared key set -- rather than searching the message for the
+    substring ``stall_watch`` -- is what keeps a sibling block out of this classification.
+    ``stall_watch_extra`` contains ``stall_watch`` but is not a declared key, so it matches
+    nothing here (review j#110146 finding_2 reproduced it being misreported as *this* block
+    being malformed).
+    """
+    tokens = set(re.findall(r"[A-Za-z_][A-Za-z0-9_]*", str(message)))
+    named = sorted(key for key in STALL_WATCH_KEYS if key in tokens)
+    return named[0] if named else UNIDENTIFIED_KEY
+
+
+def own_validator_error(exc: BaseException) -> Optional[BaseException]:
+    """The :class:`StallWatchPolicyError` this failure originated from, if any.
+
+    The loader raises ONE error type for any invalid block and chains the original with
+    ``raise ... from exc``, so the origin is available *structurally*. Reading the cause
+    chain is what makes the invalid / unreadable split a type decision instead of a string
+    decision.
+
+    The walk is **bounded**, and that bound is load-bearing rather than defensive garnish:
+    ``__cause__`` is an ordinary writable attribute, so a chain can be cyclic, and an
+    unbounded walk over one hangs forever — inside a supervisor pass, silently. A real
+    ``raise ... from`` chain is a handful of links deep, so a walk that has not found the
+    validator within :data:`CAUSE_CHAIN_LIMIT` has not got one.
+    """
+    seen = 0
+    current: Optional[BaseException] = exc
+    while current is not None and seen < CAUSE_CHAIN_LIMIT:
+        if isinstance(current, StallWatchPolicyError):
+            return current
+        current = current.__cause__
+        seen += 1
+    return None
+
+
+def redacted_detail(exc: BaseException, *, own: Optional[BaseException]) -> str:
+    """A detail built only from a closed vocabulary -- never the exception's own text."""
+    if own is not None:
+        detail = f"{type(own).__name__}: stall_watch.{_stall_watch_key_in(str(own))}"
+    else:
+        detail = f"{type(exc).__name__}: {CONFIG_UNREADABLE_DETAIL}"
+    return detail[:POLICY_DETAIL_LIMIT]
 
 
 def resolve_stall_watch_policy(repo_root: object) -> StallWatchPolicy:
@@ -70,16 +136,18 @@ def resolve_stall_watch_policy(repo_root: object) -> StallWatchPolicy:
     asks for a *typed* no-op rather than merely a silent one. Three outcomes are kept
     distinct because they need three different operator actions:
 
-    - **absent** — no block is declared. Nothing to do; this is the shipped default.
-    - **invalid** (:data:`POLICY_INVALID`) — this block is malformed. Fix the block; the
+    - **absent** -- no block is declared. Nothing to do; this is the shipped default.
+    - **invalid** (:data:`POLICY_INVALID`) -- THIS block is malformed. Fix the block; the
       detail names the offending key.
-    - **unreadable** (:data:`POLICY_CONFIG_UNREADABLE`) — the config could not be read at
-      all, or a *different* block is invalid. Fix the file; the stall-watch block may be
+    - **unreadable** (:data:`POLICY_CONFIG_UNREADABLE`) -- the config could not be read at
+      all, or a *different* block is invalid. Fix the file; the stall_watch block may be
       perfectly fine.
 
-    An earlier version collapsed all three into ``absent`` (review j#110132 finding_4),
-    which told an operator with a mistyped cadence that they had simply never configured
-    anything.
+    Which of the last two applies is decided from the exception CHAIN
+    (:func:`own_validator_error`), not from the text of the message, and the detail is
+    assembled from a closed vocabulary (:func:`redacted_detail`). Both were review j#110146
+    finding_2: a substring test misfiled a sibling key as this block's fault, and the raw
+    message leaked an absolute path plus file content into an operator surface.
     """
     try:
         from mozyo_bridge.application.repo_local_config_loader import (
@@ -88,14 +156,12 @@ def resolve_stall_watch_policy(repo_root: object) -> StallWatchPolicy:
 
         return load_repo_local_config(Path(str(repo_root))).stall_watch
     except Exception as exc:  # noqa: BLE001 - every failure still watches nothing
-        # The loader raises one error type for ANY invalid block, so the block that broke it
-        # is identified from the message the loader itself composed
-        # (``f"stall_watch config is invalid: {exc}"``). A sibling block's error must not be
-        # reported as *this* block being malformed.
-        detail = _detail(exc)
-        if _STALL_WATCH_ERROR_MARKER in detail:
-            return StallWatchPolicy.disabled(POLICY_INVALID, detail)
-        return StallWatchPolicy.disabled(POLICY_CONFIG_UNREADABLE, detail)
+        own = own_validator_error(exc)
+        return StallWatchPolicy.disabled(
+            POLICY_INVALID if own is not None else POLICY_CONFIG_UNREADABLE,
+            redacted_detail(exc, own=own),
+        )
+
 
 
 def lane_facts_snapshot(lifecycle_store: object, workspace_id: str) -> dict[str, tuple[str, str]]:
@@ -243,7 +309,12 @@ def build_stall_watch_leg_fn(
 
 
 __all__ = (
+    "CAUSE_CHAIN_LIMIT",
+    "CONFIG_UNREADABLE_DETAIL",
     "POLICY_DETAIL_LIMIT",
+    "UNIDENTIFIED_KEY",
+    "own_validator_error",
+    "redacted_detail",
     "WATCHABLE_DISPOSITIONS",
     "build_stall_watch_leg_fn",
     "default_inventory_rows",
