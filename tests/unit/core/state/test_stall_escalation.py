@@ -13,6 +13,7 @@ SQLite file, no other collaborator.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import sys
 import tempfile
@@ -23,7 +24,12 @@ ROOT = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(ROOT / "src"))
 
 from mozyo_bridge.core.state.stall_escalation import (
+    DISCOVERY_BAD_COUNT,
+    DISCOVERY_BAD_REASON_TOKEN,
+    DISCOVERY_INCONSISTENT,
+    DISCOVERY_MALFORMED,
     STALL_ESCALATION_SCHEMA_VERSION,
+    StallDiscoveryContractError,
     PendingEscalation,
     StallEscalationStore,
     StallEscalationStoreError,
@@ -345,15 +351,17 @@ class DiscoveryCoverageTest(StoreBase):
     """Coverage counts, and the difference between "never ran" and "ran, saw nothing"."""
 
     def test_record_then_read_round_trips(self) -> None:
+        # The counts satisfy the identity the store enforces: candidates == watched +
+        # sum(dropped), and out_of_reach == sum(dropped) - foreign_workspace.
         self.store.record_discovery(
-            "wsA", candidates=5, watched=2, out_of_reach=2,
+            "wsA", candidates=4, watched=2, out_of_reach=2,
             dropped={"issue_anchor_unresolved": 2}, now="t1",
         )
         self.assertEqual(
             self.store.last_discovery("wsA"),
             {
                 "observed_at": "t1",
-                "candidates": 5,
+                "candidates": 4,
                 "watched": 2,
                 "out_of_reach": 2,
                 "dropped": {"issue_anchor_unresolved": 2},
@@ -370,7 +378,10 @@ class DiscoveryCoverageTest(StoreBase):
 
     def test_a_later_pass_replaces_the_earlier_summary(self) -> None:
         self.store.record_discovery("wsA", candidates=1, watched=1, out_of_reach=0, now="t1")
-        self.store.record_discovery("wsA", candidates=9, watched=3, out_of_reach=6, now="t2")
+        self.store.record_discovery(
+            "wsA", candidates=9, watched=3, out_of_reach=6,
+            dropped={"issue_anchor_unresolved": 6}, now="t2",
+        )
         recorded = self.store.last_discovery("wsA")
         self.assertEqual(recorded["observed_at"], "t2")
         self.assertEqual(recorded["out_of_reach"], 6)
@@ -379,15 +390,218 @@ class DiscoveryCoverageTest(StoreBase):
         self.store.record_discovery("", candidates=1, watched=1, out_of_reach=0)
         self.assertIsNone(self.store.last_discovery(""))
 
-    def test_an_unreadable_dropped_blob_degrades_to_empty(self) -> None:
-        self.store.record_discovery("wsA", candidates=1, watched=0, out_of_reach=1)
+class DiscoveryContractBase(StoreBase):
+    """Shared fixtures for the two contract suites (no tests of its own)."""
+
+    def _valid(self, **overrides):
+        base = dict(
+            candidates=4,
+            watched=1,
+            out_of_reach=2,
+            dropped={
+                "foreign_workspace": 1,
+                "issue_anchor_unresolved": 1,
+                "no_live_locator": 1,
+            },
+        )
+        base.update(overrides)
+        return base
+
+    def _seed_valid(self):
+        self.store.record_discovery("wsA", now="t1", **self._valid())
+
+    def _corrupt(self, sql, *args):
         conn = sqlite3.connect(self.store.path)
         try:
-            conn.execute("UPDATE stall_watch_discovery SET dropped='not json'")
+            conn.execute(sql, args)
             conn.commit()
         finally:
             conn.close()
-        self.assertEqual(self.store.last_discovery("wsA")["dropped"], {})
+
+
+class DiscoveryWriteContractTest(DiscoveryContractBase):
+    """The WRITE seam is public, so the closed contract is enforced there, not assumed.
+
+    The module docstring declares that every stored value is a fixed classification token or
+    a count, "which is what makes a row safe to render verbatim". Review j#110169 showed the
+    declaration was enforced at neither boundary: an arbitrary path and a negative count
+    passed straight through to `--status`.
+    """
+
+    def test_an_off_vocabulary_reason_is_refused(self) -> None:
+        with self.assertRaises(StallDiscoveryContractError):
+            self.store.record_discovery(
+                "wsA",
+                **self._valid(
+                    candidates=10,
+                    watched=1,
+                    out_of_reach=9,
+                    dropped={"/home/alice/private/secret.yml": 9},
+                ),
+            )
+        self.assertIsNone(self.store.last_discovery("wsA"))
+
+    def test_the_refusal_does_not_quote_the_offending_string(self) -> None:
+        # Quoting it would put the very string this check exists to contain into a log.
+        with self.assertRaises(StallDiscoveryContractError) as caught:
+            self.store.record_discovery(
+                "wsA",
+                **self._valid(
+                    candidates=10, watched=1, out_of_reach=9,
+                    dropped={"/home/alice/private/secret.yml": 9},
+                ),
+            )
+        self.assertNotIn("secret.yml", str(caught.exception))
+        self.assertNotIn("/home/alice", str(caught.exception))
+
+    def test_negative_counts_are_refused(self) -> None:
+        for field in ("candidates", "watched", "out_of_reach"):
+            with self.subTest(field=field):
+                with self.assertRaises(StallDiscoveryContractError):
+                    self.store.record_discovery("wsA", **self._valid(**{field: -3}))
+
+    def test_a_negative_count_inside_dropped_is_refused(self) -> None:
+        with self.assertRaises(StallDiscoveryContractError):
+            self.store.record_discovery(
+                "wsA",
+                **self._valid(
+                    candidates=1, watched=4, out_of_reach=-3,
+                    dropped={"issue_anchor_unresolved": -3},
+                ),
+            )
+
+    def test_a_boolean_is_not_a_count(self) -> None:
+        # bool is an int subclass; `watched=True` is a mistake, not the number 1.
+        #
+        # The counts below are chosen so they would be CONSISTENT if the bool were silently
+        # coerced (1 == 1 + 0). An earlier version of this test used counts that broke the
+        # identity too, so it passed for the wrong reason and left the bool check untested.
+        with self.assertRaises(StallDiscoveryContractError) as caught:
+            self.store.record_discovery(
+                "wsA", candidates=1, watched=True, out_of_reach=0, dropped={}
+            )
+        self.assertIn("bool", str(caught.exception))
+
+    def test_a_boolean_inside_dropped_is_not_a_count(self) -> None:
+        with self.assertRaises(StallDiscoveryContractError) as caught:
+            self.store.record_discovery(
+                "wsA", candidates=1, watched=0, out_of_reach=1,
+                dropped={"no_live_locator": True},
+            )
+        self.assertIn("bool", str(caught.exception))
+
+    def test_counts_that_disagree_are_refused(self) -> None:
+        # candidates == watched + sum(dropped) holds in the producer by construction, so a
+        # row that breaks it is not a row this rail wrote.
+        with self.assertRaises(StallDiscoveryContractError):
+            self.store.record_discovery("wsA", **self._valid(candidates=99))
+        with self.assertRaises(StallDiscoveryContractError):
+            self.store.record_discovery("wsA", **self._valid(out_of_reach=3))
+
+    def test_a_non_mapping_dropped_is_refused(self) -> None:
+        with self.assertRaises(StallDiscoveryContractError):
+            self.store.record_discovery("wsA", **self._valid(dropped=["a"]))
+
+    def test_a_valid_summary_still_round_trips(self) -> None:
+        self._seed_valid()
+        self.assertEqual(
+            self.store.last_discovery("wsA"),
+            {
+                "observed_at": "t1",
+                "candidates": 4,
+                "watched": 1,
+                "out_of_reach": 2,
+                "dropped": {
+                    "foreign_workspace": 1,
+                    "issue_anchor_unresolved": 1,
+                    "no_live_locator": 1,
+                },
+            },
+        )
+
+
+class DiscoveryReadContractTest(DiscoveryContractBase):
+    """A store is not a trust boundary: the durable row is re-validated on the way OUT.
+
+    An older build, a hand-edited DB or a partially-written row can all hold values this
+    build's contract forbids, and the READ path is what feeds ``--status``.
+    """
+
+    def _unreadable(self):
+        got = self.store.last_discovery("wsA")
+        self.assertIsNotNone(got)
+        return got
+
+    def test_an_off_vocabulary_reason_in_the_db_is_not_rendered(self) -> None:
+        self._seed_valid()
+        self._corrupt(
+            "UPDATE stall_watch_discovery SET dropped=?", '{"/etc/shadow": 1}'
+        )
+        got = self._unreadable()
+        self.assertEqual(got["unreadable"], DISCOVERY_BAD_REASON_TOKEN)
+        self.assertNotIn("shadow", json.dumps(got))
+
+    def test_a_negative_count_in_the_db_is_not_rendered(self) -> None:
+        self._seed_valid()
+        self._corrupt("UPDATE stall_watch_discovery SET out_of_reach=-3")
+        got = self._unreadable()
+        self.assertEqual(got["unreadable"], DISCOVERY_BAD_COUNT)
+        self.assertNotIn("-3", json.dumps(got))
+
+    def test_counts_that_disagree_in_the_db_are_not_rendered(self) -> None:
+        self._seed_valid()
+        self._corrupt("UPDATE stall_watch_discovery SET candidates=99")
+        got = self._unreadable()
+        self.assertEqual(got["unreadable"], DISCOVERY_INCONSISTENT)
+        self.assertNotIn("99", json.dumps(got))
+
+    def test_malformed_json_in_the_db_is_not_rendered(self) -> None:
+        self._seed_valid()
+        self._corrupt("UPDATE stall_watch_discovery SET dropped='not json'")
+        self.assertEqual(self._unreadable()["unreadable"], DISCOVERY_MALFORMED)
+
+    def test_no_stored_value_survives_a_rejected_row(self) -> None:
+        # Including the timestamp: a row whose reasons are untrusted has an untrusted
+        # observed_at too.
+        self._seed_valid()
+        self._corrupt("UPDATE stall_watch_discovery SET dropped=?", '{"/etc/shadow": 1}')
+        got = self._unreadable()
+        self.assertEqual(got["observed_at"], "")
+        self.assertEqual(got["candidates"], 0)
+        self.assertEqual(got["watched"], 0)
+        self.assertEqual(got["out_of_reach"], 0)
+        self.assertEqual(got["dropped"], {})
+
+    def test_unreadable_is_distinct_from_never_run(self) -> None:
+        # Different operator actions: "fix the store" vs "wait for a pass".
+        self._seed_valid()
+        self._corrupt("UPDATE stall_watch_discovery SET dropped='not json'")
+        self.assertIsNotNone(self.store.last_discovery("wsA"))
+        self.assertIsNone(self.store.last_discovery("wsZ"))
+
+    def test_the_reject_token_vocabulary_is_closed(self) -> None:
+        from mozyo_bridge.core.state.stall_escalation import unreadable_discovery
+
+        for token in (
+            DISCOVERY_BAD_REASON_TOKEN,
+            DISCOVERY_BAD_COUNT,
+            DISCOVERY_INCONSISTENT,
+            DISCOVERY_MALFORMED,
+        ):
+            with self.subTest(token=token):
+                shape = unreadable_discovery(token)
+                self.assertEqual(shape["unreadable"], token)
+                self.assertEqual(
+                    set(shape),
+                    {
+                        "observed_at",
+                        "candidates",
+                        "watched",
+                        "out_of_reach",
+                        "dropped",
+                        "unreadable",
+                    },
+                )
 
 
 class SchemaTest(StoreBase):

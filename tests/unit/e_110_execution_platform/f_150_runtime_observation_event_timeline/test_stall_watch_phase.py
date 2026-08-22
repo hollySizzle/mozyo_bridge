@@ -24,6 +24,7 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     encode_assigned_name,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_phase import (  # noqa: E501
+    DROP_REASONS,
     CADENCE_DISABLED,
     CADENCE_DUE,
     CADENCE_NEVER_RAN,
@@ -181,6 +182,97 @@ class AdmittedUnitTest(unittest.TestCase):
         # than being dropped: not knowing the provider is not a reason to stop watching.
         (unit,) = _discover([_row()], provider_for=_boom).units
         self.assertEqual(unit.provider_id, "claude")
+
+
+class DropReasonVocabularyTest(unittest.TestCase):
+    """The store declares the drop vocabulary separately; the two must not drift.
+
+    The store must not import this layer (a state store that can reach the rules invites a
+    rule to be written in it), so the closed set is declared twice. That duplication is only
+    safe if a divergence FAILS, so it is checked in BOTH directions: a reason added to the
+    producer without the store would be rejected at the write boundary, and one added to the
+    store without the producer would widen what a durable row may say for no reason.
+    """
+
+    def test_the_store_and_the_producer_declare_the_same_reasons(self) -> None:
+        from mozyo_bridge.core.state.stall_escalation import DISCOVERY_DROP_REASONS
+
+        self.assertEqual(DROP_REASONS, DISCOVERY_DROP_REASONS)
+
+    def test_the_foreign_reason_token_matches(self) -> None:
+        # `out_of_reach` is defined as "dropped minus foreign", so the two layers must agree
+        # on which token that is or the coverage identity silently changes meaning.
+        from mozyo_bridge.core.state.stall_escalation import DISCOVERY_FOREIGN_REASON
+
+        self.assertEqual(DROP_FOREIGN_WORKSPACE, DISCOVERY_FOREIGN_REASON)
+
+    def test_every_reason_the_producer_can_emit_is_writable(self) -> None:
+        # Enumeration-independent: whatever the producer's set contains must pass the
+        # store's write contract, rather than a hand-listed sample of it.
+        from mozyo_bridge.core.state.stall_escalation import validate_discovery
+
+        dropped = {reason: 1 for reason in sorted(DROP_REASONS)}
+        total = len(dropped)
+        foreign = dropped.get(DROP_FOREIGN_WORKSPACE, 0)
+        validate_discovery(
+            candidates=total + 2,
+            watched=2,
+            out_of_reach=total - foreign,
+            dropped=dropped,
+        )
+
+
+class CoverageIdentityTest(unittest.TestCase):
+    """The counting identities the store enforces must hold in the PRODUCER."""
+
+    def _discovery(self, rows, **kwargs):
+        policy = StallWatchPolicy.from_record({"all_managed_lanes": True})
+        return discover_watch_units(
+            rows,
+            workspace_id=WS,
+            policy=policy,
+            generation_for=kwargs.pop("generation_for", lambda lane: "g1"),
+            issue_for=kwargs.pop("issue_for", lambda lane: "15855"),
+            **kwargs,
+        )
+
+    def test_candidates_equals_watched_plus_dropped(self) -> None:
+        discovery = self._discovery(
+            [
+                _row(lane="a"),
+                _row(lane="b", workspace="wsB"),
+                _row(lane="c", locator=""),
+                _row(lane="d"),
+            ],
+            generation_for=lambda lane: "" if lane == "d" else "g1",
+        )
+        self.assertEqual(
+            discovery.candidates, discovery.watched + sum(discovery.dropped.values())
+        )
+
+    def test_out_of_reach_is_dropped_minus_foreign(self) -> None:
+        discovery = self._discovery(
+            [_row(lane="a"), _row(lane="b", workspace="wsB"), _row(lane="c", locator="")]
+        )
+        self.assertEqual(
+            discovery.out_of_reach,
+            sum(discovery.dropped.values())
+            - discovery.dropped.get(DROP_FOREIGN_WORKSPACE, 0),
+        )
+
+    def test_a_real_discovery_satisfies_the_store_contract(self) -> None:
+        # The end-to-end claim: what the producer emits is exactly what the store accepts.
+        from mozyo_bridge.core.state.stall_escalation import validate_discovery
+
+        discovery = self._discovery(
+            [_row(lane="a"), _row(lane="b", workspace="wsB"), _row(lane="c", locator="")]
+        )
+        validate_discovery(
+            candidates=discovery.candidates,
+            watched=discovery.watched,
+            out_of_reach=discovery.out_of_reach,
+            dropped=dict(discovery.dropped),
+        )
 
 
 class CadenceTest(unittest.TestCase):

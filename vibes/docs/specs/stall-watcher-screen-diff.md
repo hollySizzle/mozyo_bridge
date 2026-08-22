@@ -2,7 +2,7 @@
 
 ## Status
 
-- version: `v0.4` (#15855 運用配線 + j#110132 / j#110146 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
+- version: `v0.5` (#15855 運用配線 + j#110132 / j#110146 / j#110169 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
 - scope: watcher 層 (background / operator) が、pane の**描画画面が進んでいるか**だけを一次
   センサーとして停滞候補を拾い、種別を分類し、種別ごとの処方を**提示**するまで。
 - non-goal: 処方の自動適用、配送 rail の retry policy、completion 判定、receiver-state
@@ -335,6 +335,32 @@ run の identity は `workspace_id + lane_id + role` (durable slot) で、termin
 generation を key に入れると relaunch のたびに孤児行が残るので、key ではなく束縛にする。
 generation が変われば run は restart する — 新しい process は自分の画面を持つのであり、
 前任者の停滞で新 agent を escalate してはならない。
+
+### 閉じた語彙は「宣言」ではなく「境界での強制」で持つ
+
+operator surface へ出る値の語彙を docstring で宣言しても、**write / read の両境界で検証しなければ
+宣言していないのと同じ**。j#110169 finding_1 の実測では、coverage の `dropped` に任意の path
+文字列と負数を渡すと `--status` までそのまま通った — 同じ file が「fixed classification token /
+count だけなので verbatim に render して安全」と宣言していたにもかかわらず。
+
+したがって discovery の coverage は次を両境界で強制する:
+
+- reason は宣言済み集合の token のみ。語彙外は拒否し、**拒否の message にその文字列を引用しない**
+  (引用したら封じ込めたい文字列がそのまま log へ出る)。
+- count は非負 integer (`bool` は count ではない)。
+- count 同士が整合する: `candidates == watched + sum(dropped)` と
+  `out_of_reach == sum(dropped) - foreign_workspace`。producer は候補を必ずどれか 1 つの bucket へ
+  分けるので、この 2 本は構成上成立する。破れている row は本 rail が書いた row ではない。
+
+**store は信頼境界ではない**。古い build・手編集・書きかけの row はいずれもこの build の契約を
+破る値を保持しうるし、`--status` に実際に流れるのは read 経路である。read 側で検証に落ちた row は
+**保存値を 1 つも echo せず** typed な `unreadable` token に倒す (timestamp も echo しない —
+reason が信用できない row は timestamp も信用できない)。`null` (= まだ 1 度も走っていない) とは
+区別する。operator の次の action が違うからである。
+
+なお store 側の語彙は discovery 層から import せず二重宣言する (state store が方針 module へ
+手を伸ばせると、そこに規則が書かれ始める)。二重化が安全なのは**双方向の一致を test が機械照合
+する**場合だけである。
 
 ### operator surface へ出す文字列は閉じた語彙だけ
 

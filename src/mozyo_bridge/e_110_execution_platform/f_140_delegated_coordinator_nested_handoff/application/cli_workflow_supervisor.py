@@ -340,6 +340,14 @@ def _stall_watch_status_lines(rows) -> list:
         discovery = row.get("discovery")
         if discovery is None:
             lines.append("    coverage: no pass recorded yet")
+        elif discovery.get("unreadable"):
+            # A stored row that failed the store's own contract. The TOKEN is shown and
+            # nothing from the row is, so a corrupt record cannot render caller-supplied
+            # text on an operator surface (review j#110169).
+            lines.append(
+                f"    coverage: unreadable ({discovery['unreadable']}) — "
+                "the recorded summary does not satisfy the discovery contract"
+            )
         else:
             dropped = discovery.get("dropped") or {}
             reasons = " ".join(f"{k}={v}" for k, v in sorted(dropped.items())) or "-"

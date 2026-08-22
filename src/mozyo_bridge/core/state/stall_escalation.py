@@ -119,6 +119,148 @@ CREATE TABLE IF NOT EXISTS stall_watch_discovery (
 )
 """
 
+#: The canonical drop-reason vocabulary a discovery row may name.
+#:
+#: Declared HERE rather than imported from the discovery layer for the same reason
+#: :class:`StreakRow` is not :class:`StreakState`: this store must not reach into the
+#: policy/application modules, or a rule ends up written in a state store. The cost of
+#: duplication is paid by a test that asserts this set equals the producer's ``DROP_REASONS``
+#: **in both directions**, so adding a reason on one side and not the other fails loudly
+#: instead of silently widening what a durable row may say.
+DISCOVERY_DROP_REASONS: frozenset[str] = frozenset(
+    {
+        "foreign_workspace",
+        "outside_declared_scope",
+        "live_generation_unresolved",
+        "issue_anchor_unresolved",
+        "no_live_locator",
+    }
+)
+
+#: The one reason that is somebody ELSE's business rather than a gap in this watcher's
+#: reach, so it is excluded from ``out_of_reach``. Kept as a name because the coverage
+#: identity below depends on it.
+DISCOVERY_FOREIGN_REASON = "foreign_workspace"
+
+#: What a stored discovery row is replaced by when it does not satisfy the contract this
+#: module declares. Every count is zero and **no stored value is echoed** — the whole point
+#: is that a row which failed validation must not reach an operator surface, and a row whose
+#: reasons are untrusted has an untrusted timestamp too.
+#:
+#: Deliberately distinct from ``None``: "the watcher has never run" and "the watcher's
+#: record is unreadable" call for different operator actions, and collapsing them would hide
+#: a corrupt store behind a benign-looking blank.
+DISCOVERY_UNREADABLE = "unreadable"
+
+#: Typed reasons a discovery row is rejected. Closed, so a status surface can branch.
+DISCOVERY_BAD_REASON_TOKEN = "off_vocabulary_reason"
+DISCOVERY_BAD_COUNT = "invalid_count"
+DISCOVERY_INCONSISTENT = "inconsistent_counts"
+DISCOVERY_MALFORMED = "malformed_row"
+
+
+class StallDiscoveryContractError(ValueError):
+    """A discovery summary violated the closed contract this module declares.
+
+    Raised at the WRITE boundary. The read boundary cannot raise — a corrupt row must not
+    make ``--status`` explode — so it degrades to :data:`DISCOVERY_UNREADABLE` instead.
+    """
+
+
+def _checked_count(value: object, *, field: str) -> int:
+    """A non-negative integer, or a typed refusal. ``bool`` is not a count."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        raise StallDiscoveryContractError(
+            f"discovery {field} must be a non-negative integer, not {type(value).__name__}"
+        )
+    if value < 0:
+        raise StallDiscoveryContractError(
+            f"discovery {field} must be non-negative; got {value}"
+        )
+    return int(value)
+
+
+def validate_discovery(
+    *, candidates: int, watched: int, out_of_reach: int, dropped: Optional[dict]
+) -> "tuple[int, int, int, dict[str, int]]":
+    """Check a coverage summary against the closed contract; raise on any violation.
+
+    Three separate obligations, each of which the store previously only *claimed*:
+
+    - every reason is a declared token, so no caller-supplied string (a path, a message, a
+      lane id) can reach a durable row and from there an operator surface;
+    - every count is a non-negative integer, so a status line cannot render ``-3``;
+    - the counts agree with each other. The producer partitions every candidate into
+      exactly one bucket, so ``candidates == watched + sum(dropped)`` holds by construction,
+      and ``out_of_reach`` is that sum minus the foreign-workspace rows. A row that fails
+      these is not a row this rail wrote, whatever it says.
+    """
+    counts = {
+        "candidates": _checked_count(candidates, field="candidates"),
+        "watched": _checked_count(watched, field="watched"),
+        "out_of_reach": _checked_count(out_of_reach, field="out_of_reach"),
+    }
+    if dropped is None:
+        dropped = {}
+    if not isinstance(dropped, dict):
+        raise StallDiscoveryContractError(
+            f"discovery dropped must be a mapping, not {type(dropped).__name__}"
+        )
+    checked: dict[str, int] = {}
+    for reason, count in dropped.items():
+        if not isinstance(reason, str) or reason not in DISCOVERY_DROP_REASONS:
+            # The reason is NOT echoed back: quoting an off-vocabulary token in the error
+            # would put the very string this check exists to contain into a log line.
+            raise StallDiscoveryContractError(
+                "discovery dropped names a reason outside the declared vocabulary; "
+                f"allowed: {sorted(DISCOVERY_DROP_REASONS)}"
+            )
+        checked[reason] = _checked_count(count, field=f"dropped[{reason}]")
+
+    total_dropped = sum(checked.values())
+    if counts["candidates"] != counts["watched"] + total_dropped:
+        raise StallDiscoveryContractError(
+            "discovery counts disagree: candidates must equal watched + sum(dropped); "
+            f"got {counts['candidates']} != {counts['watched']} + {total_dropped}"
+        )
+    expected_reach = total_dropped - checked.get(DISCOVERY_FOREIGN_REASON, 0)
+    if counts["out_of_reach"] != expected_reach:
+        raise StallDiscoveryContractError(
+            "discovery counts disagree: out_of_reach must equal sum(dropped) minus "
+            f"{DISCOVERY_FOREIGN_REASON}; got {counts['out_of_reach']} != {expected_reach}"
+        )
+    return counts["candidates"], counts["watched"], counts["out_of_reach"], checked
+
+
+def _discovery_reject_token(exc: StallDiscoveryContractError) -> str:
+    """Map a contract violation onto a CLOSED token — never the exception's own text.
+
+    Same discipline as the config resolver's redaction: an operator surface gets a token it
+    can branch on, and the message (which may quote a count, a field name, or a caller's
+    data) stays out of it.
+    """
+    text = str(exc)
+    if "vocabulary" in text:
+        return DISCOVERY_BAD_REASON_TOKEN
+    if "disagree" in text:
+        return DISCOVERY_INCONSISTENT
+    if "non-negative integer" in text or "non-negative" in text or "mapping" in text:
+        return DISCOVERY_BAD_COUNT
+    return DISCOVERY_MALFORMED
+
+
+def unreadable_discovery(reason: str) -> dict:
+    """The typed stand-in for a stored row that failed validation (echoes nothing)."""
+    return {
+        "observed_at": "",
+        "candidates": 0,
+        "watched": 0,
+        "out_of_reach": 0,
+        "dropped": {},
+        DISCOVERY_UNREADABLE: reason,
+    }
+
+
 _WATERMARK_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS stall_watch_watermark (
     workspace_id TEXT NOT NULL PRIMARY KEY,
@@ -731,10 +873,16 @@ class StallEscalationStore:
         ws = str(workspace_id or "").strip()
         if not ws:
             return
-        payload = json.dumps(
-            {str(k): int(v) for k, v in sorted((dropped or {}).items())},
-            sort_keys=True,
+        # Validate BEFORE the row exists. An off-vocabulary reason or a negative count that
+        # reaches the table is already on its way to `--status`, so the contract is enforced
+        # at the write seam rather than apologised for at the read one (review j#110169).
+        candidates, watched, out_of_reach, checked = validate_discovery(
+            candidates=candidates,
+            watched=watched,
+            out_of_reach=out_of_reach,
+            dropped=dropped,
         )
+        payload = json.dumps(checked, sort_keys=True)
         stamp = now or _utc_now_iso()
         self._mutate(
             "discovery write",
@@ -773,26 +921,49 @@ class StallEscalationStore:
             conn.close()
         if row is None:
             return None
+        # The durable row is re-validated on the way OUT as well. A store is not a trust
+        # boundary: an older build, a hand-edited DB or a partially-written row can all put
+        # values here that this build's contract forbids, and the read path is what actually
+        # feeds `--status` (review j#110169).
         try:
             dropped = json.loads(str(row[4]) or "{}")
         except ValueError:
-            dropped = {}
+            return unreadable_discovery(DISCOVERY_MALFORMED)
+        try:
+            candidates, watched, out_of_reach, checked = validate_discovery(
+                candidates=row[1],
+                watched=row[2],
+                out_of_reach=row[3],
+                dropped=dropped,
+            )
+        except StallDiscoveryContractError as exc:
+            return unreadable_discovery(_discovery_reject_token(exc))
         return {
             "observed_at": str(row[0]),
-            "candidates": int(row[1]),
-            "watched": int(row[2]),
-            "out_of_reach": int(row[3]),
-            "dropped": dropped if isinstance(dropped, dict) else {},
+            "candidates": candidates,
+            "watched": watched,
+            "out_of_reach": out_of_reach,
+            "dropped": checked,
         }
 
 
 __all__ = (
+    "DISCOVERY_BAD_COUNT",
+    "DISCOVERY_BAD_REASON_TOKEN",
+    "DISCOVERY_DROP_REASONS",
+    "DISCOVERY_FOREIGN_REASON",
+    "DISCOVERY_INCONSISTENT",
+    "DISCOVERY_MALFORMED",
+    "DISCOVERY_UNREADABLE",
     "STALL_ESCALATION_FILENAME",
     "STALL_ESCALATION_SCHEMA_VERSION",
     "PendingEscalation",
     "StallEscalationStore",
     "StallEscalationStoreError",
+    "StallDiscoveryContractError",
     "StreakRow",
     "escalation_idempotency_key",
+    "unreadable_discovery",
+    "validate_discovery",
     "stall_escalation_path",
 )

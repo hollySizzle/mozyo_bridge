@@ -1070,6 +1070,40 @@ class OperatorStatusSurfaceTest(unittest.TestCase):
         self.assertEqual(discovery["observed_at"], "2026-08-22T09:00:00+00:00")
         self.assertEqual(discovery["dropped"]["issue_anchor_unresolved"], 2)
 
+    def test_a_corrupt_coverage_row_renders_a_token_not_its_contents(self) -> None:
+        # The operator-surface half of j#110169: a stored row that fails the store's own
+        # contract must reach `--status` as a TOKEN, never as the strings it contains.
+        import sqlite3
+
+        from mozyo_bridge.core.state.stall_escalation import (
+            StallEscalationStore,
+            stall_escalation_path,
+        )
+
+        result = self._register("stall_watch:\n  lanes: [lane_a]\n")
+        StallEscalationStore(home=self.home).record_discovery(
+            result.record.workspace_id,
+            candidates=2, watched=1, out_of_reach=1,
+            dropped={"issue_anchor_unresolved": 1}, now="2026-08-22T09:00:00+00:00",
+        )
+        conn = sqlite3.connect(stall_escalation_path(self.home))
+        try:
+            conn.execute(
+                "UPDATE stall_watch_discovery SET dropped=?", ('{"/etc/shadow": 1}',)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        text = self._status()
+        self.assertIn("coverage: unreadable (off_vocabulary_reason)", text)
+        self.assertNotIn("shadow", text)
+
+        row = json.loads(self._status(as_json=True))["stall_watch"][0]["discovery"]
+        self.assertEqual(row["unreadable"], "off_vocabulary_reason")
+        self.assertNotIn("shadow", json.dumps(row))
+        self.assertEqual(row["dropped"], {})
+
     def test_the_json_surface_carries_the_full_projection(self) -> None:
         self._register("stall_watch:\n  lanes: [lane_a]\n")
         payload = json.loads(self._status(as_json=True))
