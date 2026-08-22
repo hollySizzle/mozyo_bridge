@@ -1119,15 +1119,21 @@ class AuthorityExactMatchTest(unittest.TestCase):
 
 
 class _CapEmit:
-    """A gate writer that actually lands the rendered note in the fake source."""
+    """A gate writer that actually lands the rendered note in the fake source.
 
-    def __init__(self, source, journal_id="110264") -> None:
+    The landed journal carries an author, because a real one does: the provider records who
+    posted it, and that is the only fact in the whole note an attacker cannot copy.
+    """
+
+    def __init__(self, source, journal_id="110264", author_id="7") -> None:
         self.source, self.journal_id, self.calls = source, journal_id, []
+        self.author_id = author_id
 
     def __call__(self, issue, gate, *, body="", transport=None, marker_fields=None,
                  review_findings=None):
         self.calls.append(issue)
-        self.source.append(body, journal_id=self.journal_id, issue=str(issue))
+        self.source.append(body, journal_id=self.journal_id, issue=str(issue),
+                           author_id=self.author_id)
 
         class _Receipt:
             recorded = True
@@ -1220,6 +1226,16 @@ class ReadCapTest(unittest.TestCase):
                     ReadbackResult(outcome=outcome, journal_id="110264")
         with self.assertRaises(ValueError):
             ReadbackResult(outcome=READBACK_FOUND)
+
+    def test_a_capped_result_cannot_claim_it_called_the_provider(self) -> None:
+        # The cap exists to stop the call. A capped result reporting one would be saying the
+        # opposite of what the cap did — and the read accounting would disagree with it.
+        with self.assertRaises(ValueError):
+            ReadbackResult(outcome=READBACK_CAPPED, provider_called=True)
+        # The shapes that DO make a call are unaffected.
+        self.assertTrue(
+            ReadbackResult(outcome=READBACK_UNREADABLE, provider_called=True).provider_called
+        )
 
     def test_the_readback_outcomes_are_distinguishable(self) -> None:
         # "No journal carries this" and "we never looked" are opposite facts, and only the
@@ -1460,27 +1476,74 @@ class AuthorityForgeryTest(unittest.TestCase):
         self.assertEqual(found.author_id, self.OURS)
 
     def test_a_known_issuer_makes_a_preemptive_forgery_harmless(self) -> None:
-        # The forgery lands BEFORE the rail writes — the shape that no local check can catch,
-        # because the attacker's note is well-formed and the key is public. With the issuer
-        # known it is not this rail's record and never becomes one.
+        """A forged note posted BEFORE the rail writes must not stop the rail writing.
+
+        The R10 version of this test asserted ``AMBIGUOUS`` and called that harmless. It is
+        not: ambiguity blocks the write and every later wake, and the forged note never goes
+        away, so the firing was jammed permanently (review j#110301 finding_authorityforgery).
+        The test's NAME was right and its assertion was wrong — the third time in this issue
+        that a name claimed a property the assertion did not measure, and the first time in
+        a test written to prove a fix.
+        """
         self.source.append(f"- idempotency_key: {CANONICAL_KEY}", journal_id="999001",
                            author_id=self.THEIRS)
 
-        result = read_journal_authority(self.source, REAL_ISSUE, CANONICAL_KEY)
-        self.assertTrue(result.found)  # a claimant exists...
-        self.assertEqual(result.author_id, self.THEIRS)  # ...but not ours
+        seam = build_journal_readback(source=self.source, expected_issuer=self.OURS)
+        result = seam(REAL_ISSUE, CANONICAL_KEY)
+
+        # Someone else's note is not our record, and not an ambiguity about our record:
+        # there is simply nothing of ours on the issue yet.
+        self.assertEqual(result.outcome, READBACK_ABSENT)
+
+    def test_the_legitimate_write_still_lands_after_a_preemptive_forgery(self) -> None:
+        # End to end: the forgery is already on the issue, and the rail writes anyway and
+        # binds to the journal IT created.
+        self.source.append(f"- idempotency_key: {CANONICAL_KEY}", journal_id="999001",
+                           author_id=self.THEIRS)
+        self.emit.author_id = self.OURS
+
+        result = self._writer(expected_issuer=self.OURS)(self.row)
+
+        self.assertEqual(result.outcome, WRITE_RECORDED)
+        self.assertEqual(result.journal_id, self.emit.journal_id)
+        self.assertNotEqual(result.journal_id, "999001")
+        self.assertEqual(self.emit.calls, [REAL_ISSUE])
+
+    def test_our_journal_is_chosen_when_a_forgery_sits_beside_it(self) -> None:
+        self.source.append(_rendered_note(), journal_id="110264", author_id=self.OURS)
+        self.source.append(f"- idempotency_key: {CANONICAL_KEY}", journal_id="999001",
+                           author_id=self.THEIRS)
+
+        seam = build_journal_readback(source=self.source, expected_issuer=self.OURS)
+        result = seam(REAL_ISSUE, CANONICAL_KEY)
+
+        self.assertEqual(result.outcome, READBACK_FOUND)
+        self.assertEqual(result.journal_id, "110264")
+        # ...and the wake it admits points at ours, not theirs.
+        observed = build_journal_verifier(readback=seam)(
+            _pending(idempotency_key=CANONICAL_KEY, journal_id="110264")
+        )
+        self.assertEqual(observed, "110264")
+
+    def test_two_journals_from_OUR_OWN_issuer_are_still_ambiguous(self) -> None:
+        # The ambiguity that survives issuer filtering is the real one: a duplicate this rail
+        # wrote. Refusing there is right, and it is no longer reachable by an outsider.
+        self.source.append(_rendered_note(), journal_id="110264", author_id=self.OURS)
+        self.source.append(_rendered_note(), journal_id="110265", author_id=self.OURS)
 
         seam = build_journal_readback(source=self.source, expected_issuer=self.OURS)
         self.assertEqual(seam(REAL_ISSUE, CANONICAL_KEY).outcome, READBACK_AMBIGUOUS)
-        # And the wake it would have authorised does not happen.
-        observed = build_journal_verifier(readback=seam)(
-            _pending(idempotency_key=CANONICAL_KEY, journal_id="999001")
-        )
-        self.assertEqual(observed, "")
+
+    def test_a_journal_with_no_author_is_not_attributed_to_us(self) -> None:
+        # "Not attributable" is never "attributable to anyone" (#14661 j#92494).
+        self.source.append(_rendered_note(), journal_id="110264", author_id="")
+
+        seam = build_journal_readback(source=self.source, expected_issuer=self.OURS)
+        self.assertEqual(seam(REAL_ISSUE, CANONICAL_KEY).outcome, READBACK_ABSENT)
 
     def test_a_known_issuer_still_admits_our_own_journal(self) -> None:
-        # The control: an issuer check that refused everything would pass the test above for
-        # free while turning the rail off.
+        # The control: an issuer check that refused everything would pass the tests above
+        # for free while turning the rail off.
         self.source.append(_rendered_note(), journal_id="110264", author_id=self.OURS)
         seam = build_journal_readback(source=self.source, expected_issuer=self.OURS)
         result = seam(REAL_ISSUE, CANONICAL_KEY)
@@ -1506,8 +1569,11 @@ class UnreadableAuthorityTest(unittest.TestCase):
         result = read_journal_authority(broken, REAL_ISSUE, CANONICAL_KEY)
         self.assertEqual(result.outcome, READBACK_UNREADABLE)
         self.assertNotEqual(result.outcome, READBACK_ABSENT)
-        self.assertFalse(result.asked)
-        self.assertEqual(broken.reads, 1)  # the question really was asked of the provider
+        self.assertFalse(result.answered)
+        # The call really was made — that is a different fact from "it answered", and the
+        # two used to be one boolean (review j#110301 finding_askedcollapse).
+        self.assertTrue(result.provider_called)
+        self.assertEqual(broken.reads, 1)
 
     def test_the_seam_passes_the_failure_through_untouched(self) -> None:
         budget = {"reads": 0, "mutated": False, "uncertain": False}
@@ -1515,7 +1581,8 @@ class UnreadableAuthorityTest(unittest.TestCase):
             REAL_ISSUE, CANONICAL_KEY
         )
         self.assertEqual(result.outcome, READBACK_UNREADABLE)
-        self.assertFalse(result.asked)
+        self.assertFalse(result.answered)
+        self.assertTrue(result.provider_called)
         # The read was attempted, so it is accounted for even though it answered nothing.
         self.assertEqual(budget["reads"], 1)
 

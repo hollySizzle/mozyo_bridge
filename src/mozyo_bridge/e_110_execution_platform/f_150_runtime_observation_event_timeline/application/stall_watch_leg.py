@@ -34,12 +34,14 @@ for the journal that declares it. The scan runs **before** the write as well as 
 which is what makes the whole rail idempotent across a crash: a firing whose journal already
 landed is bound to it and never written again, whatever the local store believes.
 
-What that scan can and cannot establish is worth stating exactly, because two rounds were
+What that scan can and cannot establish is worth stating exactly, because three rounds were
 lost to overstating it. It establishes that a journal declaring this firing EXISTS. It does
 not establish that this rail WROTE it — the key is public and deterministic, so anyone who
-can comment on the issue can declare it too. Several claimants are therefore refused rather
-than resolved, and the author is carried for the issuer binding whose source is still being
-decided (j#110297).
+can comment on the issue can declare it too. The order in which that is resolved matters as
+much as the check itself: **attribution first, then cardinality**. Filtering by issuer only
+after counting made one outsider's note enough to jam the firing forever (review j#110301).
+Whose journals count is decided first; how many of them there are is asked afterwards. The
+issuer's own source is the design decision in j#110297.
 
 A write is therefore classified three ways, not two (review j#110132 finding_1). "No journal
 id" is not one situation: a refused write never reached Redmine, while a POST that returned
@@ -188,6 +190,13 @@ class ReadbackResult:
     #: can write a note can write its fields — while the author is a fact the provider
     #: authenticates (the reason ``RedmineJournalEntry.author_id`` exists, #14661 j#92494).
     author_id: str = ""
+    #: Whether a request actually went to the provider. Separate from :attr:`answered`
+    #: because they are different facts and one boolean cannot carry both: a call that
+    #: raised did reach the provider (and spent a read) while answering nothing, and a cache
+    #: hit answers without any I/O at all. Collapsing them made "we never asked" and "we
+    #: asked and it broke" identical on a status surface (review j#110301
+    #: finding_askedcollapse).
+    provider_called: bool = False
 
     def __post_init__(self) -> None:
         if self.outcome not in READBACK_OUTCOMES:
@@ -203,24 +212,32 @@ class ReadbackResult:
             )
         if self.author_id and self.outcome != READBACK_FOUND:
             raise ValueError(f"a {self.outcome!r} readback must not carry an author")
+        if self.provider_called and self.outcome == READBACK_CAPPED:
+            # The cap exists precisely to stop the call. A capped result that claims to have
+            # made one would be reporting the opposite of what the cap did.
+            raise ValueError("a capped readback cannot have called the provider")
 
     @property
     def found(self) -> bool:
         return self.outcome == READBACK_FOUND
 
     @property
-    def asked(self) -> bool:
-        """Whether the authority was actually consulted.
+    def answered(self) -> bool:
+        """Whether the authority gave an answer about this firing.
 
-        A cap and a missing source are not asks. An UNREADABLE answer is not an ask either:
-        the request left, the provider refused it, and nothing came back. Reporting that as
-        "asked and answered nothing" is what review j#110293 finding_unreadablecollapse
-        found — a lie that costs nothing today and misleads the next caller.
+        Named for what it measures. It used to be called ``asked``, which claimed something
+        it never checked: a provider call that RAISED returned ``asked=False`` while having
+        really been made and really spent a read from the pass budget (review j#110301
+        finding_askedcollapse). Whether the request went out is :attr:`provider_called`;
+        whether anything came back is this. A cap, a missing source and a failed call all
+        answer nothing — but only the last of them made a call.
         """
         return self.outcome in (READBACK_FOUND, READBACK_ABSENT, READBACK_AMBIGUOUS)
 
 
-def read_journal_authority(source: object, issue: str, key: str) -> ReadbackResult:
+def read_journal_authority(
+    source: object, issue: str, key: str, expected_issuer: str = ""
+) -> ReadbackResult:
     """Ask the external system which journal carries ``key``. The rail's ONLY authority.
 
     Matching is :func:`note_declares_key` — the canonical field parser that lives beside the
@@ -239,31 +256,52 @@ def read_journal_authority(source: object, issue: str, key: str) -> ReadbackResu
     ``""``, which the seam then reported as "asked, and no journal carries this" — the exact
     collapse the typed contract was introduced to prevent (finding_unreadablecollapse).
 
-    What this still cannot do, stated plainly: it cannot tell OUR journal from a forgery
-    that copies the field, because the idempotency key is public and deterministic. Only the
-    author can, and the expected issuer is a pending design decision (j#110297). The author
-    is carried here so that decision plugs in rather than rebuilds.
+    ``expected_issuer`` is what makes any of this an authority rather than a well-formedness
+    check. The idempotency key is public and deterministic, so the field alone cannot tell
+    OUR journal from a copy of it; the author can, because the provider authenticates it.
+    When the issuer is known, journals by anyone else are not claimants — not ambiguity,
+    just not ours. Where the rail learns its own issuer is the design decision in j#110297;
+    while it is empty this function is exactly as strong as R10 left it, and the residual is
+    recorded there and in the spec rather than hidden here.
     """
     if source is None or not key or not canonical_idempotency_key(key):
         return ReadbackResult(outcome=READBACK_UNREADABLE)
     try:
         entries = source.read_entries(str(issue))  # type: ignore[attr-defined]
     except Exception:  # noqa: BLE001 - typed, never swallowed into an absence
-        return ReadbackResult(outcome=READBACK_UNREADABLE)
+        return ReadbackResult(outcome=READBACK_UNREADABLE, provider_called=True)
+    # WHOSE journal, then HOW MANY. Getting that order wrong is not a refinement detail: the
+    # first version counted every journal declaring the public key and returned AMBIGUOUS
+    # before it ever looked at an author, so one forged note blocked the legitimate write
+    # and every later wake — permanently, since the forged note does not go away (review
+    # j#110301 finding_authorityforgery). Attribution decides who is a claimant; only then
+    # does cardinality mean anything.
     claimants = [
         entry for entry in entries or ()
         if note_declares_key(getattr(entry, "notes", "")) == key
         and str(getattr(entry, "journal_id", "") or "")
+        # A missing author is not a match for a known issuer. "Not attributable" is never
+        # "attributable to anyone" (#14661 j#92494).
+        and (
+            not expected_issuer
+            or str(getattr(entry, "author_id", "") or "") == expected_issuer
+        )
     ]
     if not claimants:
-        return ReadbackResult(outcome=READBACK_ABSENT)
+        # Nothing OF OURS is on the issue. With an issuer known this is the honest answer
+        # even when someone else's note claims the firing: their journal is not our record,
+        # so the write proceeds and binds to the one it creates.
+        return ReadbackResult(outcome=READBACK_ABSENT, provider_called=True)
     if len(claimants) > 1:
-        return ReadbackResult(outcome=READBACK_AMBIGUOUS)
+        # Two of OUR OWN journals claiming one firing is a real ambiguity — a duplicate this
+        # rail wrote — and refusing is right. It is no longer reachable by an outsider.
+        return ReadbackResult(outcome=READBACK_AMBIGUOUS, provider_called=True)
     (entry,) = claimants
     return ReadbackResult(
         outcome=READBACK_FOUND,
         journal_id=str(getattr(entry, "journal_id", "") or ""),
         author_id=str(getattr(entry, "author_id", "") or ""),
+        provider_called=True,
     )
 
 
@@ -322,12 +360,9 @@ def build_journal_readback(
             return ReadbackResult(outcome=READBACK_CAPPED)
         if budget is not None:
             budget["reads"] = int(budget.get("reads", 0)) + 1
-        result = read_journal_authority(source, issue, key)
-        if result.found and expected_issuer and result.author_id != expected_issuer:
-            # Authored by someone else: not this rail's record, so not a claimant. Refused
-            # rather than reported as an absence, because "a journal claiming this firing
-            # exists and we did not write it" is an operator-visible fact.
-            result = ReadbackResult(outcome=READBACK_AMBIGUOUS)
+        # The issuer goes DOWN, not applied on the way back: attribution has to decide who
+        # is a claimant before cardinality can mean anything (review j#110301).
+        result = read_journal_authority(source, issue, key, expected_issuer)
         if result.found:
             cache[(issue, key)] = result
         return result

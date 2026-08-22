@@ -454,7 +454,8 @@ class ReadbackFenceTest(LegBase):
         result = read_journal_authority(_Broken(), "15855", "stallesc1_" + "a" * 32)
         self.assertEqual(result.outcome, READBACK_UNREADABLE)
         self.assertFalse(result.found)
-        self.assertFalse(result.asked)
+        self.assertFalse(result.answered)
+        self.assertTrue(result.provider_called)
 
 
 class NoiseTest(LegBase):

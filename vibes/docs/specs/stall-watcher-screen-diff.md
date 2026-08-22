@@ -2,7 +2,7 @@
 
 ## Status
 
-- version: `v0.11` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 / j#110192 / j#110218 / j#110254 / j#110281 / j#110293 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
+- version: `v0.12` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 / j#110192 / j#110218 / j#110254 / j#110281 / j#110293 / j#110301 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
 - scope: watcher 層 (background / operator) が、pane の**描画画面が進んでいるか**だけを一次
   センサーとして停滞候補を拾い、種別を分類し、種別ごとの処方を**提示**するまで。
 - non-goal: 処方の自動適用、配送 rail の retry policy、completion 判定、receiver-state
@@ -827,6 +827,49 @@ issuer」だけ**である。`ReadbackResult` は author を運び、`build_jour
 typed 契約を実装が満たしていない状態であり、**宣言した強制が実在しない**型の 5 度目である。
 `read_journal_authority` は例外を `unreadable` として型で返し、`asked` は False になる。
 失敗は cache しない — 1 度の outage が pass 全体で「確定した事実」に見えてはいけない。
+
+### 帰属が先、員数が後 (j#110301 finding_authorityforgery / finding_askedcollapse)
+
+v0.11 は「claimant が複数なら拒否」と「issuer 既知なら別著者を権威にしない」を両方入れた。
+**だが順序が逆だった。** 公開 key を宣言する journal を**先に数え**、複数なら author を見る前に
+`ambiguous_authority` を返していたため、issuer を既知にしても偽造 1 本で詰む。
+
+実測 (`expected_issuer=7`、修正前):
+
+    own_only            -> found       foreign_only        -> ambiguous  ← 恒久 DoS
+    own_plus_foreign    -> ambiguous   own_twice           -> ambiguous
+    author missing      -> ambiguous
+
+攻撃者の note は消えないので、これは一過性ではなく**恒久的な妨害**である。pre-POST では正規
+POST が永久に抑止され、post-POST では bind と wake が永久に止まる。**拒否は安全側とは限らない** —
+「奪取されない」ことと「配送できる」ことは別で、前者だけを守ると後者を失う。
+
+是正: **帰属 (whose) を claimant 集合の構築時に適用し、員数 (how many) はその後で数える。**
+author 欠落は既知 issuer との一致ではないので claimant から除外する (「帰属不能」は決して
+「誰にでも帰属」ではない、#14661 j#92494)。修正後:
+
+    own_only            -> found       foreign_only        -> absent   ← 正規 POST が走る
+    own_plus_foreign    -> found (ours) own_twice          -> ambiguous ← 本物の曖昧さだけが残る
+    author missing      -> absent
+
+**残る `ambiguous` は「この rail 自身が二重に書いた」場合だけ**になり、外部からは到達できない。
+
+#### test の名前が主張する性質を、assertion が測っていなかった (3 度目)
+
+R10 で書いた `test_a_known_issuer_makes_a_preemptive_forgery_harmless` は
+`assertEqual(outcome, AMBIGUOUS)` を主張していた。**`ambiguous` は harmless ではない。** 名前は
+「無害化した」と言い、assertion は「詰む」を固定していた。本 issue でこの型は 3 度目であり、
+**finding への対応を証明するために新規に書いた test でも起きる**ことが分かった。
+対策として、この種の test には**必ず「望ましい終状態」まで書く** — 「拒否される」ではなく
+「正規の書き込みが成功し、自分の journal に bind する」まで E2E で固定する。
+
+#### `asked` は「呼んだ」ではなく「答えた」だった
+
+`asked` は outcome から導出していたため、**provider を実際に呼んで例外になった場合も False** を
+返した (read budget は 1 消費されているのに)。docstring の `actually consulted` と実装が一致して
+いない。**I/O を試みたか** (`provider_called`) と **答えが返ったか** (`answered`) は別の事実であり、
+1 つの boolean には載らない — cache hit は I/O なしで答え、失敗した呼び出しは I/O ありで答えない。
+改名 + 独立 field に分離し、`capped` が `provider_called` を主張できないことは型で強制する。
 
 ## Cross-References
 
