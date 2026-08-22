@@ -292,6 +292,21 @@ documents:
       - spec-recovery-rail-taxonomy
       - spec-herdr-native-identity
 
+  - id: spec-version-owning-project-coordinator
+    type: spec
+    status: active
+    canonical_path: vibes/docs/specs/version-owning-project-coordinator.md
+    purpose: バージョンを所有するプロジェクトコーディネーターの実体化方式 (Redmine #15844)。ADR-0011 の「プロジェクトコーディネーター = Redmine Version 単位 / drain が最重要責務」を runtime で成立させる設計正本。既存の列挙面がすべて lane 集合を起点にしており Version 起点の面が無いこと (`dispatch-plan` は Version 起点だが open leaf へ射影するので閉じ残りが構造的に落ちる) を穴の内実として固定し、Version binding の置き場候補 3 案 (引数 / config / lifecycle column) と採用理由、自律ライフサイクル loop の 5 段 (列挙 / 追跡 / 終端検出 / drain / review 調整) と各段の既存 rail 対応、駆動先の候補評価 (stall watcher 層ではなく `workflow supervisor` の bounded pass) を持つ。本 doc が実装対象とするのは read-only の継続追跡 (`workflow version-track`) のみで、7 rule の全域 first-match disposition (`drain_owed` / `in_flight` / `settled` / `lane_terminal_issue_open` / `umbrella_open` / `undispatched` / `unknown_issue_state`)、umbrella × lane 保持の交差 precedence、version scope が作る死角を埋める `unscoped_lanes`、合成 verdict を出さず count に留める roll-up 規律を固定する。自律 drain / integrate は escalation 対象。
+    audit_role: version_owning_project_coordinator_spec
+    related_document_refs:
+      - rule-adr-index
+      - logic-coordinator-sublane-development-flow
+      - logic-managed-state-model
+      - spec-recovery-rail-taxonomy
+      - spec-stall-watcher-screen-diff
+      - skill-workflow-reference
+      - spec-project-map
+
   - id: spec-delegated-coordinator-role-profile
     type: spec
     status: active
