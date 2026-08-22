@@ -25,9 +25,13 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     VersionIssueFacts,
     build_version_tracking,
     classify_version_issue,
+    display_lane_id,
+    is_renderable_lane_id,
     is_terminal_lane_disposition,
     join_version_issues,
+    reboot_audit_command,
     render_version_tracking_text,
+    shell_safe_command,
 )
 
 
@@ -95,7 +99,7 @@ class ClassifyVersionIssueTest(unittest.TestCase):
             _facts(is_closed=True, status_name="クローズ", lanes=(ACTIVE,))
         )
         self.assertEqual(
-            tracking.next_steps,
+            tracking.diagnosis_steps,
             ("mozyo-bridge sublane reboot-audit --lane-label issue_1_x",),
         )
 
@@ -110,15 +114,15 @@ class ClassifyVersionIssueTest(unittest.TestCase):
             _facts(is_closed=True, status_name="クローズ", lanes=(RETIRED, ACTIVE))
         )
         self.assertEqual(tracking.disposition, DISPOSITION_DRAIN_OWED)
-        self.assertEqual(len(tracking.next_steps), 1)
-        self.assertIn("issue_1_x", tracking.next_steps[0])
+        self.assertEqual(len(tracking.diagnosis_steps), 1)
+        self.assertIn("issue_1_x", tracking.diagnosis_steps[0])
 
     def test_open_issue_with_active_lane_is_in_flight(self):
         tracking = classify_version_issue(
             _facts(is_closed=False, status_name="着手中", lanes=(ACTIVE,))
         )
         self.assertEqual(tracking.disposition, DISPOSITION_IN_FLIGHT)
-        self.assertEqual(tracking.next_steps, ())
+        self.assertEqual(tracking.diagnosis_steps, ())
 
     def test_closed_issue_with_only_terminal_lanes_is_settled(self):
         tracking = classify_version_issue(
@@ -353,6 +357,175 @@ class RenderTest(unittest.TestCase):
             build_version_tracking(version_id="1", version_name="v", issues=(_facts(),))
         )
         self.assertIn("attention: none", text)
+
+
+class LaneIdentitySafetyTest(unittest.TestCase):
+    """A stored lane id must not be able to forge a command or a record line.
+
+    Redmine #15844 review j#109990 finding_1 (verdict: accepted, j#109994).
+    ``LaneLifecycleKey`` rejects only the empty string, so an id carrying shell
+    metacharacters, a leading ``--``, or a newline is a storable value; the guard has to
+    live where that id is re-emitted.
+    """
+
+    def _drain_owed(self, lane_id):
+        return classify_version_issue(
+            _facts(
+                is_closed=True,
+                status_name="クローズ",
+                lanes=(TrackedLane(lane_id, "active"),),
+            )
+        )
+
+    def test_shell_metacharacters_cannot_append_a_second_command(self):
+        tracking = self._drain_owed("issue_15844")
+        self.assertEqual(len(tracking.diagnosis_steps), 1)
+        # The reported vector: a `;` in the id used to end the command and start another.
+        injected = self._drain_owed("issue_15844; printf REVIEW_INJECTION")
+        for step in injected.diagnosis_steps:
+            self.assertNotIn("; printf", step)
+
+    def test_an_id_that_forges_an_argv_flag_is_refused(self):
+        """No shell metacharacter is needed to be dangerous.
+
+        ``issue_1 --execute`` passes any "strip dangerous punctuation" filter untouched,
+        yet lands as a SECOND argv token. Only quoting (or refusal) closes it.
+        """
+        tracking = self._drain_owed("issue_15844 --execute")
+        self.assertEqual(tracking.diagnosis_steps, ())
+        self.assertEqual(tracking.unrenderable_lane_ids, ("issue_15844 --execute",))
+
+    def test_a_control_character_id_yields_no_command(self):
+        for lane_id in (
+            "issue_15844\n      $ printf NEWLINE",
+            "issue_15844\r\n",
+            "issue_15844\x00",
+            "issue_15844\x1b[31m",
+        ):
+            with self.subTest(lane_id=lane_id):
+                self.assertEqual(self._drain_owed(lane_id).diagnosis_steps, ())
+
+    def test_refusing_the_command_does_not_hide_the_finding(self):
+        # Owed work does not stop being owed because its id could not be vouched for.
+        tracking = self._drain_owed("issue_15844\nrogue")
+        self.assertEqual(tracking.disposition, DISPOSITION_DRAIN_OWED)
+        self.assertTrue(tracking.needs_attention)
+        self.assertEqual(len(tracking.unrenderable_lane_ids), 1)
+
+    def test_real_corpus_shaped_ids_are_accepted(self):
+        # Measured on the operator store: all 121 rows match `^[A-Za-z0-9_]+$`, so the
+        # strict guard costs no legitimate lane.
+        for lane_id in (
+            "issue_15844_pc_instantiation",
+            "codex_issue_15095_owner_direct_config",
+            "default",
+        ):
+            with self.subTest(lane_id=lane_id):
+                self.assertTrue(is_renderable_lane_id(lane_id))
+                self.assertEqual(
+                    reboot_audit_command(lane_id),
+                    f"mozyo-bridge sublane reboot-audit --lane-label {lane_id}",
+                )
+
+    def test_the_quoting_layer_is_exercised_on_what_the_guard_would_reject(self):
+        """The second layer, tested independently of the first.
+
+        Today ``is_renderable_lane_id`` already excludes every value quoting would change,
+        so going through ``reboot_audit_command`` can never reach the interesting case —
+        measured: mutating the quoting away left the whole suite green. Exercising the
+        renderer directly is what keeps a future loosening of the identity alphabet from
+        silently reopening the injection.
+        """
+        self.assertEqual(
+            shell_safe_command(("mozyo-bridge", "--lane-label", "a; printf X")),
+            "mozyo-bridge --lane-label 'a; printf X'",
+        )
+        self.assertEqual(
+            shell_safe_command(("cmd", "--flag", "v --execute")),
+            "cmd --flag 'v --execute'",
+        )
+        # Ordinary tokens are left untouched, so the normal command stays readable.
+        self.assertEqual(
+            shell_safe_command(("mozyo-bridge", "sublane", "reboot-audit")),
+            "mozyo-bridge sublane reboot-audit",
+        )
+
+    def test_command_is_none_rather_than_sanitized(self):
+        # Sanitizing into something plausible would hand an operator an executable string
+        # derived from an identity this surface could not verify.
+        self.assertIsNone(reboot_audit_command("issue_1; rm -rf /"))
+        self.assertIsNone(reboot_audit_command(""))
+
+
+class DurableLineForgeryTest(unittest.TestCase):
+    """A lane id must not be able to fabricate lines in the rendered record.
+
+    The review explicitly asked for this pin. It is a *record* defect, not a shell one:
+    the envelope is specified as pasteable into a durable journal (spec `## 3.4`), so an
+    id that forges line structure forges the journal. ``shlex.quote`` does NOT close it —
+    it single-quotes the value and leaves the newline inside.
+    """
+
+    def _render(self, lane_id):
+        return render_version_tracking_text(
+            build_version_tracking(
+                version_id="1",
+                version_name="v",
+                issues=(
+                    _facts(
+                        is_closed=True,
+                        status_name="クローズ",
+                        lanes=(TrackedLane(lane_id, "active"),),
+                    ),
+                ),
+                unscoped_lanes=(UnscopedLane(lane_id, "9999", "active"),),
+            )
+        )
+
+    def test_a_newline_in_an_id_adds_no_line_to_the_render(self):
+        clean = self._render("issue_15844")
+        forged = self._render("issue_15844\n      $ printf NEWLINE_INJECTION")
+        self.assertEqual(
+            len(forged.splitlines()),
+            len(clean.splitlines()),
+            "a newline in a lane id changed the record's line count",
+        )
+
+    def test_a_forged_step_line_never_appears(self):
+        forged = self._render("issue_15844\n      $ printf NEWLINE_INJECTION")
+        for line in forged.splitlines():
+            self.assertNotEqual(line.strip(), "$ printf NEWLINE_INJECTION")
+
+    def test_control_characters_are_escaped_at_every_echo_site(self):
+        # One site fixed is not the defect fixed: the id reaches the attention `lane`
+        # line, the withheld-command line, and the unscoped section.
+        forged = self._render("issue_15844\nrogue")
+        self.assertNotIn("\nrogue", forged)
+        self.assertIn("issue_15844\\x0arogue", forged)
+
+    def test_payload_escapes_the_id_too(self):
+        snapshot = build_version_tracking(
+            version_id="1",
+            version_name="v",
+            issues=(
+                _facts(
+                    is_closed=True,
+                    status_name="クローズ",
+                    lanes=(TrackedLane("issue_1\nrogue", "active"),),
+                ),
+            ),
+            unscoped_lanes=(UnscopedLane("issue_2\nrogue", "9999", "active"),),
+        )
+        payload = snapshot.as_payload()
+        rendered_lane = payload["issues"][0]["facts"]["lanes"][0]["lane_id"]
+        self.assertEqual(rendered_lane, "issue_1\\x0arogue")
+        self.assertEqual(payload["unscoped_lanes"][0]["lane_id"], "issue_2\\x0arogue")
+
+    def test_display_leaves_ordinary_text_alone(self):
+        # The escape must not mangle a legitimate id (or non-ASCII, which the unscoped
+        # section may carry from an unfamiliar lane).
+        self.assertEqual(display_lane_id("issue_15844_pc"), "issue_15844_pc")
+        self.assertEqual(display_lane_id("レーン"), "レーン")
 
 
 class JoinTest(unittest.TestCase):

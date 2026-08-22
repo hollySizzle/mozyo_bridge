@@ -43,6 +43,8 @@ Design spec: ``vibes/docs/specs/version-owning-project-coordinator.md``.
 
 from __future__ import annotations
 
+import re
+import shlex
 from dataclasses import dataclass
 from typing import Mapping, Optional, Sequence
 
@@ -50,6 +52,26 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
     DISPOSITION_RETIRED,
     DISPOSITION_SUPERSEDED,
 )
+
+#: A lane id this surface is willing to put into a command or a durable line.
+#:
+#: The same conservative posture as ``herdr_identity._NAME_CHAR_RE``, whose docstring
+#: states it "rejects anything that could smuggle a shell/argv token before the structured
+#: decode even runs". ``LaneLifecycleKey`` itself only rejects the empty string, so a row
+#: carrying ``issue_1; printf X`` is a storable lane id — the guard has to live wherever
+#: that id is re-emitted.
+#:
+#: Measured before adopting the strict form (Redmine #15844 review j#109990): all 121 rows
+#: of the operator store (60 ``lane_lifecycle_records`` + 61 ``lane_metadata_records``)
+#: satisfy it, so being strict costs no legitimate lane.
+_LANE_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+#: C0, DEL and C1. Neutralized wherever a lane id reaches rendered text, because a raw
+#: newline in an id forges the OUTPUT'S OWN line structure — a fabricated ``$`` step line
+#: and a split ``lane <id>:`` line were both reproduced. ``shlex.quote`` does not help
+#: here: it single-quotes the value and leaves the newline inside, so the line still
+#: breaks. Quoting and line-safety are two different defects with two different fixes.
+_CONTROL_CHARS_RE = re.compile(r"[\x00-\x1f\x7f-\x9f]")
 
 #: The lane dispositions that mean "this lane is finished with"; the terminal set is
 #: ``managed-state-model.md``'s, not a second definition. ``hibernated`` is deliberately
@@ -101,6 +123,65 @@ def is_terminal_lane_disposition(disposition: str) -> bool:
     return (disposition or "").strip() in TERMINAL_LANE_DISPOSITIONS
 
 
+def is_renderable_lane_id(lane_id: str) -> bool:
+    """May this lane id be put into a command or a durable line? (fail-closed)"""
+    return bool(_LANE_ID_SAFE_RE.match(lane_id or ""))
+
+
+def display_lane_id(lane_id: str) -> str:
+    """A lane id that cannot forge the line structure of the text it is printed into."""
+    return _CONTROL_CHARS_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", lane_id or "")
+
+
+def reboot_audit_command(lane_id: str) -> Optional[str]:
+    """The diagnosis invocation for ``lane_id``, or ``None`` when it cannot be vouched for.
+
+    Built as structured argv and rendered through ``shlex.quote`` per token — the pattern
+    this repo already settled on for copy-pasteable commands in durable records
+    (``f_130_handoff_routing/domain/handoff.py``, ``delegation_launch_adopt``,
+    ``grandchild_dispatch``), where the same class of finding was adjudicated in
+    Redmine #12162 review j#60107.
+
+    Quoting alone is not the whole fix. Two further vectors were reproduced for #15844
+    review j#109990 (verdicts in j#109994):
+
+    - an id needs no shell metacharacter to be dangerous — ``issue_1 --execute`` forges an
+      extra **argv flag**, which only quoting closes;
+    - an id with a newline forges the surrounding record's line structure, which quoting
+      does **not** close.
+
+    So an id that fails :func:`is_renderable_lane_id` yields ``None`` and no command is
+    offered at all. Sanitizing it into something plausible would hand an operator an
+    executable string derived from an identity this surface could not verify — the same
+    move as reporting an unread authority as an empty one, which this module refuses
+    everywhere else.
+    """
+    if not is_renderable_lane_id(lane_id):
+        return None
+    return shell_safe_command(
+        ("mozyo-bridge", "sublane", "reboot-audit", "--lane-label", lane_id)
+    )
+
+
+def shell_safe_command(parts: Sequence[str]) -> str:
+    """Render structured argv as one copy-pasteable command (per-token ``shlex.quote``).
+
+    The repo's established form for a command that lands in a durable record
+    (``handoff.py`` / ``delegation_launch_adopt`` / ``grandchild_dispatch``, adjudicated in
+    Redmine #12162 review j#60107).
+
+    Kept as its own function, and tested on inputs :func:`is_renderable_lane_id` would
+    reject, **because today the identity guard already excludes every value that quoting
+    would change** — measured: mutating the quoting away left the whole suite green. Two
+    honest options existed: delete it as subsumed, or keep it as the independent second
+    layer the review asked for and make it measurable. Deleting it would mean a future
+    loosening of the identity alphabet silently reopens the injection, with no test to
+    notice. So it stays, and it is exercised directly rather than only through a caller
+    that can never reach its interesting case.
+    """
+    return " ".join(shlex.quote(part) for part in parts)
+
+
 @dataclass(frozen=True)
 class TrackedLane:
     """One lane lifecycle row, reduced to the two fields tracking reads.
@@ -117,11 +198,19 @@ class TrackedLane:
     def is_terminal(self) -> bool:
         return is_terminal_lane_disposition(self.lane_disposition)
 
+    @property
+    def identity_renderable(self) -> bool:
+        return is_renderable_lane_id(self.lane_id)
+
     def as_payload(self) -> dict[str, object]:
         return {
-            "lane_id": self.lane_id,
+            # Display form: a structured consumer escapes this itself, but the same value
+            # is also read by eye out of a pasted journal, and a raw control character
+            # there forges the record's line structure.
+            "lane_id": display_lane_id(self.lane_id),
             "lane_disposition": self.lane_disposition,
             "terminal": self.is_terminal,
+            "identity_renderable": self.identity_renderable,
         }
 
 
@@ -175,12 +264,27 @@ class VersionIssueFacts:
 
 @dataclass(frozen=True)
 class VersionIssueTracking:
-    """One issue's disposition, the reason token, and the rail entry point (if any)."""
+    """One issue's disposition, its reason token, and the diagnosis entry point (if any).
+
+    ``diagnosis_steps`` is named for what it is. It was ``next_steps``, which read as "run
+    these and the lane is drained" — a claim measured to be false for the very lanes this
+    surface finds. For #15842 / #15843, ``reboot-audit`` reads Redmine and prescribes
+    ``guarded_close``, while ``sublane retire`` reads the local durable record and refuses
+    with ``issue_not_closed`` / ``durable_record_missing``: two authorities disagreeing
+    about one fact, so the chain stops one rail short of terminal (measured; recorded in
+    j#109995, class named by j#109972). What this surface can honestly offer is the entry
+    point to the *diagnosis*, not a drain that completes.
+
+    ``unrenderable_lane_ids`` keeps a lane whose identity failed the guard visible. Owed
+    work does not stop being owed because its id could not be vouched for; suppressing the
+    command must not suppress the finding.
+    """
 
     facts: VersionIssueFacts
     disposition: str
     reason: str
-    next_steps: tuple[str, ...] = ()
+    diagnosis_steps: tuple[str, ...] = ()
+    unrenderable_lane_ids: tuple[str, ...] = ()
 
     @property
     def issue_id(self) -> str:
@@ -195,7 +299,10 @@ class VersionIssueTracking:
             "issue_id": self.facts.issue_id,
             "disposition": self.disposition,
             "reason": self.reason,
-            "next_steps": list(self.next_steps),
+            "diagnosis_steps": list(self.diagnosis_steps),
+            "unrenderable_lane_ids": [
+                display_lane_id(lane) for lane in self.unrenderable_lane_ids
+            ],
             "facts": self.facts.as_payload(),
             "needs_attention": self.needs_attention,
         }
@@ -238,13 +345,17 @@ def classify_version_issue(facts: VersionIssueFacts) -> VersionIssueTracking:
     nonterminal = facts.nonterminal_lanes
     if nonterminal:
         if facts.is_closed:
+            commands = tuple(
+                (lane.lane_id, reboot_audit_command(lane.lane_id))
+                for lane in nonterminal
+            )
             return VersionIssueTracking(
                 facts=facts,
                 disposition=DISPOSITION_DRAIN_OWED,
                 reason="issue_closed_lane_not_terminal",
-                next_steps=tuple(
-                    f"mozyo-bridge sublane reboot-audit --lane-label {lane.lane_id}"
-                    for lane in nonterminal
+                diagnosis_steps=tuple(cmd for _, cmd in commands if cmd is not None),
+                unrenderable_lane_ids=tuple(
+                    lane_id for lane_id, cmd in commands if cmd is None
                 ),
             )
         return VersionIssueTracking(
@@ -299,9 +410,10 @@ class UnscopedLane:
 
     def as_payload(self) -> dict[str, object]:
         return {
-            "lane_id": self.lane_id,
+            "lane_id": display_lane_id(self.lane_id),
             "issue_id": self.issue_id,
             "lane_disposition": self.lane_disposition,
+            "identity_renderable": is_renderable_lane_id(self.lane_id),
         }
 
 
@@ -415,11 +527,17 @@ def render_version_tracking_text(snapshot: VersionTrackingSnapshot) -> str:
             )
             for lane in issue.facts.lanes:
                 lines.append(
-                    f"      lane {lane.lane_id}: {lane.lane_disposition}"
+                    f"      lane {display_lane_id(lane.lane_id)}: "
+                    f"{lane.lane_disposition}"
                     + (" [terminal]" if lane.is_terminal else "")
                 )
-            for step in issue.next_steps:
+            for step in issue.diagnosis_steps:
                 lines.append(f"      $ {step}")
+            for lane_id in issue.unrenderable_lane_ids:
+                lines.append(
+                    f"      ! lane {display_lane_id(lane_id)}: identity is not a "
+                    "renderable lane id; no command is offered for it"
+                )
     else:
         lines.append("  attention: none")
     # Always rendered, including the empty case: this section is what keeps a
@@ -427,13 +545,18 @@ def render_version_tracking_text(snapshot: VersionTrackingSnapshot) -> str:
     lines.append(f"  unscoped_lanes: {len(snapshot.unscoped_lanes)}")
     for lane in snapshot.unscoped_lanes:
         lines.append(
-            f"    {lane.lane_id} issue={lane.issue_id or '-'} "
+            f"    {display_lane_id(lane.lane_id)} issue={lane.issue_id or '-'} "
             f"({lane.lane_disposition})"
         )
     lines.append(
         "  note: read-only. This names lanes; it does not choose a recovery rail — "
         "`sublane reboot-audit` owns that judgement. The roll-up is a count, not a "
         "Version integration verdict."
+    )
+    lines.append(
+        "  note: a listed command is the entry point to a DIAGNOSIS, not a drain that "
+        "completes — measured, `reboot-audit` and `sublane retire` can disagree about "
+        "whether the issue is closed, and the chain then stops one rail short."
     )
     return "\n".join(lines)
 
@@ -456,7 +579,11 @@ __all__ = (
     "VersionTrackingSnapshot",
     "build_version_tracking",
     "classify_version_issue",
+    "display_lane_id",
+    "is_renderable_lane_id",
     "is_terminal_lane_disposition",
     "join_version_issues",
+    "reboot_audit_command",
     "render_version_tracking_text",
+    "shell_safe_command",
 )

@@ -232,6 +232,71 @@ issue の subject / journal 本文 / pane content を一切運ばない。運ぶ
 (#15843 spec `## 出力の hygiene` と同じ規律)。これにより 1 pass の JSON envelope はそのまま
 durable journal に貼れる。
 
+### 3.5 un-drainable residue (どのレールも受理しない閉じ残り)
+
+L1 追記 (#15844 j#109972) が継続追跡の扱うべき class として名指したもの。**Redmine issue は
+closed、head は main 到達可能、しかし local lane record が劣化しているため正規 retire が
+fail-close する**レーン。#15841 GAP-2 の terminal 側の穴に位置する。
+
+**実在する** (2026-08-22 実測、Version #329)。`drain_owed` の 2 件 (#15842 / #15843) が
+そのまま該当し、`sublane retire` は 6 つの reason を並べて拒否する (`issue_not_closed` /
+`durable_record_missing` / `stale_review_generation` / `unresolved_callback` /
+`verification_failure` / `preflight_failure`)。つまりこの 2 件は「閉じ残り」であると同時に
+「既存レールでは畳めない閉じ残り」でもある。
+
+構造的な要点は **2 つの authority が同じ命題について矛盾している**ことである。
+
+| authority | #15843 の issue 状態をどう読むか | 出力 |
+| --- | --- | --- |
+| `reboot-audit` (Redmine batch read) | closed | `guarded_close` を処方 |
+| `sublane retire` (local durable record) | **not closed** | fail-closed、zero-write |
+
+`drain_owed` の分類自体はこの矛盾に影響されない (lane row が非 terminal であることは
+どちらの読みでも変わらない)。影響を受けるのは**提示した手順が終端まで通るか**だけであり、
+それが `## 5` の訂正と `diagnosis_steps` への改名の理由である。
+
+**本スライスは「un-drainable かどうか」を判定しない。** 判定には retire admissibility という
+**第 3 の authority** を読む必要があり、`## 3.0` が意図的に引いた「読む authority は 2 つだけ」
+の境界を越える。越えるべきか、越えるなら lane ごとの preflight を毎 pass 走らせる代償を
+払うのかは判断事項であり、`## 6` E5 で escalate する。本 spec が固定するのは **class の存在と
+実測**までである。
+
+矛盾を解消する reconciling terminal-disposition レール (live Redmine の closed + git
+reachability を権威として劣化した local 記録を上書きし terminal-retire する) の新設可否も
+E5 の対象で、**破壊的レールの新設なので本スライスでは実装しない** (j#109972 自身が「設計段階で
+owner 判断を仰ぐ」と指定している)。
+
+### 3.6 再出力する識別子の安全性
+
+lane id は lifecycle store から来る値であり、**`LaneLifecycleKey` は空文字しか拒否しない**。
+したがって `issue_1; printf X` のような id は正当に保存されうる。この面はその id を
+(a) 提示する command、(b) durable text の行、(c) JSON envelope へ再出力するので、**guard は
+再出力側に置く**。3 つの vector を実測した (#15844 review j#109990 / verdict j#109994):
+
+| vector | 例 | 何が起きるか | 閉じるもの |
+| --- | --- | --- | --- |
+| shell 注入 | `issue_1; printf X` | copy/paste で後半が別 command として走る | quoting または拒否 |
+| **argv flag 偽装** | `issue_1 --execute` | shell metacharacter を 1 つも含まないので「危険文字除去」型の対策を素通りするが、argv 上で別 flag に化ける | quoting または拒否 |
+| **行境界偽装** | `issue_1\n      $ ...` | 出力に**偽の `$` step 行が増え**、`lane <id>:` 行も分断される。envelope は journal に貼る前提なので、これは*記録*の偽造 | 制御文字の escape (**quoting では閉じない**) |
+
+規律:
+
+- **identity は fail-closed**: `^[A-Za-z0-9_]+$` (`herdr_identity._NAME_CHAR_RE` と同じ姿勢)。
+  採用前に代償を測った — operator store の 121 行 (lifecycle 60 + metadata 61) が**全て**
+  満たすので、正当な lane を 1 本も落とさない。
+- **不正な id には command を出さない**。sanitize して「それらしい command」を作ることは、
+  検証できていない identity から実行可能な文字列を手渡すことであり、本 doc の
+  「読めなかったを読めたと報告しない」と同じ線で禁じる。**ただし finding は隠さない** —
+  当該 lane は `unrenderable_lane_ids` として提示し続ける。owed であることは id の可読性とは
+  無関係だからである。
+- **quoting と行安全化は別の対策**であり、両方要る。`shlex.quote("a\nb")` は改行を含んだまま
+  単一引用するので、行分断は残る。
+- command 描画は構造化 argv → per-token `shlex.quote` (`handoff.py` / `delegation_launch_adopt` /
+  `grandchild_dispatch` の既存型。同型の指摘が #12162 review j#60107 で裁定済み)。
+  **現在の strict guard 下では quoting が結果を変える入力は到達しない**ので、quoting 層は
+  それ単体で試験する。層を消せば将来 identity 語彙を緩めたときに黙って穴が戻るため、
+  「測れないから消す」ではなく「測れる形にして残す」を採った。
+
 ## 4. コーディネーター interface (設計のみ、本スライス外)
 
 ADR-0011 の「構成済みのバージョンを受け取って回す」を 1 操作にする形。本 doc は形だけ固定し、
@@ -275,22 +340,31 @@ coordinator                          project coordinator (L2)
   「pane が進んでいるか」を見る面。**同じ lane について別の質問**であり、どちらも他方を代替
   しない。
 
-### 委譲が実際に繋がることの実証 (2026-08-22 実測)
+### 委譲はどこまで繋がるか (2026-08-22 実測。**連鎖は終端まで通らない**)
 
 #15789 は「実行可能な invocation を伴わない代替提示が、存在しない command を coordinator に
 推測させた」を欠陥として記録している (#15151 j#108983)。したがって「名指しして委ねる」設計は、
-**委ね先が実際に走る**ことを示して初めて成立する。本レーンで read-only に実行した連鎖:
+**委ね先が実際に走る**ことを示して初めて成立する。本レーンで read-only に測った結果:
 
-1. `workflow version-track --version-id 329` → `#15843 -> drain_owed`、
-   next_step = `sublane reboot-audit --lane-label issue_15843_stall_watcher`
-2. その invocation をそのまま実行 → `guarded_close` を選択し、理由を
-   「issue #15843 は closed で lane は live managed agent (claude, codex) を保持しているので、
-   live pair を閉じる権限を持つ唯一のレールである通常の guarded close で drain せよ」と typed で返す
-3. さらに `sublane retire --issue 15843 --lane-label ... --execute` を名指す
+| 段 | 実行 | 結果 |
+| --- | --- | --- |
+| 1 | `workflow version-track --version-id 329` | `#15843 -> drain_owed`、diagnosis_step = `sublane reboot-audit --lane-label issue_15843_stall_watcher` |
+| 2 | その invocation をそのまま実行 | `guarded_close` を選択。理由: 「issue #15843 は closed で lane は live managed agent (claude, codex) を保持しているので、live pair を閉じる権限を持つ唯一のレールである通常の guarded close で drain せよ」。`sublane retire ... --execute` を名指す |
+| 3 | 名指された `sublane retire` (非 `--execute`) | **admit しない**。`integration_blocked` / `may_retire=False` / `blocked_reasons: preflight_failure, stale_review_generation, issue_not_closed, unresolved_callback, durable_record_missing, verification_failure` |
 
 **2 の判定には version-track が読まない 2 軸 (git の worktree/統合、live inventory) が効いている**
 (`worktree_present=no` / `live=claude,codex`)。境界が正しいことの証拠はここにある: version tracking
 が同じ判定を再導出しようとすれば、読まないと決めた authority を読み直すことになる。
+
+**しかし連鎖は 3 段目で止まる**。初版の本節は 2 段目までしか検証せずに「委譲が実際に繋がる」と
+書いていた (訂正記録: #15844 j#109995)。実際には `reboot-audit` (Redmine を読む) と `retire`
+(local durable record を読む) が**同じ事実について矛盾**しており、前者は `issue_closed=yes`、
+後者は `issue_not_closed` + `durable_record_missing` を返す。これは #15789 が記録した欠陥の**再現**
+であり、その class は `## 3.5` に固定する。
+
+したがって本 spec が主張できるのは「**診断レールへの入口を正しく名指せる**」までであって、
+「提示した手順で drain が完遂する」ではない。実装側の field 名を `next_steps` から
+**`diagnosis_steps`** に改めたのは、この区別を prose ではなく構造で持たせるためである。
 
 ## 6. escalation 対象 (design_consultation。本 US では判断しない)
 
@@ -300,6 +374,7 @@ coordinator                          project coordinator (L2)
 | E2 | 自律 drain / integrate をどこまで許すか | owner の risk tolerance に直接依存する。`retire --execute` は guarded close を伴い、誤判定の代償が「作業を失う」側。#15843 が server-down と frozen を意図的に統合して patience を共有処方にしたのと同じ判断が要る |
 | E3 | `lane_terminal_issue_open` を誰が drain するか | spine は「close-ready issue が `着手中` のまま残る状態は durable state の不整合」と言うが、issue の close は coordinator authority であり L2 の自律 close を認めるかは owner 判断。#15841 j#109805 のように US ごとに既定が上書きされる先例もある |
 | E4 | `unscoped_lanes` を version-track の責務に含めるか | 本 doc は「名指しだけする」で止めたが、host 全体の孤児 lane を誰が持つかは本 US の scope 外。#15846 (製本 Phase 2) と隣接する |
+| E5 | `## 3.5` の un-drainable residue をどう扱うか (j#109972) | 2 つ: (a) version-track が第 3 の authority (retire admissibility) を読んで un-drainable を判定してよいか — `## 3.0` の境界を越える判断で、毎 pass の lane ごと preflight という代償を伴う。(b) reconciling terminal-disposition レール (live Redmine の closed + git reachability を権威に劣化 local 記録を上書きして terminal-retire) を新設するか — **破壊的レールの新設**であり j#109972 が owner 判断を指定している。E2 と同じ risk tolerance の問題に帰着する |
 
 ## 検証
 
