@@ -2,7 +2,7 @@
 
 ## Status
 
-- version: `v0.5` (#15855 運用配線 + j#110132 / j#110146 / j#110169 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
+- version: `v0.6` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
 - scope: watcher 層 (background / operator) が、pane の**描画画面が進んでいるか**だけを一次
   センサーとして停滞候補を拾い、種別を分類し、種別ごとの処方を**提示**するまで。
 - non-goal: 処方の自動適用、配送 rail の retry policy、completion 判定、receiver-state
@@ -351,6 +351,24 @@ count だけなので verbatim に render して安全」と宣言していた�
 - count 同士が整合する: `candidates == watched + sum(dropped)` と
   `out_of_reach == sum(dropped) - foreign_workspace`。producer は候補を必ずどれか 1 つの bucket へ
   分けるので、この 2 本は構成上成立する。破れている row は本 rail が書いた row ではない。
+
+**timestamp も「閉じた語彙」の一部である**。「timestamp だから安全」は、それが timestamp である
+ことを誰も検証していない限り成り立たない — 検証していなければ caller 由来の任意文字列である
+(j#110183 finding_1 の実測: `/private/example/unsafe-observed-at` が text と JSON の両 status へ
+到達した)。宣言する文法は「非空・長さ上限・`fromisoformat` で parse 可能・**tz-aware**」で、
+write 時は正規形へ**正規化**して保存する (「parse できるが変な書き方」の余地も閉じる)。
+
+同じ規律を、この store が render するすべての timestamp 列に適用する — discovery の
+`observed_at`、pending の `first_observed_at` / `escalated_at` (これらは **Redmine journal 本文**へ
+verbatim に入るので exposure がより強い)、watermark の `last_pass_at` (`--status` の `last=`)。
+**1 列だけ直して残りを次 round の finding にしない。**
+
+read 側の倒し方は面によって変える: discovery と watermark は値を捨てて typed token に倒せるが、
+pending row は**実際の escalation そのもの**なので row を落とさず timestamp だけを閉じた token へ
+置換する (落とすと停滞報告が失われる。SQL の `ORDER BY escalated_at` も影響を受けない)。
+
+なお `x or default` は「空文字を既定値で黙って修復する」ので使わない。明示的に渡された空文字は
+caller の誤りであり、修復ではなく拒否が正しい。
 
 **store は信頼境界ではない**。古い build・手編集・書きかけの row はいずれもこの build の契約を
 破る値を保持しうるし、`--status` に実際に流れるのは read 経路である。read 側で検証に落ちた row は

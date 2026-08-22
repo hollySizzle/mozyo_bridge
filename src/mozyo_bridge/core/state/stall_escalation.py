@@ -48,6 +48,24 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional, Sequence
 
+from mozyo_bridge.core.state.stall_discovery_contract import (
+    DISCOVERY_BAD_COUNT,
+    DISCOVERY_BAD_REASON_TOKEN,
+    DISCOVERY_BAD_TIMESTAMP,
+    DISCOVERY_DROP_REASONS,
+    DISCOVERY_FOREIGN_REASON,
+    DISCOVERY_INCONSISTENT,
+    DISCOVERY_MALFORMED,
+    DISCOVERY_UNREADABLE,
+    TIMESTAMP_MAX_LENGTH,
+    TIMESTAMP_UNREADABLE,
+    StallDiscoveryContractError,
+    checked_timestamp,
+    discovery_reject_token,
+    rendered_timestamp,
+    unreadable_discovery,
+    validate_discovery,
+)
 from mozyo_bridge.shared.paths import mozyo_bridge_home
 
 #: The home-scoped SQLite file holding stall streaks and pending escalations.
@@ -118,148 +136,6 @@ CREATE TABLE IF NOT EXISTS stall_watch_discovery (
     dropped      TEXT NOT NULL DEFAULT '{}'
 )
 """
-
-#: The canonical drop-reason vocabulary a discovery row may name.
-#:
-#: Declared HERE rather than imported from the discovery layer for the same reason
-#: :class:`StreakRow` is not :class:`StreakState`: this store must not reach into the
-#: policy/application modules, or a rule ends up written in a state store. The cost of
-#: duplication is paid by a test that asserts this set equals the producer's ``DROP_REASONS``
-#: **in both directions**, so adding a reason on one side and not the other fails loudly
-#: instead of silently widening what a durable row may say.
-DISCOVERY_DROP_REASONS: frozenset[str] = frozenset(
-    {
-        "foreign_workspace",
-        "outside_declared_scope",
-        "live_generation_unresolved",
-        "issue_anchor_unresolved",
-        "no_live_locator",
-    }
-)
-
-#: The one reason that is somebody ELSE's business rather than a gap in this watcher's
-#: reach, so it is excluded from ``out_of_reach``. Kept as a name because the coverage
-#: identity below depends on it.
-DISCOVERY_FOREIGN_REASON = "foreign_workspace"
-
-#: What a stored discovery row is replaced by when it does not satisfy the contract this
-#: module declares. Every count is zero and **no stored value is echoed** — the whole point
-#: is that a row which failed validation must not reach an operator surface, and a row whose
-#: reasons are untrusted has an untrusted timestamp too.
-#:
-#: Deliberately distinct from ``None``: "the watcher has never run" and "the watcher's
-#: record is unreadable" call for different operator actions, and collapsing them would hide
-#: a corrupt store behind a benign-looking blank.
-DISCOVERY_UNREADABLE = "unreadable"
-
-#: Typed reasons a discovery row is rejected. Closed, so a status surface can branch.
-DISCOVERY_BAD_REASON_TOKEN = "off_vocabulary_reason"
-DISCOVERY_BAD_COUNT = "invalid_count"
-DISCOVERY_INCONSISTENT = "inconsistent_counts"
-DISCOVERY_MALFORMED = "malformed_row"
-
-
-class StallDiscoveryContractError(ValueError):
-    """A discovery summary violated the closed contract this module declares.
-
-    Raised at the WRITE boundary. The read boundary cannot raise — a corrupt row must not
-    make ``--status`` explode — so it degrades to :data:`DISCOVERY_UNREADABLE` instead.
-    """
-
-
-def _checked_count(value: object, *, field: str) -> int:
-    """A non-negative integer, or a typed refusal. ``bool`` is not a count."""
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise StallDiscoveryContractError(
-            f"discovery {field} must be a non-negative integer, not {type(value).__name__}"
-        )
-    if value < 0:
-        raise StallDiscoveryContractError(
-            f"discovery {field} must be non-negative; got {value}"
-        )
-    return int(value)
-
-
-def validate_discovery(
-    *, candidates: int, watched: int, out_of_reach: int, dropped: Optional[dict]
-) -> "tuple[int, int, int, dict[str, int]]":
-    """Check a coverage summary against the closed contract; raise on any violation.
-
-    Three separate obligations, each of which the store previously only *claimed*:
-
-    - every reason is a declared token, so no caller-supplied string (a path, a message, a
-      lane id) can reach a durable row and from there an operator surface;
-    - every count is a non-negative integer, so a status line cannot render ``-3``;
-    - the counts agree with each other. The producer partitions every candidate into
-      exactly one bucket, so ``candidates == watched + sum(dropped)`` holds by construction,
-      and ``out_of_reach`` is that sum minus the foreign-workspace rows. A row that fails
-      these is not a row this rail wrote, whatever it says.
-    """
-    counts = {
-        "candidates": _checked_count(candidates, field="candidates"),
-        "watched": _checked_count(watched, field="watched"),
-        "out_of_reach": _checked_count(out_of_reach, field="out_of_reach"),
-    }
-    if dropped is None:
-        dropped = {}
-    if not isinstance(dropped, dict):
-        raise StallDiscoveryContractError(
-            f"discovery dropped must be a mapping, not {type(dropped).__name__}"
-        )
-    checked: dict[str, int] = {}
-    for reason, count in dropped.items():
-        if not isinstance(reason, str) or reason not in DISCOVERY_DROP_REASONS:
-            # The reason is NOT echoed back: quoting an off-vocabulary token in the error
-            # would put the very string this check exists to contain into a log line.
-            raise StallDiscoveryContractError(
-                "discovery dropped names a reason outside the declared vocabulary; "
-                f"allowed: {sorted(DISCOVERY_DROP_REASONS)}"
-            )
-        checked[reason] = _checked_count(count, field=f"dropped[{reason}]")
-
-    total_dropped = sum(checked.values())
-    if counts["candidates"] != counts["watched"] + total_dropped:
-        raise StallDiscoveryContractError(
-            "discovery counts disagree: candidates must equal watched + sum(dropped); "
-            f"got {counts['candidates']} != {counts['watched']} + {total_dropped}"
-        )
-    expected_reach = total_dropped - checked.get(DISCOVERY_FOREIGN_REASON, 0)
-    if counts["out_of_reach"] != expected_reach:
-        raise StallDiscoveryContractError(
-            "discovery counts disagree: out_of_reach must equal sum(dropped) minus "
-            f"{DISCOVERY_FOREIGN_REASON}; got {counts['out_of_reach']} != {expected_reach}"
-        )
-    return counts["candidates"], counts["watched"], counts["out_of_reach"], checked
-
-
-def _discovery_reject_token(exc: StallDiscoveryContractError) -> str:
-    """Map a contract violation onto a CLOSED token — never the exception's own text.
-
-    Same discipline as the config resolver's redaction: an operator surface gets a token it
-    can branch on, and the message (which may quote a count, a field name, or a caller's
-    data) stays out of it.
-    """
-    text = str(exc)
-    if "vocabulary" in text:
-        return DISCOVERY_BAD_REASON_TOKEN
-    if "disagree" in text:
-        return DISCOVERY_INCONSISTENT
-    if "non-negative integer" in text or "non-negative" in text or "mapping" in text:
-        return DISCOVERY_BAD_COUNT
-    return DISCOVERY_MALFORMED
-
-
-def unreadable_discovery(reason: str) -> dict:
-    """The typed stand-in for a stored row that failed validation (echoes nothing)."""
-    return {
-        "observed_at": "",
-        "candidates": 0,
-        "watched": 0,
-        "out_of_reach": 0,
-        "dropped": {},
-        DISCOVERY_UNREADABLE: reason,
-    }
-
 
 _WATERMARK_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS stall_watch_watermark (
@@ -644,6 +520,13 @@ class StallEscalationStore:
         """
         if not pending.idempotency_key or not pending.workspace_id:
             return False
+        # Same closed render boundary as the discovery row, and for a stronger reason: these
+        # two reach a Redmine journal body verbatim through `render_escalation_body`, not
+        # just a status line. Validated at the public seam so no such row is ever created.
+        first_observed_at = checked_timestamp(
+            pending.first_observed_at, field="observed_at.first"
+        )
+        escalated_at = checked_timestamp(pending.escalated_at, field="observed_at.escalated")
 
         def _work(conn):
             cursor = conn.execute(
@@ -663,8 +546,8 @@ class StallEscalationStore:
                     pending.matched_id,
                     pending.evidence_tier,
                     int(pending.consecutive),
-                    pending.first_observed_at,
-                    pending.escalated_at,
+                    first_observed_at,
+                    escalated_at,
                     pending.journal_id,
                     pending.written_at,
                     pending.woke_at,
@@ -730,8 +613,11 @@ class StallEscalationStore:
                 matched_id=str(r[9] or ""),
                 evidence_tier=str(r[10] or ""),
                 consecutive=int(r[11]),
-                first_observed_at=str(r[12]),
-                escalated_at=str(r[13]),
+                # A row that predates this build (or was hand-edited) can still hold junk
+                # here. The row is KEPT -- it is a real escalation and dropping it would
+                # lose the stall report -- but nothing arbitrary is rendered from it.
+                first_observed_at=rendered_timestamp(r[12], field="observed_at.first"),
+                escalated_at=rendered_timestamp(r[13], field="observed_at.escalated"),
                 journal_id=str(r[14] or ""),
                 written_at=str(r[15] or ""),
                 woke_at=str(r[16] or ""),
@@ -756,7 +642,14 @@ class StallEscalationStore:
             cursor = conn.execute(
                 "UPDATE stall_escalation_pending SET attempts=attempts+1, "
                 "last_attempt_at=?, last_reason=? WHERE idempotency_key=? AND journal_id=''",
-                (now or _utc_now_iso(), str(reason or ""), idempotency_key),
+                (
+                    checked_timestamp(
+                        _utc_now_iso() if now is None else now,
+                        field="observed_at.attempt",
+                    ),
+                    str(reason or ""),
+                    idempotency_key,
+                ),
             )
             return cursor.rowcount > 0
 
@@ -774,13 +667,16 @@ class StallEscalationStore:
         jid = str(journal_id or "").strip()
         if not jid or not self.path.exists():
             return False
+        stamp = checked_timestamp(
+            _utc_now_iso() if now is None else now, field="observed_at.written"
+        )
 
         def _work(conn):
             cursor = conn.execute(
                 "UPDATE stall_escalation_pending SET journal_id=?, written_at=?, "
                 "attempts=attempts+1, last_attempt_at=?, last_reason='' "
                 "WHERE idempotency_key=? AND journal_id=''",
-                (jid, now or _utc_now_iso(), now or _utc_now_iso(), idempotency_key),
+                (jid, stamp, stamp, idempotency_key),
             )
             return cursor.rowcount > 0
 
@@ -800,7 +696,12 @@ class StallEscalationStore:
             cursor = conn.execute(
                 "UPDATE stall_escalation_pending SET woke_at=? "
                 "WHERE idempotency_key=? AND journal_id<>'' AND woke_at=''",
-                (now or _utc_now_iso(), idempotency_key),
+                (
+                    checked_timestamp(
+                        _utc_now_iso() if now is None else now, field="observed_at.woke"
+                    ),
+                    idempotency_key,
+                ),
             )
             return cursor.rowcount > 0
 
@@ -833,14 +734,21 @@ class StallEscalationStore:
             ).fetchone()
         finally:
             conn.close()
-        return str(row[0]) if row else ""
+        if not row:
+            return ""
+        # An unparseable stored watermark renders as the closed token, which the cadence
+        # reader already treats as "unreadable -> due" (`CADENCE_UNREADABLE_WATERMARK`).
+        # So a corrupt row makes the watcher run again rather than emit arbitrary text.
+        return rendered_timestamp(row[0], field="observed_at.last_pass")
 
     def mark_pass(self, workspace_id: str, *, now: Optional[str] = None) -> None:
         """Record that a stall-watch phase ran for this workspace."""
         ws = str(workspace_id or "").strip()
         if not ws:
             return
-        stamp = now or _utc_now_iso()
+        stamp = checked_timestamp(
+            _utc_now_iso() if now is None else now, field="observed_at.last_pass"
+        )
         self._mutate(
             "watermark write",
             lambda conn: conn.execute(
@@ -883,7 +791,11 @@ class StallEscalationStore:
             dropped=dropped,
         )
         payload = json.dumps(checked, sort_keys=True)
-        stamp = now or _utc_now_iso()
+        # The fifth column. Validated and normalized like every other value in the row --
+        # "it is a timestamp" was an assumption nothing enforced (review j#110183).
+        stamp = checked_timestamp(
+            _utc_now_iso() if now is None else now, field="observed_at"
+        )
         self._mutate(
             "discovery write",
             lambda conn: conn.execute(
@@ -936,10 +848,11 @@ class StallEscalationStore:
                 out_of_reach=row[3],
                 dropped=dropped,
             )
+            observed_at = checked_timestamp(row[0], field="observed_at")
         except StallDiscoveryContractError as exc:
-            return unreadable_discovery(_discovery_reject_token(exc))
+            return unreadable_discovery(discovery_reject_token(exc))
         return {
-            "observed_at": str(row[0]),
+            "observed_at": observed_at,
             "candidates": candidates,
             "watched": watched,
             "out_of_reach": out_of_reach,
@@ -949,6 +862,7 @@ class StallEscalationStore:
 
 __all__ = (
     "DISCOVERY_BAD_COUNT",
+    "DISCOVERY_BAD_TIMESTAMP",
     "DISCOVERY_BAD_REASON_TOKEN",
     "DISCOVERY_DROP_REASONS",
     "DISCOVERY_FOREIGN_REASON",
@@ -956,6 +870,8 @@ __all__ = (
     "DISCOVERY_MALFORMED",
     "DISCOVERY_UNREADABLE",
     "STALL_ESCALATION_FILENAME",
+    "TIMESTAMP_MAX_LENGTH",
+    "TIMESTAMP_UNREADABLE",
     "STALL_ESCALATION_SCHEMA_VERSION",
     "PendingEscalation",
     "StallEscalationStore",

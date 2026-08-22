@@ -1104,6 +1104,72 @@ class OperatorStatusSurfaceTest(unittest.TestCase):
         self.assertNotIn("shadow", json.dumps(row))
         self.assertEqual(row["dropped"], {})
 
+    def test_a_corrupt_timestamp_reaches_neither_text_nor_json(self) -> None:
+        # The surfaces the finding named: a durable row whose counts and reasons are valid
+        # but whose timestamp is arbitrary must not render that timestamp anywhere
+        # (review j#110183).
+        import sqlite3
+
+        from mozyo_bridge.core.state.stall_escalation import (
+            StallEscalationStore,
+            stall_escalation_path,
+        )
+
+        result = self._register("stall_watch:\n  lanes: [lane_a]\n")
+        StallEscalationStore(home=self.home).record_discovery(
+            result.record.workspace_id,
+            candidates=2, watched=1, out_of_reach=1,
+            dropped={"issue_anchor_unresolved": 1},
+            now="2026-08-22T09:00:00+00:00",
+        )
+        conn = sqlite3.connect(stall_escalation_path(self.home))
+        try:
+            conn.execute(
+                "UPDATE stall_watch_discovery SET observed_at=?",
+                ("/private/example/unsafe-observed-at",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        text = self._status()
+        self.assertIn("coverage: unreadable (invalid_timestamp)", text)
+        self.assertNotIn("unsafe-observed-at", text)
+
+        row = json.loads(self._status(as_json=True))["stall_watch"][0]["discovery"]
+        self.assertEqual(row["unreadable"], "invalid_timestamp")
+        self.assertNotIn("unsafe-observed-at", json.dumps(row))
+        self.assertEqual(row["observed_at"], "")
+
+    def test_a_corrupt_watermark_reaches_neither_text_nor_json(self) -> None:
+        import sqlite3
+
+        from mozyo_bridge.core.state.stall_escalation import (
+            StallEscalationStore,
+            stall_escalation_path,
+        )
+
+        result = self._register("stall_watch:\n  lanes: [lane_a]\n")
+        StallEscalationStore(home=self.home).mark_pass(
+            result.record.workspace_id, now="2026-08-22T09:00:00+00:00"
+        )
+        conn = sqlite3.connect(stall_escalation_path(self.home))
+        try:
+            conn.execute(
+                "UPDATE stall_watch_watermark SET last_pass_at=?", ("/etc/shadow",)
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        text = self._status()
+        self.assertNotIn("shadow", text)
+        payload = json.loads(self._status(as_json=True))["stall_watch"][0]
+        self.assertNotIn("shadow", json.dumps(payload))
+        # An unreadable watermark reads as "due", so the watcher runs again rather than
+        # staying silently off.
+        self.assertTrue(payload["cadence"]["due"])
+
     def test_the_json_surface_carries_the_full_projection(self) -> None:
         self._register("stall_watch:\n  lanes: [lane_a]\n")
         payload = json.loads(self._status(as_json=True))

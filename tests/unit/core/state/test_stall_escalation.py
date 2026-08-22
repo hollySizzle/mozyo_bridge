@@ -26,9 +26,11 @@ sys.path.insert(0, str(ROOT / "src"))
 from mozyo_bridge.core.state.stall_escalation import (
     DISCOVERY_BAD_COUNT,
     DISCOVERY_BAD_REASON_TOKEN,
+    DISCOVERY_BAD_TIMESTAMP,
     DISCOVERY_INCONSISTENT,
     DISCOVERY_MALFORMED,
     STALL_ESCALATION_SCHEMA_VERSION,
+    TIMESTAMP_UNREADABLE,
     StallDiscoveryContractError,
     PendingEscalation,
     StallEscalationStore,
@@ -37,6 +39,11 @@ from mozyo_bridge.core.state.stall_escalation import (
     escalation_idempotency_key,
     stall_escalation_path,
 )
+
+#: Real tz-aware instants: the store now enforces an ISO-8601 timestamp grammar, so a
+#: pseudo-stamp like "t1" is (correctly) refused. Order is preserved so every
+#: ordering / fairness assertion keeps its meaning.
+ISO = {f"t{i}": f"2026-08-22T09:0{i}:00+00:00" for i in range(10)}
 
 WS = "wsA"
 LANE = "issue_15855_stall_wiring"
@@ -54,8 +61,8 @@ def _row(*, lane_id=LANE, role=ROLE, generation="g1", target="w1V:pK",
         target=target,
         stall_class=stall_class,
         consecutive=consecutive,
-        first_observed_at="t1",
-        last_observed_at="t1",
+        first_observed_at="2026-08-22T09:01:00+00:00",
+        last_observed_at="2026-08-22T09:01:00+00:00",
         escalated_at=escalated_at,
     )
 
@@ -67,13 +74,13 @@ def _key(**overrides):
         role=ROLE,
         generation="g1",
         stall_class="content_refusal",
-        first_observed_at="t1",
+        first_observed_at="2026-08-22T09:01:00+00:00",
     )
     base.update(overrides)
     return escalation_idempotency_key(**base)
 
 
-def _pending(*, idempotency_key=None, lane_id=LANE, issue="15855", escalated_at="t2",
+def _pending(*, idempotency_key=None, lane_id=LANE, issue="15855", escalated_at="2026-08-22T09:02:00+00:00",
              **overrides):
     base = dict(
         idempotency_key=(
@@ -88,7 +95,7 @@ def _pending(*, idempotency_key=None, lane_id=LANE, issue="15855", escalated_at=
         stall_class="content_refusal",
         prescription="context_reset_reinjection",
         consecutive=2,
-        first_observed_at="t1",
+        first_observed_at="2026-08-22T09:01:00+00:00",
         escalated_at=escalated_at,
     )
     base.update(overrides)
@@ -115,7 +122,7 @@ class IdempotencyKeyTest(unittest.TestCase):
         # Deriving it from escalated_at would make every retry look like a new escalation
         # and write a duplicate journal -- the failure the readback fence exists to stop.
         self.assertEqual(_key(), _key())
-        self.assertNotIn("t2", _key())
+        self.assertNotIn(ISO["t2"], _key())
 
     def test_a_different_run_yields_a_different_key(self) -> None:
         base = _key()
@@ -125,7 +132,7 @@ class IdempotencyKeyTest(unittest.TestCase):
             ("role", "codex"),
             ("generation", "g2"),
             ("stall_class", "unsent_composer"),
-            ("first_observed_at", "t9"),
+            ("first_observed_at", ISO["t9"]),
         ):
             with self.subTest(field=field):
                 self.assertNotEqual(base, _key(**{field: value}))
@@ -154,13 +161,13 @@ class AbsentStoreTest(StoreBase):
 
 class StreakTest(StoreBase):
     def test_write_then_read_round_trips(self) -> None:
-        self.store.write_streak(_row(consecutive=3, escalated_at="t9"))
+        self.store.write_streak(_row(consecutive=3, escalated_at="2026-08-22T09:09:00+00:00"))
         streaks = self.store.read_streaks(WS)
         self.assertEqual(set(streaks), {SLOT})
         row = streaks[SLOT]
         self.assertEqual(row.stall_class, "content_refusal")
         self.assertEqual(row.consecutive, 3)
-        self.assertEqual(row.escalated_at, "t9")
+        self.assertEqual(row.escalated_at, "2026-08-22T09:09:00+00:00")
         self.assertEqual(row.generation, "g1")
         self.assertEqual(row.target, "w1V:pK")
 
@@ -212,7 +219,7 @@ class ForgetAbsentTest(StoreBase):
         self.store.write_streak(
             StreakRow(
                 workspace_id="wsB", lane_id=LANE, role=ROLE, stall_class="content_refusal",
-                consecutive=1, first_observed_at="t1", last_observed_at="t1",
+                consecutive=1, first_observed_at="2026-08-22T09:01:00+00:00", last_observed_at="2026-08-22T09:01:00+00:00",
             )
         )
         self.store.forget_absent_slots(WS, [])
@@ -249,7 +256,7 @@ class PendingLifecycleTest(StoreBase):
 
     def test_the_same_firing_is_idempotent(self) -> None:
         self.assertTrue(self.store.enqueue_pending(_pending()))
-        self.assertFalse(self.store.enqueue_pending(_pending(escalated_at="t99")))
+        self.assertFalse(self.store.enqueue_pending(_pending(escalated_at="2026-08-22T09:59:00+00:00")))
         self.assertEqual(len(self.store.unrecorded_pending(WS)), 1)
 
     def test_a_firing_without_an_identity_is_refused(self) -> None:
@@ -258,11 +265,11 @@ class PendingLifecycleTest(StoreBase):
 
     def test_recording_binds_the_journal_and_moves_it_to_unwoken(self) -> None:
         self.store.enqueue_pending(_pending())
-        self.assertTrue(self.store.mark_recorded(_key(), "110130", now="t5"))
+        self.assertTrue(self.store.mark_recorded(_key(), "110130", now="2026-08-22T09:05:00+00:00"))
         self.assertEqual(self.store.unrecorded_pending(WS), ())
         (pending,) = self.store.unwoken_pending(WS)
         self.assertEqual(pending.journal_id, "110130")
-        self.assertEqual(pending.written_at, "t5")
+        self.assertEqual(pending.written_at, "2026-08-22T09:05:00+00:00")
         self.assertTrue(pending.recorded)
         self.assertFalse(pending.settled)
 
@@ -293,7 +300,7 @@ class PendingLifecycleTest(StoreBase):
     def test_waking_a_recorded_firing_settles_it(self) -> None:
         self.store.enqueue_pending(_pending())
         self.store.mark_recorded(_key(), "110130")
-        self.assertTrue(self.store.mark_woken(_key(), now="t6"))
+        self.assertTrue(self.store.mark_woken(_key(), now="2026-08-22T09:06:00+00:00"))
         self.assertEqual(self.store.unwoken_pending(WS), ())
         self.assertEqual(self.store.open_pending(WS), ())
 
@@ -308,12 +315,12 @@ class AttemptVisibilityTest(StoreBase):
     def test_a_refused_write_is_counted_with_its_reason(self) -> None:
         # A repeatedly-refused write must not look like an escalation nobody reached yet.
         self.store.enqueue_pending(_pending())
-        self.assertTrue(self.store.record_attempt(_key(), "write_optin_unset", now="t3"))
-        self.assertTrue(self.store.record_attempt(_key(), "credential_missing", now="t4"))
+        self.assertTrue(self.store.record_attempt(_key(), "write_optin_unset", now="2026-08-22T09:03:00+00:00"))
+        self.assertTrue(self.store.record_attempt(_key(), "credential_missing", now="2026-08-22T09:04:00+00:00"))
         (pending,) = self.store.unrecorded_pending(WS)
         self.assertEqual(pending.attempts, 2)
         self.assertEqual(pending.last_reason, "credential_missing")
-        self.assertEqual(pending.last_attempt_at, "t4")
+        self.assertEqual(pending.last_attempt_at, "2026-08-22T09:04:00+00:00")
 
     def test_attempts_are_not_counted_against_a_recorded_firing(self) -> None:
         self.store.enqueue_pending(_pending())
@@ -332,9 +339,9 @@ class FairnessOrderTest(StoreBase):
     def test_unrecorded_pending_is_oldest_first(self) -> None:
         # Whichever escalation has waited longest takes the next write slot, so a newer
         # stall cannot repeatedly overtake an older one.
-        self.store.enqueue_pending(_pending(lane_id="lane_c", escalated_at="t7"))
-        self.store.enqueue_pending(_pending(lane_id="lane_a", escalated_at="t1"))
-        self.store.enqueue_pending(_pending(lane_id="lane_b", escalated_at="t4"))
+        self.store.enqueue_pending(_pending(lane_id="lane_c", escalated_at="2026-08-22T09:07:00+00:00"))
+        self.store.enqueue_pending(_pending(lane_id="lane_a", escalated_at="2026-08-22T09:01:00+00:00"))
+        self.store.enqueue_pending(_pending(lane_id="lane_b", escalated_at="2026-08-22T09:04:00+00:00"))
         order = [p.lane_id for p in self.store.unrecorded_pending(WS)]
         self.assertEqual(order, ["lane_a", "lane_b", "lane_c"])
 
@@ -355,12 +362,12 @@ class DiscoveryCoverageTest(StoreBase):
         # sum(dropped), and out_of_reach == sum(dropped) - foreign_workspace.
         self.store.record_discovery(
             "wsA", candidates=4, watched=2, out_of_reach=2,
-            dropped={"issue_anchor_unresolved": 2}, now="t1",
+            dropped={"issue_anchor_unresolved": 2}, now="2026-08-22T09:01:00+00:00",
         )
         self.assertEqual(
             self.store.last_discovery("wsA"),
             {
-                "observed_at": "t1",
+                "observed_at": "2026-08-22T09:01:00+00:00",
                 "candidates": 4,
                 "watched": 2,
                 "out_of_reach": 2,
@@ -377,13 +384,13 @@ class DiscoveryCoverageTest(StoreBase):
         self.assertIsNone(self.store.last_discovery("wsA"))
 
     def test_a_later_pass_replaces_the_earlier_summary(self) -> None:
-        self.store.record_discovery("wsA", candidates=1, watched=1, out_of_reach=0, now="t1")
+        self.store.record_discovery("wsA", candidates=1, watched=1, out_of_reach=0, now="2026-08-22T09:01:00+00:00")
         self.store.record_discovery(
             "wsA", candidates=9, watched=3, out_of_reach=6,
-            dropped={"issue_anchor_unresolved": 6}, now="t2",
+            dropped={"issue_anchor_unresolved": 6}, now="2026-08-22T09:02:00+00:00",
         )
         recorded = self.store.last_discovery("wsA")
-        self.assertEqual(recorded["observed_at"], "t2")
+        self.assertEqual(recorded["observed_at"], "2026-08-22T09:02:00+00:00")
         self.assertEqual(recorded["out_of_reach"], 6)
 
     def test_a_blank_workspace_records_nothing(self) -> None:
@@ -408,7 +415,7 @@ class DiscoveryContractBase(StoreBase):
         return base
 
     def _seed_valid(self):
-        self.store.record_discovery("wsA", now="t1", **self._valid())
+        self.store.record_discovery("wsA", now="2026-08-22T09:01:00+00:00", **self._valid())
 
     def _corrupt(self, sql, *args):
         conn = sqlite3.connect(self.store.path)
@@ -507,7 +514,7 @@ class DiscoveryWriteContractTest(DiscoveryContractBase):
         self.assertEqual(
             self.store.last_discovery("wsA"),
             {
-                "observed_at": "t1",
+                "observed_at": "2026-08-22T09:01:00+00:00",
                 "candidates": 4,
                 "watched": 1,
                 "out_of_reach": 2,
@@ -518,6 +525,96 @@ class DiscoveryWriteContractTest(DiscoveryContractBase):
                 },
             },
         )
+
+
+class TimestampContractTest(DiscoveryContractBase):
+    """The fifth column. R4 validated counts and reasons and left this one unchecked.
+
+    "It is a timestamp" was an assumption nothing enforced, so it was whatever the caller
+    passed — review j#110183 reproduced ``/private/example/unsafe-observed-at`` reaching both
+    operator surfaces. The grammar is now enforced at write AND read, for every timestamp
+    this store renders, not only the one the finding named.
+    """
+
+    GOOD = "2026-08-22T13:00:00+00:00"
+
+    def test_a_non_timestamp_write_is_refused(self) -> None:
+        for label, now in (
+            ("path sentinel", "/private/example/unsafe-observed-at"),
+            ("free text", "hello"),
+            ("naive instant", "2026-08-22T13:00:00"),
+            ("empty string", ""),
+            ("not a string", 12345),
+        ):
+            with self.subTest(label=label):
+                with self.assertRaises(StallDiscoveryContractError):
+                    self.store.record_discovery("wsA", now=now, **self._valid())
+        self.assertIsNone(self.store.last_discovery("wsA"))
+
+    def test_an_explicit_empty_string_is_refused_not_defaulted(self) -> None:
+        # `now or default` would silently repair it — the same "repair instead of refuse"
+        # pattern the config resolver was corrected on.
+        with self.assertRaises(StallDiscoveryContractError):
+            self.store.record_discovery("wsA", now="", **self._valid())
+
+    def test_none_still_means_use_the_current_time(self) -> None:
+        self.store.record_discovery("wsA", **self._valid())
+        self.assertTrue(self.store.last_discovery("wsA")["observed_at"])
+
+    def test_the_refusal_does_not_quote_the_supplied_value(self) -> None:
+        with self.assertRaises(StallDiscoveryContractError) as caught:
+            self.store.record_discovery(
+                "wsA", now="/private/example/unsafe-observed-at", **self._valid()
+            )
+        self.assertNotIn("unsafe-observed-at", str(caught.exception))
+        self.assertNotIn("/private", str(caught.exception))
+
+    def test_an_accepted_timestamp_is_normalized(self) -> None:
+        # "parses but is written oddly" cannot survive either: what comes back out is what
+        # this module would have written itself.
+        self.store.record_discovery(
+            "wsA", now="2026-08-22T13:00:00.123456+00:00", **self._valid()
+        )
+        self.assertEqual(self.store.last_discovery("wsA")["observed_at"], self.GOOD)
+
+    def test_a_corrupted_stored_timestamp_is_not_rendered(self) -> None:
+        self.store.record_discovery("wsA", now=self.GOOD, **self._valid())
+        self._corrupt("UPDATE stall_watch_discovery SET observed_at='/etc/shadow'")
+        got = self.store.last_discovery("wsA")
+        self.assertEqual(got["unreadable"], DISCOVERY_BAD_TIMESTAMP)
+        self.assertNotIn("shadow", json.dumps(got))
+        self.assertEqual(got["observed_at"], "")
+
+    def test_pending_timestamps_are_refused_on_write(self) -> None:
+        # Stronger exposure than the discovery row: these reach a Redmine journal BODY.
+        for field in ("first_observed_at", "escalated_at"):
+            with self.subTest(field=field):
+                kwargs = {"first_observed_at": self.GOOD, "escalated_at": self.GOOD}
+                kwargs[field] = "/home/alice/private/secret"
+                with self.assertRaises(StallDiscoveryContractError):
+                    self.store.enqueue_pending(_pending(**kwargs))
+
+    def test_a_corrupted_pending_timestamp_is_replaced_not_dropped(self) -> None:
+        # The row IS the escalation; dropping it would lose the stall report. The value is
+        # replaced so nothing arbitrary reaches the note or the JSON status.
+        self.store.enqueue_pending(
+            _pending(first_observed_at=self.GOOD, escalated_at=self.GOOD)
+        )
+        self._corrupt(
+            "UPDATE stall_escalation_pending SET first_observed_at='/etc/shadow'"
+        )
+        (pending,) = self.store.unrecorded_pending(WS)
+        self.assertEqual(pending.first_observed_at, TIMESTAMP_UNREADABLE)
+        self.assertNotIn("shadow", json.dumps(pending.telemetry()))
+
+    def test_the_watermark_is_held_to_the_same_grammar(self) -> None:
+        # `last_pass_at` reaches `--status` as `last=`, so it is the same class of column.
+        with self.assertRaises(StallDiscoveryContractError):
+            self.store.mark_pass("wsA", now="/private/x")
+        self.store.mark_pass("wsA", now=self.GOOD)
+        self.assertEqual(self.store.last_pass_at("wsA"), self.GOOD)
+        self._corrupt("UPDATE stall_watch_watermark SET last_pass_at='/etc/shadow'")
+        self.assertEqual(self.store.last_pass_at("wsA"), TIMESTAMP_UNREADABLE)
 
 
 class DiscoveryReadContractTest(DiscoveryContractBase):

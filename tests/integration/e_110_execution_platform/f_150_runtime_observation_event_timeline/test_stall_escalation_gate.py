@@ -566,8 +566,8 @@ class BudgetTest(SettleBase):
                 stall_class=CLASS_CONTENT_REFUSAL,
                 prescription="context_reset_reinjection",
                 consecutive=2,
-                first_observed_at="t1",
-                escalated_at="t2",
+                first_observed_at="2026-08-22T09:01:00+00:00",
+                escalated_at="2026-08-22T09:02:00+00:00",
                 issue="15999",
             )
         )
