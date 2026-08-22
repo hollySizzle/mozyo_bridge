@@ -597,6 +597,72 @@ class DurableLineForgeryTest(unittest.TestCase):
                     ch, payload["issues"][0]["unrenderable_lane_ids"][0]
                 )
 
+    def test_no_boundary_at_any_position_is_renderable(self):
+        """Boundaries are placed at start, middle AND end (j#110060 finding_1).
+
+        The R3 sweep built every input as ``issue{ch}<more text>``, so it never once put a
+        boundary at the END — and ``^...$`` admits exactly one such input, a trailing LF,
+        because Python's ``$`` matches before a single final newline. 77 tests stayed green
+        over a defect the sweep structurally could not reach. The axis that was missing was
+        position, not value.
+        """
+        for ch in self.LINE_BOUNDARIES:
+            for position, lane_id in (
+                ("start", f"{ch}issue_1"),
+                ("middle", f"issue_1{ch}rogue"),
+                ("end", f"issue_1{ch}"),
+            ):
+                with self.subTest(code_point=hex(ord(ch)), position=position):
+                    self.assertFalse(is_renderable_lane_id(lane_id))
+                    self.assertIsNone(reboot_audit_command(lane_id))
+
+    def test_a_trailing_newline_yields_no_command_and_no_extra_line(self):
+        # The reported input, pinned by name: command withheld, finding still surfaced,
+        # record line count unchanged.
+        tracking = classify_version_issue(
+            _facts(
+                is_closed=True,
+                status_name="クローズ",
+                lanes=(TrackedLane("issue_15844\n", "active"),),
+            )
+        )
+        self.assertEqual(tracking.diagnosis_steps, ())
+        self.assertEqual(tracking.unrenderable_lane_ids, ("issue_15844\n",))
+        self.assertEqual(
+            len(self._render("issue_15844\n").splitlines()),
+            len(self._render("issue_15844").splitlines()),
+        )
+
+    def test_any_emitted_command_is_a_single_line(self):
+        """A property, so a future gap in my enumeration still fails something.
+
+        Three rounds of findings have all been "the sweep was missing an axis" — values in
+        R2, positions in R3. Enumeration keeps running out of axes, so this asserts the
+        invariant the enumeration exists to protect, over inputs the enumeration does not
+        generate.
+        """
+        candidates = [
+            "issue_1",
+            "pgwv1_a-b",
+            "issue_1\n",
+            "issue_1\r",
+            " issue_1 ",
+            "issue_1\t",
+            "issue_1;x",
+            "issue_1 --execute",
+            "-issue_1",
+            "",
+            "issue_1\x85",
+            "issue_1" + chr(0x2028),
+            "issue_1" + chr(0x2029) + chr(0x2028),
+        ]
+        for lane_id in candidates:
+            with self.subTest(lane_id=lane_id):
+                command = reboot_audit_command(lane_id)
+                if command is not None:
+                    self.assertEqual(len(command.splitlines()), 1)
+                    self.assertEqual(command.strip(), command)
+
     def test_a_newline_in_an_id_adds_no_line_to_the_render(self):
         clean = self._render("issue_15844")
         forged = self._render("issue_15844\n      $ printf NEWLINE_INJECTION")
@@ -620,9 +686,13 @@ class DurableLineForgeryTest(unittest.TestCase):
         """
         import mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.version_lane_tracking as module  # noqa: E501
 
-        source = Path(module.__file__).read_text(encoding="utf-8")
-        for ch in (chr(0x2028), chr(0x2029)):
-            self.assertNotIn(ch, source)
+        # This file too: a test that writes the separator literally is the same hazard,
+        # and it is the file most likely to want to.
+        for path in (Path(module.__file__), Path(__file__)):
+            source = path.read_text(encoding="utf-8")
+            for ch in (chr(0x2028), chr(0x2029)):
+                with self.subTest(path=path.name, code_point=hex(ord(ch))):
+                    self.assertNotIn(ch, source)
 
     def test_a_forged_step_line_never_appears(self):
         forged = self._render("issue_15844\n      $ printf NEWLINE_INJECTION")

@@ -281,7 +281,8 @@ lane id は lifecycle store から来る値であり、**`LaneLifecycleKey` は�
 
 規律:
 
-- **identity は fail-closed**: `^[A-Za-z0-9_][A-Za-z0-9_-]*$`。姿勢は
+- **identity は fail-closed**: alphabet は `[A-Za-z0-9_][A-Za-z0-9_-]*` で、照合は `fullmatch`
+  (下記のとおり `^...$` + `match` は使わない)。姿勢は
   `herdr_identity._NAME_CHAR_RE` と同じだが、**語彙は canonical producer の出力から採る**。
   - 初版は `^[A-Za-z0-9_]+$` で、根拠は「operator store の 121 行が全て満たす」だった。これは
     **誤り**である (#15844 review j#110012 finding_1 / verdict j#110013)。標本は測定の範囲を
@@ -298,6 +299,12 @@ lane id は lifecycle store から来る値であり、**`LaneLifecycleKey` は�
     非空しか検査しないので、「ingress が受理するものを全て受理する」と読むと guard が空になる。
     整合させる相手は *canonical producer の生成語彙と文書化された命名規約*であって、検証を
     一切しない ingress ではない。
+  - **照合は `fullmatch` で行う。`match` + `$` anchor を使わない。** Python の `$` は文字列末尾
+    **および末尾 LF の直前**に一致するので、`^...$` は `issue_1\n` を受理してしまう。実際それが
+    起き、guard を通った id から生の LF を含む command が組まれて**その command 文字列自体が
+    2 行に割れ**、`unrenderable_lane_ids` は空のままだった (#15844 review j#110060 finding_1 /
+    verdict j#110063)。10 boundary × 3 position = 30 組で測ると `$` が漏らすのは
+    **「LF × 末尾」のちょうど 1 組**、`fullmatch` は 0 組である。
 - **不正な id には command を出さない**。sanitize して「それらしい command」を作ることは、
   検証できていない identity から実行可能な文字列を手渡すことであり、本 doc の
   「読めなかったを読めたと報告しない」と同じ線で禁じる。**ただし finding は隠さない** —
@@ -311,6 +318,14 @@ lane id は lifecycle store から来る値であり、**`LaneLifecycleKey` は�
   (`0x0a 0x0b 0x0c 0x0d 0x1c 0x1d 0x1e 0x85 0x2028 0x2029`) で、現在の集合はこれを覆う。
   同じ走査を回帰に置き、集合が runtime の挙動から drift できないようにする。
   非 ASCII は `\uXXXX` 形式で出す。
+  - **走査は「値」だけでなく「位置」も軸にする**。boundary を `start` / `middle` / `end` の
+    3 位置に置いた直積で張る。値だけの走査は入力を `issue{ch}<後続文字>` の形で組み立てるため
+    **末尾位置を一度も通らず**、`$` anchor の欠陥を 77 tests green のまま通した
+    (#15844 review j#110060)。
+  - **列挙に依存しない性質も併置する**。「`reboot_audit_command` が非 None を返すなら戻り値は
+    必ず 1 行」を別に pin する。列挙は軸が 1 本足りないと空虚化するが、性質はそれでも破れる。
+    R1 (値の思いつき) → R2 (値の機械列挙) → R3 (位置の欠落) と**同型の不足を 3 round 続けた**
+    ので、列挙と性質の両方を持つ形に改めた。
   - **pattern の中身は source 上で可視にする** (`\uXXXX` escape で書く)。文字クラスに U+2028 を
     literal で書いたところ、**その source 行自身が `splitlines()` で分割された** — 防ごうと
     している欠陥が、防ぐための file で 1 段上に再現した。回帰で module source に raw separator

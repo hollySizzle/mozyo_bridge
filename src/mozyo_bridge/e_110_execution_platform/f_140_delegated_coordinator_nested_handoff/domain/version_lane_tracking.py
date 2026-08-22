@@ -81,7 +81,16 @@ from mozyo_bridge.core.state.lane_lifecycle_model import (
 #: only checks non-emptiness, so "accept whatever ingress accepts" would empty the guard.
 #: What this aligns with is the canonical producers' output and the documented naming
 #: conventions.
-_LANE_ID_SAFE_RE = re.compile(r"^[A-Za-z0-9_][A-Za-z0-9_-]*$")
+#:
+#: Matched with :meth:`re.Pattern.fullmatch`, never ``match`` + ``$``. Python's ``$`` also
+#: matches immediately before a **single trailing newline**, so ``^...$`` admitted
+#: ``issue_1\n`` — the guard passed it, and the command was then built with a raw LF inside
+#: the quoted token, splitting the rendered command across two lines while
+#: ``unrenderable_lane_ids`` stayed empty (Redmine #15844 review j#110060 finding_1;
+#: verdict j#110063). Measured over all ten boundary code points × three positions
+#: (start / middle / end): ``$`` leaked exactly one combination (LF at end); ``fullmatch``
+#: leaks none.
+_LANE_ID_SAFE_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*")
 
 #: Characters neutralized wherever a lane id reaches rendered text or a payload.
 #:
@@ -152,8 +161,12 @@ def is_terminal_lane_disposition(disposition: str) -> bool:
 
 
 def is_renderable_lane_id(lane_id: str) -> bool:
-    """May this lane id be put into a command or a durable line? (fail-closed)"""
-    return bool(_LANE_ID_SAFE_RE.match(lane_id or ""))
+    """May this lane id be put into a command or a durable line? (fail-closed)
+
+    ``fullmatch``, not ``match`` — see :data:`_LANE_ID_SAFE_RE`. A ``^...$`` pattern would
+    accept a trailing newline, which is the one input that has to be refused here.
+    """
+    return bool(_LANE_ID_SAFE_RE.fullmatch(lane_id or ""))
 
 
 def display_lane_id(lane_id: str) -> str:
