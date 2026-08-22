@@ -61,6 +61,9 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_drain import (
     register_drain_queue,
 )
+from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_version_track import (
+    register_version_track,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.application.cli_workflow_review_escalation import (
     register_review_escalation,
 )
@@ -851,6 +854,7 @@ def register(sub) -> None:
     register_stall_watch(workflow_sub)
     register_glance(workflow_sub)
     register_drain_queue(workflow_sub)
+    register_version_track(workflow_sub)
     register_review_escalation(workflow_sub)
     register_callbacks(workflow_sub)
     register_supervisor(workflow_sub)
