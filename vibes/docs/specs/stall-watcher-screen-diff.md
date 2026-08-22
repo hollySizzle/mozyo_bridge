@@ -2,15 +2,21 @@
 
 ## Status
 
-- version: `v0.1`
+- version: `v0.2` (#15855 で運用配線を追加。v0.1 のセンサー / 分類 / 処方の記述は不変)
 - scope: watcher 層 (background / operator) が、pane の**描画画面が進んでいるか**だけを一次
   センサーとして停滞候補を拾い、種別を分類し、種別ごとの処方を**提示**するまで。
 - non-goal: 処方の自動適用、配送 rail の retry policy、completion 判定、receiver-state
   observability の再設計。いずれも既存正本が所有する (`## 既存正本との境界`)。
+- v0.2 追加 scope (#15855): 上記 pass を**誰が回すか**と、本物の停滞を**どうやって
+  coordinator へ戻すか**の配線 (`## 運用配線`)。センサー・分類・処方の意味論は一切変えない。
 - 実装: `e_110_execution_platform/f_150_runtime_observation_event_timeline` の
   `domain/pane_stall_sensor.py` / `domain/stall_disposition.py` /
   `application/stall_watch_pass.py` / `application/cli_workflow_stall_watch.py`、
   provider data は `e_140_adapter_provider/f_160_provider_registry/domain/agent_provider_stall_signatures.yaml`。
+- 運用配線の実装 (#15855): 同 feature の `domain/stall_escalation_policy.py` /
+  `domain/stall_escalation_note.py` / `domain/stall_watch_policy.py` /
+  `application/stall_escalation_pass.py` / `application/stall_watch_phase.py` /
+  `application/stall_watch_leg.py`、durable state は `core/state/stall_escalation.py`。
 
 ## なぜ画面差分なのか (この class に他のセンサーが無い)
 
@@ -246,6 +252,142 @@ target ごとに待つと cockpit の成長に対して cadence が線形に劣�
   *3 値センサー / 分類の順序と交差 / 処方 map / patience が fail-safe であること / evidence
   tier* までである。
 
+## 運用配線 (#15855)
+
+v0.1 は「センサーと分類器は在るが、誰も回していない」状態で close した。本節はその運用
+完成 (operational completion) を記述する。**判断の内容は 1 つも変えていない** — 変えたのは
+「いつ動くか」「何を見るか」「何処に書くか」の 3 点だけである。
+
+### OS registration は増やさない
+
+#15192 は「host あたり OS registration はちょうど 1 つ」を確定し、**2 つ目を能動的に削除
+する一方向 migration** を出荷している (`supervisor_launchd_migration.py`)。したがって
+stall-watch 専用の timer / LaunchAgent は作らない。watcher は既存の 1 unit が回す bounded
+sweep の **1 leg** として畳み込む (retire / hibernate leg と同型)。install / uninstall /
+restart / service-status は既存 lifecycle をそのまま継承する。
+
+裁定の正本: #15855 j#110121-1。
+
+### 約5分は OS tick ではなく watcher 自身の watermark
+
+OS tick は `DEFAULT_OS_TICK_INTERVAL_SECONDS` (180s) のまま据え置く。callback supervisor の
+局所 cadence を劣化させないためである。約5分の周期は `stall_watch_watermark` という
+**この watcher 専用の watermark** から出る。provider reconciliation watermark と既定値が
+同じ 300s であっても、state / key / 責務は分離する — 一方の変更が他方を黙って再調整して
+しまうからである。
+
+phase は tick が回るときにしか走らないので、**実効周期は tick に量子化され 300 秒ちょうどに
+はならない**。status は `next_due_at` を「越えるべき閾値」として出し、「次の実行時刻」とは
+名乗らない。
+
+### scope は opt-in。設定不在は「何も見ない」
+
+`## 既存正本との境界` のとおり、cadence / N / 対象集合は operator runtime policy である。
+これを `.mozyo-bridge/config.yaml` の `stall_watch` block として型付けした。
+
+- **block が無い → 何も見ない。** 「既定値で全部見る」ではない。host 上の全 pane を黙って
+  読む watcher は誰も頼んでいない監視面であり、宣言していない lane について escalate する
+  のは operator が予期しようのない noise だからである。
+- **wildcard は無い。** 全 managed lane を見ることは表現できるが、`all_managed_lanes` という
+  operator が自分で打った key としてのみである。cockpit が育ったとき黙って広がる pattern に
+  はしない。
+- **malformed → 無効 + 理由。** 既定値へ repair しない。cadence を書いて打ち間違えた operator
+  が受け取るべきは「選んでいない cadence で黙って動く watcher」ではなく「なぜ止まっているか
+  を言う watcher」である。
+
+off の状態は 3 つ (`absent` / `declared_without_scope` / `invalid`) あり、status で区別できる。
+
+### target 発見は scan ではなく join
+
+live agent 行は *候補* にすぎない。4 つの独立した filter を全部通ったものだけが観測対象に
+なる: (1) managed identity (`herdr_inventory` に委譲、自前で parse し直さない)、(2) 自
+workspace、(3) 宣言済み scope、(4) live generation と authoritative active issue anchor の
+**両方**が解決すること。
+
+filter 4 は意図的な死角である。issue anchor が解けない lane について本 watcher は永久に
+escalate しない。代替は「どの issue の停滞か推測して coordinator 向け記録を誤った issue に
+書く」ことであり、そちらが遥かに悪い。死角は隠さない: 落ちた候補は理由別に数えられ、status
+が「N 台が watcher の射程外、内訳はこれ」と出す。
+
+### streak は slot に束縛する。locator ではない
+
+run の identity は `workspace_id + lane_id + role` (durable slot) で、terminal `generation` は
+**束縛**される (key ではない)。pane locator は evidence として持つだけで、いかなる比較にも
+使わない。
+
+- locator は**再利用される**。死んだ unit の locator に貯めた run は、次にそこへ来た別 unit を
+  数え始め、止まっていない lane について escalate する。
+- locator は同じ unit のまま**変わる**。relaunch / rebind で logical agent は同じまま locator が
+  動くので、locator を key にすると run が黙って reset し、rebind を跨いで固まった unit は
+  永久に閾値へ届かない。
+
+generation を key に入れると relaunch のたびに孤児行が残るので、key ではなく束縛にする。
+generation が変われば run は restart する — 新しい process は自分の画面を持つのであり、
+前任者の停滞で新 agent を escalate してはならない。
+
+### 発火条件: 同一 class の N 連続。無evidence は数えない
+
+| class | 効果 |
+| --- | --- |
+| `screen_progressing` / `busy_likely` | **reset** (render loop が生きている積極証拠) |
+| `screen_unreadable` / `unknown` | **hold** (どちら向きの証拠でもない) |
+| `startup_interaction` / `content_refusal` / `unsent_composer` / `provider_unresponsive_suspected` / `unresponsive_indeterminate` | **advance** |
+
+`hold` は進めも戻しもしない。進めれば「読めなかった *reader*」が、誰にも見えない unit に
+ついて停滞の verdict を捏造できてしまう。戻せば 1 回の読み取り失敗が 5 pass 分の本物の run を
+消してしまう。機械的な帰結として、**ずっと読めない target は決して閾値に届かない**。
+
+`startup_interaction` を advance 側に置くのは、trust dialog に座った unit が「遅い」のではなく
+**永久に止まっている**からである。処方 (`operator_resolves_startup_screen`) 自体が「人間だけが
+解ける」と既に言っている。
+
+閾値に達した run は **1 回だけ**発火して latch する。長時間の停滞が 5 分ごとに人を呼ぶことは
+ない。その代償は明示された残余である: **本層は未確認の escalation を再送しない**。cadence で
+再発火する watcher は mute されるものになり、mute された watcher は無いより悪い。落ちた
+escalation の回収は durable record 側の責務であり、本層が完了を推測してよい事柄ではない
+(ADR-0014)。
+
+### durable record の正本は Redmine journal
+
+local SQLite は **streak と pending の durability** であって workflow truth ではない。閾値到達は
+既存語彙の `## Gate: blocked` (`reason: stall_watch_escalation`) journal を canonical gate
+writer 経由で append することで記録する。新しい gate token も新しい transport kind も作らない
+— `blocked` は既に「coordinator を起こして journal を読ませるだけで、何も authorize しない」と
+定義されており、本 rail の意味そのものである。
+
+note は固定 field のみを載せ、**pane content を構造的に運べない** (renderer に画面文字列を
+渡す引数が存在しない)。note は観測を主張し、結論は主張しない — unit が死んだとも、作業が
+完了したとも、処方が適用されたとも書かない。`policy` field は cadence / N / 出所を載せるので、
+「N 連続」が後の読者にとって意味を持つ。
+
+### 予算と冪等性
+
+Redmine journal append は external mutation であり、`workspace_callback_supervisor` の
+**pass あたり 1 external mutation** 予算を消費する。callback delivery の第一優先は反転しない。
+予算が既に使われている pass では escalation は local pending に留まり、次に空いている pass で
+1 件だけ書かれる。
+
+順序は **pending → journal → readback → wake** で、各矢印に fence がある:
+
+- pending の key は firing の identity 由来 (発火 pass の時計ではない) なので、crash 後の retry
+  は衝突して 2 通目の journal を生まない。
+- `mark_recorded` は空の journal id を拒否する。「多分書けた」を「書けた」と数えない。
+- `mark_woken` は journal id を持たない firing を **SQL で**拒否する。存在しない journal を
+  読めと coordinator を起こすのが、この rail が防ぐべき唯一の逆転だからである。
+- 書き込み前にも readback を回す。既に着地した journal は束縛され、local store が何を信じて
+  いようと二度と書かれない。
+
+**非飢餓の前提は明示する。** pending は古い順に settle され、`attempts` / `last_reason` で
+「拒否された書き込み」と「まだ誰も手を付けていない書き込み」を区別できる。その上で非飢餓性は
+**「callback delivery はいずれ暇になる」という前提**に依存する。これは outbox drain が既に
+依存している前提と同じ (恒常的に空でない outbox はそれ自体が病理) だが、前提が崩れたときに
+escalation は失われるのではなく**溜まる**、そして最古 pending の age が status に出るので
+silent にはならない。age を上限で縛るために delivery-first を反転することは、実装詳細ではなく
+記録済み決定の変更なので、ここでは行わない。
+
+裁定の正本: #15855 j#110121-5 / j#110121-6。
+
+
 ## Cross-References
 
 - `vibes/docs/logics/ack-completion-receiver-state.md` — 沈黙を completion にしない正本、
@@ -253,5 +395,6 @@ target ごとに待つと cockpit の成長に対して cadence が線形に劣�
 - `vibes/docs/logics/tmux-send-safety-contract.md` — 送信側 rail の挙動正本
 - `vibes/docs/adr/adr-0002-enter-resend-priority.md` — Enter-only retry の owner 決定
 - `vibes/docs/adr/adr-0013-ui-hides-pane-operations.md` — 手動 pane 操作を既定にしない UX 要件
+- `vibes/docs/adr/adr-0014-dead-unit-proxy-recovery.md` — 事実は回収するが完了は推測しない
 - `skills/mozyo-bridge-agent/references/workflow.md` — `## Wait / polling 効率標準` /
   `## Stall / no-progress 検出標準` / `## 停滞・拒否からの context reset 回復`

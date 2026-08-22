@@ -71,6 +71,7 @@ ACTIONS: frozenset[str] = frozenset(
 #: which is a schema marker, not an operator-facing setting.
 CONFIG_BLOCK_KEYS: tuple[str, ...] = (
     "work_unit",
+    "stall_watch",
     "sublane_integration",
     "auto_integration",
     "terminal_transport",
@@ -150,6 +151,17 @@ PLACEMENT_LEAF_KEYS: tuple[str, ...] = tuple(
 #: is a reviewable act.
 CONFIG_LEAF_KEYS: tuple[tuple[str, tuple[tuple[str, ...], ...]], ...] = (
     ("work_unit.granularity", (("work_unit", "granularity"),)),
+    # The #15855 stall-watch leaves. Cadence and threshold have portable defaults, but
+    # SCOPE does not: an absent `stall_watch` block watches nothing at all, and an operator
+    # must be able to read which of the three off-states a workspace is in (absent /
+    # declared-without-scope / invalid) rather than infer it. `all_managed_lanes` and
+    # `lanes` are the two ways scope is declared, and they are mutually exclusive, so both
+    # are listed — reading only one of them cannot tell you what is watched.
+    ("stall_watch.cadence_seconds", (("stall_watch", "cadence_seconds"),)),
+    ("stall_watch.threshold", (("stall_watch", "threshold"),)),
+    ("stall_watch.all_managed_lanes", (("stall_watch", "all_managed_lanes"),)),
+    ("stall_watch.lanes", (("stall_watch", "lanes"),)),
+    ("stall_watch.roles", (("stall_watch", "roles"),)),
     (
         "sublane_integration.integration_branch",
         (("sublane_integration", "integration_branch"),),

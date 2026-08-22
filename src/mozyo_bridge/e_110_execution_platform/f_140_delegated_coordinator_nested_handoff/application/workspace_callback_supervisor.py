@@ -184,6 +184,10 @@ class WorkspaceCallbackSupervisor:
         hibernate_leg_fn: Optional[Callable[[SupervisedWorkspace, Callable[[], bool]], object]] = None,
         retire_leg_fn: Optional[Callable[..., object]] = None,
         auto_integration_leg_fn: Optional[Callable[[str, str, object], object]] = None,
+        #: The #15855 stall-watch leg. Injected rather than imported so this composition root
+        #: keeps no dependency on the observation feature, and so a host that never configured
+        #: a stall_watch policy runs a sweep byte-identical to the pre-#15855 one.
+        stall_watch_leg_fn: Optional[Callable[..., object]] = None,
     ) -> None:
         holder = str(holder or "").strip()
         if not holder:
@@ -220,6 +224,7 @@ class WorkspaceCallbackSupervisor:
         # It runs on the same leased issue path and shares the pass's one external-mutation
         # budget, so an accepted push never follows a callback wake in the same bounded pass.
         self._auto_integration_leg_fn = auto_integration_leg_fn
+        self._stall_watch_leg_fn = stall_watch_leg_fn
         # Redmine #13968 F1: the authoritative-workspace resolver — a home-global
         # ``{issue -> sole actively-owning workspace}`` map from the durable lifecycle authority.
         # When wired, each workspace supervises ONLY the issues it uniquely owns (owned-elsewhere /
@@ -416,6 +421,16 @@ class WorkspaceCallbackSupervisor:
                     bound_issues=wake_issues, renew=_renew,
                 )
                 _hibernate.mark_pass_budget(pass_budget, outcome)
+                # #15855: the stall-watch leg runs LAST in the pass, after retire and
+                # hibernate have had the one external-mutation slot. That ordering is the
+                # delivery-first priority j#110121-6 preserved: an escalation may only take
+                # the slot on a pass where nothing else needed it. It is also why the leg is
+                # cheap on most ticks -- its own cadence watermark returns immediately.
+                if self._stall_watch_leg_fn is not None:
+                    try:
+                        self._stall_watch_leg_fn(ws, pass_budget=pass_budget)
+                    except Exception:  # noqa: BLE001 - the watcher never breaks a sweep
+                        pass
             return outcome
         finally:
             # A bounded run-once releases each workspace at the end of its sweep so the next
@@ -880,6 +895,21 @@ def build_supervisor(
     )
 
     workspaces_fn = lambda: default_workspaces(home=home)
+    # #15855: the stall-watch leg. Built here and injected so this module keeps no import
+    # dependency on the observation feature. It is safe to wire unconditionally: with no
+    # `stall_watch` block in a workspace's repo-local config the leg returns immediately
+    # without reading a lane, a pane or a screen, so a host that never configured it runs
+    # a sweep indistinguishable from the pre-#15855 one.
+    from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_wiring import (  # noqa: E501
+        build_stall_watch_leg_fn,
+    )
+
+    stall_watch_leg_fn = build_stall_watch_leg_fn(
+        home=home,
+        lifecycle_store=lifecycle_store,
+        wake_store=SupervisorWakeStore(path=supervisor_wake_path(home)),
+        redmine_source_fn=lambda ws: default_redmine_source(ws, home=home),
+    )
     auto_integration_leg_fn = build_auto_integration_supervisor_leg(
         home=home,
         callback_outbox=outbox,
@@ -917,6 +947,7 @@ def build_supervisor(
         ),
         retire_leg_fn=default_retire_leg_fn(home=home, outbox=outbox),
         auto_integration_leg_fn=auto_integration_leg_fn,
+        stall_watch_leg_fn=stall_watch_leg_fn,
     )
 
 

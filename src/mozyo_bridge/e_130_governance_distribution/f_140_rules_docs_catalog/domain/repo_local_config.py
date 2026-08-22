@@ -77,6 +77,10 @@ from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_ha
     DelegationConfig,
     DelegationConfigError,
 )
+from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.domain.stall_watch_policy import (  # noqa: E501
+    StallWatchPolicy,
+    StallWatchPolicyError,
+)
 from mozyo_bridge.e_110_execution_platform.f_140_delegated_coordinator_nested_handoff.domain.work_unit_granularity import (
     WorkUnitGranularityConfig,
     WorkUnitGranularityError,
@@ -197,6 +201,7 @@ REPO_LOCAL_CONFIG_KEYS: frozenset[str] = frozenset(
         "sublane_integration",
         "auto_integration",
         "work_unit",
+        "stall_watch",
         "agent_launch",
         "lane_placement",
         "provider_binding",
@@ -496,6 +501,13 @@ class RepoLocalConfig:
     work_unit: WorkUnitGranularityConfig = field(
         default_factory=WorkUnitGranularityConfig.default
     )
+    #: The operator's stall-watch runtime policy (#15855). An absent block resolves to a
+    #: policy that watches NOTHING — deliberately not "everything with defaults". Scope is
+    #: opt-in because a watcher that silently reads every pane it can find is a surveillance
+    #: surface nobody asked for (``stall-watcher-screen-diff.md`` `## 既存正本との境界`;
+    #: #15855 j#110121-2). That makes it behavior-preserving in the strongest sense: a repo
+    #: that never declares it behaves exactly as every build before the watcher existed.
+    stall_watch: StallWatchPolicy = field(default_factory=StallWatchPolicy.default)
     agent_launch: AgentLaunchConfig = field(
         default_factory=AgentLaunchConfig.default
     )
@@ -651,6 +663,18 @@ class RepoLocalConfig:
             raise RepoLocalConfigError(
                 f"work_unit config is invalid: {exc}"
             ) from exc
+        # The operator's stall-watch runtime policy (#15855). Parsed by its own
+        # self-contained domain schema; its StallWatchPolicyError is re-raised as a
+        # RepoLocalConfigError so the loader keeps a single fail-closed boundary. NOTE the
+        # asymmetry with every sibling above: a MALFORMED block raises here (an operator who
+        # mistyped a cadence must not get a watcher quietly running on a cadence they did
+        # not choose), while an ABSENT block resolves to a policy that watches nothing.
+        try:
+            stall_watch = StallWatchPolicy.from_record(record.get("stall_watch"))
+        except StallWatchPolicyError as exc:
+            raise RepoLocalConfigError(
+                f"stall_watch config is invalid: {exc}"
+            ) from exc
         # The lane-class pane-pair placement knob (#13646) declares the herdr split
         # direction / provider order / pair split ratio (#14569) per lane class. It is
         # parsed by its own self-contained domain schema (the sibling that also owns the
@@ -737,6 +761,7 @@ class RepoLocalConfig:
             sublane_integration=sublane_integration,
             auto_integration=auto_integration,
             work_unit=work_unit,
+            stall_watch=stall_watch,
             agent_launch=agent_launch,
             lane_placement=lane_placement,
             provider_binding=provider_binding,
