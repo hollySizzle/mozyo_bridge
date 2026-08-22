@@ -143,10 +143,13 @@ _KEY_LINE_PREFIX = f"- {IDEMPOTENCY_FIELD}: "
 def note_declares_key(notes: object) -> str:
     """The ONE idempotency key a note declares as a canonical field, or ``""``.
 
-    ``""`` for a note that declares none — and equally for one that declares SEVERAL
-    different keys. A note claiming two firings is malformed, and picking either one would
-    let a crafted journal be accepted as proof for a firing it does not carry. Ambiguity is
-    refused rather than resolved.
+    ``""`` for a note that declares none — and equally for one that declares the field more
+    than ONCE, whatever the values. A note claiming two firings is malformed; so is a note
+    declaring the same firing twice, and the first version of this parser collapsed the
+    second case with a ``set`` and accepted it (review j#110293 finding_authorityforgery).
+    Counting declarations rather than deduplicating them is the difference between "what
+    does this note say" and "is there something in this note I can use". Ambiguity is
+    refused, never resolved.
 
     Only the renderer's own line shape counts. Everything the substring search used to
     accept is refused here, and each of these was reproduced as accepted before the fix:
@@ -160,15 +163,14 @@ def note_declares_key(notes: object) -> str:
     never match one — and the key's grammar stays in the single place that owns it instead
     of acquiring a second implementation in this module.
     """
-    declared = set()
-    for raw in str(notes or "").splitlines():
-        line = raw.strip()
-        if not line.startswith(_KEY_LINE_PREFIX):
-            continue
-        declared.add(line[len(_KEY_LINE_PREFIX):].strip())
+    declared = [
+        line[len(_KEY_LINE_PREFIX):].strip()
+        for line in (raw.strip() for raw in str(notes or "").splitlines())
+        if line.startswith(_KEY_LINE_PREFIX)
+    ]
     if len(declared) != 1:
         return ""
-    return declared.pop()
+    return declared[0]
 
 
 __all__ = (

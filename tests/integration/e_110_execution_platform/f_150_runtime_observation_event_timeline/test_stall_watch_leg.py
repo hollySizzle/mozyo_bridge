@@ -44,10 +44,11 @@ from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timel
     LEG_NOT_DUE,
     LEG_NO_READER,
     LEG_RAN,
+    READBACK_UNREADABLE,
     build_journal_readback,
     build_journal_verifier,
     build_journal_writer,
-    journal_id_carrying_key,
+    read_journal_authority,
     run_stall_watch_leg,
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_body_marker import (  # noqa: E501
@@ -428,7 +429,7 @@ class ReadbackFenceTest(LegBase):
         (pending,) = self.store.unrecorded_pending(WS)
         self.assertEqual(pending.last_reason, "write_optin_unset")
 
-    def test_journal_id_carrying_key_matches_only_the_exact_key(self) -> None:
+    def test_read_journal_authority_matches_only_the_exact_key(self) -> None:
         # This test's NAME claimed exactness for seven rounds while it measured only
         # difference: `stallesc1_aaa` and `stallesc1_bbb` are not prefixes of one another,
         # so the substring matcher it was written against passed it too (review j#110281
@@ -438,16 +439,22 @@ class ReadbackFenceTest(LegBase):
         other = "stallesc1_" + "b" * 32
         self.source.append("15855", f"- idempotency_key: {other}", "1")
         self.source.append("15855", f"- idempotency_key: {key}", "2")
-        self.assertEqual(journal_id_carrying_key(self.source, "15855", key), "2")
-        self.assertEqual(journal_id_carrying_key(self.source, "15855", other), "1")
-        self.assertEqual(journal_id_carrying_key(self.source, "15855", "nope"), "")
+        self.assertEqual(read_journal_authority(self.source, "15855", key).journal_id, "2")
+        self.assertEqual(read_journal_authority(self.source, "15855", other).journal_id, "1")
+        self.assertFalse(read_journal_authority(self.source, "15855", "nope").found)
 
-    def test_an_unreadable_source_reports_not_recorded(self) -> None:
+    def test_an_unreadable_source_is_typed_unreadable_not_an_absence(self) -> None:
+        # "The provider refused the question" and "the provider answered no" are opposite
+        # facts, and the first must never authorise anything (review j#110293
+        # finding_unreadablecollapse).
         class _Broken:
             def read_entries(self, issue_id):
                 raise RuntimeError("provider down")
 
-        self.assertEqual(journal_id_carrying_key(_Broken(), "15855", "k"), "")
+        result = read_journal_authority(_Broken(), "15855", "stallesc1_" + "a" * 32)
+        self.assertEqual(result.outcome, READBACK_UNREADABLE)
+        self.assertFalse(result.found)
+        self.assertFalse(result.asked)
 
 
 class NoiseTest(LegBase):

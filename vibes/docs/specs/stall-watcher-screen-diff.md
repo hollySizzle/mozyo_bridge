@@ -2,7 +2,7 @@
 
 ## Status
 
-- version: `v0.10` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 / j#110192 / j#110218 / j#110254 / j#110281 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
+- version: `v0.11` (#15855 運用配線 + j#110132 / j#110146 / j#110169 / j#110183 / j#110192 / j#110218 / j#110254 / j#110281 / j#110293 review の指摘を反映。v0.1 のセンサー / 分類 / 処方の記述は不変)
 - scope: watcher 層 (background / operator) が、pane の**描画画面が進んでいるか**だけを一次
   センサーとして停滞候補を拾い、種別を分類し、種別ごとの処方を**提示**するまで。
 - non-goal: 処方の自動適用、配送 rail の retry policy、completion 判定、receiver-state
@@ -778,6 +778,55 @@ verifier は 0 read、writer は **2 read**、共有 counter は**動かない**
 
 いずれも「第 2 の matcher / 第 2 の read 経路 / 第 2 の seam を足すと落ちる」形で、
 実際に注入して赤になることを確認している。
+
+### 公開鍵は権威ではない — 出所の検査 (j#110293 finding_authorityforgery / finding_unreadablecollapse)
+
+v0.10 は照会を **exact 一致**にした。しかしそれは *note の形式* の検査であって、*note の出所*
+の検査ではない。`escalation_idempotency_key` は row の内容から得られる**公開・決定的な
+SHA-256** であり、**秘密ではないので認証に使えない**。issue にコメントできる者は誰でも同じ
+canonical field 行を書ける。
+
+#### 誤りの形は 5 round とも同じで、1 段ずつ外側にずれ続けている
+
+| round | 閉じたと宣言 | 空いていた 1 段外側 |
+| --- | --- | --- |
+| R6 | row 全体の契約 | persistence state 列が素通し |
+| R7 | 全列の文法表 | 各面が表を**使っている**保証がない |
+| R8 | 存在照会の admission | 照会そのものが部分文字列一致 |
+| R9 | 照会の exact 化と単一 seam | **照会の *出所* を問うていない** |
+| R9 | typed readback 契約 (`found`/`absent`/`capped`/`unreadable`) | **`unreadable` が実際の read 失敗で到達しない** |
+
+#### 攻撃の 3 形と、閉じ方
+
+1. **事後奪取** — 正規 journal の後に同じ行を投稿すると、`last-match-wins` が binding と wake
+   pointer を後発の journal へ渡した。→ **claimant が 0 件または複数なら fail-closed**
+   (`ambiguous_authority`)。「どちらが記録か誰にも言えない」ときに片方を選ぶのは推測であり、
+   推測の上には何も建てない。writer は POST もしない (deterministic zero-send)。
+2. **同一 field の二重宣言** — parser が宣言を `set` で畳んでいたため、同じ field を 2 回書いた
+   note が「1 つ宣言している」と読まれた。→ **宣言を数える**。「この note は何と言っているか」と
+   「この note に使えるものがあるか」は違う問いである。
+3. **先回り偽造** — rail が書く**前**に偽の行を投稿すると、pre-POST readback がそれを
+   `already_recorded` と読み、**本物の escalation note は投稿されず**、wake は攻撃者の journal を
+   指す。→ **local な検査では原理的に閉じない。** 宣言 threat model は攻撃者に row 読取も与えて
+   いるので、local nonce は読まれ、note 本文の全 field は row から復元できる。認証を持つのは
+   Redmine 側の**著者**だけである。
+
+#### 出所の機構は既にこの repo にある
+
+`RedmineJournalEntry.author_id` は #14661 j#92494 で「**approval source を *名乗る* だけの
+marker は何も証明しない — note を書ける者は誰でもその field を書ける**」という理由で導入され、
+`RedmineJournalSource` が provider の値から populate している。**欠けているのは「期待する
+issuer」だけ**である。`ReadbackResult` は author を運び、`build_journal_readback` は
+`expected_issuer` が既知なら別著者の claimant を権威として扱わない。**issuer をどこから得るかは
+運用影響のある設計判断であり、j#110297 の `design_consultation` で裁定を仰いでいる。**
+裁定までの残余 (先回り偽造) は本節に明記し、隠さない。
+
+#### read 失敗は不存在ではない
+
+`read_entries` の例外を空文字に潰して「照会したが無かった」と報告していた。v0.10 が宣言した
+typed 契約を実装が満たしていない状態であり、**宣言した強制が実在しない**型の 5 度目である。
+`read_journal_authority` は例外を `unreadable` として型で返し、`asked` は False になる。
+失敗は cache しない — 1 度の outage が pass 全体で「確定した事実」に見えてはいけない。
 
 ## Cross-References
 

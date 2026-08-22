@@ -87,6 +87,11 @@ PENDING_REASONS: frozenset[str] = frozenset(
         # — a reason that drifts silently becomes `unclassified_reason`, which is exactly
         # the field an operator reads to learn WHY nothing is being written.
         "read_cap_reached",
+        # The writer's refusal when several journals claim one firing: nobody can say which
+        # is the record, so the firing stays pending and visible rather than being bound to
+        # a guess (review j#110293 finding_authorityforgery). Same equality-by-test rule as
+        # `read_cap_reached` above.
+        "ambiguous_authority",
         # The sentinel the store substitutes for a reason it does not recognise. It is a
         # member of this set because a value the store WRITES must be a value the store can
         # read back -- otherwise the substitution quarantines the very row it was protecting.

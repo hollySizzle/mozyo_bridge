@@ -81,8 +81,9 @@ from mozyo_bridge.core.state.stall_pending_transition import (  # noqa: E402
 )
 from mozyo_bridge.e_110_execution_platform.f_150_runtime_observation_event_timeline.application.stall_watch_leg import (  # noqa: E402,E501
     build_journal_writer,
-    journal_id_carrying_key,
+    read_journal_authority,
     READBACK_ABSENT,
+    READBACK_AMBIGUOUS,
     READBACK_CAPPED,
     READBACK_FOUND,
     READBACK_UNREADABLE,
@@ -1023,8 +1024,11 @@ class _AuthoritySource:
     """The minimum a Redmine journal source has to look like, plus a read counter."""
 
     class Entry:
-        def __init__(self, issue_id, journal_id, notes):
+        def __init__(self, issue_id, journal_id, notes, author_id=""):
             self.issue_id, self.journal_id, self.notes = issue_id, journal_id, notes
+            #: What the provider authenticates about this journal, as
+            #: `RedmineJournalEntry` carries it (#14661 j#92494).
+            self.author_id = author_id
 
     def __init__(self) -> None:
         self.entries: list = []
@@ -1034,17 +1038,19 @@ class _AuthoritySource:
         self.reads += 1
         return [e for e in self.entries if e.issue_id == str(issue_id)]
 
-    def append(self, notes, journal_id="110264", issue=REAL_ISSUE):
-        self.entries.append(self.Entry(issue, journal_id, notes))
+    def append(self, notes, journal_id="110264", issue=REAL_ISSUE, author_id="7"):
+        self.entries.append(self.Entry(issue, journal_id, notes, author_id))
 
 
 class AuthorityExactMatchTest(unittest.TestCase):
     """The one external authority answers on a canonical field, not on a substring."""
 
     def _lookup(self, notes, key=CANONICAL_KEY) -> str:
+        """The journal id the authority attributes to ``key``; ``""`` for anything else."""
         source = _AuthoritySource()
         source.append(notes)
-        return journal_id_carrying_key(source, REAL_ISSUE, key)
+        result = read_journal_authority(source, REAL_ISSUE, key)
+        return result.journal_id if result.found else ""
 
     def test_the_renderer_s_own_note_is_found(self) -> None:
         # The property that matters, stated as a round trip: whatever the renderer emits,
@@ -1083,7 +1089,7 @@ class AuthorityExactMatchTest(unittest.TestCase):
         source.append(_rendered_note())
         for bogus in ("", "stallesc1_", CANONICAL_KEY[:20], "nope", CANONICAL_KEY + "0"):
             with self.subTest(key=bogus):
-                self.assertEqual(journal_id_carrying_key(source, REAL_ISSUE, bogus), "")
+                self.assertFalse(read_journal_authority(source, REAL_ISSUE, bogus).found)
 
     def test_a_note_declaring_a_junk_key_cannot_be_matched_by_asking_for_junk(self) -> None:
         # The case that separates "the request is validated" from "the request is merely
@@ -1092,15 +1098,20 @@ class AuthorityExactMatchTest(unittest.TestCase):
         source = _AuthoritySource()
         source.append("- idempotency_key: not-a-key")
         self.assertEqual(note_declares_key("- idempotency_key: not-a-key"), "not-a-key")
-        self.assertEqual(journal_id_carrying_key(source, REAL_ISSUE, "not-a-key"), "")
+        self.assertFalse(read_journal_authority(source, REAL_ISSUE, "not-a-key").found)
 
     def test_the_right_journal_is_picked_out_of_several(self) -> None:
+        # Several journals, but only ONE claims each key: that is a find, not an ambiguity.
         source = _AuthoritySource()
         source.append(_rendered_note(OTHER_KEY), journal_id="110100")
         source.append("- idempotency_key: not-a-key", journal_id="110101")
         source.append(_rendered_note(CANONICAL_KEY), journal_id="110102")
-        self.assertEqual(journal_id_carrying_key(source, REAL_ISSUE, CANONICAL_KEY), "110102")
-        self.assertEqual(journal_id_carrying_key(source, REAL_ISSUE, OTHER_KEY), "110100")
+        self.assertEqual(
+            read_journal_authority(source, REAL_ISSUE, CANONICAL_KEY).journal_id, "110102"
+        )
+        self.assertEqual(
+            read_journal_authority(source, REAL_ISSUE, OTHER_KEY).journal_id, "110100"
+        )
 
     def test_indentation_and_trailing_space_do_not_change_the_answer(self) -> None:
         # A markdown list item may be indented; that is still the canonical field.
@@ -1287,7 +1298,7 @@ class RootClosureTest(unittest.TestCase):
                 and n.func.attr == "read_entries",
             )
             callers |= {f"{path.name}:{name}" for name in names}
-        self.assertEqual(callers, {"stall_watch_leg.py:journal_id_carrying_key"})
+        self.assertEqual(callers, {"stall_watch_leg.py:read_journal_authority"})
 
     def test_only_the_counted_seam_calls_that_function(self) -> None:
         callers = set()
@@ -1296,7 +1307,7 @@ class RootClosureTest(unittest.TestCase):
                 tree,
                 lambda n: isinstance(n, ast.Call)
                 and isinstance(n.func, ast.Name)
-                and n.func.id == "journal_id_carrying_key",
+                and n.func.id == "read_journal_authority",
             )
             callers |= {f"{path.name}:{name}" for name in names}
         # `read` is the inner function `build_journal_readback` returns: the counted, capped
@@ -1361,6 +1372,169 @@ class RootClosureTest(unittest.TestCase):
                 if isinstance(node.value, str) and "idempotency_key:" in node.value:
                     owners.add(path.name)
         self.assertEqual(owners, {"stall_escalation_note.py"})
+
+
+
+# ======================================================================================
+# Review j#110293: a public key is not an authority
+# ======================================================================================
+#
+# R9 made the authority match EXACTLY. It did not make it match the RIGHT journal. The
+# idempotency key is a public, deterministic SHA-256 of row fields, so anyone who can
+# comment on the issue can declare it — and the rail believed them. Two of the three shapes
+# close here; the third needs an issuer this rail can prove is itself (j#110297).
+
+
+class AuthorityForgeryTest(unittest.TestCase):
+    """A journal that merely CLAIMS a firing cannot take the record from the one that has it."""
+
+    def setUp(self) -> None:
+        self.source = _AuthoritySource()
+        self.emit = _CapEmit(self.source)
+        self.row = _pending(idempotency_key=CANONICAL_KEY)
+
+    #: The rail's own provider account, and an attacker who can comment on the issue.
+    OURS = "7"
+    THEIRS = "99"
+
+    def _writer(self, **kwargs):
+        return build_journal_writer(
+            policy=StallWatchPolicy.from_record({"lanes": [LANE]}),
+            transport=object(),
+            readback=build_journal_readback(source=self.source, **kwargs),
+            emit=self.emit,
+        )
+
+    def test_a_later_forged_claim_cannot_hijack_the_binding(self) -> None:
+        # Reproduced before the fix: last-match-wins handed the binding and the coordinator's
+        # wake pointer to whichever journal was posted LAST.
+        self.source.append(_rendered_note(), journal_id="110264", author_id=self.OURS)
+        self.assertEqual(
+            read_journal_authority(self.source, REAL_ISSUE, CANONICAL_KEY).journal_id, "110264"
+        )
+
+        self.source.append(f"- idempotency_key: {CANONICAL_KEY}", journal_id="999002",
+                           author_id=self.THEIRS)
+
+        hijacked = read_journal_authority(self.source, REAL_ISSUE, CANONICAL_KEY)
+        self.assertEqual(hijacked.outcome, READBACK_AMBIGUOUS)
+        self.assertEqual(hijacked.journal_id, "")
+
+    def test_an_ambiguous_authority_neither_writes_nor_wakes(self) -> None:
+        # Ambiguity is a refusal at every consumer, not a quieter kind of success.
+        self.source.append(_rendered_note(), journal_id="110264", author_id=self.OURS)
+        self.source.append(f"- idempotency_key: {CANONICAL_KEY}", journal_id="999002",
+                           author_id=self.THEIRS)
+
+        result = self._writer()(self.row)
+        self.assertEqual(result.outcome, WRITE_NOT_SENT)
+        self.assertEqual(result.reason, READBACK_AMBIGUOUS)
+        self.assertEqual(self.emit.calls, [])
+
+        observed = build_journal_verifier(
+            readback=build_journal_readback(source=self.source)
+        )(_pending(idempotency_key=CANONICAL_KEY, journal_id="110264"))
+        self.assertEqual(observed, "")
+        self.assertEqual(
+            admit_wake(_pending(idempotency_key=CANONICAL_KEY, journal_id="110264"), observed),
+            WAKE_JOURNAL_UNVERIFIED,
+        )
+
+    def test_a_note_declaring_the_same_field_twice_is_refused(self) -> None:
+        # A `set` collapsed this into a single declaration and accepted it. Counting
+        # declarations instead of deduplicating them is the whole difference between "what
+        # does this note say" and "is there something in here I can use".
+        doubled = f"- idempotency_key: {CANONICAL_KEY}\n- idempotency_key: {CANONICAL_KEY}"
+        self.assertEqual(note_declares_key(doubled), "")
+        self.source.append(doubled, journal_id="999003", author_id=self.THEIRS)
+        self.assertFalse(
+            read_journal_authority(self.source, REAL_ISSUE, CANONICAL_KEY).found
+        )
+
+    def test_the_authority_carries_the_author_the_provider_authenticates(self) -> None:
+        # The field that makes the remaining shape closable. A note can SAY anything; who
+        # wrote it is the provider's fact (#14661 j#92494).
+        self.source.append(_rendered_note(), journal_id="110264", author_id=self.OURS)
+        found = read_journal_authority(self.source, REAL_ISSUE, CANONICAL_KEY)
+        self.assertTrue(found.found)
+        self.assertEqual(found.author_id, self.OURS)
+
+    def test_a_known_issuer_makes_a_preemptive_forgery_harmless(self) -> None:
+        # The forgery lands BEFORE the rail writes — the shape that no local check can catch,
+        # because the attacker's note is well-formed and the key is public. With the issuer
+        # known it is not this rail's record and never becomes one.
+        self.source.append(f"- idempotency_key: {CANONICAL_KEY}", journal_id="999001",
+                           author_id=self.THEIRS)
+
+        result = read_journal_authority(self.source, REAL_ISSUE, CANONICAL_KEY)
+        self.assertTrue(result.found)  # a claimant exists...
+        self.assertEqual(result.author_id, self.THEIRS)  # ...but not ours
+
+        seam = build_journal_readback(source=self.source, expected_issuer=self.OURS)
+        self.assertEqual(seam(REAL_ISSUE, CANONICAL_KEY).outcome, READBACK_AMBIGUOUS)
+        # And the wake it would have authorised does not happen.
+        observed = build_journal_verifier(readback=seam)(
+            _pending(idempotency_key=CANONICAL_KEY, journal_id="999001")
+        )
+        self.assertEqual(observed, "")
+
+    def test_a_known_issuer_still_admits_our_own_journal(self) -> None:
+        # The control: an issuer check that refused everything would pass the test above for
+        # free while turning the rail off.
+        self.source.append(_rendered_note(), journal_id="110264", author_id=self.OURS)
+        seam = build_journal_readback(source=self.source, expected_issuer=self.OURS)
+        result = seam(REAL_ISSUE, CANONICAL_KEY)
+        self.assertTrue(result.found)
+        self.assertEqual(result.journal_id, "110264")
+
+
+class UnreadableAuthorityTest(unittest.TestCase):
+    """A provider that refuses the question did not answer it."""
+
+    class _Broken:
+        def __init__(self) -> None:
+            self.reads = 0
+
+        def read_entries(self, issue_id):
+            self.reads += 1
+            raise RuntimeError("redmine unreachable")
+
+    def test_a_provider_failure_is_never_reported_as_an_absence(self) -> None:
+        # Reproduced before the fix as `outcome=absent, asked=True` — the contract this rail
+        # declared in v0.10 and then did not implement.
+        broken = self._Broken()
+        result = read_journal_authority(broken, REAL_ISSUE, CANONICAL_KEY)
+        self.assertEqual(result.outcome, READBACK_UNREADABLE)
+        self.assertNotEqual(result.outcome, READBACK_ABSENT)
+        self.assertFalse(result.asked)
+        self.assertEqual(broken.reads, 1)  # the question really was asked of the provider
+
+    def test_the_seam_passes_the_failure_through_untouched(self) -> None:
+        budget = {"reads": 0, "mutated": False, "uncertain": False}
+        result = build_journal_readback(source=self._Broken(), budget=budget)(
+            REAL_ISSUE, CANONICAL_KEY
+        )
+        self.assertEqual(result.outcome, READBACK_UNREADABLE)
+        self.assertFalse(result.asked)
+        # The read was attempted, so it is accounted for even though it answered nothing.
+        self.assertEqual(budget["reads"], 1)
+
+    def test_a_failure_is_not_cached_as_an_answer(self) -> None:
+        # Caching a failure would make one outage look like a settled fact for the rest of
+        # the pass.
+        class _FlakyThenFine:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def read_entries(self, issue_id):
+                self.calls += 1
+                if self.calls == 1:
+                    raise RuntimeError("transient")
+                return [_AuthoritySource.Entry(REAL_ISSUE, "110264", _rendered_note(), "7")]
+
+        seam = build_journal_readback(source=_FlakyThenFine())
+        self.assertEqual(seam(REAL_ISSUE, CANONICAL_KEY).outcome, READBACK_UNREADABLE)
+        self.assertEqual(seam(REAL_ISSUE, CANONICAL_KEY).journal_id, "110264")
 
 
 if __name__ == "__main__":  # pragma: no cover

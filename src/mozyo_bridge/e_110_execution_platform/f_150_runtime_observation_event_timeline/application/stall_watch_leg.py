@@ -27,12 +27,19 @@ only after a journal **id** is read back, and for a good reason: "the POST did n
 not the same as "a journal exists", and a pass that treated it as such would, after an
 uncertain write, write a second journal on the next pass.
 
-:func:`journal_id_carrying_key` closes that by making the escalation note *self-identifying*:
-the body carries ``idempotency_key: <key>`` (rendered by
+:func:`read_journal_authority` closes that by making the escalation note *self-identifying*:
+the body carries the firing's key in a canonical field (rendered by
 :func:`render_escalation_body`), so the id can be recovered by scanning the issue's journals
-for that key. The scan runs **before** the write as well as after it, which is what makes
-the whole rail idempotent across a crash: a firing whose journal already landed is bound to
-it and never written again, whatever the local store believes.
+for the journal that declares it. The scan runs **before** the write as well as after it,
+which is what makes the whole rail idempotent across a crash: a firing whose journal already
+landed is bound to it and never written again, whatever the local store believes.
+
+What that scan can and cannot establish is worth stating exactly, because two rounds were
+lost to overstating it. It establishes that a journal declaring this firing EXISTS. It does
+not establish that this rail WROTE it — the key is public and deterministic, so anyone who
+can comment on the issue can declare it too. Several claimants are therefore refused rather
+than resolved, and the author is carried for the issuer binding whose source is still being
+decided (j#110297).
 
 A write is therefore classified three ways, not two (review j#110132 finding_1). "No journal
 id" is not one situation: a refused write never reached Redmine, while a POST that returned
@@ -143,47 +150,7 @@ class StallWatchLegOutcome:
         return payload
 
 
-def journal_id_carrying_key(source: object, issue: str, key: str) -> str:
-    """The id of the issue journal whose note carries ``key``, or ``""``.
-
-    The readback half of the write fence. The key is derived from the run's identity, so
-    exactly one journal can ever carry it, and finding it is proof the durable record holds
-    this firing.
-
-    Matching is :func:`note_declares_key` — the canonical field parser that lives beside the
-    renderer — compared for EQUALITY with the firing's own key. It used to be
-    ``needle in notes``, a substring search, while this docstring already claimed an exact
-    line match: a journal declaring ``<key>-suffix``, or merely quoting another journal's
-    key in prose, was accepted as proof that this firing had been recorded (review j#110281
-    finding_exactmatch). A false claim here is the worst kind this rail can hold, because
-    this readback is its ONLY external authority — it binds the writer to an existing
-    journal and it admits every coordinator wake.
-
-    A non-canonical ``key`` matches nothing: the request itself is refused rather than
-    compared, so a caller cannot go fishing with a prefix.
-
-    Fail-soft on an unreadable source is the CALLER's decision now, not this function's:
-    ``read_journal_authority`` returns a typed result and each caller chooses. This function
-    keeps returning ``""`` for "no journal carries this key" only.
-    """
-    if source is None or not key or not canonical_idempotency_key(key):
-        return ""
-    try:
-        entries = source.read_entries(str(issue))  # type: ignore[attr-defined]
-    except Exception:  # noqa: BLE001 - an unreadable issue is "not recorded", never a crash
-        return ""
-    best = ""
-    for entry in entries or ():
-        if note_declares_key(getattr(entry, "notes", "")) == key:
-            candidate = str(getattr(entry, "journal_id", "") or "")
-            # Last match wins: a duplicate can only arise from a pre-fence write, and the
-            # later journal is the one a reader following the issue will act on.
-            if candidate:
-                best = candidate
-    return best
-
-
-#: A journal carrying this firing was found; ``journal_id`` holds its id.
+#: Exactly ONE journal carries this firing; ``journal_id`` holds its id.
 READBACK_FOUND = "found"
 #: The authority was asked and no journal carries this firing.
 READBACK_ABSENT = "absent"
@@ -191,9 +158,15 @@ READBACK_ABSENT = "absent"
 READBACK_CAPPED = "read_cap_reached"
 #: The authority was asked and could not answer (no source, or the read raised).
 READBACK_UNREADABLE = "unreadable"
+#: SEVERAL journals claim this firing. Nobody can say which is the record, so nothing may
+#: be built on any of them (review j#110293 finding_authorityforgery).
+READBACK_AMBIGUOUS = "ambiguous_authority"
 
 READBACK_OUTCOMES: frozenset[str] = frozenset(
-    {READBACK_FOUND, READBACK_ABSENT, READBACK_CAPPED, READBACK_UNREADABLE}
+    {
+        READBACK_FOUND, READBACK_ABSENT, READBACK_CAPPED, READBACK_UNREADABLE,
+        READBACK_AMBIGUOUS,
+    }
 )
 
 
@@ -201,13 +174,20 @@ READBACK_OUTCOMES: frozenset[str] = frozenset(
 class ReadbackResult:
     """What the external authority said, and whether it was asked at all.
 
-    Three distinguishable answers, because collapsing them is what let the cap leak. "No
-    journal carries this" and "we never looked" are opposite facts that a boolean cannot
-    tell apart, and the second must never authorise anything.
+    Five distinguishable answers, because collapsing any pair of them has already cost this
+    issue a round. "No journal carries this" and "we never looked" are opposite facts that a
+    boolean cannot tell apart, and only the first may ever authorise anything. "Several
+    journals claim it" is a third fact again: it is not an absence, and it is certainly not
+    a find.
     """
 
     outcome: str
     journal_id: str = ""
+    #: The provider's opaque author id for the found journal (``""`` when not applicable).
+    #: Carried because a note that merely SAYS it is the record proves nothing — anyone who
+    #: can write a note can write its fields — while the author is a fact the provider
+    #: authenticates (the reason ``RedmineJournalEntry.author_id`` exists, #14661 j#92494).
+    author_id: str = ""
 
     def __post_init__(self) -> None:
         if self.outcome not in READBACK_OUTCOMES:
@@ -221,6 +201,8 @@ class ReadbackResult:
                 f"a {self.outcome!r} readback must "
                 f"{'carry' if self.outcome == READBACK_FOUND else 'not carry'} a journal id"
             )
+        if self.author_id and self.outcome != READBACK_FOUND:
+            raise ValueError(f"a {self.outcome!r} readback must not carry an author")
 
     @property
     def found(self) -> bool:
@@ -228,8 +210,61 @@ class ReadbackResult:
 
     @property
     def asked(self) -> bool:
-        """Whether the authority was actually consulted (cap and no-source are not asks)."""
-        return self.outcome in (READBACK_FOUND, READBACK_ABSENT)
+        """Whether the authority was actually consulted.
+
+        A cap and a missing source are not asks. An UNREADABLE answer is not an ask either:
+        the request left, the provider refused it, and nothing came back. Reporting that as
+        "asked and answered nothing" is what review j#110293 finding_unreadablecollapse
+        found — a lie that costs nothing today and misleads the next caller.
+        """
+        return self.outcome in (READBACK_FOUND, READBACK_ABSENT, READBACK_AMBIGUOUS)
+
+
+def read_journal_authority(source: object, issue: str, key: str) -> ReadbackResult:
+    """Ask the external system which journal carries ``key``. The rail's ONLY authority.
+
+    Matching is :func:`note_declares_key` — the canonical field parser that lives beside the
+    renderer — compared for EQUALITY with the firing's own key. A non-canonical ``key``
+    matches nothing: the request itself is refused rather than compared, so a caller cannot
+    go fishing with a prefix.
+
+    **Several claimants is a refusal, not a choice.** This used to take the last match, on
+    the reasoning that a duplicate could only come from a pre-fence write. That reasoning
+    omitted the attacker this rail's own threat model declares: anyone who can comment on
+    the issue can post the same canonical field line, and last-match-wins handed them the
+    binding and the coordinator's wake pointer (review j#110293 finding_authorityforgery).
+    Nobody can say which of two claimants is the record, so nothing is built on either.
+
+    **An unreadable provider is not an absence.** The exception used to be swallowed into
+    ``""``, which the seam then reported as "asked, and no journal carries this" — the exact
+    collapse the typed contract was introduced to prevent (finding_unreadablecollapse).
+
+    What this still cannot do, stated plainly: it cannot tell OUR journal from a forgery
+    that copies the field, because the idempotency key is public and deterministic. Only the
+    author can, and the expected issuer is a pending design decision (j#110297). The author
+    is carried here so that decision plugs in rather than rebuilds.
+    """
+    if source is None or not key or not canonical_idempotency_key(key):
+        return ReadbackResult(outcome=READBACK_UNREADABLE)
+    try:
+        entries = source.read_entries(str(issue))  # type: ignore[attr-defined]
+    except Exception:  # noqa: BLE001 - typed, never swallowed into an absence
+        return ReadbackResult(outcome=READBACK_UNREADABLE)
+    claimants = [
+        entry for entry in entries or ()
+        if note_declares_key(getattr(entry, "notes", "")) == key
+        and str(getattr(entry, "journal_id", "") or "")
+    ]
+    if not claimants:
+        return ReadbackResult(outcome=READBACK_ABSENT)
+    if len(claimants) > 1:
+        return ReadbackResult(outcome=READBACK_AMBIGUOUS)
+    (entry,) = claimants
+    return ReadbackResult(
+        outcome=READBACK_FOUND,
+        journal_id=str(getattr(entry, "journal_id", "") or ""),
+        author_id=str(getattr(entry, "author_id", "") or ""),
+    )
 
 
 def build_journal_readback(
@@ -237,6 +272,7 @@ def build_journal_readback(
     source: object,
     budget: Optional[dict] = None,
     read_cap: Optional[int] = None,
+    expected_issuer: str = "",
 ) -> Callable[[str, str], ReadbackResult]:
     """The ONE counted, capped way this rail asks Redmine whether a journal exists.
 
@@ -251,10 +287,18 @@ def build_journal_readback(
     (``budget["reads"]`` / :data:`MAX_PROVIDER_READS_PER_PASS`) — imported rather than
     re-picked, so "how many provider reads may a bounded pass make" stays ONE decision.
 
-    Positive answers are cached for the pass; absences are not. A journal, once written,
-    does not stop existing, so a hit is free to reuse — while caching a MISS would make the
-    firing this pass is about to write unverifiable for the rest of the pass, because the
-    miss would have been recorded before the write.
+    Positive answers are cached for the pass; nothing else is. A journal, once written, does
+    not stop existing, so a hit is free to reuse — while caching a MISS would make the firing
+    this pass is about to write unverifiable for the rest of the pass, because the miss would
+    have been recorded before the write. An ambiguity or a provider failure is likewise not
+    cached: neither is a fact about the world that stays true.
+
+    ``expected_issuer`` is the provider author id this rail writes as. When it is known, a
+    claimant authored by anyone else is not a claimant at all — that is what makes a forged
+    note harmless rather than merely ambiguous. It is empty today: where the rail learns its
+    own issuer is the design decision raised in j#110297, and until that is settled this
+    parameter is the seam that decision plugs into. The residual while it is empty is
+    recorded there and in the spec, not hidden here.
     """
     if read_cap is None:
         # Lazily, the way this rail already imports `budget_spent`: the read budget stays one
@@ -264,25 +308,29 @@ def build_journal_readback(
         )
 
         read_cap = MAX_PROVIDER_READS_PER_PASS
-    cache: dict[tuple[str, str], str] = {}
+    cache: dict[tuple[str, str], ReadbackResult] = {}
 
     def read(issue: str, key: str) -> ReadbackResult:
         issue, key = str(issue or ""), str(key or "")
         if not issue or not key:
             return ReadbackResult(outcome=READBACK_UNREADABLE)
         if (issue, key) in cache:
-            return ReadbackResult(outcome=READBACK_FOUND, journal_id=cache[(issue, key)])
+            return cache[(issue, key)]
         if source is None:
             return ReadbackResult(outcome=READBACK_UNREADABLE)
         if budget is not None and int(budget.get("reads", 0)) >= read_cap:
             return ReadbackResult(outcome=READBACK_CAPPED)
         if budget is not None:
             budget["reads"] = int(budget.get("reads", 0)) + 1
-        found = journal_id_carrying_key(source, issue, key)
-        if found:
-            cache[(issue, key)] = found
-            return ReadbackResult(outcome=READBACK_FOUND, journal_id=found)
-        return ReadbackResult(outcome=READBACK_ABSENT)
+        result = read_journal_authority(source, issue, key)
+        if result.found and expected_issuer and result.author_id != expected_issuer:
+            # Authored by someone else: not this rail's record, so not a claimant. Refused
+            # rather than reported as an absence, because "a journal claiming this firing
+            # exists and we did not write it" is an operator-visible fact.
+            result = ReadbackResult(outcome=READBACK_AMBIGUOUS)
+        if result.found:
+            cache[(issue, key)] = result
+        return result
 
     return read
 
@@ -334,11 +382,13 @@ DETERMINISTIC_NO_SEND_REASONS: frozenset[str] = frozenset(
         "no_anchor",
         "disabled",
         "unsupported_source",
-        # Not a transport reason: the writer's own refusal when the pass has spent its
-        # provider-read budget and the idempotency check therefore could not run. It belongs
-        # in this allowlist because it proves the same thing every other member does —
-        # nothing reached Redmine (review j#110281 finding_readcap).
+        # Not transport reasons: the writer's own refusals when the idempotency check could
+        # not run (the pass spent its provider-read budget) or could not conclude (several
+        # journals claim the firing). Both belong in this allowlist because they prove the
+        # same thing every other member does — nothing reached Redmine (review j#110281
+        # finding_readcap, j#110293 finding_authorityforgery).
         READBACK_CAPPED,
+        READBACK_AMBIGUOUS,
     }
 )
 
@@ -393,6 +443,14 @@ def build_journal_writer(
                 outcome=WRITE_RECORDED,
                 journal_id=existing.journal_id,
                 reason="already_recorded",
+            )
+        if existing.outcome == READBACK_AMBIGUOUS:
+            # Several journals claim this firing. Posting would add a third and binding to
+            # any of them would be a guess, so the firing stays pending and visible. A
+            # deterministic zero-send: nothing reached Redmine (review j#110293
+            # finding_authorityforgery).
+            return JournalWriteResult(
+                outcome=WRITE_NOT_SENT, reason=READBACK_AMBIGUOUS
             )
         if existing.outcome == READBACK_CAPPED:
             # The pass has spent its provider-read budget, so the idempotency check could
@@ -678,6 +736,7 @@ __all__ = (
     "LEG_RAN",
     "StallWatchLegOutcome",
     "READBACK_ABSENT",
+    "READBACK_AMBIGUOUS",
     "READBACK_CAPPED",
     "READBACK_FOUND",
     "READBACK_OUTCOMES",
@@ -686,6 +745,6 @@ __all__ = (
     "build_journal_readback",
     "build_journal_verifier",
     "build_journal_writer",
-    "journal_id_carrying_key",
+    "read_journal_authority",
     "run_stall_watch_leg",
 )
